@@ -55,7 +55,8 @@ RUN pip install xgrammar triton termplotlib
 # Note: Using the same index URLs as provided in your script
 RUN pip install flashinfer-python --no-deps --index-url https://flashinfer.ai/whl && \
     pip install flashinfer-cubin --index-url https://flashinfer.ai/whl && \
-    pip install flashinfer-jit-cache --index-url https://flashinfer.ai/whl/cu130
+    pip install flashinfer-jit-cache --index-url https://flashinfer.ai/whl/cu130 && \
+    pip install apache-tvm-ffi nvidia-cudnn-frontend nvidia-cutlass-dsl nvidia-ml-py tabulate
 
 # Install fast safetensors to improve loading speeds
 RUN pip install fastsafetensors
