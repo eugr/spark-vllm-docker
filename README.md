@@ -12,6 +12,10 @@ The Dockerfile builds from the main branch of VLLM, so depending on when you run
 
 ## CHANGELOG
 
+### 2025-12-05
+
+Added `build-and-copy.sh` for convenience.
+
 ### 2025-11-26
 
 Initial release.
