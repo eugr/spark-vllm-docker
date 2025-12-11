@@ -12,6 +12,10 @@ The Dockerfile builds from the main branch of VLLM, so depending on when you run
 
 ## CHANGELOG
 
+### 2025-12-11 update
+
+PR for MiniMax-M2 has been merged into main, so removed the temporary patch from Dockerfile.
+
 ### 2025-12-11
 
 Applied a patch to fix broken MiniMax-M2 in some quants after [this commit](https://github.com/vllm-project/vllm/commit/d017bceb08eaac7bae2c499124ece737fb4fb22b) until [this PR](https://github.com/vllm-project/vllm/pull/30389) is approved. 
