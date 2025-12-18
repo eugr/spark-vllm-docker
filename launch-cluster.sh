@@ -137,50 +137,60 @@ fi
 if [[ -z "$NODES_ARG" ]]; then
     echo "Auto-detecting nodes..."
     
-    if ! command -v avahi-browse &> /dev/null; then
-        echo "Error: avahi-browse not found. Please install avahi-utils."
-        exit 1
-    fi
-
-    # Get local IP of the selected ETH_IF
-    LOCAL_IP=$(ip -4 addr show "$ETH_IF" | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | head -n 1)
-    if [[ -z "$LOCAL_IP" ]]; then
-        echo "Error: Could not determine IP for interface $ETH_IF"
+    if ! command -v nc &> /dev/null; then
+        echo "Error: nc (netcat) not found. Please install netcat."
         exit 1
     fi
     
-    echo "  Detected Local IP: $LOCAL_IP"
+    if ! command -v python3 &> /dev/null; then
+        echo "Error: python3 not found. Please install python3."
+        exit 1
+    fi
+
+    # Get CIDR of the selected ETH_IF
+    CIDR=$(ip -o -f inet addr show "$ETH_IF" | awk '{print $4}' | head -n 1)
+    
+    if [[ -z "$CIDR" ]]; then
+        echo "Error: Could not determine IP/CIDR for interface $ETH_IF"
+        exit 1
+    fi
+    
+    LOCAL_IP=${CIDR%/*}
+    echo "  Detected Local IP: $LOCAL_IP ($CIDR)"
 
     DETECTED_IPS=("$LOCAL_IP")
     
-    # Scan for other nodes
-    echo "  Scanning for peers via avahi..."
-    # Run avahi-browse, filter for _ssh._tcp, and look for our interface
-    # Note: avahi-browse output format varies, we use -p (parsable)
-    # Format: =;interface;IPv4;name;type;domain;hostname;ip;port;txt
+    echo "  Scanning for SSH peers on $CIDR..."
     
-    # We only care about services on our selected ETH_IF or related interfaces?
-    # The reference script scans ALL interfaces found by ibdev2netdev.
-    # Let's stick to the reference logic: scan on all IB-associated interfaces.
+    # Generate list of IPs using python
+    ALL_IPS=$(python3 -c "import ipaddress, sys; [print(ip) for ip in ipaddress.ip_network(sys.argv[1], strict=False).hosts()]" "$CIDR")
     
-    TEMP_FILE=$(mktemp)
-    trap 'rm -f "$TEMP_FILE"' EXIT
+    TEMP_IPS_FILE=$(mktemp)
     
-    avahi_output=$(avahi-browse -p -r -f -t _ssh._tcp 2>/dev/null)
+    # Scan in parallel
+    for ip in $ALL_IPS; do
+        # Skip own IP
+        if [[ "$ip" == "$LOCAL_IP" ]]; then continue; fi
+        
+        (
+            # Check port 22 with 1 second timeout
+            if nc -z -w 1 "$ip" 22 &>/dev/null; then
+                echo "$ip" >> "$TEMP_IPS_FILE"
+            fi
+        ) &
+    done
     
-    # Filter by the selected management interface (ETH_IF)
-    echo "$avahi_output" | grep ";$ETH_IF;" > "$TEMP_FILE"
-       
-    # Extract IPs
-    while IFS=';' read -r prefix iface protocol name type domain hostname ip port txt; do
-        if [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-             # Avoid duplicates
-             if [[ ! " ${DETECTED_IPS[@]} " =~ " ${ip} " ]]; then
-                 DETECTED_IPS+=("$ip")
-                 echo "  Found peer: $ip ($hostname)"
-             fi
-        fi
-    done < <(grep "^=" "$TEMP_FILE" | grep "IPv4")
+    # Wait for all background scans to complete
+    wait
+    
+    # Read found IPs
+    if [[ -f "$TEMP_IPS_FILE" ]]; then
+        while read -r ip; do
+             DETECTED_IPS+=("$ip")
+             echo "  Found peer: $ip"
+        done < "$TEMP_IPS_FILE"
+        rm -f "$TEMP_IPS_FILE"
+    fi
     
     # Sort IPs
     IFS=$'\n' SORTED_IPS=($(sort <<<"${DETECTED_IPS[*]}"))
