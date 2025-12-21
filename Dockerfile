@@ -192,15 +192,28 @@ RUN apt update && apt upgrade -y \
     python3 python3-pip python3-dev vim curl git wget \
     libcudnn9-cuda-13 \
     libnccl-dev libnccl2 libibverbs1 libibverbs-dev rdma-core \
+    # vllm bench plotting
+    gnuplot-nox \
     && rm -rf /var/lib/apt/lists/*
 
 # Set final working directory
 WORKDIR $VLLM_BASE_DIR
 
-# Download Tiktoken files
-RUN mkdir -p tiktoken_encodings && \
-    wget -O tiktoken_encodings/o200k_base.tiktoken "https://openaipublic.blob.core.windows.net/encodings/o200k_base.tiktoken" && \
-    wget -O tiktoken_encodings/cl100k_base.tiktoken "https://openaipublic.blob.core.windows.net/encodings/cl100k_base.tiktoken"
+# Download and cache Tiktoken encodings
+RUN --mount=type=cache,id=tiktoken-encodings,target=/root/.cache/tiktoken_encodings \
+    set -eux; \
+    mkdir -p /root/.cache/tiktoken_encodings; \
+    for f in o200k_base.tiktoken cl100k_base.tiktoken; do \
+      if [ ! -s "/root/.cache/tiktoken_encodings/$f" ]; then \
+        echo "Downloading $f..."; \
+        wget -q -O "/root/.cache/tiktoken_encodings/$f" \
+          "https://openaipublic.blob.core.windows.net/encodings/$f"; \
+      else \
+        echo "Cache hit: $f"; \
+      fi; \
+    done; \
+    mkdir -p "$VLLM_BASE_DIR/tiktoken_encodings"; \
+    cp -a /root/.cache/tiktoken_encodings/. "$VLLM_BASE_DIR/tiktoken_encodings/"
 
 # Copy artifacts from Builder Stage
 # We copy the python packages and executables
@@ -220,5 +233,7 @@ RUN chmod +x $VLLM_BASE_DIR/run-cluster-node.sh
 
 # Final extra deps
 RUN --mount=type=cache,id=pip-cache,target=/root/.cache/pip \
-    pip install ray[default]
+    pip install ray[default] \
+    # vllm bench plotting
+    termplotlib
 
