@@ -116,7 +116,7 @@ For periodic maintenance, I recommend using a filter: `docker builder prune --fi
 
 ### 2025-12-21
 
-- Added `--pre-tf` / `--pre-transformers` flag to `build-and-copy.sh` to install pre-release transformers (5.0.0rc or higher). Use it if you need to run GLM 4.6 Air or any other model that requires transformers 5.0. It may cause issues with other models, so you may want to stick to the release version for everything else.
+- Added `--pre-tf` / `--pre-transformers` flag to `build-and-copy.sh` to install pre-release transformers (5.0.0rc or higher). Use it if you need to run GLM 4.6V or any other model that requires transformers 5.0. It may cause issues with other models, so you may want to stick to the release version for everything else.
 - Pre-built wheels now support release versions. Use with `--use-wheels release`.
 - Using nightly wheels or building from source is recommended for better performance.
 
