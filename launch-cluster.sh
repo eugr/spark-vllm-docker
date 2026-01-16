@@ -592,82 +592,6 @@ apply_mod_to_container() {
     fi
 }
 
-# Start Cluster Function
-start_cluster() {
-    check_cluster_running
-
-    if [[ "$CLUSTER_WAS_RUNNING" == "true" && ${#MOD_QUEUE_PATHS[@]} -eq 0 ]]; then
-        return
-    fi
-
-    if [[ "$CLUSTER_WAS_RUNNING" == "false" ]]; then
-        # Start Head Node
-        echo "Starting Head Node on $HEAD_IP..."
-        
-        # If we have mods to apply, we pause the container entrypoint until mods are done.
-        # This is achieved by checking for /tmp/mod_done which this script creates after applying mods.
-        local head_cmd_args=()
-        if [[ ${#MOD_QUEUE_PATHS[@]} -gt 0 ]]; then
-            head_cmd_args=(bash -c "echo Waiting for mod application...; while [ ! -f /tmp/mod_done ]; do sleep 1; done; echo Mod applied, starting node...; exec ./run-cluster-node.sh --role head --host-ip $HEAD_IP --eth-if $ETH_IF --ib-if $IB_IF")
-        else
-            head_cmd_args=(./run-cluster-node.sh --role head --host-ip "$HEAD_IP" --eth-if "$ETH_IF" --ib-if "$IB_IF")
-        fi
-
-        docker run -d --privileged --gpus all --rm \
-            --ipc=host --network host \
-            --name "$CONTAINER_NAME" \
-            $DOCKER_ARGS \
-            "$IMAGE_NAME" \
-            "${head_cmd_args[@]}"
-
-        # Start Worker Nodes
-        for worker in "${PEER_NODES[@]}"; do
-            echo "Starting Worker Node on $worker..."
-
-            local docker_run_cmd="docker run -d --privileged --gpus all --rm --ipc=host --network host --name $CONTAINER_NAME $DOCKER_ARGS $IMAGE_NAME"
-
-            # Similar pause logic for worker nodes
-            if [[ ${#MOD_QUEUE_PATHS[@]} -gt 0 ]]; then
-                local inner_script="echo Waiting for mod application...; while [ ! -f /tmp/mod_done ]; do sleep 1; done; echo Mod applied, starting node...; exec ./run-cluster-node.sh --role node --host-ip $worker --eth-if $ETH_IF --ib-if $IB_IF --head-ip $HEAD_IP"
-                ssh "$worker" "$docker_run_cmd bash -c \"$inner_script\""
-            else
-                ssh "$worker" "$docker_run_cmd ./run-cluster-node.sh --role node --host-ip $worker --eth-if $ETH_IF --ib-if $IB_IF --head-ip $HEAD_IP"
-            fi
-        done
-    fi
-
-    # Apply mods if requested
-    if [[ ${#MOD_QUEUE_PATHS[@]} -gt 0 ]]; then
-        echo "Processing modifications on cluster nodes..."
-        
-        # Apply to Head
-        for i in "${!MOD_QUEUE_PATHS[@]}"; do
-            apply_mod_to_container "$HEAD_IP" "$CONTAINER_NAME" "true" "${MOD_QUEUE_PATHS[$i]}" "${MOD_QUEUE_TYPES[$i]}" "${MOD_QUEUE_ACTIONS[$i]}"
-        done
-
-         if [[ "$CLUSTER_WAS_RUNNING" == "false" ]]; then
-            # Signal completion on Head
-            docker exec "$CONTAINER_NAME" touch /tmp/mod_done
-        fi
-
-        # Apply to Workers
-        for worker in "${PEER_NODES[@]}"; do
-            for i in "${!MOD_QUEUE_PATHS[@]}"; do
-                apply_mod_to_container "$worker" "$CONTAINER_NAME" "false" "${MOD_QUEUE_PATHS[$i]}" "${MOD_QUEUE_TYPES[$i]}" "${MOD_QUEUE_ACTIONS[$i]}"
-            done
-            
-            if [[ "$CLUSTER_WAS_RUNNING" == "false" ]]; then
-                # Signal completion on Worker
-                ssh -o BatchMode=yes -o StrictHostKeyChecking=no "$worker" "docker exec $CONTAINER_NAME touch /tmp/mod_done"
-            fi
-        done
-    fi
-
-    if [[ "$CLUSTER_WAS_RUNNING" == "false" ]]; then
-        wait_for_cluster
-    fi
-}
-
 # Wait for Cluster Readiness
 wait_for_cluster() {
     echo "Waiting for cluster to be ready..."
@@ -691,6 +615,73 @@ wait_for_cluster() {
     exit 1
 }
 
+# Start Cluster Function
+start_cluster() {
+    check_cluster_running
+
+    if [[ "$CLUSTER_WAS_RUNNING" == "true" && ${#MOD_QUEUE_PATHS[@]} -eq 0 ]]; then
+        return
+    fi
+
+    if [[ "$CLUSTER_WAS_RUNNING" == "false" ]]; then
+        # Start Head Node
+        echo "Starting Head Node on $HEAD_IP..."
+        local head_cmd_args=()
+        if [[ ${#MOD_QUEUE_PATHS[@]} -gt 0 ]]; then
+            head_cmd_args=(bash -c "echo Waiting for mod application...; while [ ! -f /tmp/mod_done ]; do sleep 1; done; echo Mod applied, starting node...; exec ./run-cluster-node.sh --role head --host-ip $HEAD_IP --eth-if $ETH_IF --ib-if $IB_IF")
+        else
+            head_cmd_args=(./run-cluster-node.sh --role head --host-ip "$HEAD_IP" --eth-if "$ETH_IF" --ib-if "$IB_IF")
+        fi
+
+        docker run -d --privileged --gpus all --rm \
+            --ipc=host --network host \
+            --name "$CONTAINER_NAME" \
+            $DOCKER_ARGS \
+            "$IMAGE_NAME" \
+            "${head_cmd_args[@]}"
+
+        # Start Worker Nodes
+        for worker in "${PEER_NODES[@]}"; do
+            echo "Starting Worker Node on $worker..."
+            local docker_run_cmd="docker run -d --privileged --gpus all --rm --ipc=host --network host --name $CONTAINER_NAME $DOCKER_ARGS $IMAGE_NAME"
+            if [[ ${#MOD_QUEUE_PATHS[@]} -gt 0 ]]; then
+                local inner_script="echo Waiting for mod application...; while [ ! -f /tmp/mod_done ]; do sleep 1; done; echo Mod applied, starting node...; exec ./run-cluster-node.sh --role node --host-ip $worker --eth-if $ETH_IF --ib-if $IB_IF --head-ip $HEAD_IP"
+                ssh "$worker" "$docker_run_cmd bash -c \"$inner_script\""
+            else
+                ssh "$worker" "$docker_run_cmd ./run-cluster-node.sh --role node --host-ip $worker --eth-if $ETH_IF --ib-if $IB_IF --head-ip $HEAD_IP"
+            fi
+        done
+    fi
+
+    # Apply mods if requested
+    if [[ ${#MOD_QUEUE_PATHS[@]} -gt 0 ]]; then
+        echo "Processing modifications on cluster nodes..."
+        # Apply to Head
+        for i in "${!MOD_QUEUE_PATHS[@]}"; do
+            apply_mod_to_container "$HEAD_IP" "$CONTAINER_NAME" "true" "${MOD_QUEUE_PATHS[$i]}" "${MOD_QUEUE_TYPES[$i]}" "${MOD_QUEUE_ACTIONS[$i]}"
+        done
+        if [[ "$CLUSTER_WAS_RUNNING" == "false" ]]; then
+            # Signal completion on Head
+            docker exec "$CONTAINER_NAME" touch /tmp/mod_done
+        fi
+        
+        # Apply to Workers
+        for worker in "${PEER_NODES[@]}"; do
+            for i in "${!MOD_QUEUE_PATHS[@]}"; do
+                apply_mod_to_container "$worker" "$CONTAINER_NAME" "false" "${MOD_QUEUE_PATHS[$i]}" "${MOD_QUEUE_TYPES[$i]}" "${MOD_QUEUE_ACTIONS[$i]}"
+            done
+            if [[ "$CLUSTER_WAS_RUNNING" == "false" ]]; then
+                # Signal completion on Worker
+                ssh -o BatchMode=yes -o StrictHostKeyChecking=no "$worker" "docker exec $CONTAINER_NAME touch /tmp/mod_done"
+            fi
+        done
+    fi
+
+    if [[ "$CLUSTER_WAS_RUNNING" == "false" ]]; then
+        wait_for_cluster
+    fi
+}
+
 if [[ "$ACTION" == "exec" ]]; then
     start_cluster
     echo "Executing command on head node: $COMMAND_TO_RUN"
@@ -703,6 +694,7 @@ if [[ "$ACTION" == "exec" ]]; then
     fi
     
     docker exec $DOCKER_EXEC_FLAGS "$CONTAINER_NAME" bash -i -c "$COMMAND_TO_RUN"
+
 elif [[ "$ACTION" == "start" ]]; then
     start_cluster
     if [[ "$DAEMON_MODE" == "true" ]]; then
