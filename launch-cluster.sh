@@ -97,25 +97,25 @@ while [[ "$#" -gt 0 ]]; do
         --name) CONTAINER_NAME="$2"; shift ;;
         --eth-if) ETH_IF="$2"; shift ;;
         --ib-if) IB_IF="$2"; shift ;;
-        --apply-mod) 
+        --apply-mod)
             MOD_QUEUE_PATHS+=("$2")
             MOD_QUEUE_ACTIONS+=("apply")
-            shift 
+            shift
             ;;
-        --revert-mod) 
+        --revert-mod)
             MOD_QUEUE_PATHS+=("$2")
             MOD_QUEUE_ACTIONS+=("revert")
-            shift 
+            shift
             ;;
         --download-mod)
             DOWNLOAD_URL="$2"
-            
+
             # Simple regex to extract owner, repo, pr number
             if [[ "$DOWNLOAD_URL" =~ https://github.com/([^/]+)/([^/]+)/pull/([0-9]+) ]]; then
                 owner="${BASH_REMATCH[1]}"
                 repo="${BASH_REMATCH[2]}"
                 pr_num="${BASH_REMATCH[3]}"
-                
+
                 mod_dir="mods/pr-${pr_num}"
                 patch_file="${mod_dir}/pr-${pr_num}.patch"
                 run_script="${mod_dir}/run.sh"
@@ -127,7 +127,7 @@ while [[ "$#" -gt 0 ]]; do
                     echo "Error: Mod directory '$mod_dir' already exists."
                     exit 1
                 fi
-                
+
                 mkdir -p "$mod_dir"
                 echo "Downloading patch from $diff_url..."
                 if ! curl -sL "$diff_url" -o "$patch_file"; then
@@ -135,7 +135,7 @@ while [[ "$#" -gt 0 ]]; do
                     rm -rf "$mod_dir"
                     exit 1
                 fi
-                
+
                 # Clean up git headers and adjust paths to match container python location
                 # This ensures we can apply the patch from root (/) just like other mods
                 sed -e '/^diff --git/d' \
@@ -167,7 +167,7 @@ while [[ "$#" -gt 0 ]]; do
                 echo ""
                 printf "  %-35s | %s\n" "Mod Name" "Description"
                 printf "  %s\n" "------------------------------------|---------------------------------------------------"
-                
+
                 # Determine terminal width for wrapping
                 term_cols=$(tput cols 2>/dev/null || echo 80)
                 # 2 spaces + 35 column + 3 separator = 40 chars fixed width prefix
@@ -181,9 +181,9 @@ while [[ "$#" -gt 0 ]]; do
                     [ -e "$mod_path" ] || continue
                     mod_name=$(basename "$mod_path")
                     # Handle zip files stripping extension for display if desired, but filename is better for reference
-                    
+
                     desc=""
-                    
+
                     if [[ -d "$mod_path" && -f "$mod_path/run.sh" ]]; then
                         # Check if description function exists to avoid accidental execution of 'apply'
                         if grep -q "description()" "$mod_path/run.sh" || grep -q "description ()" "$mod_path/run.sh"; then
@@ -199,21 +199,21 @@ while [[ "$#" -gt 0 ]]; do
                     elif [[ -f "$mod_path" && "$mod_path" == *.zip ]]; then
                         desc="(Zip package)"
                     else
-                        continue 
+                        continue
                     fi
 
                     if [ "$need_separator" = true ]; then
                         printf "  %s\n" "------------------------------------|---------------------------------------------------"
                     fi
                     need_separator=true
-                    
+
                     # Wrap description
                     if command -v fold >/dev/null 2>&1; then
                         wrapped_desc=$(echo "$desc" | fold -s -w "$desc_width")
                     else
                         wrapped_desc="$desc"
                     fi
-                    
+
                     first_line=true
                     while IFS= read -r line || [[ -n "$line" ]]; do
                         if [ "$first_line" = true ]; then
@@ -279,12 +279,12 @@ fi
 # Validate MOD_QUEUE_PATHS if set
 for i in "${!MOD_QUEUE_PATHS[@]}"; do
     mod_path="${MOD_QUEUE_PATHS[$i]}"
-    
+
     # Check if path exists, if not check in mods/ directory
     if [[ ! -e "$mod_path" ]]; then
         if [[ -e "mods/$mod_path" ]]; then
             mod_path="mods/$mod_path"
-            # Update the path in the array mostly for reference, 
+            # Update the path in the array mostly for reference,
             # though we use local mod_path var below
             MOD_QUEUE_PATHS[$i]="$mod_path"
         else
@@ -474,7 +474,14 @@ check_cluster_running() {
     fi
 }
 
-# Apply Mod Function
+# Apply Mod Function:
+# This function handles the complex logistics of applying patches to running containers.
+# It supports both local (head node) and remote (worker nodes) execution.
+# Steps:
+# 1. Transport: Using SCP to move mod files to remote nodes if necessary.
+# 2. Injection: Using 'docker cp' to get files from the host (local or remote) into the container.
+#    - Includes special handling for ZIP files using Python to unzip in-container (avoiding 'unzip' dependency).
+# 3. Execution: Runs the mod's 'run.sh' script with the specified action (apply/revert).
 apply_mod_to_container() {
     local node_ip="$1"
     local container="$2"
@@ -597,6 +604,8 @@ start_cluster() {
         # Start Head Node
         echo "Starting Head Node on $HEAD_IP..."
         
+        # If we have mods to apply, we pause the container entrypoint until mods are done.
+        # This is achieved by checking for /tmp/mod_done which this script creates after applying mods.
         local head_cmd_args=()
         if [[ ${#MOD_QUEUE_PATHS[@]} -gt 0 ]]; then
             head_cmd_args=(bash -c "echo Waiting for mod application...; while [ ! -f /tmp/mod_done ]; do sleep 1; done; echo Mod applied, starting node...; exec ./run-cluster-node.sh --role head --host-ip $HEAD_IP --eth-if $ETH_IF --ib-if $IB_IF")
@@ -614,9 +623,10 @@ start_cluster() {
         # Start Worker Nodes
         for worker in "${PEER_NODES[@]}"; do
             echo "Starting Worker Node on $worker..."
-            
+
             local docker_run_cmd="docker run -d --privileged --gpus all --rm --ipc=host --network host --name $CONTAINER_NAME $DOCKER_ARGS $IMAGE_NAME"
-            
+
+            # Similar pause logic for worker nodes
             if [[ ${#MOD_QUEUE_PATHS[@]} -gt 0 ]]; then
                 local inner_script="echo Waiting for mod application...; while [ ! -f /tmp/mod_done ]; do sleep 1; done; echo Mod applied, starting node...; exec ./run-cluster-node.sh --role node --host-ip $worker --eth-if $ETH_IF --ib-if $IB_IF --head-ip $HEAD_IP"
                 ssh "$worker" "$docker_run_cmd bash -c \"$inner_script\""
@@ -634,12 +644,12 @@ start_cluster() {
         for i in "${!MOD_QUEUE_PATHS[@]}"; do
             apply_mod_to_container "$HEAD_IP" "$CONTAINER_NAME" "true" "${MOD_QUEUE_PATHS[$i]}" "${MOD_QUEUE_TYPES[$i]}" "${MOD_QUEUE_ACTIONS[$i]}"
         done
-        
+
          if [[ "$CLUSTER_WAS_RUNNING" == "false" ]]; then
             # Signal completion on Head
             docker exec "$CONTAINER_NAME" touch /tmp/mod_done
         fi
-        
+
         # Apply to Workers
         for worker in "${PEER_NODES[@]}"; do
             for i in "${!MOD_QUEUE_PATHS[@]}"; do
