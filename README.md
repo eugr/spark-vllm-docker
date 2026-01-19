@@ -60,8 +60,10 @@ Then run the following command that will build and distribute image across the c
 
 **On a single node**:
 
+ORIGINAL
+
 ```bash
- docker run \
+docker run \
   --privileged \
   --gpus all \
   -it --rm \
@@ -69,11 +71,32 @@ Then run the following command that will build and distribute image across the c
   -v  ~/.cache/huggingface:/root/.cache/huggingface \
   vllm-node \
   bash -c -i "vllm serve \
-  QuantTrio/Qwen3-VL-30B-A3B-Instruct-AWQ \
+  Qwen/Qwen3-30B-A3B  \
   --port 8000 --host 0.0.0.0 \
   --gpu-memory-utilization 0.7 \
   --load-format fastsafetensors"
 ```
+
+ALETERED VESRSION to find path of Python path installed via UV
+
+```sh
+docker run \
+  --privileged \
+  --gpus all \
+  -it --rm \
+  --network host --ipc=host \
+  -v ~/.cache/huggingface:/root/.cache/huggingface \
+  -e PYTHONPATH=/usr/lib/python3.12:/usr/local/lib/python3.12 \
+  vllm-node \
+  bash -c -i "vllm serve \
+  Qwen/Qwen3-30B-A3B \
+  --port 8000 --host 0.0.0.0 \
+  --gpu-memory-utilization 0.7 \
+  --load-format fastsafetensors"
+```
+
+
+
 
 **On a cluster**
 
@@ -104,6 +127,52 @@ To launch the model:
 This will run the model on all available cluster nodes.
 
 **NOTE:** do not use `--load-format fastsafetensors` if you are loading models that would take >0.8 of available RAM (without KV cache) as it may result in out of memory situation.
+
+### Calls
+
+Your model is running in a docker ip table port 8000.
+Some calls in another terminal will determine if it is healthy and serving properly.
+
+Ensure the route is healthy and available for the calls
+
+```sh
+# Health check
+curl http://localhost:8000/health
+```
+
+Call the model
+
+```sh
+# List models
+curl http://localhost:8000/v1/models
+```
+
+Call chat completions
+
+```sh
+# Completion request
+curl -X POST http://localhost:8000/v1/completions \
+  -H "Content-Type: application/json" \
+  -d '{"model":"Qwen/Qwen3-30B-A3B","prompt":"Hello","max_tokens":10}'  | jq .
+
+```
+
+Chat with it
+```sh
+curl http://localhost:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "Qwen/Qwen3-30B-A3B",
+    "messages": [
+      {"role": "user", "content": "Give me a short introduction to large language models."}
+    ],
+    "temperature": 0.6,
+    "top_p": 0.95,
+    "top_k": 20,
+    "max_tokens": 4096
+  }' | jq .
+```
+
 
 ## CHANGELOG
 
