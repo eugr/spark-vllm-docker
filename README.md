@@ -77,7 +77,9 @@ docker run \
   --load-format fastsafetensors"
 ```
 
-ALETERED VESRSION to find path of Python path installed via UV
+ALTERED VERSION 
+- to find path of Python path installed via UV
+- to include other env variables
 
 ```sh
 docker run \
@@ -87,12 +89,13 @@ docker run \
   --network host --ipc=host \
   -v ~/.cache/huggingface:/root/.cache/huggingface \
   -e PYTHONPATH=/usr/lib/python3.12:/usr/local/lib/python3.12 \
+  -e VLLM_BATCH_INVARIANT=1 \
   vllm-node \
   bash -c -i "vllm serve \
   Qwen/Qwen3-30B-A3B \
+  --attention-backend flash_attn \
   --port 8000 --host 0.0.0.0 \
-  --gpu-memory-utilization 0.7 \
-  --load-format fastsafetensors"
+  --gpu-memory-utilization 0.7"
 ```
 
 
