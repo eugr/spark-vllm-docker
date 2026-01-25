@@ -24,9 +24,8 @@ DAEMON_MODE="false"
 CHECK_CONFIG="false"
 ACTION="start"
 CLUSTER_WAS_RUNNING="false"
-MOD_QUEUE_PATHS=()
-MOD_QUEUE_TYPES=()
-MOD_QUEUE_ACTIONS=()
+MOD_PATHS=()
+MOD_TYPES=()
 
 # Function to print usage
 usage() {
@@ -38,7 +37,6 @@ usage() {
     echo "  --ib-if         InfiniBand interface (Optional, auto-detected)"
     echo "  --nccl-debug    NCCL debug level (Optional, one of: VERSION, WARN, INFO, TRACE). If no level is provided, defaults to INFO."
     echo "  --apply-mod     Path to directory or zip file containing run.sh to apply."
-    echo "  --revert-mod    Path to directory or zip file containing run.sh to revert."
     echo "  --download-mod  Download a GitHub PR as a mod (e.g., https://github.com/vllm-project/vllm/pull/31386)"
     echo "  --list-mods     List available mods in mods/ directory."
     echo "  --check-config  Check configuration and auto-detection without launching"
@@ -64,23 +62,14 @@ PATCH_FILE="\$DIR/$patch_filename"
 
 apply() {
     echo "Applying patch..."
-    patch -p1 -d / < "\$PATCH_FILE"
-}
-
-revert() {
-    echo "Reverting patch..."
-    patch -R -p1 -d / < "\$PATCH_FILE"
+    patch -p1 -d /usr/local/lib/python3.12/dist-packages < "\$PATCH_FILE"
 }
 
 description() {
     echo "$desc_text"
 }
 
-if [ "\$1" == "revert" ]; then
-    revert
-elif [ "\$1" == "apply" ]; then
-    apply
-elif [ "\$1" == "description" ]; then
+if [ "\$1" == "description" ]; then
     description
 else
     apply
@@ -98,13 +87,7 @@ while [[ "$#" -gt 0 ]]; do
         --eth-if) ETH_IF="$2"; shift ;;
         --ib-if) IB_IF="$2"; shift ;;
         --apply-mod)
-            MOD_QUEUE_PATHS+=("$2")
-            MOD_QUEUE_ACTIONS+=("apply")
-            shift
-            ;;
-        --revert-mod)
-            MOD_QUEUE_PATHS+=("$2")
-            MOD_QUEUE_ACTIONS+=("revert")
+            MOD_PATHS+=("$2")
             shift
             ;;
         --download-mod)
@@ -135,15 +118,6 @@ while [[ "$#" -gt 0 ]]; do
                     rm -rf "$mod_dir"
                     exit 1
                 fi
-
-                # Clean up git headers and adjust paths to match container python location
-                # This ensures we can apply the patch from root (/) just like other mods
-                sed -e '/^diff --git/d' \
-                    -e '/^index /d' \
-                    -e '/^new file mode /d' \
-                    -e 's|^--- a/|--- a/usr/local/lib/python3.12/dist-packages/|' \
-                    -e 's|^+++ b/|+++ b/usr/local/lib/python3.12/dist-packages/|' \
-                    "$patch_file" > "${patch_file}.tmp" && mv "${patch_file}.tmp" "$patch_file"
 
                 echo "Fetching PR details..."
                 # Try to get title via API (public repos usually allow without auth for low volume)
@@ -276,9 +250,9 @@ if [[ -n "$NCCL_DEBUG_VAL" ]]; then
     esac
 fi
 
-# Validate MOD_QUEUE_PATHS if set
-for i in "${!MOD_QUEUE_PATHS[@]}"; do
-    mod_path="${MOD_QUEUE_PATHS[$i]}"
+# Validate MOD_PATHS if set
+for i in "${!MOD_PATHS[@]}"; do
+    mod_path="${MOD_PATHS[$i]}"
 
     # Check if path exists, if not check in mods/ directory
     if [[ ! -e "$mod_path" ]]; then
@@ -286,7 +260,7 @@ for i in "${!MOD_QUEUE_PATHS[@]}"; do
             mod_path="mods/$mod_path"
             # Update the path in the array mostly for reference,
             # though we use local mod_path var below
-            MOD_QUEUE_PATHS[$i]="$mod_path"
+            MOD_PATHS[$i]="$mod_path"
         else
             echo "Error: Mod path '$mod_path' does not exist."
             exit 1
@@ -298,7 +272,7 @@ for i in "${!MOD_QUEUE_PATHS[@]}"; do
              echo "Error: Mod directory '$mod_path' must contain 'run.sh'."
              exit 1
         fi
-        MOD_QUEUE_TYPES[$i]="dir"
+        MOD_TYPES[$i]="dir"
     elif [[ -f "$mod_path" && "$mod_path" == *.zip ]]; then
         # Check zip content using unzip if available, else python
         if command -v unzip &> /dev/null; then
@@ -313,12 +287,12 @@ for i in "${!MOD_QUEUE_PATHS[@]}"; do
                  exit 1
              fi
         fi
-        MOD_QUEUE_TYPES[$i]="zip"
+        MOD_TYPES[$i]="zip"
     else
         echo "Error: Mod '$mod_path' must be a directory or a .zip file."
         exit 1
     fi
-    MOD_QUEUE_PATHS[$i]=$(realpath "$mod_path")
+    MOD_PATHS[$i]=$(realpath "$mod_path")
 done
 
 # --- Auto-Detection Logic ---
@@ -391,6 +365,9 @@ cleanup() {
     # Remove traps to prevent nested cleanup
     trap - EXIT INT TERM HUP
 
+    # Don't stop a cluster that was already running before we started.
+    # This allows 'exec' commands to run against an existing cluster without
+    # tearing it down when the command finishes.
     if [[ "$CLUSTER_WAS_RUNNING" == "true" ]]; then
         echo "Cluster was already running when script started. Skipping cleanup."
         return
@@ -469,6 +446,7 @@ check_cluster_running() {
     
     if [[ "$running" == "true" ]]; then
         echo "Cluster containers are already running. Skipping launch."
+        # Track that we didn't start the cluster, so we don't stop it on exit
         CLUSTER_WAS_RUNNING="true"
         return 0
     fi
@@ -481,21 +459,20 @@ check_cluster_running() {
 # 1. Transport: Using SCP to move mod files to remote nodes if necessary.
 # 2. Injection: Using 'docker cp' to get files from the host (local or remote) into the container.
 #    - Includes special handling for ZIP files using Python to unzip in-container (avoiding 'unzip' dependency).
-# 3. Execution: Runs the mod's 'run.sh' script with the specified action (apply/revert).
+# 3. Execution: Runs the mod's 'run.sh' script.
 apply_mod_to_container() {
     local node_ip="$1"
     local container="$2"
     local is_local="$3" # true/false
     local mod_path="$4"
     local mod_type="$5"
-    local mod_action="$6" # apply or revert
 
     local mod_name=$(basename "$mod_path")
     if [[ "$mod_type" == "zip" ]]; then
         mod_name="${mod_name%.*}"
     fi
 
-    echo "Running mod action '$mod_action' for '$mod_name' on $node_ip..."
+    echo "Applying mod '$mod_name' on $node_ip..."
 
     # 1. Copy mod to node (if remote)
     local target_mod_path=""
@@ -569,7 +546,7 @@ apply_mod_to_container() {
     # 3. Run run.sh
     echo "  Running patch script on $node_ip..."
 
-    local exec_cmd="cd $container_dest && chmod +x run.sh && ./run.sh $mod_action"
+    local exec_cmd="cd $container_dest && chmod +x run.sh && ./run.sh"
     local ret_code=0
 
     if [[ "$is_local" == "true" ]]; then
@@ -590,6 +567,64 @@ apply_mod_to_container() {
     if [[ "$is_local" == "false" ]]; then
         ssh -o BatchMode=yes -o StrictHostKeyChecking=no "$node_ip" "rm -rf $remote_cleanup_path"
     fi
+}
+
+# Start Cluster Function
+start_cluster() {
+    check_cluster_running
+
+    # If cluster was already running, skip launching (but allow exec to proceed)
+    if [[ "$CLUSTER_WAS_RUNNING" == "true" ]]; then
+        return
+    fi
+
+    # Start Head Node
+    echo "Starting Head Node on $HEAD_IP..."
+    local head_cmd_args=()
+    if [[ ${#MOD_PATHS[@]} -gt 0 ]]; then
+        head_cmd_args=(bash -c "echo Waiting for mod application...; while [ ! -f /tmp/mod_done ]; do sleep 1; done; echo Mod applied, starting node...; exec ./run-cluster-node.sh --role head --host-ip $HEAD_IP --eth-if $ETH_IF --ib-if $IB_IF")
+    else
+        head_cmd_args=(./run-cluster-node.sh --role head --host-ip "$HEAD_IP" --eth-if "$ETH_IF" --ib-if "$IB_IF")
+    fi
+
+    docker run -d --privileged --gpus all --rm \
+        --ipc=host --network host \
+        --name "$CONTAINER_NAME" \
+        $DOCKER_ARGS \
+        "$IMAGE_NAME" \
+        "${head_cmd_args[@]}"
+
+    # Start Worker Nodes
+    for worker in "${PEER_NODES[@]}"; do
+        echo "Starting Worker Node on $worker..."
+        local docker_run_cmd="docker run -d --privileged --gpus all --rm --ipc=host --network host --name $CONTAINER_NAME $DOCKER_ARGS $IMAGE_NAME"
+        if [[ ${#MOD_PATHS[@]} -gt 0 ]]; then
+            local inner_script="echo Waiting for mod application...; while [ ! -f /tmp/mod_done ]; do sleep 1; done; echo Mod applied, starting node...; exec ./run-cluster-node.sh --role node --host-ip $worker --eth-if $ETH_IF --ib-if $IB_IF --head-ip $HEAD_IP"
+            ssh "$worker" "$docker_run_cmd bash -c \"$inner_script\""
+        else
+            ssh "$worker" "$docker_run_cmd ./run-cluster-node.sh --role node --host-ip $worker --eth-if $ETH_IF --ib-if $IB_IF --head-ip $HEAD_IP"
+        fi
+    done
+
+    # Apply mods if requested
+    if [[ ${#MOD_PATHS[@]} -gt 0 ]]; then
+        echo "Applying modifications to cluster nodes..."
+        # Apply to Head
+        for i in "${!MOD_PATHS[@]}"; do
+            apply_mod_to_container "$HEAD_IP" "$CONTAINER_NAME" "true" "${MOD_PATHS[$i]}" "${MOD_TYPES[$i]}"
+        done
+        docker exec "$CONTAINER_NAME" touch /tmp/mod_done
+        
+        # Apply to Workers
+        for worker in "${PEER_NODES[@]}"; do
+            for i in "${!MOD_PATHS[@]}"; do
+                apply_mod_to_container "$worker" "$CONTAINER_NAME" "false" "${MOD_PATHS[$i]}" "${MOD_TYPES[$i]}"
+            done
+            ssh -o BatchMode=yes -o StrictHostKeyChecking=no "$worker" "docker exec $CONTAINER_NAME touch /tmp/mod_done"
+        done
+    fi
+
+    wait_for_cluster
 }
 
 # Wait for Cluster Readiness
@@ -613,73 +648,6 @@ wait_for_cluster() {
     
     echo "Timeout waiting for cluster to start."
     exit 1
-}
-
-# Start Cluster Function
-start_cluster() {
-    check_cluster_running
-
-    if [[ "$CLUSTER_WAS_RUNNING" == "true" && ${#MOD_QUEUE_PATHS[@]} -eq 0 ]]; then
-        return
-    fi
-
-    if [[ "$CLUSTER_WAS_RUNNING" == "false" ]]; then
-        # Start Head Node
-        echo "Starting Head Node on $HEAD_IP..."
-        local head_cmd_args=()
-        if [[ ${#MOD_QUEUE_PATHS[@]} -gt 0 ]]; then
-            head_cmd_args=(bash -c "echo Waiting for mod application...; while [ ! -f /tmp/mod_done ]; do sleep 1; done; echo Mod applied, starting node...; exec ./run-cluster-node.sh --role head --host-ip $HEAD_IP --eth-if $ETH_IF --ib-if $IB_IF")
-        else
-            head_cmd_args=(./run-cluster-node.sh --role head --host-ip "$HEAD_IP" --eth-if "$ETH_IF" --ib-if "$IB_IF")
-        fi
-
-        docker run -d --privileged --gpus all --rm \
-            --ipc=host --network host \
-            --name "$CONTAINER_NAME" \
-            $DOCKER_ARGS \
-            "$IMAGE_NAME" \
-            "${head_cmd_args[@]}"
-
-        # Start Worker Nodes
-        for worker in "${PEER_NODES[@]}"; do
-            echo "Starting Worker Node on $worker..."
-            local docker_run_cmd="docker run -d --privileged --gpus all --rm --ipc=host --network host --name $CONTAINER_NAME $DOCKER_ARGS $IMAGE_NAME"
-            if [[ ${#MOD_QUEUE_PATHS[@]} -gt 0 ]]; then
-                local inner_script="echo Waiting for mod application...; while [ ! -f /tmp/mod_done ]; do sleep 1; done; echo Mod applied, starting node...; exec ./run-cluster-node.sh --role node --host-ip $worker --eth-if $ETH_IF --ib-if $IB_IF --head-ip $HEAD_IP"
-                ssh "$worker" "$docker_run_cmd bash -c \"$inner_script\""
-            else
-                ssh "$worker" "$docker_run_cmd ./run-cluster-node.sh --role node --host-ip $worker --eth-if $ETH_IF --ib-if $IB_IF --head-ip $HEAD_IP"
-            fi
-        done
-    fi
-
-    # Apply mods if requested
-    if [[ ${#MOD_QUEUE_PATHS[@]} -gt 0 ]]; then
-        echo "Processing modifications on cluster nodes..."
-        # Apply to Head
-        for i in "${!MOD_QUEUE_PATHS[@]}"; do
-            apply_mod_to_container "$HEAD_IP" "$CONTAINER_NAME" "true" "${MOD_QUEUE_PATHS[$i]}" "${MOD_QUEUE_TYPES[$i]}" "${MOD_QUEUE_ACTIONS[$i]}"
-        done
-        if [[ "$CLUSTER_WAS_RUNNING" == "false" ]]; then
-            # Signal completion on Head
-            docker exec "$CONTAINER_NAME" touch /tmp/mod_done
-        fi
-        
-        # Apply to Workers
-        for worker in "${PEER_NODES[@]}"; do
-            for i in "${!MOD_QUEUE_PATHS[@]}"; do
-                apply_mod_to_container "$worker" "$CONTAINER_NAME" "false" "${MOD_QUEUE_PATHS[$i]}" "${MOD_QUEUE_TYPES[$i]}" "${MOD_QUEUE_ACTIONS[$i]}"
-            done
-            if [[ "$CLUSTER_WAS_RUNNING" == "false" ]]; then
-                # Signal completion on Worker
-                ssh -o BatchMode=yes -o StrictHostKeyChecking=no "$worker" "docker exec $CONTAINER_NAME touch /tmp/mod_done"
-            fi
-        done
-    fi
-
-    if [[ "$CLUSTER_WAS_RUNNING" == "false" ]]; then
-        wait_for_cluster
-    fi
 }
 
 if [[ "$ACTION" == "exec" ]]; then

@@ -131,19 +131,11 @@ For periodic maintenance, I recommend using a filter: `docker builder prune --fi
 
 - Added `--download-mod` flag to `launch-cluster.sh` to download GitHub PRs as mods.
 - Added `--list-mods` flag to `launch-cluster.sh` to list available mods.
-- Added `--revert-mod` flag to `launch-cluster.sh` to revert a previously applied mod.
-- Updated `--apply-mod` to explicitly call the `apply` method in the mod's `run.sh` script.
 
 Example: Downloading a PR as a mod
 
 ```bash
 ./launch-cluster.sh --download-mod https://github.com/vllm-project/vllm/pull/31386
-```
-
-Example: Reverting a mod
-
-```bash
-./launch-cluster.sh --revert-mod ./mods/fix-Salyut1-GLM-4.7-NVFP4
 ```
 
 Example: Listing available mods
@@ -646,7 +638,7 @@ To create your own mod:
 
 1. Create a new directory in the `mods/` folder
 2. Add your patch files (`.patch`) or other assets as necessary (optional).
-3. Create a `run.sh` script to apply the patch. This script should handle `apply`, `revert` and `description` actions.
+3. Create a `run.sh` script to apply the patch. This script should handle `apply` and `description` actions.
 4. Reference your mod using the `--apply-mod path/to/your/mod` flag
 
 ### Downloading Mods from GitHub PRs
@@ -660,7 +652,7 @@ You can automatically download a pull request from the vLLM repository and conve
 This will:
 1.  Download the PR patch.
 2.  Create a mod directory (e.g., `mods/pr-31386`).
-3.  Generate a `run.sh` script to apply/revert the patch.
+3.  Generate a `run.sh` script to apply the patch.
 4.  Fetch the PR title for the description.
 
 You can then apply it:
