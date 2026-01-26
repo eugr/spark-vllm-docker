@@ -26,6 +26,8 @@ ACTION="start"
 CLUSTER_WAS_RUNNING="false"
 MOD_PATHS=()
 MOD_TYPES=()
+PROFILE_PATH=""
+SCRIPT_DIR="$(dirname "$(realpath "$0")")"
 
 # Function to print usage
 usage() {
@@ -37,10 +39,15 @@ usage() {
     echo "  --ib-if         InfiniBand interface (Optional, auto-detected)"
     echo "  --nccl-debug    NCCL debug level (Optional, one of: VERSION, WARN, INFO, TRACE). If no level is provided, defaults to INFO."
     echo "  --apply-mod     Path to directory or zip file containing run.sh to apply before launch (Can be specified multiple times)"
+    echo "  --profile       Path to bash profile script or profile name (from profiles/ directory)"
     echo "  --check-config  Check configuration and auto-detection without launching"
     echo "  -d              Daemon mode (only for 'start' action)"
     echo "  action          start | stop | status | exec (Default: start)"
-    echo "  command         Command to run (only for 'exec' action)"
+    echo "  command         Command to run (only for 'exec' action, ignored if --profile is used)"
+    echo ""
+    echo "Profile Usage:"
+    echo "  $0 --profile my-profile.sh exec       # Uses profile from profiles/ directory"
+    echo "  $0 --profile /path/to/profile.sh exec # Uses absolute path to profile"
     exit 1
 }
 
@@ -53,6 +60,7 @@ while [[ "$#" -gt 0 ]]; do
         --eth-if) ETH_IF="$2"; shift ;;
         --ib-if) IB_IF="$2"; shift ;;
         --apply-mod) MOD_PATHS+=("$2"); shift ;;
+        --profile) PROFILE_PATH="$2"; shift ;;
         --nccl-debug)
             if [[ -n "$2" && "$2" =~ ^(VERSION|WARN|INFO|TRACE)$ ]]; then
                 NCCL_DEBUG_VAL="$2"
@@ -98,6 +106,63 @@ if [[ -n "$NCCL_DEBUG_VAL" ]]; then
             exit 1
             ;;
     esac
+fi
+
+# Resolve profile path if specified
+if [[ -n "$PROFILE_PATH" ]]; then
+    # Check if it's an absolute path or relative path that exists
+    if [[ -f "$PROFILE_PATH" ]]; then
+        PROFILE_PATH=$(realpath "$PROFILE_PATH")
+    # Check if it's just a filename, look in profiles/ directory
+    elif [[ -f "$SCRIPT_DIR/profiles/$PROFILE_PATH" ]]; then
+        PROFILE_PATH="$SCRIPT_DIR/profiles/$PROFILE_PATH"
+    # Check if it's a name without .sh extension
+    elif [[ -f "$SCRIPT_DIR/profiles/${PROFILE_PATH}.sh" ]]; then
+        PROFILE_PATH="$SCRIPT_DIR/profiles/${PROFILE_PATH}.sh"
+    else
+        echo "Error: Profile '$PROFILE_PATH' not found."
+        echo "Searched in:"
+        echo "  - $PROFILE_PATH"
+        echo "  - $SCRIPT_DIR/profiles/$PROFILE_PATH"
+        echo "  - $SCRIPT_DIR/profiles/${PROFILE_PATH}.sh"
+        exit 1
+    fi
+    
+    echo "Using profile: $PROFILE_PATH"
+    
+    # Source the profile script
+    # shellcheck disable=SC1090
+    source "$PROFILE_PATH" || { echo "Error: Failed to source profile '$PROFILE_PATH'." >&2; exit 1; }
+    
+    # Validate required variables
+    [[ -z "$PROFILE_RUNTIME" ]] && { echo "Error: Profile must define PROFILE_RUNTIME." >&2; exit 1; }
+    
+    # Call profile_init if defined
+    if declare -f profile_init > /dev/null; then
+        echo "Running profile initialization..."
+        profile_init
+    fi
+    
+    # Build command string
+    COMMAND_TO_RUN="$PROFILE_RUNTIME ${PROFILE_COMMAND:-} ${PROFILE_MODEL:-} ${PROFILE_ARGS[*]}"
+    echo "Profile command: $COMMAND_TO_RUN"
+    
+    # Append profile mods to MOD_PATHS
+    if [[ ${#PROFILE_MODS[@]} -gt 0 ]]; then
+        for mod in "${PROFILE_MODS[@]}"; do
+            # Resolve relative paths from SCRIPT_DIR
+            if [[ ! -e "$mod" && -e "$SCRIPT_DIR/$mod" ]]; then
+                mod="$SCRIPT_DIR/$mod"
+            fi
+            MOD_PATHS+=("$mod")
+        done
+        echo "Profile mods: ${PROFILE_MODS[*]}"
+    fi
+    
+    # If profile is specified, default action to exec unless explicitly set to stop/status
+    if [[ "$ACTION" == "start" ]]; then
+        ACTION="exec"
+    fi
 fi
 
 # Validate MOD_PATHS if set
