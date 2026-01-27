@@ -219,10 +219,21 @@ RUN apt update && apt upgrade -y \
 # Set final working directory
 WORKDIR $VLLM_BASE_DIR
 
-# Download Tiktoken files
-RUN mkdir -p tiktoken_encodings && \
-    wget -O tiktoken_encodings/o200k_base.tiktoken "https://openaipublic.blob.core.windows.net/encodings/o200k_base.tiktoken" && \
-    wget -O tiktoken_encodings/cl100k_base.tiktoken "https://openaipublic.blob.core.windows.net/encodings/cl100k_base.tiktoken"
+# Download and cache Tiktoken encodings
+RUN --mount=type=cache,id=tiktoken-encodings,target=/root/.cache/tiktoken_encodings \
+    set -eux; \
+    mkdir -p /root/.cache/tiktoken_encodings; \
+    for f in o200k_base.tiktoken cl100k_base.tiktoken; do \
+      if [ ! -s "/root/.cache/tiktoken_encodings/$f" ]; then \
+        echo "Downloading $f..."; \
+        wget -q -O "/root/.cache/tiktoken_encodings/$f" \
+          "https://openaipublic.blob.core.windows.net/encodings/$f"; \
+      else \
+        echo "Cache hit: $f"; \
+      fi; \
+    done; \
+    mkdir -p "$VLLM_BASE_DIR/tiktoken_encodings"; \
+    cp -a /root/.cache/tiktoken_encodings/. "$VLLM_BASE_DIR/tiktoken_encodings/"
 
 # Copy artifacts from Builder Stage
 # We copy the python packages and executables
