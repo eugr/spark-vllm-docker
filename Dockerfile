@@ -189,9 +189,6 @@ RUN --mount=type=cache,id=uv-cache,target=/root/.cache/uv \
 #     else \
 #         patch -p1 < fastsafetensors.patch; \
 #     fi
-# TEMPORARY PATCH for broken vLLM build (unguarded Hopper code) - reverting PR #34758
-RUN curl -L https://patch-diff.githubusercontent.com/raw/vllm-project/vllm/pull/34758.diff | patch -p1 -R || echo "Cannot revert PR #34758, skipping"
-
 # Final Compilation
 RUN --mount=type=cache,id=ccache,target=/root/.ccache \
     --mount=type=cache,id=uv-cache,target=/root/.cache/uv \
