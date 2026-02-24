@@ -1,0 +1,46 @@
+# Recipe: Qwen3.5-35B-A3B
+# Qwen3.5 Vision-Language MoE model (35B total / ~3B active params) in BF16 format
+# Tuned for NVIDIA DGX Spark (GB10 Grace Blackwell, 128GB unified memory)
+# Free memory at startup ~106.5 GiB → gpu_memory_utilization must stay below 0.890
+# --language-model-only skips vision encoder (saves memory, text-only serving)
+# --enable-prefix-caching DISABLED: crashes with Mamba-hybrid models (experimental, assert block_hash bug)
+# Thinking disabled by default (enable_thinking=false), re-enable per-request via extra_body if needed
+
+recipe_version: "1"
+name: Qwen3.5-35B-A3B
+description: vLLM serving Qwen3.5-35B-A3B (VL MoE, text-only) on DGX Spark 128GB
+
+# HuggingFace model to download (optional, for --download-model)
+model: Qwen/Qwen3.5-35B-A3B
+
+# Container image to use
+container: vllm-node
+
+# Upgrade transformers: qwen3_5_moe architecture not yet recognized by bundled version
+mods:
+  - mods/upgrade-transformers
+
+# Default settings (can be overridden via CLI)
+defaults:
+  port: 8000
+  host: 0.0.0.0
+  tensor_parallel: 1
+  gpu_memory_utilization: 0.80
+  max_model_len: 110000
+
+# Environment variables
+env: {}
+
+# The vLLM serve command template
+command: |
+  vllm serve Qwen/Qwen3.5-35B-A3B \
+    --enable-auto-tool-choice \
+    --tool-call-parser qwen3_coder \
+    --language-model-only \
+    --gpu-memory-utilization {gpu_memory_utilization} \
+    --host {host} \
+    --port {port} \
+    --tensor-parallel-size {tensor_parallel} \
+    --load-format fastsafetensors \
+    --attention-backend flashinfer \
+    --max-model-len {max_model_len}
