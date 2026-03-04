@@ -1133,7 +1133,8 @@ Examples:
         os.chmod(temp_script, 0o755)
         
         # Build launch-cluster.sh command
-        cmd = [str(LAUNCH_SCRIPT), "-t", container]
+        recipe_name = recipe.get('name', 'vllm_node')
+        cmd = [str(LAUNCH_SCRIPT), "-t", container, "--name", recipe_name]
         
         # Add mods
         for mod in recipe.get("mods", []):
