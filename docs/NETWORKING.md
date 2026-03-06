@@ -58,8 +58,8 @@ network:
   ethernets:
     enp1s0f1np1:
       dhcp4: no
-      dhcp6: no              # Explicitly disable DHCPv6
-      link-local: []   # Restrict link-local addresses to fix IPv4 only
+      dhcp6: no        # Explicitly disable DHCPv6
+      link-local: []   # Restrict link-local addresses to static IPv4 only
       mtu: 9000
       addresses: [192.168.177.11/24]
     enP2p1s0f1np1:
@@ -76,8 +76,8 @@ network:
   ethernets:
     enp1s0f1np1:
       dhcp4: no
-      dhcp6: no              # Explicitly disable DHCPv6
-      link-local: []   # Restrict link-local addresses to fix IPv4 only
+      dhcp6: no        # Explicitly disable DHCPv6
+      link-local: []   # Restrict link-local addresses to static IPv4 only
       mtu: 9000
       addresses: [192.168.177.12/24]
     enP2p1s0f1np1:
