@@ -85,6 +85,8 @@ RELATED FILES:
 
 import argparse
 import os
+import pwd
+import re
 import subprocess
 import shlex
 import sys
@@ -461,7 +463,6 @@ def generate_launch_script(recipe: dict[str, Any], overrides: dict[str, Any], is
     # In solo mode, remove --distributed-executor-backend ray
     # (it's not needed and can cause issues on single node)
     if is_solo:
-        import re
         # Remove the entire line containing --distributed-executor-backend
         # This handles multi-line commands with backslash continuations
         lines_list = command.split('\n')
@@ -586,6 +587,258 @@ def save_env_file(env: dict[str, str]) -> None:
         f.write("\n".join(lines))
     
     print(f"Saved to {ENV_FILE}")
+
+
+def get_service_name(recipe: dict[str, Any]) -> str:
+    """
+    Generate a systemd service name from a recipe.
+
+    Args:
+        recipe: Loaded recipe dictionary
+
+    Returns:
+        Service name like 'vllm-glm-4.7-flash-awq'
+    """
+    # Sanitize recipe name for systemd: lowercase, replace spaces/special chars with dashes
+    name = recipe["name"].lower()
+    name = re.sub(r'[^a-z0-9]+', '-', name).strip('-')
+    return f"vllm-{name}"
+
+
+def generate_service_file(recipe: dict[str, Any], recipe_arg: str, cli_args: argparse.Namespace,
+                          extra_args: list[str] | None = None) -> str:
+    """
+    Generate a systemd service unit file for a recipe.
+
+    Creates a service that runs run-recipe.sh with the same arguments
+    the user provided, minus the --install-service flag. The service
+    will auto-start on boot after docker is ready.
+
+    Args:
+        recipe: Loaded recipe dictionary
+        recipe_arg: The recipe argument as passed on CLI (name or path)
+        cli_args: Parsed CLI arguments to reconstruct the command
+        extra_args: Extra vLLM arguments (after --)
+
+    Returns:
+        Complete systemd unit file content as string
+    """
+    service_name = get_service_name(recipe)
+    run_script = str(SCRIPT_DIR / "run-recipe.sh")
+
+    # Reconstruct the run-recipe.sh command from CLI args
+    cmd_parts = [run_script, recipe_arg]
+
+    if cli_args.solo:
+        cmd_parts.append("--solo")
+    if cli_args.nodes:
+        cmd_parts.extend(["-n", cli_args.nodes])
+    if cli_args.container_override:
+        cmd_parts.extend(["-t", cli_args.container_override])
+    if cli_args.nccl_debug:
+        cmd_parts.extend(["--nccl-debug", cli_args.nccl_debug])
+    if cli_args.port:
+        cmd_parts.extend(["--port", str(cli_args.port)])
+    if cli_args.host:
+        cmd_parts.extend(["--host", cli_args.host])
+    if cli_args.tensor_parallel:
+        cmd_parts.extend(["--tp", str(cli_args.tensor_parallel)])
+    if cli_args.gpu_memory_utilization:
+        cmd_parts.extend(["--gpu-mem", str(cli_args.gpu_memory_utilization)])
+    if cli_args.max_model_len:
+        cmd_parts.extend(["--max-model-len", str(cli_args.max_model_len)])
+
+    # Always run in daemon mode for the service
+    cmd_parts.append("-d")
+
+    if extra_args:
+        cmd_parts.append("--")
+        cmd_parts.extend(extra_args)
+
+    exec_start = " ".join(cmd_parts)
+
+    # Stop command: use launch-cluster.sh stop
+    container = cli_args.container_override or recipe["container"]
+    stop_cmd = f"{LAUNCH_SCRIPT} -t {container}"
+    if cli_args.solo:
+        stop_cmd += " --solo"
+    elif cli_args.nodes:
+        stop_cmd += f" -n {cli_args.nodes}"
+    stop_cmd += " stop"
+
+    # Get current user info
+    user = pwd.getpwuid(os.getuid()).pw_name
+    home = os.path.expanduser("~")
+
+    unit = f"""[Unit]
+Description=vLLM Model Server - {recipe['name']}
+After=network-online.target docker.service
+Wants=network-online.target
+Requires=docker.service
+
+[Service]
+Type=simple
+User={user}
+Group={user}
+WorkingDirectory={SCRIPT_DIR}
+Environment="HOME={home}"
+Environment="PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
+# No start timeout — model loading can take 5+ minutes
+TimeoutStartSec=infinity
+TimeoutStopSec=120
+
+ExecStart={exec_start}
+ExecStop={stop_cmd}
+
+# Restart on failure after 30 seconds
+Restart=on-failure
+RestartSec=30
+
+[Install]
+WantedBy=multi-user.target
+"""
+    return unit
+
+
+def install_service(recipe: dict[str, Any], recipe_arg: str, cli_args: argparse.Namespace,
+                    extra_args: list[str] | None = None) -> int:
+    """
+    Install and enable a systemd service for a recipe.
+
+    Args:
+        recipe: Loaded recipe dictionary
+        recipe_arg: The recipe argument as passed on CLI
+        cli_args: Parsed CLI arguments
+        extra_args: Extra vLLM arguments
+
+    Returns:
+        0 on success, 1 on failure
+    """
+    service_name = get_service_name(recipe)
+    service_file = f"/etc/systemd/system/{service_name}.service"
+    unit_content = generate_service_file(recipe, recipe_arg, cli_args, extra_args)
+
+    print(f"Installing systemd service: {service_name}")
+    print(f"Service file: {service_file}")
+    print()
+    print("Generated service file:")
+    print("---")
+    print(unit_content)
+    print("---")
+
+    # Write to temp file and copy with sudo
+    with tempfile.NamedTemporaryFile(mode='w', suffix='.service', delete=False) as f:
+        f.write(unit_content)
+        temp_path = f.name
+
+    try:
+        # Copy to systemd directory
+        result = subprocess.run(
+            ["sudo", "cp", temp_path, service_file],
+            capture_output=True, text=True
+        )
+        if result.returncode != 0:
+            print(f"Error: Failed to install service file: {result.stderr}")
+            return 1
+
+        # Set permissions
+        subprocess.run(["sudo", "chmod", "644", service_file], check=True)
+
+        # Reload systemd
+        subprocess.run(["sudo", "systemctl", "daemon-reload"], check=True)
+
+        # Enable the service
+        subprocess.run(["sudo", "systemctl", "enable", service_name], check=True)
+
+        print()
+        print(f"Service '{service_name}' installed and enabled!")
+        print()
+        print("Commands:")
+        print(f"  Start now:     sudo systemctl start {service_name}")
+        print(f"  Stop:          sudo systemctl stop {service_name}")
+        print(f"  Status:        sudo systemctl status {service_name}")
+        print(f"  Logs:          journalctl -u {service_name} -f")
+        print(f"  Disable:       sudo systemctl disable {service_name}")
+        print(f"  Uninstall:     ./run-recipe.sh {recipe_arg} --uninstall-service")
+        print()
+
+        response = input("Start the service now? [Y/n]: ").strip().lower()
+        if response in ("", "y", "yes"):
+            result = subprocess.run(
+                ["sudo", "systemctl", "start", service_name],
+                capture_output=True, text=True
+            )
+            if result.returncode == 0:
+                print(f"Service started! Check status with: sudo systemctl status {service_name}")
+            else:
+                print(f"Failed to start: {result.stderr}")
+                print(f"Check logs: journalctl -u {service_name} -f")
+
+        return 0
+    finally:
+        os.unlink(temp_path)
+
+
+def uninstall_service(recipe: dict[str, Any]) -> int:
+    """
+    Stop, disable, and remove a systemd service for a recipe.
+
+    Args:
+        recipe: Loaded recipe dictionary
+
+    Returns:
+        0 on success, 1 on failure
+    """
+    service_name = get_service_name(recipe)
+    service_file = f"/etc/systemd/system/{service_name}.service"
+
+    if not Path(service_file).exists():
+        print(f"Service '{service_name}' is not installed.")
+        return 0
+
+    print(f"Uninstalling service: {service_name}")
+
+    # Stop and disable
+    subprocess.run(["sudo", "systemctl", "stop", service_name], capture_output=True)
+    subprocess.run(["sudo", "systemctl", "disable", service_name], capture_output=True)
+
+    # Remove service file
+    result = subprocess.run(
+        ["sudo", "rm", "-f", service_file],
+        capture_output=True, text=True
+    )
+    if result.returncode != 0:
+        print(f"Error: Failed to remove service file: {result.stderr}")
+        return 1
+
+    # Reload systemd
+    subprocess.run(["sudo", "systemctl", "daemon-reload"], check=True)
+
+    print(f"Service '{service_name}' has been uninstalled.")
+    return 0
+
+
+def show_service_status(recipe: dict[str, Any]) -> int:
+    """
+    Show the status of a systemd service for a recipe.
+
+    Args:
+        recipe: Loaded recipe dictionary
+
+    Returns:
+        0 on success
+    """
+    service_name = get_service_name(recipe)
+    service_file = f"/etc/systemd/system/{service_name}.service"
+
+    if not Path(service_file).exists():
+        print(f"Service '{service_name}' is not installed.")
+        print(f"Install with: ./run-recipe.sh {recipe.get('name', '')} --install-service")
+        return 0
+
+    subprocess.run(["sudo", "systemctl", "status", service_name])
+    return 0
 
 
 def run_autodiscover() -> dict[str, str] | None:
@@ -756,6 +1009,11 @@ Examples:
 
   # Show current .env configuration
   %(prog)s --show-env
+
+  # Auto-start on boot (systemd service)
+  %(prog)s glm-4.7-nvfp4 --solo --install-service   # Install and enable service
+  %(prog)s glm-4.7-nvfp4 --service-status            # Check service status
+  %(prog)s glm-4.7-nvfp4 --uninstall-service          # Remove service
         """
     )
     
@@ -821,6 +1079,24 @@ Examples:
     launch_group.add_argument("--nccl-debug", choices=["VERSION", "WARN", "INFO", "TRACE"], help="NCCL debug level")
     launch_group.add_argument("-e", "--env", action="append", dest="env_vars", default=[], metavar="VAR=VALUE", help="Environment variable to pass to container (e.g. -e HF_TOKEN=xxx). Can be used multiple times.")
     
+    # Service options
+    service_group = parser.add_argument_group("Systemd service (auto-start on boot)")
+    service_group.add_argument(
+        "--install-service",
+        action="store_true",
+        help="Install a systemd service to auto-start this recipe on boot"
+    )
+    service_group.add_argument(
+        "--uninstall-service",
+        action="store_true",
+        help="Remove the systemd service for this recipe"
+    )
+    service_group.add_argument(
+        "--service-status",
+        action="store_true",
+        help="Show status of the systemd service for this recipe"
+    )
+
     # Cluster discovery options
     discover_group = parser.add_argument_group("Cluster discovery")
     discover_group.add_argument(
@@ -830,7 +1106,7 @@ Examples:
     )
     discover_group.add_argument(
         "--show-env",
-        action="store_true", 
+        action="store_true",
         help="Show current .env configuration"
     )
     
@@ -888,7 +1164,17 @@ Examples:
     if recipe.get("description"):
         print(f"  {recipe['description']}")
     print()
-    
+
+    # Handle service commands (these don't need node resolution or launch)
+    if args.uninstall_service:
+        return uninstall_service(recipe)
+
+    if args.service_status:
+        return show_service_status(recipe)
+
+    if args.install_service:
+        return install_service(recipe, args.recipe, args, extra_args)
+
     # Determine container image
     container = args.container_override or recipe["container"]
     model = recipe.get("model")

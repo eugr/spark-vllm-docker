@@ -191,6 +191,11 @@ Launch options:
   -t, --container IMAGE       Override container from recipe
   --nccl-debug LEVEL          NCCL debug level (VERSION, WARN, INFO, TRACE)
 
+Systemd service (auto-start on boot):
+  --install-service           Install and enable a systemd service for the recipe
+  --uninstall-service         Remove the systemd service
+  --service-status            Show the current service status
+
 Extra vLLM arguments:
   -- ARGS...                  Pass additional arguments directly to vLLM
 
@@ -198,6 +203,66 @@ Other:
   --dry-run                   Show what would be executed
   --list, -l                  List available recipes
 ```
+
+## Auto-Start on Boot (Systemd Service)
+
+Recipes can be installed as systemd services so they automatically start on boot and restart on failure.
+
+### Installing a Service
+
+```bash
+# Install service for a recipe (uses current CLI options)
+./run-recipe.sh minimax-m2.5-awq --install-service
+
+# Install with specific nodes
+./run-recipe.sh minimax-m2.5-awq -n 169.254.117.47,169.254.41.35 --install-service
+
+# Install in solo mode
+./run-recipe.sh glm-4.7-flash-awq --solo --install-service
+
+# Pass extra vLLM arguments to the service
+./run-recipe.sh minimax-m2.5-awq --install-service -- --load-format safetensors
+```
+
+This creates and enables a systemd service (e.g., `vllm-minimax-m2-5-awq`) that will:
+- Start the model automatically on boot (after Docker is ready)
+- Restart on failure (after a 30-second delay)
+- Run as the current user
+
+### Managing the Service
+
+```bash
+# Check service status
+./run-recipe.sh minimax-m2.5-awq --service-status
+
+# Or use systemctl directly
+sudo systemctl status vllm-minimax-m2-5-awq
+
+# View service logs
+sudo journalctl -u vllm-minimax-m2-5-awq -f
+
+# Stop the service
+sudo systemctl stop vllm-minimax-m2-5-awq
+
+# Start the service
+sudo systemctl start vllm-minimax-m2-5-awq
+```
+
+### Uninstalling a Service
+
+```bash
+./run-recipe.sh minimax-m2.5-awq --uninstall-service
+```
+
+This stops the service, disables it, and removes the service file.
+
+### Notes
+
+- The service uses `Type=simple` — systemd treats the process as a long-running daemon.
+- There is no startup timeout (`TimeoutStartSec=infinity`) since model loading can take several minutes.
+- The stop timeout is 120 seconds to allow graceful cluster shutdown.
+- The service file is installed to `/etc/systemd/system/` and requires `sudo`.
+- Service names are derived from the recipe name (e.g., `MiniMax-M2.5-AWQ` becomes `vllm-minimax-m2-5-awq`).
 
 ## Extra vLLM Arguments
 
