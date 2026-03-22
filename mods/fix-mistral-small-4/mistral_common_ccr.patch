@@ -1,0 +1,136 @@
+--- a/mistral_common/protocol/instruct/chunk.py
++++ b/mistral_common/protocol/instruct/chunk.py
+@@ -64,9 +64,13 @@ class BaseContentChunk(MistralBase):
+     def from_openai(cls, openai_chunk: dict[str, str | dict[str, str]]) -> "BaseContentChunk":
+         r"""Converts the OpenAI chunk to the Mistral format.
+
+-        Should be implemented by subclasses.
++        Strips extra fields (e.g. ``cache_control``) that are not part of the
++        Mistral schema so that OpenAI-compatible messages produced by other
++        providers can be ingested without validation errors.
+         """
+-        raise NotImplementedError(f"from_openai method not implemented for {cls.__name__}")
++        allowed = set(cls.model_fields.keys())
++        cleaned = {k: v for k, v in openai_chunk.items() if k in allowed}
++        return cls.model_validate(cleaned)
+
+
+ class ImageChunk(BaseContentChunk):
+@@ -277,10 +281,6 @@ class AudioURLChunk(BaseContentChunk):
+         else:
+             return {"type": self.type, "audio_url": {"url": self.audio_url}}
+
+-    @classmethod
+-    def from_openai(cls, openai_chunk: dict[str, str | dict[str, str]]) -> "AudioURLChunk":
+-        r"""Converts the OpenAI chunk to the Mistral format."""
+-        return cls.model_validate(openai_chunk)
+
+
+ class AudioChunk(BaseContentChunk):
+@@ -332,17 +332,6 @@ class AudioChunk(BaseContentChunk):
+             "input_audio": RawAudio(data=content, format=self.input_audio.format).model_dump(),
+         }
+
+-    @classmethod
+-    def from_openai(cls, openai_chunk: dict[str, str | dict[str, str]]) -> "AudioChunk":
+-        r"""Converts the OpenAI chunk to the Mistral format.
+-
+-        Args:
+-            openai_chunk: A dictionary representing the audio chunk in the OpenAI format.
+-
+-        Returns:
+-            An AudioChunk instance initialized with the data from the OpenAI chunk.
+-        """
+-        return cls.model_validate(openai_chunk)
+
+
+ class TextChunk(BaseContentChunk):
+@@ -362,11 +351,6 @@ class TextChunk(BaseContentChunk):
+         r"""Converts the chunk to the OpenAI format."""
+         return self.model_dump()
+
+-    @classmethod
+-    def from_openai(cls, openai_chunk: dict[str, str | dict[str, str]]) -> "TextChunk":
+-        r"""Converts the OpenAI chunk to the Mistral format."""
+-        return cls.model_validate(openai_chunk)
+-
+
+ class ThinkChunk(BaseContentChunk):
+     r"""Thinking chunk.
+@@ -385,11 +369,6 @@ class ThinkChunk(BaseContentChunk):
+         r"""Converts the chunk to the OpenAI format."""
+         return self.model_dump()
+
+-    @classmethod
+-    def from_openai(cls, openai_chunk: dict[str, str | dict[str, str]]) -> "ThinkChunk":
+-        r"""Converts the OpenAI chunk to the Mistral format."""
+-        return cls.model_validate(openai_chunk)
+-
+
+ ContentChunk = Annotated[
+     TextChunk | ImageChunk | ImageURLChunk | AudioChunk | AudioURLChunk | ThinkChunk, Field(discriminator="type")
+diff --git a/mistral_common/protocol/instruct/messages.py b/mistral_common/protocol/instruct/messages.py
+index 4645cfe..591517e 100644
+--- a/mistral_common/protocol/instruct/messages.py
++++ b/mistral_common/protocol/instruct/messages.py
+@@ -50,6 +50,17 @@ class BaseMessage(MistralBase):
+         """
+         raise NotImplementedError(f"to_openai method not implemented for {type(self).__name__}")
+
++    @classmethod
++    def _strip_extra_fields(cls, data: dict[str, Any]) -> dict[str, Any]:
++        r"""Return *data* with keys not in the model schema removed.
++
++        This lets ``from_openai`` silently ignore provider-specific extensions
++        such as Anthropic's ``cache_control`` without tripping Pydantic's
++        ``extra="forbid"`` validation.
++        """
++        allowed = set(cls.model_fields.keys())
++        return {k: v for k, v in data.items() if k in allowed}
++
+     @classmethod
+     def from_openai(cls, openai_message: dict[str, str | list[dict[str, str | dict[str, Any]]]]) -> "BaseMessage":
+         r"""Converts the OpenAI message to the Mistral format.
+@@ -82,7 +93,7 @@ class UserMessage(BaseMessage):
+     def from_openai(cls, openai_message: dict[str, str | list[dict[str, str | dict[str, Any]]]]) -> "UserMessage":
+         r"""Converts the OpenAI message to the Mistral format."""
+         if isinstance(openai_message["content"], str):
+-            return cls.model_validate(openai_message)
++            return cls.model_validate(cls._strip_extra_fields(openai_message))
+         return cls.model_validate(
+             {
+                 "role": openai_message["role"],
+@@ -111,7 +122,14 @@ class SystemMessage(BaseMessage):
+     @classmethod
+     def from_openai(cls, openai_message: dict[str, str | list[dict[str, str | dict[str, Any]]]]) -> "SystemMessage":
+         r"""Converts the OpenAI message to the Mistral format."""
+-        return cls.model_validate(openai_message)
++        if isinstance(openai_message.get("content"), list):
++            return cls.model_validate(
++                {
++                    "role": openai_message["role"],
++                    "content": [_convert_openai_content_chunks(chunk) for chunk in openai_message["content"]],
++                },
++            )
++        return cls.model_validate(cls._strip_extra_fields(openai_message))
+
+
+ class AssistantMessage(BaseMessage):
+@@ -218,7 +236,17 @@ class ToolMessage(BaseMessage):
+     @classmethod
+     def from_openai(cls, messages: dict[str, str | list[dict[str, str | dict[str, Any]]]]) -> "ToolMessage":
+         r"""Converts the OpenAI message to the Mistral format."""
+-        tool_message = cls.model_validate(messages)
++        if isinstance(messages.get("content"), list):
++            tool_message = cls.model_validate(
++                {
++                    "role": messages["role"],
++                    "content": [_convert_openai_content_chunks(chunk) for chunk in messages["content"]],
++                    "tool_call_id": messages.get("tool_call_id"),
++                    "name": messages.get("name"),
++                },
++            )
++        else:
++            tool_message = cls.model_validate(cls._strip_extra_fields(messages))
+         assert tool_message.tool_call_id is not None, "tool_call_id must be provided for tool messages."
+         return tool_message

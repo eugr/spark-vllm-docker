@@ -1,0 +1,52 @@
+--- a/vllm/tokenizers/mistral.py
++++ b/vllm/tokenizers/mistral.py
+@@ -428,16 +428,36 @@ class MistralTokenizer(TokenizerLike):
+         truncation = kwargs.get("truncation", False)
+         max_length = kwargs.get("max_length")
+ 
+-        version_kwargs = {}
+-        # NOTE: This is for backward compatibility.
+-        # Transformers should be passed arguments it knows.
+-        if self.version >= 15:
+-            version_kwargs["reasoning_effort"] = kwargs.get("reasoning_effort")
++        # Extract reasoning_effort before passing to transformers, which
++        # does not accept it as a kwarg. Instead, we pass it directly to
++        # mistral-common's ChatCompletionRequest via from_openai().
++        reasoning_effort = kwargs.get("reasoning_effort")
+ 
+         messages, tools = _prepare_apply_chat_template_tools_and_messages(
+             messages, tools, continue_final_message, add_generation_prompt
+         )
+ 
++        # When reasoning_effort is set, bypass transformers' apply_chat_template
++        # (which rejects unknown kwargs) and use mistral-common directly.
++        if reasoning_effort is not None and self.version >= 15:
++            request_kwargs: dict[str, Any] = {
++                "reasoning_effort": reasoning_effort,
++            }
++            chat_request = MistralChatCompletionRequest.from_openai(
++                messages=messages,
++                tools=tools,
++                continue_final_message=continue_final_message,
++                **request_kwargs,
++            )
++            encoded = self.mistral.encode_chat_completion(chat_request)
++            result: str | list[int] = encoded.tokens if tokenize else encoded.text
++
++            if tokenize and truncation and max_length is not None:
++                assert isinstance(result, list)
++                result = result[:max_length]
++
++            return result  # type: ignore[return-value]
++
+         return self.transformers_tokenizer.apply_chat_template(
+             conversation=messages,
+             tools=tools,
+@@ -448,7 +468,6 @@ class MistralTokenizer(TokenizerLike):
+             max_length=max_length,
+             return_tensors=None,
+             return_dict=False,
+-            **version_kwargs,
+         )
+ 
+     def decode(
