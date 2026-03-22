@@ -143,12 +143,15 @@ ARG CACHEBUST_VLLM=1
 # Git reference (branch, tag, or SHA) to checkout
 ARG VLLM_REF=main
 
+# Git repo for vllm
+ARG VLLM_REPO=https://github.com/vllm-project/vllm.git
+
 # Smart Git Clone (Fetch changes instead of full re-clone)
 RUN --mount=type=cache,id=repo-cache,target=/repo-cache \
     cd /repo-cache && \
     if [ ! -d "vllm" ]; then \
         echo "Cache miss: Cloning vLLM from scratch..." && \
-        git clone --recursive https://github.com/vllm-project/vllm.git; \
+        git clone --recursive ${VLLM_REPO}; \
         if [ "$VLLM_REF" != "main" ]; then \
             cd vllm && \
             git checkout ${VLLM_REF}; \
@@ -156,12 +159,24 @@ RUN --mount=type=cache,id=repo-cache,target=/repo-cache \
     else \
         echo "Cache hit: Fetching updates..." && \
         cd vllm && \
-        git fetch origin && \
-        git fetch origin --tags --force && \
-        (git checkout --detach origin/${VLLM_REF} 2>/dev/null || git checkout ${VLLM_REF}) && \
-        git submodule update --init --recursive && \
-        git clean -fdx && \
-        git gc --auto; \
+	CURRENT_REMOTE=$(git remote get-url origin) && \
+        if [ "$CURRENT_REMOTE" != "${VLLM_REPO}" ]; then \
+            echo "Remote mismatch: cached=$CURRENT_REMOTE expected=${VLLM_REPO}" && \
+            echo "Re-cloning from correct repo..." && \
+            cd .. && rm -rf vllm && \
+            git clone --recursive ${VLLM_REPO} && \
+            cd vllm && \
+            if [ "$VLLM_REF" != "main" ]; then \
+                git checkout ${VLLM_REF}; \
+            fi; \
+        else \
+            git fetch origin && \
+            git fetch origin --tags --force && \
+            (git checkout --detach origin/${VLLM_REF} 2>/dev/null || git checkout ${VLLM_REF}) && \
+            git submodule update --init --recursive && \
+            git clean -fdx && \
+            git gc --auto; \
+	fi; \
     fi && \
     cp -a /repo-cache/vllm $VLLM_BASE_DIR/
 
@@ -282,4 +297,21 @@ ENV PATH=$VLLM_BASE_DIR:$PATH
 
 # Final extra deps
 RUN --mount=type=cache,id=uv-cache,target=/root/.cache/uv \
-    uv pip install ray[default] fastsafetensors
+    uv pip install ray[default] fastsafetensors nvidia-nvshmem-cu13
+
+# Cleanup
+
+# Keeping it here for reference - this won't work as is without squashing layers
+# RUN uv pip uninstall absl-py apex argon2-cffi \
+#     argon2-cffi-bindings arrow asttokens astunparse async-lru audioread babel beautifulsoup4 \
+#     black bleach comm contourpy cycler datasets debugpy decorator defusedxml dllist dm-tree \
+#     execnet executing expecttest fastjsonschema fonttools fqdn gast hypothesis \
+#     ipykernel ipython ipython_pygments_lexers isoduration isort jedi joblib jupyter-events \
+#     jupyter-lsp jupyter_client jupyter_core jupyter_server jupyter_server_terminals jupyterlab \
+#     jupyterlab_code_formatter jupyterlab_code_formatter jupyterlab_pygments jupyterlab_server \
+#     jupyterlab_tensorboard_pro jupytext kiwisolver matplotlib matplotlib-inline matplotlib-inline \
+#     mistune ml_dtypes mock nbclient nbconvert nbformat nest-asyncio notebook notebook_shim \
+#     opt_einsum optree outlines_core overrides pandas pandocfilters parso pexpect polygraphy pooch \
+#     pyarrow pycocotools pytest-flakefinder pytest-rerunfailures pytest-shard pytest-xdist \
+#     scikit-learn scipy Send2Trash soundfile soupsieve soxr spin stack-data \
+#     wcwidth webcolors xdoctest Werkzeug

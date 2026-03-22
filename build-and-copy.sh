@@ -16,6 +16,7 @@ TMP_IMAGE=""
 PARALLEL_COPY=false
 EXP_MXFP4=false
 VLLM_REF_SET=false
+VLLM_REPO_SET=false
 VLLM_PRS=""
 PRE_TRANSFORMERS=false
 FULL_LOG=false
@@ -235,6 +236,7 @@ usage() {
     echo "  --rebuild-flashinfer          : Force rebuild of FlashInfer wheels (ignore cached wheels)"
     echo "  --rebuild-vllm                : Force rebuild of vLLM wheels (ignore cached wheels)"
     echo "  --vllm-ref <ref>              : vLLM commit SHA, branch or tag (default: 'main')"
+    echo "  --vllm-repo <repo>            : vLLM repo to use (default: https://github.com/vllm-project/vllm.git)"
     echo "  -c, --copy-to <hosts>         : Host(s) to copy the image to. Accepts comma or space-delimited lists."
     echo "      --copy-to-host            : Alias for --copy-to (backwards compatibility)."
     echo "      --copy-parallel           : Copy to all hosts in parallel instead of serially."
@@ -258,6 +260,7 @@ while [[ "$#" -gt 0 ]]; do
         --rebuild-flashinfer) REBUILD_FLASHINFER=true ;;
         --rebuild-vllm) REBUILD_VLLM=true ;;
         --vllm-ref) VLLM_REF="$2"; VLLM_REF_SET=true; shift ;;
+	--vllm-repo) VLLM_REPO="$2"; VLLM_REPO_SET=true; shift ;;
         -c|--copy-to|--copy-to-host|--copy-to-hosts)
             shift
             while [[ "$#" -gt 0 && "$1" != -* ]]; do
@@ -465,6 +468,11 @@ if [ "$NO_BUILD" = false ]; then
 
             if [ "$REBUILD_VLLM" = true ]; then
                 VLLM_CMD+=("--build-arg" "CACHEBUST_VLLM=$(date +%s)")
+            fi
+
+            if [ -n "$VLLM_REPO" ]; then
+                echo "Using vLLM repo: $VLLM_REPO"
+                VLLM_CMD+=("--build-arg" "VLLM_REPO=$VLLM_REPO")
             fi
 
             if [ -n "$VLLM_PRS" ]; then
