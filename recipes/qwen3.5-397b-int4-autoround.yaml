@@ -18,11 +18,23 @@ container: vllm-node-tf5
 build_args:
   - --tf5
 
+# ==============================================================================
+# The official Intel/Qwen3.5-397B-A17B-int4-AutoRound checkpoint has duplicate
+# tensor keys leaked between shard_39 and shard_40.
+# While the default vLLM loader silently overwrites these duplicates, the
+# `fastsafetensors` loader strictly enforces unique keys and will CRASH
+# if not manually fixed.
+#
+# Before running this recipe, sanitize the model files:
+#   python3 dedup-safetensors.py /path/to/models/Intel/Qwen3.5-397B-A17B...
+# ==============================================================================
+
 # Mod required to fix ROPE syntax error
 mods:
   - mods/fix-qwen3.5-autoround
   - mods/fix-qwen3.5-chat-template
   - mods/gpu-mem-util-gb
+  - mods/fix-fastsafetensors-no-broadcast
 
 # Default settings (can be overridden via CLI)
 defaults:
@@ -34,13 +46,14 @@ defaults:
   max_num_batched_tokens: 4176
 
 # Environment variables
-env: 
-  PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True" 
+env:
+  PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
   VLLM_MARLIN_USE_ATOMIC_ADD: 1
 
 # The vLLM serve command template
 command: |
   vllm serve Intel/Qwen3.5-397B-A17B-int4-AutoRound \
+    --load-format fastsafetensors \
     --max-model-len {max_model_len} \
     --max-num-seqs 2 \
     --kv-cache-dtype fp8 \
@@ -56,5 +69,3 @@ command: |
     --chat-template unsloth.jinja \
     -tp {tensor_parallel} \
     --distributed-executor-backend ray
-
-  
