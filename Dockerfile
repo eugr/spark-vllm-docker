@@ -206,6 +206,11 @@ RUN curl -fsL https://patch-diff.githubusercontent.com/raw/vllm-project/vllm/pul
        fi \
     && rm pr38126.diff
 
+# FIX: enable_sm120_only -> enable_sm120_family for SM12.1 FP8 CUTLASS (saifgithub/vllm-gb10-sm121)
+RUN sed -i "s/enable_sm120_only/enable_sm120_family/g" \
+    csrc/quantization/w8a8/cutlass/c3x/scaled_mm.cuh \
+    csrc/quantization/w8a8/cutlass/c3x/scaled_mm_sm120_fp8_dispatch.cuh
+
 # Final Compilation
 RUN --mount=type=cache,id=ccache,target=/root/.ccache \
     --mount=type=cache,id=uv-cache,target=/root/.cache/uv \
