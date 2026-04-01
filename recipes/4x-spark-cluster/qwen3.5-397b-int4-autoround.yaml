@@ -1,11 +1,13 @@
 # Recipe: Qwen3.5-397B-A17B-INT4-Autoround
 # Qwen3.5-397B model in Intel INT4-Autoround quantization, TP=4 across 4 DGX Spark nodes
-# Benchmarked at 37 tok/s single-user, 103 tok/s aggregate (4 concurrent) on 4× DGX Spark
-# Requires NVIDIA driver 580.x (590.x has CUDAGraph deadlock bug on GB10)
+# FIXED: Uses gpu-mem-util-gb (absolute 80 GiB) + piecewise cudagraph for driver 590.x stability
+# NOTE: --enforce-eager BREAKS on driver 590 (triggers Marlin UMA crash in fused_marlin_moe.py:368)
+#       piecewise cudagraph avoids the crash and gives 2x+ throughput (21 tok/s vs 9 tok/s)
+# Pre-launch: stop Ollama, drop caches, set GPU clocks on all 4 nodes
 
 recipe_version: "1"
 name: Qwen3.5-397B-INT4-Autoround
-description: Qwen3.5-397B with TP=4 across 4 DGX Spark nodes (Marlin fix applied)
+description: Qwen3.5-397B with TP=4 across 4 DGX Spark nodes (65K context, piecewise cudagraph, ~21 tok/s)
 
 # HuggingFace model to download (optional, for --download-model)
 model: Intel/Qwen3.5-397B-A17B-int4-AutoRound
@@ -16,26 +18,35 @@ container: vllm-node-tf5
 build_args:
   - --tf5
 
-# Mods required: coder-next tool/reasoning parser + Marlin TP fix
+# Mods required: coder-next tool/reasoning parser + Marlin TP fix + Conch kernels + GPU mem GiB
 mods:
   - mods/fix-qwen3-coder-next
   - mods/fix-qwen35-tp4-marlin
+  - mods/install-conch
+  - mods/gpu-mem-util-gb
 
-# Environment variables
+# Environment variables — FLA_USE_TMA=0 recovers ~1GB/node on SM121 (GB10)
 env:
   VLLM_MARLIN_USE_ATOMIC_ADD: 1
   PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
+  FLA_USE_TMA: 0
+  TRITON_CACHE_AUTOTUNING: 1
 
 # Default settings (can be overridden via CLI, e.g. --tensor_parallel 2)
 defaults:
   port: 8000
   host: 0.0.0.0
   tensor_parallel: 4
-  gpu_memory_utilization: 0.78
-  max_model_len: 32768
-  max_num_batched_tokens: 8192
+  gpu_memory_utilization: 80
+  max_model_len: 65536
+  max_num_batched_tokens: 4176
 
 # The vLLM serve command template
+# NOTE: --gpu-memory-utilization-gb (absolute GiB) NOT --gpu-memory-utilization (fraction)
+#       Fraction mode fails on DGX Spark unified memory where OS consumes variable amounts
+# NOTE: piecewise cudagraph is the correct mode for driver 590.x on GB10
+#       --enforce-eager causes Marlin UMA crash (fused_marlin_moe.py:368, illegal memory access)
+#       Full CUDAGraph also causes illegal memory access — piecewise is the sweet spot
 command: |
   vllm serve Intel/Qwen3.5-397B-A17B-int4-AutoRound \
     --tool-call-parser qwen3_coder \
@@ -44,10 +55,12 @@ command: |
     --tensor-parallel-size {tensor_parallel} \
     --distributed-executor-backend ray \
     --kv-cache-dtype fp8 \
-    --gpu-memory-utilization {gpu_memory_utilization} \
+    --gpu-memory-utilization-gb {gpu_memory_utilization} \
     --max-model-len {max_model_len} \
     --max-num-batched-tokens {max_num_batched_tokens} \
+    --max-num-seqs 2 \
     --enable-prefix-caching \
+    --compilation-config '{{"cudagraph_mode":"piecewise"}}' \
     --trust-remote-code \
     --host {host} \
     --port {port}
