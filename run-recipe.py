@@ -1269,6 +1269,8 @@ Examples:
             cmd_parts.extend(["--mount-volume", mount_volume])
         for port_mapping in args.port_mappings:
             cmd_parts.extend(["-p", port_mapping])
+        for mount_volume in args.mount_volumes:
+            cmd_parts.extend(["--mount-volume", mount_volume])
         if args.master_port:
             cmd_parts.extend(["--master-port", str(args.master_port)])
         if args.container_name:
