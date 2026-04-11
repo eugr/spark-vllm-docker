@@ -1,2 +1,4 @@
 .env
 build-metadata.yaml
+wheels/.*-commit
+wheels/*.whl
