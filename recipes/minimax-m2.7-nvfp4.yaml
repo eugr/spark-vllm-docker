@@ -1,0 +1,60 @@
+# Recipe: MiniMax-M2.7-NVFP4
+# MiniMax M2.7 model with NVFP4 (modelopt_fp4) quantization
+# Requires TF5 container build and 2-node cluster (TP=2 via Ray)
+
+recipe_version: "1"
+name: MiniMax-M2.7-NVFP4
+description: vLLM serving MiniMax-M2.7-NVFP4 with CUTLASS kernels and Ray distributed backend
+
+# HuggingFace model to download (optional, for --download-model)
+model: lukealonso/MiniMax-M2.7-NVFP4
+
+# Container image to use (TF5 build for NVFP4 support)
+container: vllm-node-tf5
+build_args:
+  - --tf5
+
+# Requires 2 nodes for TP=2
+cluster_only: true
+
+# No mods required
+mods: []
+
+# Environment variables
+env:
+  VLLM_USE_FLASHINFER_MOE_FP4: "0"
+  VLLM_NVFP4_GEMM_BACKEND: cutlass
+  VLLM_ALLOW_LONG_MAX_MODEL_LEN: "1"
+  OMP_NUM_THREADS: "8"
+
+# Default settings (can be overridden via CLI)
+defaults:
+  port: 8888
+  host: 0.0.0.0
+  tensor_parallel: 2
+  gpu_memory_utilization: 0.92
+  max_num_seqs: 4
+  max_num_batched_tokens: 8192
+
+# The vLLM serve command template
+command: |
+  vllm serve lukealonso/MiniMax-M2.7-NVFP4 \
+      --port {port} \
+      --host {host} \
+      --max-num-seqs {max_num_seqs} \
+      --max-num-batched-tokens {max_num_batched_tokens} \
+      --gpu-memory-utilization {gpu_memory_utilization} \
+      --mamba_ssm_cache_dtype float32 \
+      --enable-prefix-caching \
+      --enable-auto-tool-choice \
+      --served-model-name MiniMax-M2.7 \
+      --tool-call-parser minimax_m2 \
+      --reasoning-parser minimax_m2_append_think \
+      --kv-cache-dtype fp8 \
+      --quantization modelopt_fp4 \
+      --moe-backend cutlass \
+      --disable-custom-all-reduce \
+      --dtype auto \
+      --trust-remote-code \
+      --tensor-parallel-size {tensor_parallel} \
+      --distributed-executor-backend ray
