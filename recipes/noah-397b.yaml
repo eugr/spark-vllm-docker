@@ -1,34 +1,34 @@
 # Recipe: Noah 397B (Intel/Qwen3.5-397B-A17B-int4-AutoRound)
-# Uses pre-patched image: vllm-node-noah-patched:latest
-# Baked: install-conch (1.3)
-# Runtime mods applied at launch (in order):
-#   - fix-qwen35-tp4-marlin: replaces in_proj_ba MergedColumnParallelLinear with
-#     two ReplicatedLinear(N=64) for Qwen3.5. Fixes ConchLinearKernel BLOCK_N=64
-#     unmasked OOB scale reads (N=32 < BLOCK_N=64 with TP=4). H1 — pending validation.
-#   - gpu-mem-util-gb: adds --gpu-memory-utilization-gb flag (bypasses fraction check)
-#   - fix-qwen3.5-chat-template: copies unsloth.jinja to /workspace
+# CANONICAL — validated baseline only. No unvalidated changes.
 #
-# TP=2 IS NOT VIABLE: 98.24 GiB weights/node + ~4 GiB NCCL overhead = 102+ GiB profiling peak
-#   on 121 GiB nodes. Budget ≥ 103 GiB → kernel panic (kcompactd Driver 590 UMA bug).
+# For experiments: use recipes/noah_397b_h1.yaml (H1 test), noah_397b_debug.yaml (debug)
+#
+# Validated baseline items:
+#   --skip-mm-profiling: confirmed prior to H1. Log 2026-04-15 08:53:20 shows
+#     "Skipping memory profiling for multimodal encoder and encoder cache [x3]"
+#     before the determine_available_memory crash. Vision encoder path not causal.
+#   VLLM_DISABLED_KERNELS: confirmed active during failure (ConchLinearKernel selected).
+#   gpu_memory_utilization_gb=80: confirmed safe on 121.69 GiB nodes (memory math below).
+#
+# TP=2 IS NOT VIABLE: 98.24 GiB weights/node + ~4 GiB NCCL overhead = 102+ GiB profiling
+#   peak on 121 GiB nodes. Budget >= 103 GiB → kernel panic (kcompactd Driver 590 UMA).
 #   Budget < 103 GiB → no KV cache. No viable budget exists for TP=2.
 #
-# Memory math (TP=4, ARK-4+ARK-6+ARK-7+ARK-8, 121.69 GiB total, ~109-112 GiB free):
-#   Weights per node (TP=4, fp4): ~49.12 GiB
+# Memory math (TP=4, 121.69 GiB total, ~109-112 GiB free):
+#   Weights per node (TP=4, int4): ~49.12 GiB
 #   Ray + NCCL overhead: ~15 GiB → init_device sees ~96 GiB free
 #   gpu_memory_utilization_gb=80: requested=80 < 96+0.5 GiB ✓
-#   Kernel headroom: 121 - (25 overhead + 80 vLLM) = ~16 GiB ✓ (very safe)
+#   Kernel headroom: 121 - (25 overhead + 80 vLLM) = ~16 GiB ✓
 #   Profiling peak estimate: ~55 GiB → KV available: 80-55 = ~25 GiB ✓
 
 recipe_version: "1"
 name: noah-397b
-description: Noah 397B - Intel Qwen3.5-397B-A17B-int4-AutoRound (patched image)
+description: Noah 397B - Intel Qwen3.5-397B-A17B-int4-AutoRound (validated baseline)
 
 cluster_only: true
-
 container: vllm-node-noah-patched
 
 mods:
-  - mods/fix-qwen35-tp4-marlin
   - mods/gpu-mem-util-gb
   - mods/fix-qwen3.5-chat-template
 
@@ -36,7 +36,6 @@ defaults:
   port: 9000
   host: 0.0.0.0
   tensor_parallel: 4
-  # Absolute GiB (via gpu-mem-util-gb mod): 80 GiB per node, ~16 GiB kernel headroom
   gpu_memory_utilization: 80
   max_model_len: 16384
   max_num_batched_tokens: 1024
