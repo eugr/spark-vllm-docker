@@ -1,0 +1,68 @@
+# Recipe: Noah 397B — A0 TOPOLOGY TEST
+# Hypothesis A0: TP=1 + Expert Parallelism across N nodes avoids the Marlin/Conch
+# N=32 kernel constraint without patching. With TP=1, in_proj_ba N=64 >= BLOCK_N=64.
+#
+# Single change from baseline (noah-397b.yaml):
+#   - tensor_parallel: 1  (was 4)
+#   - --enable-expert-parallel added
+#   - fix-qwen35-tp4-marlin NOT included (not needed — N=64 with TP=1 is safe)
+#
+# Memory estimate with EP across N nodes (int4, 397B total):
+#   Expert weights per node (EP=9): ~197GiB / 9 ≈ 21.9 GiB
+#   Non-expert (attention, embeddings, replicated): ~7 GiB
+#   Total per node: ~29 GiB — fits comfortably on 121.69 GiB
+#
+# Launch example (from head node, 8 workers = 9 total EP ranks):
+#   ./run-recipe.sh recipes/noah_397b_a0.yaml -n IP1,IP2,IP3,IP4,IP5,IP6,IP7,IP8
+#
+# Confirmer: Uvicorn running on http://0.0.0.0:9000 with no kernel crash
+# Falsifier: cudaErrorIllegalAddress in any kernel path after confirming -tp 1 active
+#
+# After run: update docs/incidents/noah_397b_experiment_ledger.md (H1 table row A0)
+# If confirmed: update noah-397b.yaml to TP=1+EP and delete this file
+# If rejected: record exact error, proceed to A1 (official Qwen GPTQ-Int4 artifact)
+
+recipe_version: "1"
+name: noah-397b-a0
+description: Noah 397B A0 — TP=1 EP topology test (Intel AutoRound, no kernel patches)
+
+cluster_only: true
+container: vllm-node-noah-patched
+
+mods:
+  - mods/gpu-mem-util-gb
+  - mods/fix-qwen3.5-chat-template
+
+defaults:
+  port: 9000
+  host: 0.0.0.0
+  tensor_parallel: 1
+  gpu_memory_utilization: 80
+  max_model_len: 16384
+  max_num_batched_tokens: 1024
+
+env:
+  PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
+  VLLM_USE_FLASHINFER_MOE_FP4: "0"
+  VLLM_DISABLED_KERNELS: "MarlinLinearKernel,GPTQMarlinLinearMethod"
+
+command: |
+  vllm serve Intel/Qwen3.5-397B-A17B-int4-AutoRound \
+    --max-model-len {max_model_len} \
+    --max-num-seqs 2 \
+    --kv-cache-dtype fp8 \
+    --gpu-memory-utilization-gb {gpu_memory_utilization} \
+    --port {port} \
+    --host {host} \
+    --enforce-eager \
+    --skip-mm-profiling \
+    --enable-expert-parallel \
+    --enable-prefix-caching \
+    --enable-auto-tool-choice \
+    --tool-call-parser qwen3_coder \
+    --reasoning-parser qwen3 \
+    --max-num-batched-tokens {max_num_batched_tokens} \
+    --trust-remote-code \
+    --chat-template unsloth.jinja \
+    -tp {tensor_parallel} \
+    --distributed-executor-backend ray
