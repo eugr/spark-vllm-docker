@@ -1,0 +1,59 @@
+# Recipe: Noah 397B — DEBUG ONLY
+# DO NOT use for production or performance testing.
+# Adds CUDA_LAUNCH_BLOCKING=1 to surface async CUDA errors synchronously.
+# This halves throughput and must be removed before any perf measurement.
+#
+# Use this recipe when:
+#   - A new crash needs precise kernel attribution
+#   - Async CUDA errors show a misleading traceback location
+#   - You need to identify which kernel is the first to fault
+#
+# Use noah-397b.yaml (production recipe) for:
+#   - Validation runs (H1 etc.)
+#   - All performance testing
+#   - Normal operation
+
+recipe_version: "1"
+name: noah-397b-debug
+description: Noah 397B — DEBUG (CUDA_LAUNCH_BLOCKING=1, do not use for production)
+
+cluster_only: true
+container: vllm-node-noah-patched
+
+mods:
+  - mods/fix-qwen35-tp4-marlin
+  - mods/gpu-mem-util-gb
+  - mods/fix-qwen3.5-chat-template
+
+defaults:
+  port: 9000
+  host: 0.0.0.0
+  tensor_parallel: 4
+  gpu_memory_utilization: 80
+  max_model_len: 4096
+  max_num_batched_tokens: 512
+
+env:
+  PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
+  VLLM_USE_FLASHINFER_MOE_FP4: "0"
+  VLLM_DISABLED_KERNELS: "MarlinLinearKernel,GPTQMarlinLinearMethod"
+  # DEBUG ONLY — remove before any perf measurement or production use
+  CUDA_LAUNCH_BLOCKING: 1
+  VLLM_RAY_EXTRA_ENV_VARS_TO_COPY: "CUDA_LAUNCH_BLOCKING"
+  TRITON_CACHE_AUTOTUNING: 0
+
+command: |
+  vllm serve Intel/Qwen3.5-397B-A17B-int4-AutoRound \
+    --max-model-len {max_model_len} \
+    --max-num-seqs 1 \
+    --kv-cache-dtype fp8 \
+    --gpu-memory-utilization-gb {gpu_memory_utilization} \
+    --port {port} \
+    --host {host} \
+    --enforce-eager \
+    --skip-mm-profiling \
+    --max-num-batched-tokens {max_num_batched_tokens} \
+    --trust-remote-code \
+    --chat-template unsloth.jinja \
+    -tp {tensor_parallel} \
+    --distributed-executor-backend ray
