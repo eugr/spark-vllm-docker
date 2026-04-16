@@ -1,14 +1,23 @@
 #!/bin/bash
 
-# Default Configuration
-IMAGE_NAME="vllm-node"
-DEFAULT_CONTAINER_NAME="vllm_node"
+# Default Configuration — Jetson AGX Thor
+IMAGE_NAME="vllm-thor"
+DEFAULT_CONTAINER_NAME="vllm_thor"
 HF_CACHE_DIR="${HF_HOME:-$HOME/.cache/huggingface}"
-# Modify these if you want to pass additional docker args or set VLLM_SPARK_EXTRA_DOCKER_ARGS variable
+# Modify these if you want to pass additional docker args, or set
+# VLLM_THOR_EXTRA_DOCKER_ARGS (preferred) / VLLM_SPARK_EXTRA_DOCKER_ARGS
+# (back-compat alias) environment variables.
 DOCKER_ARGS="-e NCCL_IGNORE_CPU_AFFINITY=1 -v $HF_CACHE_DIR:/root/.cache/huggingface"
 
-# Append additional arguments from environment variable
+# Append additional arguments from environment variable.
+# VLLM_THOR_EXTRA_DOCKER_ARGS is the canonical name on Thor;
+# VLLM_SPARK_EXTRA_DOCKER_ARGS is kept as a deprecated alias so that
+# existing user scripts keep working during the Spark→Thor transition.
+if [[ -n "$VLLM_THOR_EXTRA_DOCKER_ARGS" ]]; then
+    DOCKER_ARGS="$DOCKER_ARGS $VLLM_THOR_EXTRA_DOCKER_ARGS"
+fi
 if [[ -n "$VLLM_SPARK_EXTRA_DOCKER_ARGS" ]]; then
+    echo "Note: VLLM_SPARK_EXTRA_DOCKER_ARGS is deprecated — use VLLM_THOR_EXTRA_DOCKER_ARGS." >&2
     DOCKER_ARGS="$DOCKER_ARGS $VLLM_SPARK_EXTRA_DOCKER_ARGS"
 fi
 
@@ -39,7 +48,9 @@ LAUNCH_SCRIPT_MODE="false"
 MOUNT_CACHE_DIRS="true"
 BUILD_JOBS=""
 NON_PRIVILEGED_MODE="false"
-MEM_LIMIT_GB="110"
+# Thor = 128 GB LPDDR5X unified.  Leave ~16 GB headroom for host OS
+# + driver + other processes when running in non-privileged mode.
+MEM_LIMIT_GB="112"
 MEM_SWAP_LIMIT_GB=""
 PIDS_LIMIT="4096"
 SHM_SIZE_GB="64"
@@ -259,8 +270,28 @@ if [[ -z "$MASTER_PORT" || "$MASTER_PORT" == "29501" ]] && [[ -n "$DOTENV_MASTER
     MASTER_PORT="$DOTENV_MASTER_PORT"
 fi
 
-if [[ -z "$CONTAINER_NAME" || "$CONTAINER_NAME" == "vllm_node" ]] && [[ -n "$DOTENV_CONTAINER_NAME" ]]; then
+if [[ -z "$CONTAINER_NAME" || "$CONTAINER_NAME" == "vllm_node" || "$CONTAINER_NAME" == "vllm_thor" ]] && [[ -n "$DOTENV_CONTAINER_NAME" ]]; then
     CONTAINER_NAME="$DOTENV_CONTAINER_NAME"
+fi
+
+# ---------------------------------------------------------------
+# LMCache auto-wiring (opt-in).
+# Set ENABLE_LMCACHE=1 in your .env (or export it) and we pass
+# through the standard LMCACHE_* env vars plus the CPU-offload
+# defaults.  The user still appends
+#     --kv-transfer-config '{"kv_connector":"LMCacheConnectorV1","kv_role":"kv_both"}'
+# to their `vllm serve` line.  See README §LMCache for details.
+# ---------------------------------------------------------------
+if [[ "${ENABLE_LMCACHE:-${DOTENV_ENABLE_LMCACHE:-0}}" == "1" ]]; then
+    : "${DOTENV_CONTAINER_LMCACHE_CHUNK_SIZE:=256}"
+    : "${DOTENV_CONTAINER_LMCACHE_LOCAL_CPU:=True}"
+    # Thor's LPDDR5X is shared with the GPU, so CPU offload is near-zero-copy.
+    # Allocate 16 GB by default — tune via LMCACHE_MAX_LOCAL_CPU_SIZE.
+    : "${DOTENV_CONTAINER_LMCACHE_MAX_LOCAL_CPU_SIZE:=16}"
+    export DOTENV_CONTAINER_LMCACHE_CHUNK_SIZE
+    export DOTENV_CONTAINER_LMCACHE_LOCAL_CPU
+    export DOTENV_CONTAINER_LMCACHE_MAX_LOCAL_CPU_SIZE
+    echo "LMCache enabled: chunk=$DOTENV_CONTAINER_LMCACHE_CHUNK_SIZE cpu=$DOTENV_CONTAINER_LMCACHE_LOCAL_CPU max_cpu=${DOTENV_CONTAINER_LMCACHE_MAX_LOCAL_CPU_SIZE}GB"
 fi
 
 if [[ -n "$DOTENV_LOCAL_IP" ]]; then
@@ -797,9 +828,18 @@ copy_script_to_worker() {
          rm -f $remote_tmp" || { echo "Error: docker cp to worker $worker_ip failed"; exit 1; }
 }
 
-# Build -e KEY=VALUE flags for a given node IP (used in docker run and docker exec)
+# Build -e KEY=VALUE flags for a given node IP (used in docker run and docker exec).
+# On Thor without a SmartNIC we force NCCL to use plain TCP over ETH_IF
+# (NCCL_IB_DISABLE=1).  If the user attached a ConnectX card and set IB_IF,
+# we flip back to the RDMA path (NCCL_IB_DISABLE=0).
 get_env_flags() {
     local node_ip="$1"
+    local ib_disable="1"
+    local ib_hca_flag=""
+    if [[ -n "$IB_IF" ]]; then
+        ib_disable="0"
+        ib_hca_flag="-e NCCL_IB_HCA=$IB_IF "
+    fi
     printf -- '-e %s ' \
         "VLLM_HOST_IP=$node_ip" \
         "RAY_NODE_IP_ADDRESS=$node_ip" \
@@ -807,14 +847,14 @@ get_env_flags() {
         "MN_IF_NAME=$ETH_IF" \
         "UCX_NET_DEVICES=$ETH_IF" \
         "NCCL_SOCKET_IFNAME=$ETH_IF" \
-        "NCCL_IB_HCA=$IB_IF" \
-        "NCCL_IB_DISABLE=0" \
+        "NCCL_IB_DISABLE=$ib_disable" \
         "OMPI_MCA_btl_tcp_if_include=$ETH_IF" \
         "GLOO_SOCKET_IFNAME=$ETH_IF" \
         "TP_SOCKET_IFNAME=$ETH_IF" \
         "RAY_memory_monitor_refresh_ms=0" \
         "RAY_num_prestart_python_workers=0" \
         "RAY_object_store_memory=1073741824"
+    printf '%s' "$ib_hca_flag"
 }
 
 # Start Ray head node inside the container
@@ -845,15 +885,26 @@ start_cluster() {
         return
     fi
 
-    # Build docker run arguments based on mode
-    local docker_args_common="--gpus all -d --rm --network host --name $CONTAINER_NAME $DOCKER_ARGS $IMAGE_NAME"
+    # Build docker run arguments based on mode.
+    # Thor's NVIDIA Container Runtime exposes the iGPU via --runtime=nvidia
+    # (the Jetson convention).  `--gpus all` also works on recent JP7
+    # releases, so we default to --runtime=nvidia and let the user
+    # override via DOCKER_GPU_FLAG=...  for non-Jetson hosts.
+    local gpu_flag="${DOCKER_GPU_FLAG:-"--runtime=nvidia"}"
+    local docker_args_common="$gpu_flag -d --rm --network host --name $CONTAINER_NAME $DOCKER_ARGS $IMAGE_NAME"
     local docker_caps_args=""
     local docker_resource_args=""
 
     if [[ "$NON_PRIVILEGED_MODE" == "true" ]]; then
         echo "Running in non-privileged mode..."
         docker_caps_args="--cap-add=IPC_LOCK"
-        docker_resource_args="--shm-size=${SHM_SIZE_GB}g --device=/dev/infiniband --memory ${MEM_LIMIT_GB}g --memory-swap ${MEM_SWAP_LIMIT_GB}g --pids-limit ${PIDS_LIMIT}"
+        # Only bind-mount /dev/infiniband when the kernel actually has it
+        # (i.e. user attached a ConnectX SmartNIC).  Stock Thor has none.
+        local ib_device_flag=""
+        if [[ -e /dev/infiniband ]]; then
+            ib_device_flag="--device=/dev/infiniband"
+        fi
+        docker_resource_args="--shm-size=${SHM_SIZE_GB}g $ib_device_flag --memory ${MEM_LIMIT_GB}g --memory-swap ${MEM_SWAP_LIMIT_GB}g --pids-limit ${PIDS_LIMIT}"
     else
         docker_caps_args="--privileged"
         docker_resource_args="--ipc=host"

@@ -12,7 +12,7 @@
 # README Reference: Lines 186-198 (solo) and 203-218 (cluster)
 # ==============================================================================
 GLM_FLASH_AWQ_MODEL="cyankiwi/GLM-4.7-Flash-AWQ-4bit"
-GLM_FLASH_AWQ_CONTAINER="vllm-node-tf5"
+GLM_FLASH_AWQ_CONTAINER="vllm-thor-tf5"
 GLM_FLASH_AWQ_MOD="mods/fix-glm-4.7-flash-AWQ"
 GLM_FLASH_AWQ_ARGS=(
     "--tool-call-parser glm47"
@@ -32,7 +32,7 @@ GLM_FLASH_AWQ_ARGS=(
 # README Reference: Lines 244-257 (solo) and 264-280 (cluster)
 # ==============================================================================
 GPT_OSS_MODEL="openai/gpt-oss-120b"
-GPT_OSS_CONTAINER="vllm-node-mxfp4"
+GPT_OSS_CONTAINER="vllm-thor-mxfp4"
 GPT_OSS_ARGS=(
     "--port 8000"
     "--host 0.0.0.0"
@@ -55,7 +55,7 @@ GPT_OSS_ARGS=(
 # README Reference: Not explicitly documented, but based on model requirements
 # ==============================================================================
 MINIMAX_MODEL="QuantTrio/MiniMax-M2-AWQ"
-MINIMAX_CONTAINER="vllm-node"
+MINIMAX_CONTAINER="vllm-thor"
 MINIMAX_ARGS=(
     "--port 8000"
     "--host 0.0.0.0"

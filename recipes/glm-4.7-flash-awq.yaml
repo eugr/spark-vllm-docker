@@ -21,7 +21,7 @@ cluster_only: false
 solo_only: false
 
 # Container image to use
-container: vllm-node-tf5
+container: vllm-thor-tf5
 
 # Build arguments for build-and-copy.sh
 # tf5 = transformers 5.0 (required for GLM-4.7)

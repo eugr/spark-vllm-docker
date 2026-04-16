@@ -11,7 +11,7 @@ description: Qwen3.5-397B with TP=4 across 4 DGX Spark nodes (Marlin fix applied
 model: Intel/Qwen3.5-397B-A17B-int4-AutoRound
 
 # Container image to use
-container: vllm-node-tf5
+container: vllm-thor-tf5
 
 build_args:
   - --tf5

@@ -45,7 +45,7 @@ The recipe runner can automatically discover cluster nodes:
 
 When you run `--discover`, it:
 1. Detects active CX7 interfaces and determines mesh vs. standard topology.
-2. Scans the network for peers that are both SSH-reachable **and** have an NVIDIA GB10 GPU.
+2. Scans the network for peers that are both SSH-reachable **and** have an Jetson AGX Thor GPU.
 3. In mesh mode, separately discovers `COPY_HOSTS` on the direct IB-attached interfaces.
 4. Prompts for per-node confirmation for `CLUSTER_NODES` and `COPY_HOSTS`.
 5. Saves the full configuration (including mesh NCCL settings if applicable) to `.env`.
@@ -255,7 +255,7 @@ Example:
 ```yaml
 name: My Model
 description: My custom model setup
-container: vllm-node-tf5
+container: vllm-thor-tf5
 
 build_args:
   - --pre-tf
@@ -283,7 +283,7 @@ command: |
 ┌─────────────────────────────────────────────────────────┐
 │  autodiscover.sh                                        │
 │  - Interface detection (standard / mesh topology)       │
-│  - GB10 peer verification via SSH                       │
+│  - Thor peer verification via SSH                       │
 │  - CLUSTER_NODES and COPY_HOSTS discovery               │
 │  - Interactive .env save with per-node confirmation     │
 └──────────────────────────┬──────────────────────────────┘

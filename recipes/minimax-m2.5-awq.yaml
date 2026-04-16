@@ -9,7 +9,7 @@ description: vLLM serving MiniMax-M2.5-AWQ with Ray distributed backend
 model: cyankiwi/MiniMax-M2.5-AWQ-4bit
 
 # Container image to use
-container: vllm-node
+container: vllm-thor
 
 # Can only be run in a cluster
 cluster_only: true

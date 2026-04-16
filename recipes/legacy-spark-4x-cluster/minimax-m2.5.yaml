@@ -9,7 +9,7 @@ description: vLLM serving MiniMax-M2.5 with Ray distributed backend
 model: MiniMaxAI/MiniMax-M2.5
 
 # Container image to use
-container: vllm-node
+container: vllm-thor
 
 # Can only be run in a cluster
 cluster_only: true

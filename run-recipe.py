@@ -125,7 +125,7 @@ def load_recipe(recipe_path: Path) -> dict[str, Any]:
         recipe_version (str, required): Schema version for compatibility checking.
             Used by run-recipe.py to determine which features are available.
             Current version: '1'. Bump when adding new recipe fields.
-        container (str, required): Docker image tag to use (e.g., 'vllm-node-mxfp4')
+        container (str, required): Docker image tag to use (e.g., 'vllm-thor-mxfp4')
         command (str, required): vLLM serve command template with {placeholders}
         description (str, optional): Brief description shown in --list
         model (str, optional): HuggingFace model ID for --setup downloads
@@ -226,7 +226,7 @@ def list_recipes() -> None:
             name = recipe.get("name", recipe_path.stem)
             recipe_version = recipe.get("recipe_version", "1")
             desc = recipe.get("description", "")
-            container = recipe.get("container", "vllm-node")
+            container = recipe.get("container", "vllm-thor")
             build_args = recipe.get("build_args", [])
             model = recipe.get("model", "")
             mods = recipe.get("mods", [])
@@ -266,7 +266,7 @@ def check_image_exists(image: str, host: str | None = None) -> bool:
     - For custom SSH options: Modify the ssh command array
 
     Args:
-        image: Docker image tag to check (e.g., 'vllm-node-mxfp4')
+        image: Docker image tag to check (e.g., 'vllm-thor-mxfp4')
         host: Optional remote hostname/IP. If None, checks locally.
 
     Returns:

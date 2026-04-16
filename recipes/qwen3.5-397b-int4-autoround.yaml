@@ -13,7 +13,7 @@ model: Intel/Qwen3.5-397B-A17B-int4-AutoRound
 cluster_only: true
 
 # Container image to use
-container: vllm-node-tf5
+container: vllm-thor-tf5
 
 build_args:
   - --tf5

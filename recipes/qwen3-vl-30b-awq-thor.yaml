@@ -1,0 +1,65 @@
+# Recipe: Qwen3-VL-30B-A3B-Instruct-AWQ on a single Jetson AGX Thor.
+#
+# QuantTrio's 4-bit AWQ build fits comfortably in Thor's 128 GB LPDDR5X
+# with room for KV cache and activation memory.  This recipe enables
+# LMCache (CPU offload) to cut repeat-prompt TTFT in multi-turn chat.
+#
+# References:
+#   * LMCache vLLM integration — https://docs.vllm.ai/en/latest/examples/others/lmcache/
+#   * NVFP4 would be the Thor-native low-bit format for larger models,
+#     see recipes/nemotron-3-nano-nvfp4.yaml for an NVFP4 example.
+
+recipe_version: "1"
+name: Qwen3-VL-30B-A3B-AWQ-Thor
+description: Qwen3-VL-30B-A3B-Instruct-AWQ tuned for a single Jetson AGX Thor with LMCache CPU offload.
+
+# HuggingFace model
+model: QuantTrio/Qwen3-VL-30B-A3B-Instruct-AWQ
+
+# Thor is single-GPU per board.  Multi-Thor over 25 GbE is feasible but
+# slow compared to DGX Spark's ConnectX-7, so we default to solo.
+cluster_only: false
+solo_only: true
+
+# Container image to use
+container: vllm-thor
+
+# No extra build args required
+build_args: []
+
+# No mods required
+mods: []
+
+# Default settings (override via CLI)
+defaults:
+  port: 8000
+  host: 0.0.0.0
+  tensor_parallel: 1
+  gpu_memory_utilization: 0.75
+  max_model_len: 65536
+  max_num_batched_tokens: 4096
+  max_num_seqs: 32
+  served_model_name: qwen3-vl-30b-awq
+
+# Environment variables to set in the container
+env:
+  # Opt-in LMCache; the connector is declared on the vLLM command line below.
+  LMCACHE_CHUNK_SIZE: "256"
+  LMCACHE_LOCAL_CPU: "True"
+  # Thor has unified memory, so "CPU offload" is near-zero-copy; 16 GB is
+  # a conservative default that leaves plenty of room for weights + KV.
+  LMCACHE_MAX_LOCAL_CPU_SIZE: "16"
+
+# The vLLM serve command template
+command: |
+  vllm serve QuantTrio/Qwen3-VL-30B-A3B-Instruct-AWQ \
+      --served-model-name {served_model_name} \
+      --max-model-len {max_model_len} \
+      --max-num-batched-tokens {max_num_batched_tokens} \
+      --max-num-seqs {max_num_seqs} \
+      --gpu-memory-utilization {gpu_memory_utilization} \
+      -tp {tensor_parallel} \
+      --load-format fastsafetensors \
+      --kv-transfer-config '{"kv_connector":"LMCacheConnectorV1","kv_role":"kv_both"}' \
+      --host {host} \
+      --port {port}

@@ -49,31 +49,79 @@ load_env_if_exists() {
 # Load .env file
 load_env_if_exists
 
-# Mesh mode flag (set by detect_interfaces)
+# Mesh mode flag (set by detect_interfaces).
+# Thor does not ship a ConnectX NIC, so real RoCE mesh is a DGX-Spark-only
+# concept; on Thor this stays "false" and only matters if the user attaches
+# an external ConnectX SmartNIC over PCIe.
 MESH_MODE="false"
 
-# Function to detect IB and Ethernet interfaces
+# Thor default: only stock Ethernet (25 GbE MGBE), no RoCE.
+# THOR_ETHERNET_ONLY=1 skips the `ibdev2netdev` path entirely.
+THOR_ETHERNET_ONLY="${THOR_ETHERNET_ONLY:-1}"
+
+# Detect the "primary" Ethernet interface by finding the one carrying the
+# default route.  Works for Thor's `eth0` / `enP*` MGBE ports as well as
+# for any SmartNIC the user has attached.
+_detect_primary_eth() {
+    ip -o -4 route show default 2>/dev/null | awk '{print $5; exit}'
+}
+
+# Thor-only interface detection: no InfiniBand, just pick the NIC with
+# a default route.  If multiple Thors are wired directly via 25 GbE we
+# still use the same primary NIC — the cluster operator is expected
+# to statically configure CLUSTER_NODES in .env for that topology.
+_detect_interfaces_thor() {
+    local primary
+    primary=$(_detect_primary_eth)
+    if [[ -z "$primary" ]]; then
+        echo "Error: could not find a primary Ethernet interface on this Thor."
+        echo "       Set ETH_IF explicitly or add a default route (e.g. `ip route add default ...`)."
+        return 1
+    fi
+
+    if [[ -z "$ETH_IF" ]]; then
+        ETH_IF="$primary"
+        echo "  Detected ETH_IF: $ETH_IF (Thor 25 GbE / default route)"
+    fi
+    # IB_IF is intentionally left empty on Thor — NCCL will fall back
+    # to the TCP sockets transport over ETH_IF.
+    IB_IF=""
+    return 0
+}
+
+# Function to detect IB and Ethernet interfaces.
+# On Thor (default) we skip the ConnectX auto-detection entirely.
+# Set THOR_ETHERNET_ONLY=0 and configure an attached SmartNIC to
+# re-enable the original DGX-Spark RoCE path.
 detect_interfaces() {
     # If both interfaces are already set, nothing to do
     if [[ -n "$ETH_IF" && -n "$IB_IF" ]]; then
         return 0
     fi
 
-    # Check for required tools
+    if [[ "$THOR_ETHERNET_ONLY" == "1" ]]; then
+        _detect_interfaces_thor
+        return $?
+    fi
+
+    # ------------------------------------------------------------------
+    # Legacy path: ConnectX-7 / RoCE (DGX Spark, or Thor + SmartNIC).
+    # ------------------------------------------------------------------
     if ! command -v ibdev2netdev &> /dev/null; then
-        echo "Error: ibdev2netdev not found. Cannot auto-detect interfaces."
-        return 1
+        echo "Warning: ibdev2netdev not found — falling back to Thor Ethernet-only detection."
+        _detect_interfaces_thor
+        return $?
     fi
 
     echo "Auto-detecting interfaces..."
 
     # Get all Up interfaces: "rocep1s0f1 port 1 ==> enp1s0f1np1 (Up)"
-    # We capture: IB_DEV, NET_DEV
     mapfile -t IB_NET_PAIRS < <(ibdev2netdev | awk '/Up\)/ {print $1 " " $5}')
 
     if [ ${#IB_NET_PAIRS[@]} -eq 0 ]; then
-        echo "Error: No active IB interfaces found."
-        return 1
+        echo "No active IB interfaces found — falling back to Thor Ethernet-only detection."
+        _detect_interfaces_thor
+        return $?
     fi
 
     DETECTED_IB_IFS=()
@@ -218,9 +266,15 @@ detect_local_ip() {
     echo "  Detected Local IP: $LOCAL_IP ($CIDR)"
 }
 
-# Scan a subnet for GB10-capable peers via SSH
-# Usage: _scan_subnet_for_gb10 <cidr> <local_ip_to_exclude> <output_file>
-_scan_subnet_for_gb10() {
+# GPU-name regex identifying a Jetson Thor peer via `nvidia-smi`.
+# Thor reports itself as "Orin (nvgpu)" on some L4T builds and as
+# "NVIDIA Thor" / "Thor" / "Jetson AGX Thor" on JetPack 7+.  We match
+# generously; users can override via THOR_GPU_REGEX env var.
+THOR_GPU_REGEX="${THOR_GPU_REGEX:-Thor|Jetson AGX}"
+
+# Scan a subnet for Thor peers via SSH.
+# Usage: _scan_subnet_for_thor <cidr> <local_ip_to_exclude> <output_file>
+_scan_subnet_for_thor() {
     local cidr="$1"
     local exclude_ip="$2"
     local out_file="$3"
@@ -241,10 +295,10 @@ _scan_subnet_for_gb10() {
         [[ "$ip" == "$exclude_ip" ]] && continue
         (
             if nc -z -w 1 "$ip" 22 &>/dev/null; then
-                # Check if remote is a GB10 system
+                # Check if remote is a Thor system
                 if ssh -o ConnectTimeout=3 -o StrictHostKeyChecking=no -o BatchMode=yes "$ip" \
                     "nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null" \
-                    2>/dev/null | grep -q "NVIDIA GB10"; then
+                    2>/dev/null | grep -qE "$THOR_GPU_REGEX"; then
                     echo "$ip" >> "$out_file"
                 fi
             fi
@@ -252,6 +306,9 @@ _scan_subnet_for_gb10() {
     done
     wait
 }
+
+# Back-compat shim for any external callers still using the old name.
+_scan_subnet_for_gb10() { _scan_subnet_for_thor "$@"; }
 
 # Function to detect cluster nodes
 detect_nodes() {
@@ -283,12 +340,12 @@ detect_nodes() {
         return 0
     fi
 
-    echo "Auto-detecting nodes on $CIDR (checking for NVIDIA GB10)..."
+    echo "Auto-detecting nodes on $CIDR (checking for Jetson AGX Thor, regex: $THOR_GPU_REGEX)..."
 
     local temp_file
     temp_file=$(mktemp)
 
-    _scan_subnet_for_gb10 "$CIDR" "$LOCAL_IP" "$temp_file"
+    _scan_subnet_for_thor "$CIDR" "$LOCAL_IP" "$temp_file"
 
     PEER_NODES=()
     local detected_ips=("$LOCAL_IP")
@@ -296,7 +353,7 @@ detect_nodes() {
         while read -r ip; do
             PEER_NODES+=("$ip")
             detected_ips+=("$ip")
-            echo "  Found GB10 peer: $ip"
+            echo "  Found Thor peer: $ip"
         done < <(sort "$temp_file")
         rm -f "$temp_file"
     fi
@@ -310,7 +367,10 @@ detect_nodes() {
 
 # Function to detect COPY_HOSTS for build/model distribution
 # In non-mesh mode: COPY_PEER_NODES = PEER_NODES (same network)
-# In mesh mode: scan enp* interfaces (direct IB-attached) for GB10 peers
+# In mesh mode: scan enp* interfaces (direct IB-attached) for Thor peers
+# NOTE: mesh mode requires an external ConnectX SmartNIC on Thor — the
+# stock 25 GbE MGBE ports are a single-port each with no RoCE, so this
+# branch is effectively dead code on a stock Thor devkit.
 detect_copy_hosts() {
     if [[ "$MESH_MODE" == "false" ]]; then
         COPY_PEER_NODES=("${PEER_NODES[@]}")
@@ -353,7 +413,7 @@ detect_copy_hosts() {
             fi
             [[ -n "$host_ip" ]] && _SEEN_HOST["$host_ip"]="$ip"
             COPY_PEER_NODES+=("$ip")
-            echo "  Found GB10 copy host: $ip"
+            echo "  Found Thor copy host: $ip"
         done < <(sort "$temp_file")
         rm -f "$temp_file"
     fi

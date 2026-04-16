@@ -598,8 +598,8 @@ test_launch_cmd_container_image() {
     output=$("$PROJECT_DIR/run-recipe.py" openai-gpt-oss-120b --dry-run --solo 2>&1)
     launch_cmd=$(extract_launch_cmd "$output")
     
-    # Check the container is vllm-node-mxfp4 (from the recipe)
-    if echo "$launch_cmd" | grep -q "\-t vllm-node-mxfp4"; then
+    # Check the container is vllm-thor-mxfp4 (from the recipe)
+    if echo "$launch_cmd" | grep -q "\-t vllm-thor-mxfp4"; then
         log_pass "Launch command includes correct container image"
     else
         log_fail "Launch command has wrong container image"

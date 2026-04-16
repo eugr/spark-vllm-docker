@@ -10,7 +10,7 @@ description: vLLM serving Nemotron-3-Nano-NVFP4 on a SINGLE NODE ONLY!
 model: nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4
 
 # Container image to use
-container: vllm-node
+container: vllm-thor
 
 # This model can only run on single node (solo)
 solo_only: true

@@ -4,8 +4,10 @@ set -e
 # Start total time tracking
 START_TIME=$(date +%s)
 
-# Default values
-IMAGE_TAG="vllm-node"
+# Default values — tuned for NVIDIA Jetson AGX Thor (sm_110a).
+# DGX Spark (sm_121a) is NOT supported by this image; use the
+# upstream eugr/spark-vllm-docker for Spark.
+IMAGE_TAG="vllm-thor"
 IMAGE_TAG_SET=false
 REBUILD_FLASHINFER=false
 REBUILD_VLLM=false
@@ -24,14 +26,22 @@ VLLM_PRS=""
 FLASHINFER_PRS=""
 PRE_TRANSFORMERS=false
 FULL_LOG=false
-BUILD_JOBS="16"
-GPU_ARCH_LIST="12.1a"
+# Thor has 14 V3AE cores and 128 GB LPDDR5X shared with the GPU.
+# 8 parallel compile jobs stays within memory budget for CUDA TUs.
+BUILD_JOBS="8"
+# Jetson Thor = sm_110a (Blackwell-Jetson).  Was sm_101 in CUDA 12.8/12.9
+# and was renumbered to sm_110 in CUDA 13.0 — we require CUDA 13.
+GPU_ARCH_LIST="11.0a"
 NETWORK_ARG=""
-WHEELS_REPO="eugr/spark-vllm-docker"
+# No public prebuilt-wheel release for Thor yet — everything is built
+# from source on-box.  If a community mirror appears, point WHEELS_REPO
+# at it and list the arch in PREBUILT_WHEELS_SUPPORTED_ARCHS.
+WHEELS_REPO=""
 FLASHINFER_RELEASE_TAG="prebuilt-flashinfer-current"
 VLLM_RELEASE_TAG="prebuilt-vllm-current"
-# Space-separated list of GPU architectures for which prebuilt wheels are available
-PREBUILT_WHEELS_SUPPORTED_ARCHS="12.1a"
+# Space-separated list of GPU architectures for which prebuilt wheels
+# are available.  Empty = always build from source (the Thor default).
+PREBUILT_WHEELS_SUPPORTED_ARCHS=""
 CLEANUP_MODE="false"
 CONFIG_FILE=""
 
@@ -117,6 +127,13 @@ try_download_wheels() {
     local TAG="$1"
     local PREFIX="$2"
     local WHEELS_DIR="./wheels"
+
+    # If no wheels repo is configured (default for Thor) we always build
+    # from source — no upstream binary wheels exist for sm_110a yet.
+    if [ -z "$WHEELS_REPO" ]; then
+        echo "No prebuilt wheels repo configured for $PREFIX (Thor sm_110a has no public wheel release) — will build from source."
+        return 1
+    fi
 
     local arch
     for arch in $PREBUILT_WHEELS_SUPPORTED_ARCHS; do
@@ -269,8 +286,11 @@ if downloads:
 # Help function
 usage() {
     echo "Usage: $0 [OPTIONS]"
-    echo "  -t, --tag <tag>               : Image tag (default: 'vllm-node', 'vllm-node-tf5' with --tf5, 'vllm-node-mxfp4' with --exp-mxfp4)"
-    echo "  --gpu-arch <arch>             : GPU architecture (default: '12.1a')"
+    echo ""
+    echo "Build the Jetson Thor vLLM Docker image (sm_110a, CUDA 13.0, arm64-sbsa)."
+    echo ""
+    echo "  -t, --tag <tag>               : Image tag (default: 'vllm-thor', 'vllm-thor-tf5' with --tf5)"
+    echo "  --gpu-arch <arch>             : GPU architecture (default: '11.0a' for Thor; use '12.1a' only if cross-building for DGX Spark)"
     echo "  --rebuild-flashinfer          : Force rebuild of FlashInfer wheels (ignore cached wheels)"
     echo "  --rebuild-vllm                : Force rebuild of vLLM wheels (ignore cached wheels)"
     echo "  --vllm-ref <ref>              : vLLM commit SHA, branch or tag (default: 'main')"
@@ -367,9 +387,9 @@ done
 # Apply default IMAGE_TAG based on flags if -t was not specified
 if [ "$IMAGE_TAG_SET" = false ]; then
     if [ "$PRE_TRANSFORMERS" = true ]; then
-        IMAGE_TAG="vllm-node-tf5"
+        IMAGE_TAG="vllm-thor-tf5"
     elif [ "$EXP_MXFP4" = true ]; then
-        IMAGE_TAG="vllm-node-mxfp4"
+        IMAGE_TAG="vllm-thor-mxfp4"
     fi
 fi
 
@@ -413,7 +433,16 @@ if [ "$COPY_TO_FLAG" = true ] && [ "${#COPY_HOSTS[@]}" -eq 0 ]; then
     fi
 fi
 
-# Validate flag combinations
+# Validate flag combinations.
+# NOTE: --exp-mxfp4 was DGX-Spark specific (gpt-oss on sm_121 with hand-pinned
+# CUTLASS/FlashInfer/vLLM SHAs).  On Jetson Thor (sm_110a) the recommended
+# low-bit path is native NVFP4 in the main Dockerfile, not MXFP4.  The flag
+# is retained for users cross-building for Spark; it will almost certainly
+# not produce a working image on a Thor host.
+if [ "$EXP_MXFP4" = true ]; then
+    echo "WARNING: --exp-mxfp4 uses Spark-pinned SHAs (sm_121).  Thor uses NVFP4 natively — this mode is kept for Spark cross-builds only."
+fi
+
 if [ -n "$VLLM_PRS" ]; then
     if [ "$EXP_MXFP4" = true ]; then echo "Error: --apply-vllm-pr is incompatible with --exp-mxfp4"; exit 1; fi
 fi

@@ -5,7 +5,7 @@ name: Nemotron-3-Super-NVFP4-CUTLASS-Optimized
 description: vLLM serving Nemotron-3-Super-120B using CUTLASS kernels
 
 model: nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4
-container: vllm-node
+container: vllm-thor
 cluster_only: false
 solo_only: false
 
@@ -16,7 +16,7 @@ env:
   VLLM_FLASHINFER_ALLREDUCE_BACKEND: trtllm
   VLLM_ALLOW_LONG_MAX_MODEL_LEN: 1
 
-container: vllm-node
+container: vllm-thor
 defaults:
   port: 8000
   host: 0.0.0.0

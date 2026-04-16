@@ -9,7 +9,7 @@ description: vLLM serving openai/gpt-oss-120b with MXFP4 quantization and FlashI
 model: openai/gpt-oss-120b
 
 # Container image to use
-container: vllm-node-mxfp4
+container: vllm-thor-mxfp4
 
 # Only solo now
 solo_only: true

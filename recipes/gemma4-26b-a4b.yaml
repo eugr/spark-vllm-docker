@@ -13,7 +13,7 @@ cluster_only: false
 solo_only: false
 
 # Container image to use
-container: vllm-node-tf5
+container: vllm-thor-tf5
 
 build_args:
   - --tf5

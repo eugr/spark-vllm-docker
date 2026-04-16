@@ -1,4 +1,45 @@
-# DGX Spark Networking
+# Networking
+
+This repository is now targeted at **NVIDIA Jetson AGX Thor**.  The
+rest of this document is the original **DGX Spark** networking guide,
+retained for reference — multi-Thor clustering, the ConnectX topology,
+and the 3-node mesh mode described below are all Spark-specific.
+
+## Jetson AGX Thor — single-node (recommended)
+
+Thor is a single-GPU-per-board SoC with 4× 25 GbE MGBE ports on the
+devkit and **no on-board ConnectX / RoCE**.  For the overwhelming
+majority of deployments:
+
+* Run in `--solo` mode.  `launch-cluster.sh --solo` skips peer
+  discovery, NCCL IB, and Ray head/worker orchestration.
+* `autodiscover.sh` defaults to Ethernet-only (`THOR_ETHERNET_ONLY=1`).
+  It picks the NIC that carries the default IPv4 route.
+* NCCL uses plain TCP sockets (`NCCL_IB_DISABLE=1`) over `ETH_IF`.
+
+## Jetson AGX Thor — multi-Thor over 25 GbE
+
+You *can* wire several Thor boards together over their 25 GbE ports,
+but bandwidth is ~8× lower than Spark's 200 GbE ConnectX-7 fabric.
+Pipeline-parallel splits work acceptably; tensor-parallel across Thors
+is bandwidth-bound.
+
+* Set `CLUSTER_NODES` in `.env` (or pass `-n a.b.c.d,e.f.g.h`).
+* Keep `THOR_ETHERNET_ONLY=1` unless you attach a SmartNIC.
+* Everything runs over `NCCL_SOCKET_IFNAME=$ETH_IF`.
+
+## Jetson AGX Thor + external ConnectX SmartNIC
+
+If you attach a Mellanox/NVIDIA ConnectX card to Thor over PCIe:
+
+1. Install its OFED userspace + `ibdev2netdev`.
+2. Set `THOR_ETHERNET_ONLY=0` in the environment.
+3. The original Spark RoCE-mesh auto-detection path below re-enables
+   (interfaces named `rocep*` / `enp*s*f*np*`).
+
+---
+
+# DGX Spark Networking (legacy reference)
 
 The following guide is for two node cluster, but it is also applicable to larger clusters.
 

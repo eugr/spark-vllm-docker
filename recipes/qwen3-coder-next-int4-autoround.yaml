@@ -12,7 +12,7 @@ model: Intel/Qwen3-Coder-Next-int4-AutoRound
 solo_only: true
 
 # Container image to use
-container: vllm-node
+container: vllm-thor
 
 # Mod required to fix autoround weight loading issues
 mods:
