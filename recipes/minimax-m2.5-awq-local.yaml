@@ -1,0 +1,46 @@
+# Recipe: MiniMax-M2.5-AWQ-Local
+# Like minimax-m2.5-awq but uses locally vetted code instead of --trust-remote-code.
+# The vetted_local_code field points to a sibling repo (vetted-vllm-code) which installs
+# a vetted MiniMaxM2Config class as a vLLM plugin so transformers can load the model config
+# without network access or trust-remote-code.
+#
+# SETUP:
+#   1. Download the model first (only needed once):
+#      ./run-recipe.py minimax-m2.5-awq --download-model
+#   2. Review the vetted code in ../vetted-vllm-code/minimax-m2.5-awq/ if desired
+#   3. Run this recipe:
+#      ./run-recipe.py minimax-m2.5-awq-local
+
+recipe_version: "1"
+name: MiniMax-M2.5-AWQ-Local
+description: vLLM serving MiniMax-M2.5-AWQ using local vetted code (no trust-remote-code, offline HF)
+
+model: cyankiwi/MiniMax-M2.5-AWQ-4bit
+container: vllm-node
+cluster_only: true
+solo_only: false
+
+vetted_local_code: ../vetted-vllm-code/minimax-m2.5-awq
+
+defaults:
+  port: 8000
+  host: 0.0.0.0
+  tensor_parallel: 2
+  gpu_memory_utilization: 0.7
+  max_model_len: 128000
+
+env:
+  HF_HUB_OFFLINE: "1"
+
+command: |
+  vllm serve cyankiwi/MiniMax-M2.5-AWQ-4bit \
+      --port {port} \
+      --host {host} \
+      --gpu-memory-utilization {gpu_memory_utilization} \
+      -tp {tensor_parallel} \
+      --distributed-executor-backend ray \
+      --max-model-len {max_model_len} \
+      --load-format fastsafetensors \
+      --enable-auto-tool-choice \
+      --tool-call-parser minimax_m2 \
+      --reasoning-parser minimax_m2
