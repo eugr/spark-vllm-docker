@@ -1,0 +1,43 @@
+# Recipe: Kimi-K2.5-NVFP4
+# Pilot-only cluster recipe for the isolated ARK-2/3/4/6 lane.
+# Do not expose in ArkUI or attach to Jay Exec until direct validation passes.
+recipe_version: "1"
+name: Kimi-K2.5-NVFP4-Pilot
+description: vLLM serving NVIDIA Kimi-K2.5-NVFP4 on an isolated 4-node Spark pilot lane
+
+model: nvidia/Kimi-K2.5-NVFP4
+container: vllm/vllm-openai:v0.17.0-aarch64-cu130
+cluster_only: true
+solo_only: false
+
+env:
+  VLLM_ALLOW_LONG_MAX_MODEL_LEN: "1"
+  VLLM_USE_FLASHINFER_MOE_FP4: "1"
+  NCCL_MIN_CTAS: "32"
+
+defaults:
+  port: 30020
+  host: 0.0.0.0
+  tensor_parallel: 4
+  gpu_memory_utilization: 0.82
+  max_model_len: 32768
+  max_num_seqs: 2
+
+command: |
+  vllm serve nvidia/Kimi-K2.5-NVFP4 \
+  --served-model-name nvidia/Kimi-K2.5-NVFP4 \
+  --trust-remote-code \
+  --kv-cache-dtype fp8 \
+  --gpu-memory-utilization {gpu_memory_utilization} \
+  --max-model-len {max_model_len} \
+  --max-num-seqs {max_num_seqs} \
+  --mm-encoder-tp-mode data \
+  --compilation_config.pass_config.fuse_allreduce_rms true \
+  --enable-prefix-caching \
+  --enable-auto-tool-choice \
+  --tool-call-parser kimi_k2 \
+  --reasoning-parser kimi_k2 \
+  --host {host} \
+  --port {port} \
+  --tensor-parallel-size {tensor_parallel} \
+  --distributed-executor-backend ray
