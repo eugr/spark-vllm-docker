@@ -23,8 +23,8 @@ defaults:
   host: 0.0.0.0
   tensor_parallel: 2
   gpu_memory_utilization_gb: 103
-  max_model_len: 131072
-  max_num_batched_tokens: 131072
+  max_model_len: 262144
+  max_num_batched_tokens: 262144
 
 # Environment variables
 env: 
