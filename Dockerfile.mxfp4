@@ -204,12 +204,30 @@ ARG PRE_TRANSFORMERS=0
 RUN --mount=type=cache,id=uv-cache,target=/root/.cache/uv \
     python3 use_existing_torch.py && \
     sed -i "/flashinfer/d" requirements/cuda.txt && \
-    sed -i '/^fastsafetensors\b/d' requirements/test.txt && \
+    if [ -f requirements/test.txt ]; then \
+        sed -i '/^fastsafetensors\b/d' requirements/test.txt; \
+    else \
+        find requirements/test -type f \( -name '*.txt' -o -name '*.in' \) \
+            -exec sed -i '/^fastsafetensors\b/d' {} + 2>/dev/null || true; \
+    fi && \
     if [ "$PRE_TRANSFORMERS" = "1" ]; then \
         sed -i '/^transformers\b/d' requirements/common.txt; \
-        sed -i '/^transformers\b/d' requirements/test.txt; \
+        if [ -f requirements/test.txt ]; then \
+            sed -i '/^transformers\b/d' requirements/test.txt; \
+        else \
+            find requirements/test -type f \( -name '*.txt' -o -name '*.in' \) \
+                -exec sed -i '/^transformers\b/d' {} + 2>/dev/null || true; \
+        fi; \
     fi && \
-    uv pip install -r requirements/build.txt
+    if [ -f requirements/build.txt ]; then \
+        BUILD_REQUIREMENTS=requirements/build.txt; \
+    elif [ -f requirements/build/cuda.txt ]; then \
+        BUILD_REQUIREMENTS=requirements/build/cuda.txt; \
+    else \
+        echo "Unable to locate vLLM build requirements file" >&2; \
+        exit 1; \
+    fi && \
+    uv pip install -r "$BUILD_REQUIREMENTS"
 
 # Apply Patches
 # TEMPORARY PATCH for fastsafetensors loading in cluster setup - tracking https://github.com/vllm-project/vllm/issues/34180

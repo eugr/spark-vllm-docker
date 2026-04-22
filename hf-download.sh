@@ -2,6 +2,8 @@
 set -e
 
 HUB_PATH="${HF_HOME:-$HOME/.cache/huggingface}/hub"
+HF_DOWNLOAD_UVX_SPEC="${HF_DOWNLOAD_UVX_SPEC:-huggingface_hub==1.11.0}"
+MODEL_REVISION=""
 
 # Default values
 COPY_HOSTS=()
@@ -15,6 +17,7 @@ usage() {
     echo "  -c, --copy-to <hosts>       : Host(s) to copy the model to. Accepts comma or space-delimited lists after the flag."
     echo "      --copy-to-host          : Alias for --copy-to (backwards compatibility)."
     echo "      --copy-parallel         : Copy to all hosts in parallel instead of serially."
+    echo "      --revision <sha>        : Pin the download to a specific Hub revision."
     echo "  -u, --user <user>           : Username for ssh commands (default: \$USER)"
     echo "  -h, --help                  : Show this help message"
     exit 1
@@ -42,7 +45,7 @@ copy_model_to_host() {
     local host_copy_start host_copy_end host_copy_time
     host_copy_start=$(date +%s)
     
-    if rsync -av --mkpath --progress "$model_dir" "${SSH_USER}@${host}:$HUB_PATH/"; then
+    if rsync -a --mkpath --partial --partial-dir=.rsync-partial --info=progress2 "$model_dir" "${SSH_USER}@${host}:$HUB_PATH/"; then
         host_copy_end=$(date +%s)
         host_copy_time=$((host_copy_end - host_copy_start))
         printf "Copy to %s completed in %02d:%02d:%02d\n" "$host" $((host_copy_time/3600)) $((host_copy_time%3600/60)) $((host_copy_time%60))
@@ -88,6 +91,7 @@ while [[ "$#" -gt 0 ]]; do
             continue
             ;;
         --copy-parallel) PARALLEL_COPY=true ;;
+        --revision) MODEL_REVISION="$2"; shift ;;
         -u|--user) SSH_USER="$2"; shift ;;
         -h|--help) usage ;;
         *) 
@@ -127,7 +131,11 @@ START_TIME=$(date +%s)
 # Download model
 echo "Downloading model '$MODEL_NAME' using uvx..."
 DOWNLOAD_START=$(date +%s)
-if uvx hf download "$MODEL_NAME"; then
+download_cmd=(uvx --from "$HF_DOWNLOAD_UVX_SPEC" hf download "$MODEL_NAME")
+if [ -n "$MODEL_REVISION" ]; then
+    download_cmd+=(--revision "$MODEL_REVISION")
+fi
+if "${download_cmd[@]}"; then
     DOWNLOAD_END=$(date +%s)
     DOWNLOAD_TIME=$((DOWNLOAD_END - DOWNLOAD_START))
     printf "Download completed in %02d:%02d:%02d\n" $((DOWNLOAD_TIME/3600)) $((DOWNLOAD_TIME%3600/60)) $((DOWNLOAD_TIME%60))

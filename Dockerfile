@@ -181,9 +181,22 @@ RUN if [ -n "$VLLM_PRS" ]; then \
 RUN --mount=type=cache,id=uv-cache,target=/root/.cache/uv \
     python3 use_existing_torch.py && \
     sed -i "/flashinfer/d" requirements/cuda.txt && \
-    sed -i '/^triton\b/d' requirements/test.txt && \
-    sed -i '/^fastsafetensors\b/d' requirements/test.txt && \
-    uv pip install -r requirements/build.txt
+    if [ -f requirements/test.txt ]; then \
+        sed -i '/^triton\b/d' requirements/test.txt && \
+        sed -i '/^fastsafetensors\b/d' requirements/test.txt; \
+    else \
+        find requirements/test -type f \( -name '*.txt' -o -name '*.in' \) \
+            -exec sed -i '/^triton\b/d;/^fastsafetensors\b/d' {} + 2>/dev/null || true; \
+    fi && \
+    if [ -f requirements/build.txt ]; then \
+        BUILD_REQUIREMENTS=requirements/build.txt; \
+    elif [ -f requirements/build/cuda.txt ]; then \
+        BUILD_REQUIREMENTS=requirements/build/cuda.txt; \
+    else \
+        echo "Unable to locate vLLM build requirements file" >&2; \
+        exit 1; \
+    fi && \
+    uv pip install -r "$BUILD_REQUIREMENTS"
 
 # Apply Patches
 # TEMPORARY PATCH for fastsafetensors loading in cluster setup - tracking https://github.com/vllm-project/vllm/issues/34180

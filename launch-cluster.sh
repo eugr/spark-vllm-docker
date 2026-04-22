@@ -20,6 +20,7 @@ MASTER_PORT="29501"
 
 # Initialize variables
 NODES_ARG=""
+CONTROL_NODES_ARG=""
 CONTAINER_NAME="$DEFAULT_CONTAINER_NAME"
 COMMAND_TO_RUN=""
 DAEMON_MODE="false"
@@ -38,6 +39,7 @@ LAUNCH_SCRIPT_MODE="false"
 MOUNT_CACHE_DIRS="true"
 BUILD_JOBS=""
 NON_PRIVILEGED_MODE="false"
+CONTROL_IF=""
 MEM_LIMIT_GB="110"
 MEM_SWAP_LIMIT_GB=""
 PIDS_LIMIT="4096"
@@ -45,12 +47,14 @@ SHM_SIZE_GB="64"
 
 # Function to print usage
 usage() {
-    echo "Usage: $0 [-n <node_ips>] [-t <image_name>] [--name <container_name>] [--eth-if <if_name>] [--ib-if <if_name>] [--nccl-debug <level>] [--check-config] [--solo] [-d] [action] [command]"
-    echo "  -n, --nodes     Comma-separated list of node IPs (Optional, auto-detected if omitted)"
+    echo "Usage: $0 [-n <node_ips>] [--control-nodes <node_ips>] [-t <image_name>] [--name <container_name>] [--eth-if <if_name>] [--ib-if <if_name>] [--control-if <if_name>] [--nccl-debug <level>] [--check-config] [--solo] [-d] [action] [command]"
+    echo "  -n, --nodes     Comma-separated list of data-plane node IPs (Optional, auto-detected if omitted)"
+    echo "  --control-nodes Comma-separated list of control-plane node IPs aligned with --nodes"
     echo "  -t              Docker image name (Optional, default: $IMAGE_NAME)"
     echo "  --name          Container name (Optional, default: $DEFAULT_CONTAINER_NAME)"
     echo "  --eth-if        Ethernet interface (Optional, auto-detected)"
     echo "  --ib-if         InfiniBand interface (Optional, auto-detected)"
+    echo "  --control-if    Control-plane interface (Optional, defaults to default-route interface)"
     echo "  -e, --env       Environment variable to pass to container (e.g. -e VAR=val)"
     echo "  -j              Number of parallel jobs for build environment variables (optional)"
     echo "  --nccl-debug    NCCL debug level (Optional, one of: VERSION, WARN, INFO, TRACE). If no level is provided, defaults to INFO."
@@ -80,10 +84,12 @@ usage() {
 while [[ "$#" -gt 0 ]]; do
     case $1 in
         -n|--nodes) NODES_ARG="$2"; shift ;;
+        --control-nodes) CONTROL_NODES_ARG="$2"; shift ;;
         -t) IMAGE_NAME="$2"; shift ;;
         --name) CONTAINER_NAME="$2"; shift ;;
         --eth-if) ETH_IF="$2"; shift ;;
         --ib-if) IB_IF="$2"; shift ;;
+        --control-if) CONTROL_IF="$2"; shift ;;
         -e|--env) DOCKER_ARGS="$DOCKER_ARGS -e $2"; shift ;;
         -j) BUILD_JOBS="$2"; shift ;;
         --apply-mod) MOD_PATHS+=("$2"); shift ;;
@@ -132,6 +138,21 @@ while [[ "$#" -gt 0 ]]; do
     esac
     shift
 done
+
+NOAH_CAPTURE_LOCK="${NOAH_CAPTURE_LOCK:-/home/novaadmin/morrisaegis-codex/configs/pilot/disable_noah_capture.lock}"
+IS_NOAH_CAPTURE_REQUEST="false"
+if [[ "$IMAGE_NAME" == "vllm-node-noah-patched" ]]; then
+    IS_NOAH_CAPTURE_REQUEST="true"
+fi
+case "$LAUNCH_SCRIPT_PATH" in
+    *noah_capture_wrapper.sh|*noah_capture_noprefix_wrapper.sh)
+        IS_NOAH_CAPTURE_REQUEST="true"
+        ;;
+esac
+if [[ -f "$NOAH_CAPTURE_LOCK" && "$IS_NOAH_CAPTURE_REQUEST" == "true" && "$ACTION" != "stop" && "$ACTION" != "status" && "$CHECK_CONFIG" != "true" ]]; then
+    echo "Noah capture launch blocked by $NOAH_CAPTURE_LOCK"
+    exit 0
+fi
 
 # Validate non-privileged mode flags
 if [[ "$NON_PRIVILEGED_MODE" == "true" ]]; then
@@ -259,6 +280,20 @@ done
 # Source autodiscover module
 source "$(dirname "$0")/autodiscover.sh"
 
+detect_control_if() {
+    if [[ -n "$CONTROL_IF" ]]; then
+        return 0
+    fi
+
+    CONTROL_IF=$(ip route show default 2>/dev/null | awk '/default/ {print $5; exit}')
+    if [[ -z "$CONTROL_IF" ]]; then
+        echo "Error: Could not determine control interface from default route. Pass --control-if."
+        return 1
+    fi
+
+    echo "  Detected CONTROL_IF: $CONTROL_IF"
+}
+
 if [[ "$SOLO_MODE" == "true" ]]; then
     if [[ -n "$NODES_ARG" ]]; then
         echo "Error: --solo is incompatible with -n/--nodes."
@@ -289,13 +324,29 @@ if [[ "$SOLO_MODE" != "true" ]]; then
 fi
 
 HEAD_IP="$LOCAL_IP"
+detect_control_if || exit 1
+
+if [[ -n "$CONTROL_NODES_ARG" ]]; then
+    IFS=',' read -r -a ALL_CONTROL_NODES <<< "$CONTROL_NODES_ARG"
+    if [[ ${#ALL_CONTROL_NODES[@]} -ne ${#ALL_NODES[@]} ]]; then
+        echo "Error: --control-nodes must have the same number of entries as --nodes."
+        exit 1
+    fi
+else
+    ALL_CONTROL_NODES=("${ALL_NODES[@]}")
+fi
 
 # Verify HEAD_IP is in ALL_NODES
 FOUND_HEAD=false
-for ip in "${ALL_NODES[@]}"; do
-    ip=$(echo "$ip" | xargs)
+HEAD_INDEX=-1
+for i in "${!ALL_NODES[@]}"; do
+    ip=$(echo "${ALL_NODES[$i]}" | xargs)
+    control_ip=$(echo "${ALL_CONTROL_NODES[$i]}" | xargs)
+    ALL_NODES[$i]="$ip"
+    ALL_CONTROL_NODES[$i]="$control_ip"
     if [[ "$ip" == "$HEAD_IP" ]]; then
         FOUND_HEAD=true
+        HEAD_INDEX=$i
         break
     fi
 done
@@ -304,6 +355,17 @@ if [ "$FOUND_HEAD" = false ]; then
     echo "Error: Local IP ($HEAD_IP) is not in the list of nodes ($NODES_ARG)."
     exit 1
 fi
+
+HEAD_CONTROL_IP="${ALL_CONTROL_NODES[$HEAD_INDEX]}"
+PEER_NODES=()
+PEER_CONTROL_NODES=()
+for i in "${!ALL_NODES[@]}"; do
+    if [[ "$i" -eq "$HEAD_INDEX" ]]; then
+        continue
+    fi
+    PEER_NODES+=("${ALL_NODES[$i]}")
+    PEER_CONTROL_NODES+=("${ALL_CONTROL_NODES[$i]}")
+done
 
 # Implicit Solo Mode Detection
 if [[ "$SOLO_MODE" == "false" && ${#PEER_NODES[@]} -eq 0 ]]; then
@@ -317,22 +379,26 @@ if [[ "$NO_RAY_MODE" == "true" && "$SOLO_MODE" == "true" ]]; then
 fi
 
 echo "Head Node: $HEAD_IP"
+echo "Head Control Node: $HEAD_CONTROL_IP"
 echo "Worker Nodes: ${PEER_NODES[*]}"
+echo "Worker Control Nodes: ${PEER_CONTROL_NODES[*]}"
 echo "Container Name: $CONTAINER_NAME"
 echo "Image Name: $IMAGE_NAME"
 echo "Action: $ACTION"
 
 # Check SSH connectivity to worker nodes
 if [[ "$ACTION" == "start" || "$ACTION" == "exec" || "$CHECK_CONFIG" == "true" ]]; then
-    if [ ${#PEER_NODES[@]} -gt 0 ]; then
+    if [ ${#PEER_CONTROL_NODES[@]} -gt 0 ]; then
         echo "Checking SSH connectivity to worker nodes..."
-        for worker in "${PEER_NODES[@]}"; do
-            if ! ssh -o BatchMode=yes -o ConnectTimeout=5 -o StrictHostKeyChecking=no "$worker" true 2>/dev/null; then
-                echo "Error: Passwordless SSH to $worker failed."
+        for i in "${!PEER_CONTROL_NODES[@]}"; do
+            worker="${PEER_NODES[$i]}"
+            worker_control="${PEER_CONTROL_NODES[$i]}"
+            if ! ssh -o BatchMode=yes -o ConnectTimeout=5 -o StrictHostKeyChecking=no "$worker_control" true 2>/dev/null; then
+                echo "Error: Passwordless SSH to $worker_control failed."
                 echo "  Please ensure SSH keys are configured and the host is reachable."
                 exit 1
             fi
-            echo "  SSH to $worker: OK"
+            echo "  SSH to $worker_control (data $worker): OK"
         done
     fi
 fi
@@ -342,6 +408,7 @@ if [[ "$CHECK_CONFIG" == "true" ]]; then
     echo "  Image Name: $IMAGE_NAME"
     echo "  ETH Interface: $ETH_IF"
     echo "  IB Interface: $IB_IF"
+    echo "  CONTROL Interface: $CONTROL_IF"
     echo "  Docker Args: $DOCKER_ARGS"
     if [[ "$MOUNT_CACHE_DIRS" == "true" ]]; then
          echo "  Mounting Cache Dirs: ${CACHE_DIRS_TO_CREATE[*]}"
@@ -369,9 +436,11 @@ cleanup() {
     docker stop "$CONTAINER_NAME" >/dev/null 2>&1 || true
     
     # Stop Workers
-    for worker in "${PEER_NODES[@]}"; do
-        echo "Stopping worker node ($worker)..."
-        ssh "$worker" "docker stop $CONTAINER_NAME" >/dev/null 2>&1 || true
+    for i in "${!PEER_NODES[@]}"; do
+        worker="${PEER_NODES[$i]}"
+        worker_control="${PEER_CONTROL_NODES[$i]}"
+        echo "Stopping worker node ($worker via $worker_control)..."
+        ssh "$worker_control" "docker stop $CONTAINER_NAME" >/dev/null 2>&1 || true
     done
     
     echo "Cluster stopped."
@@ -400,11 +469,13 @@ if [[ "$ACTION" == "status" ]]; then
     fi
     
     # Check Workers
-    for worker in "${PEER_NODES[@]}"; do
-        if ssh "$worker" "docker ps | grep -q '$CONTAINER_NAME'"; then
-             echo "[WORKER] $worker: Container '$CONTAINER_NAME' is RUNNING."
+    for i in "${!PEER_NODES[@]}"; do
+        worker="${PEER_NODES[$i]}"
+        worker_control="${PEER_CONTROL_NODES[$i]}"
+        if ssh "$worker_control" "docker ps | grep -q '$CONTAINER_NAME'"; then
+             echo "[WORKER] $worker (control $worker_control): Container '$CONTAINER_NAME' is RUNNING."
         else
-             echo "[WORKER] $worker: Container '$CONTAINER_NAME' is NOT running."
+             echo "[WORKER] $worker (control $worker_control): Container '$CONTAINER_NAME' is NOT running."
         fi
     done
     exit 0
@@ -427,9 +498,11 @@ check_cluster_running() {
     fi
     
     # Check Workers
-    for worker in "${PEER_NODES[@]}"; do
-        if ssh "$worker" "docker ps --format '{{.Names}}' | grep -q '^${CONTAINER_NAME}$'"; then
-             echo "Warning: Container '$CONTAINER_NAME' is already running on worker node ($worker)."
+    for i in "${!PEER_NODES[@]}"; do
+        worker="${PEER_NODES[$i]}"
+        worker_control="${PEER_CONTROL_NODES[$i]}"
+        if ssh "$worker_control" "docker ps --format '{{.Names}}' | grep -q '^${CONTAINER_NAME}$'"; then
+             echo "Warning: Container '$CONTAINER_NAME' is already running on worker node ($worker via $worker_control)."
              running=true
         fi
     done
@@ -575,6 +648,7 @@ make_node_script() {
 copy_script_to_container() {
     local container="$1"; local script_path="$2"; local label="${3:-node}"
     echo "Copying launch script to $label..."
+    docker exec "$container" mkdir -p /workspace
     docker cp "$script_path" "$container:/workspace/exec-script.sh" || { echo "Error: docker cp to $label failed"; exit 1; }
     docker exec "$container" chmod +x /workspace/exec-script.sh
 }
@@ -586,26 +660,146 @@ copy_script_to_worker() {
     local remote_tmp="/tmp/vllm_script_$(date +%s)_$RANDOM.sh"
     scp -o BatchMode=yes -o StrictHostKeyChecking=no "$script_path" "$worker_ip:$remote_tmp" || { echo "Error: scp to $worker_ip failed"; exit 1; }
     ssh -o BatchMode=yes -o StrictHostKeyChecking=no "$worker_ip" \
-        "docker cp $remote_tmp $container:/workspace/exec-script.sh && \
+        "docker exec $container mkdir -p /workspace && \
+         docker cp $remote_tmp $container:/workspace/exec-script.sh && \
          docker exec $container chmod +x /workspace/exec-script.sh && \
          rm -f $remote_tmp" || { echo "Error: docker cp to worker $worker_ip failed"; exit 1; }
+}
+
+# Resolve the data-plane network interface for a node.
+# Prefer the configured ETH_IF when it exists on the target host; otherwise
+# derive the interface that owns the node's data-plane IP.
+resolve_socket_if() {
+    local node_ip="$1"
+    local control_host="${2:-}"
+    local if_name=""
+
+    if [[ -z "$control_host" || "$control_host" == "$HEAD_CONTROL_IP" ]]; then
+        if [[ -n "$ETH_IF" ]] && ip -o link show "$ETH_IF" >/dev/null 2>&1; then
+            if_name="$ETH_IF"
+        fi
+        if [[ -z "$if_name" ]]; then
+            if_name=$(ip -o -4 addr show | awk -v ip="$node_ip" '$4 ~ "^" ip "/" {print $2; exit}')
+        fi
+    else
+        if [[ -n "$ETH_IF" ]]; then
+            if_name=$(ssh -o BatchMode=yes -o StrictHostKeyChecking=no "$control_host" \
+                "if ip -o link show '$ETH_IF' >/dev/null 2>&1; then printf '%s' '$ETH_IF'; fi")
+        fi
+        if [[ -z "$if_name" ]]; then
+            if_name=$(ssh -o BatchMode=yes -o StrictHostKeyChecking=no "$control_host" \
+                "ip -o -4 addr show | awk -v ip='$node_ip' '\$4 ~ \"^\" ip \"/\" {print \$2; exit}'")
+        fi
+    fi
+
+    if [[ -z "$if_name" ]]; then
+        echo "Error: Could not resolve socket interface for node $node_ip" >&2
+        exit 1
+    fi
+
+    echo "$if_name"
+}
+
+# Resolve the control-plane/bootstrap interface for a node.
+# Prefer the configured CONTROL_IF when it exists on the target host; otherwise
+# derive the interface that owns the control-plane IP.
+resolve_control_socket_if() {
+    local control_host="${1:-}"
+    local if_name=""
+
+    if [[ -z "$control_host" || "$control_host" == "$HEAD_CONTROL_IP" ]]; then
+        if [[ -n "$CONTROL_IF" ]] && ip -o link show "$CONTROL_IF" >/dev/null 2>&1; then
+            if_name="$CONTROL_IF"
+        fi
+        if [[ -z "$if_name" && -n "$control_host" ]]; then
+            if_name=$(ip -o -4 addr show | awk -v ip="$control_host" '$4 ~ "^" ip "/" {print $2; exit}')
+        fi
+        if [[ -z "$if_name" ]]; then
+            if_name=$(ip route get "$HEAD_CONTROL_IP" 2>/dev/null | awk '/dev/ {for (i = 1; i <= NF; ++i) if ($i == "dev") {print $(i + 1); exit}}')
+        fi
+    else
+        if [[ -n "$CONTROL_IF" ]]; then
+            if_name=$(ssh -o BatchMode=yes -o StrictHostKeyChecking=no "$control_host" \
+                "if ip -o link show '$CONTROL_IF' >/dev/null 2>&1; then printf '%s' '$CONTROL_IF'; fi")
+        fi
+        if [[ -z "$if_name" ]]; then
+            if_name=$(ssh -o BatchMode=yes -o StrictHostKeyChecking=no "$control_host" \
+                "ip -o -4 addr show | awk -v ip='$control_host' '\$4 ~ \"^\" ip \"/\" {print \$2; exit}'")
+        fi
+        if [[ -z "$if_name" ]]; then
+            if_name=$(ssh -o BatchMode=yes -o StrictHostKeyChecking=no "$control_host" \
+                "ip route get '$HEAD_CONTROL_IP' 2>/dev/null | awk '/dev/ {for (i = 1; i <= NF; ++i) if (\$i == \"dev\") {print \$(i + 1); exit}}'")
+        fi
+    fi
+
+    if [[ -z "$if_name" ]]; then
+        echo "Error: Could not resolve control interface for host $control_host" >&2
+        exit 1
+    fi
+
+    echo "$if_name"
+}
+
+resolve_ib_hca_for_socket_if() {
+    local socket_if="$1"
+
+    case "$socket_if" in
+        enp1s0f0np0|enP2p1s0f0np0)
+            echo "rocep1s0f0,roceP2p1s0f0"
+            ;;
+        enp1s0f1np1|enP2p1s0f1np1)
+            echo "rocep1s0f1,roceP2p1s0f1"
+            ;;
+        *)
+            echo "$IB_IF"
+            ;;
+    esac
+}
+
+resolve_ucx_devices_for_ib_hca() {
+    local ib_hca="$1"
+    local ucx_devices=""
+    local dev
+
+    IFS=',' read -r -a devs <<< "$ib_hca"
+    for dev in "${devs[@]}"; do
+        [[ -z "$dev" ]] && continue
+        if [[ -n "$ucx_devices" ]]; then
+            ucx_devices+=","
+        fi
+        ucx_devices+="${dev}:1"
+    done
+
+    echo "$ucx_devices"
 }
 
 # Build -e KEY=VALUE flags for a given node IP (used in docker run and docker exec)
 get_env_flags() {
     local node_ip="$1"
+    local control_host="${2:-}"
+    local socket_if
+    local control_socket_if
+    local socket_ib_if
+    local socket_ucx_devices
+    local node_host_ip
+    socket_if="$(resolve_socket_if "$node_ip" "$control_host")"
+    control_socket_if="$(resolve_control_socket_if "$control_host")"
+    socket_ib_if="$(resolve_ib_hca_for_socket_if "$socket_if")"
+    socket_ucx_devices="$(resolve_ucx_devices_for_ib_hca "$socket_ib_if")"
+    node_host_ip="${control_host:-$node_ip}"
     printf -- '-e %s ' \
-        "VLLM_HOST_IP=$node_ip" \
-        "RAY_NODE_IP_ADDRESS=$node_ip" \
-        "RAY_OVERRIDE_NODE_IP_ADDRESS=$node_ip" \
-        "MN_IF_NAME=$ETH_IF" \
-        "UCX_NET_DEVICES=$ETH_IF" \
-        "NCCL_SOCKET_IFNAME=$ETH_IF" \
-        "NCCL_IB_HCA=$IB_IF" \
+        "VLLM_HOST_IP=$node_host_ip" \
+        "RAY_NODE_IP_ADDRESS=$node_host_ip" \
+        "RAY_OVERRIDE_NODE_IP_ADDRESS=$node_host_ip" \
+        "MN_IF_NAME=$control_socket_if" \
+        "UCX_NET_DEVICES=$socket_ucx_devices" \
+        "NCCL_SOCKET_IFNAME=$control_socket_if" \
+        "NCCL_IB_HCA=$socket_ib_if" \
         "NCCL_IB_DISABLE=0" \
-        "OMPI_MCA_btl_tcp_if_include=$ETH_IF" \
-        "GLOO_SOCKET_IFNAME=$ETH_IF" \
-        "TP_SOCKET_IFNAME=$ETH_IF" \
+        "OMPI_MCA_btl_tcp_if_include=$control_socket_if" \
+        "OMPI_MCA_oob_tcp_if_include=$control_socket_if" \
+        "GLOO_SOCKET_IFNAME=$control_socket_if" \
+        "TP_SOCKET_IFNAME=$socket_if" \
         "RAY_memory_monitor_refresh_ms=0" \
         "RAY_num_prestart_python_workers=0" \
         "RAY_object_store_memory=1073741824"
@@ -614,21 +808,21 @@ get_env_flags() {
 # Start Ray head node inside the container
 start_ray_head() {
     local container="$1"
-    echo "Starting Ray HEAD node on $HEAD_IP..."
+    echo "Starting Ray HEAD node on $HEAD_CONTROL_IP (data $HEAD_IP)..."
     docker exec -d "$container" bash -c \
         "ray start --block --head --port $MASTER_PORT --object-store-memory 1073741824 --num-cpus 2 \
-         --node-ip-address $HEAD_IP --include-dashboard=false --disable-usage-stats \
+         --node-ip-address $HEAD_CONTROL_IP --include-dashboard=false --disable-usage-stats \
          >> /proc/1/fd/1 2>&1"
 }
 
 # Start Ray worker node inside the container on a remote host
 start_ray_worker() {
-    local worker_ip="$1"; local container="$2"
-    echo "Starting Ray WORKER node on $worker_ip..."
-    ssh -o BatchMode=yes -o StrictHostKeyChecking=no "$worker_ip" \
+    local worker_control_ip="$1"; local worker_ip="$2"; local container="$3"
+    echo "Starting Ray WORKER node on $worker_control_ip (data $worker_ip)..."
+    ssh -o BatchMode=yes -o StrictHostKeyChecking=no "$worker_control_ip" \
         "docker exec -d $container bash -c \
          'ray start --block --object-store-memory 1073741824 --num-cpus 2 --disable-usage-stats \
-          --address=$HEAD_IP:$MASTER_PORT --node-ip-address $worker_ip >> /proc/1/fd/1 2>&1'"
+          --address=$HEAD_CONTROL_IP:$MASTER_PORT --node-ip-address $worker_control_ip >> /proc/1/fd/1 2>&1'"
 }
 
 # Start Cluster Function
@@ -653,7 +847,8 @@ start_cluster() {
         docker_resource_args="--ipc=host"
     fi
 
-    # Start Head Node
+    # Start Head Node. vLLM images may have a non-shell entrypoint (for example `vllm serve`),
+    # so force an idle shell as PID 1 before later `docker exec` calls.
     echo "Starting Head Node on $HEAD_IP..."
     if [[ "$MOUNT_CACHE_DIRS" == "true" ]]; then
         for dir in "${CACHE_DIRS_TO_CREATE[@]}"; do
@@ -661,27 +856,31 @@ start_cluster() {
         done
     fi
     docker run $docker_caps_args $docker_resource_args \
-        $(get_env_flags "$HEAD_IP") $docker_args_common sleep infinity
+        --entrypoint /bin/bash \
+        $(get_env_flags "$HEAD_IP" "$HEAD_CONTROL_IP") $docker_args_common -lc 'sleep infinity'
 
     # Start Worker Nodes
-    for worker in "${PEER_NODES[@]}"; do
-        echo "Starting Worker Node on $worker..."
+    for i in "${!PEER_NODES[@]}"; do
+        worker="${PEER_NODES[$i]}"
+        worker_control="${PEER_CONTROL_NODES[$i]}"
+        echo "Starting Worker Node on $worker_control (data $worker)..."
         if [[ "$MOUNT_CACHE_DIRS" == "true" ]]; then
-            ssh "$worker" "mkdir -p ${CACHE_DIRS_TO_CREATE[*]}"
+            ssh "$worker_control" "mkdir -p ${CACHE_DIRS_TO_CREATE[*]}"
         fi
-        local docker_run_cmd="docker run $docker_caps_args $docker_resource_args $(get_env_flags "$worker") $docker_args_common"
-        ssh "$worker" "$docker_run_cmd sleep infinity"
+        local docker_run_cmd="docker run $docker_caps_args $docker_resource_args --entrypoint /bin/bash $(get_env_flags "$worker" "$worker_control") $docker_args_common"
+        ssh "$worker_control" "$docker_run_cmd -lc 'sleep infinity'"
     done
 
     # Apply mods (containers are idle — no mod_done sync needed)
     if [[ ${#MOD_PATHS[@]} -gt 0 ]]; then
         echo "Applying modifications to cluster nodes..."
-        for i in "${!MOD_PATHS[@]}"; do
-            apply_mod_to_container "$HEAD_IP" "$CONTAINER_NAME" "true" "${MOD_PATHS[$i]}" "${MOD_TYPES[$i]}"
+        for j in "${!MOD_PATHS[@]}"; do
+            apply_mod_to_container "$HEAD_IP" "$CONTAINER_NAME" "true" "${MOD_PATHS[$j]}" "${MOD_TYPES[$j]}"
         done
-        for worker in "${PEER_NODES[@]}"; do
-            for i in "${!MOD_PATHS[@]}"; do
-                apply_mod_to_container "$worker" "$CONTAINER_NAME" "false" "${MOD_PATHS[$i]}" "${MOD_TYPES[$i]}"
+        for i in "${!PEER_NODES[@]}"; do
+            worker_control="${PEER_CONTROL_NODES[$i]}"
+            for j in "${!MOD_PATHS[@]}"; do
+                apply_mod_to_container "$worker_control" "$CONTAINER_NAME" "false" "${MOD_PATHS[$j]}" "${MOD_TYPES[$j]}"
             done
         done
     fi
@@ -691,14 +890,15 @@ start_cluster() {
         local total_nodes=$(( 1 + ${#PEER_NODES[@]} ))
         if [[ "$NO_RAY_MODE" == "true" ]]; then
             # Build per-node patched scripts on the host, then copy
-            local head_script; head_script=$(make_node_script "$LAUNCH_SCRIPT_PATH" "$total_nodes" "0" "$HEAD_IP")
+            local head_script; head_script=$(make_node_script "$LAUNCH_SCRIPT_PATH" "$total_nodes" "0" "$HEAD_CONTROL_IP")
             copy_script_to_container "$CONTAINER_NAME" "$head_script" "head node ($HEAD_IP)"
             rm -f "$head_script"
 
             local rank=1
-            for worker in "${PEER_NODES[@]}"; do
-                local worker_script; worker_script=$(make_node_script "$LAUNCH_SCRIPT_PATH" "$total_nodes" "$rank" "$HEAD_IP")
-                copy_script_to_worker "$worker" "$CONTAINER_NAME" "$worker_script"
+            for i in "${!PEER_NODES[@]}"; do
+                worker_control="${PEER_CONTROL_NODES[$i]}"
+                local worker_script; worker_script=$(make_node_script "$LAUNCH_SCRIPT_PATH" "$total_nodes" "$rank" "$HEAD_CONTROL_IP")
+                copy_script_to_worker "$worker_control" "$CONTAINER_NAME" "$worker_script"
                 rm -f "$worker_script"
                 (( rank++ ))
             done
@@ -710,8 +910,10 @@ start_cluster() {
     # Start Ray cluster (unless solo or no-ray)
     if [[ "$SOLO_MODE" == "false" && "$NO_RAY_MODE" == "false" ]]; then
         start_ray_head "$CONTAINER_NAME"
-        for worker in "${PEER_NODES[@]}"; do
-            start_ray_worker "$worker" "$CONTAINER_NAME"
+        for i in "${!PEER_NODES[@]}"; do
+            worker="${PEER_NODES[$i]}"
+            worker_control="${PEER_CONTROL_NODES[$i]}"
+            start_ray_worker "$worker_control" "$worker" "$CONTAINER_NAME"
         done
         wait_for_cluster
     else
@@ -761,17 +963,19 @@ exec_no_ray_cluster() {
 
     # Launch workers first (always background)
     local rank=1
-    for worker in "${PEER_NODES[@]}"; do
+    for i in "${!PEER_NODES[@]}"; do
+        local worker="${PEER_NODES[$i]}"
+        local worker_control="${PEER_CONTROL_NODES[$i]}"
         local worker_cmd
         if [[ "$LAUNCH_SCRIPT_MODE" == "true" ]]; then
             worker_cmd="$base_cmd"  # script already patched per-node in start_cluster()
         else
             local clean
             clean=$(echo "$base_cmd" | sed 's/--distributed-executor-backend[[:space:]]*[^[:space:]]*//')
-            worker_cmd="$clean --nnodes $total_nodes --node-rank $rank --master-addr $HEAD_IP --master-port $MASTER_PORT --headless"
+            worker_cmd="$clean --nnodes $total_nodes --node-rank $rank --master-addr $HEAD_CONTROL_IP --master-port $MASTER_PORT --headless"
         fi
-        echo "Launching worker (rank $rank) on $worker..."
-        ssh -o BatchMode=yes -o StrictHostKeyChecking=no "$worker" \
+        echo "Launching worker (rank $rank) on $worker_control (data $worker)..."
+        ssh -o BatchMode=yes -o StrictHostKeyChecking=no "$worker_control" \
             "docker exec -d $CONTAINER_NAME bash -c \"$worker_cmd >> /proc/1/fd/1 2>&1\""
         (( rank++ ))
     done
@@ -783,7 +987,7 @@ exec_no_ray_cluster() {
     else
         local clean
         clean=$(echo "$base_cmd" | sed 's/--distributed-executor-backend[[:space:]]*[^[:space:]]*//')
-        head_cmd="$clean --nnodes $total_nodes --node-rank 0 --master-addr $HEAD_IP --master-port $MASTER_PORT"
+        head_cmd="$clean --nnodes $total_nodes --node-rank 0 --master-addr $HEAD_CONTROL_IP --master-port $MASTER_PORT"
     fi
 
     echo "Executing command on head node (rank 0): $head_cmd"
