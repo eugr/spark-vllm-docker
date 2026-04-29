@@ -20,7 +20,7 @@ build_args:
 
 # Mods
 mods:
-  - mods/fix-gemma4-tool-parser
+  # - mods/fix-gemma4-tool-parser
 
 # Default settings (can be overridden via CLI)
 defaults:
@@ -41,7 +41,7 @@ command: |
     --gpu-memory-utilization {gpu_memory_utilization} \
     --port {port} \
     --host {host} \
-    --load-format instanttensor \
+    --load-format safetensors \
     --enable-prefix-caching \
     --enable-auto-tool-choice \
     --tool-call-parser gemma4 \
