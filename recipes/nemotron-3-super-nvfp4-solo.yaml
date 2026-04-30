@@ -1,0 +1,52 @@
+# Recipe: Nemotron-3-Super-120B Solo (Single DGX Spark)
+# Contributed by: phtan
+#
+# Single-node variant of Nemotron-3-Super-120B for a single DGX Spark.
+# The existing nemotron-3-super-nvfp4.yaml recipe targets dual-node
+# clusters (-tp 2, Ray, fastsafetensors). This recipe is optimised for
+# solo mode with tighter memory management and flags validated on a
+# single GB10.
+#
+# Key differences from the dual-node recipe:
+#   - gpu_memory_utilization: 0.85 (vs 0.7) — necessary to fit model + KV cache
+#   - No fastsafetensors (causes OOM at 0.85 util on single node)
+#   - No --reasoning-parser (causes 60s+ TCP timeouts with agentic IDE clients)
+#   - FLASHINFER attention backend (vs TRITON_ATTN)
+#   - No Ray / tensor parallelism (single GPU)
+#
+# See docs/NEMOTRON-3-SUPER-SOLO.md for agentic IDE integration guide.
+
+recipe_version: "1"
+name: Nemotron-3-Super-NVFP4-Solo
+description: >
+  Single DGX Spark deployment of Nemotron-3-Super-120B with CUTLASS MoE
+  backend and agentic tool-calling support (Cline / RooCode compatible).
+
+model: nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4
+container: vllm-node
+cluster_only: false
+solo_only: true
+
+env:
+  VLLM_ATTENTION_BACKEND: FLASHINFER
+
+defaults:
+  port: 8000
+  host: 0.0.0.0
+  gpu_memory_utilization: 0.85
+  max_model_len: 131072
+  max_num_seqs: 4
+
+command: |
+  vllm serve nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4 \
+  --kv-cache-dtype fp8 \
+  --moe-backend cutlass \
+  --trust-remote-code \
+  --gpu-memory-utilization {gpu_memory_utilization} \
+  --max-model-len {max_model_len} \
+  --max-num-seqs {max_num_seqs} \
+  --enable-prefix-caching \
+  --host {host} \
+  --port {port} \
+  --enable-auto-tool-choice \
+  --tool-call-parser qwen3_coder
