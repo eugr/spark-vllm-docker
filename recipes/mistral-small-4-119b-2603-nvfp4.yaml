@@ -8,9 +8,8 @@ description: vLLM serving Mistral-Small-4-119B-2603-NVFP4
 # HuggingFace model to download (optional, for --download-model)
 model: mistralai/Mistral-Small-4-119B-2603-NVFP4
 
-# Only cluster is supported
-cluster_only: false
-solo_only: false
+# Only solo now
+solo_only: true
 
 # Container image to use
 container: vllm-node-tf5
