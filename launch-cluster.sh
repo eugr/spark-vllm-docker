@@ -846,7 +846,7 @@ start_cluster() {
     fi
 
     # Build docker run arguments based on mode
-    local docker_args_common="--gpus all -d --rm --network host --name $CONTAINER_NAME $DOCKER_ARGS $IMAGE_NAME"
+    local docker_args_common="--gpus all -d --rm --network host --entrypoint= --name $CONTAINER_NAME $DOCKER_ARGS $IMAGE_NAME"
     local docker_caps_args=""
     local docker_resource_args=""
 
@@ -977,10 +977,8 @@ exec_no_ray_cluster() {
             worker_cmd="$clean --nnodes $total_nodes --node-rank $rank --master-addr $HEAD_IP --master-port $MASTER_PORT --headless"
         fi
         echo "Launching worker (rank $rank) on $worker..."
-        local remote_payload remote_cmd
-        remote_payload="$worker_cmd >> /proc/1/fd/1 2>&1"
-        printf -v remote_cmd 'docker exec -d %q bash -c %q' "$CONTAINER_NAME" "$remote_payload"
-        ssh -o BatchMode=yes -o StrictHostKeyChecking=no "$worker" "$remote_cmd"
+        ssh -o BatchMode=yes -o StrictHostKeyChecking=no "$worker" \
+            "docker exec -d $CONTAINER_NAME bash -c \"$worker_cmd >> /proc/1/fd/1 2>&1\""
         (( rank++ ))
     done
 
