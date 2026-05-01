@@ -1,0 +1,45 @@
+# Recipe: Qwen3.6-35B-A3B-TurboQuant
+# Uses FP8 weights and FP8 KV Cache (TurboQuant configuration)
+# optimized for single-node DGX Spark with 256k context.
+
+recipe_version: "1"
+name: Qwen3.6-35B-A3B-TurboQuant
+description: >
+  Single DGX Spark deployment of Qwen 3.6 MoE (35B total, 3B active) 
+  using FP8 weights and TurboQuant KV cache. Pushed to 262k context.
+  
+model: Qwen/Qwen3.6-35B-A3B-FP8
+
+# Bleeding-edge container to ensure latest TurboQuant PRs are included
+container: vllm-tq-spark:latest
+cluster_only: false
+solo_only: true
+
+defaults:
+  port: 8000
+  host: 0.0.0.0
+  gpu_memory_utilization: 0.70
+  max_model_len: 262144
+  max_num_seqs: 1
+
+command: |
+  python3 -c "
+  p='/app/vllm/vllm/v1/core/kv_cache_utils.py'
+  t=open(p).read()
+  old='            if max_page_size % layer_page_size != 0:\n                raise NotImplementedError(\n                    \"The page size of the layer is not divisible by the \"\n                    \"maximum page size. Cannot unify by adjusting block_size.\"\n                )'
+  new='            if max_page_size % layer_page_size != 0:\n                layer_spec = replace(layer_spec, page_size_padded=max_page_size)\n                layer_page_size = max_page_size'
+  assert old in t, 'Patch target not found - vLLM version may have changed'
+  open(p,'w').write(t.replace(old,new))
+  print('PATCH OK: unify_kv_cache_spec_page_size - Mamba page padding enabled')
+  " && \
+  vllm serve Qwen/Qwen3.6-35B-A3B-FP8 \
+  --quantization fp8 \
+  --kv-cache-dtype fp8 \
+  --max-num-batched-tokens 4192 \
+  --gpu-memory-utilization {gpu_memory_utilization} \
+  --max-model-len {max_model_len} \
+  --max-num-seqs {max_num_seqs} \
+  --host {host} \
+  --port {port} \
+  --enable-auto-tool-choice \
+  --tool-call-parser pythonic

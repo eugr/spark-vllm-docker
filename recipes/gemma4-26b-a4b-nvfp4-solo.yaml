@@ -1,0 +1,42 @@
+# Recipe: Gemma4-26B-A4B-NVFP4 Solo
+# Uses the bg-digitalservices NVFP4 quantized checkpoint and Marlin MoE
+# optimized for single-node DGX Spark.
+
+recipe_version: "1"
+name: Gemma4-26B-A4B-NVFP4-Solo
+description: >
+  Single DGX Spark deployment of Gemma 4 26B-A4B using NVFP4
+  and Marlin MoE backend. Provides ~52 tok/s on GB10.
+  
+model: bg-digitalservices/Gemma-4-26B-A4B-it-NVFP4
+
+# Must use this or vllm-node to have the SM121 FP4 Cutlass/Marlin fixes
+container: vllm/vllm-openai:gemma4-cu130
+cluster_only: false
+solo_only: true
+
+# Apply the patch for expert_params_mapping needed for NVFP4 scale keys
+mods:
+  - mods/fix-gemma4-nvfp4
+
+defaults:
+  port: 8000
+  host: 0.0.0.0
+  gpu_memory_utilization: 0.85
+  max_model_len: 262144
+  max_num_seqs: 1
+
+command: |
+  vllm serve bg-digitalservices/Gemma-4-26B-A4B-it-NVFP4 \
+  --quantization modelopt \
+  --kv-cache-dtype fp8 \
+  --moe-backend marlin \
+  --gpu-memory-utilization {gpu_memory_utilization} \
+  --max-model-len {max_model_len} \
+  --max-num-seqs {max_num_seqs} \
+  --enable-prefix-caching \
+  --host {host} \
+  --port {port} \
+  --enable-auto-tool-choice \
+  --tool-call-parser pythonic \
+  --reasoning-parser gemma4
