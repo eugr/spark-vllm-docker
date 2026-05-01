@@ -22,7 +22,7 @@ build_args:
 mods:
   - mods/fix-qwen3.5-autoround
   - mods/fix-qwen3.5-chat-template
-  - mods/gpu-mem-util-gb
+  - mods/fix-gpu-mem-util-gb
 
 # Default settings (can be overridden via CLI)
 defaults:

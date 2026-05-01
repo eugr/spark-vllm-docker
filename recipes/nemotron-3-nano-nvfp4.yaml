@@ -17,7 +17,7 @@ solo_only: true
 
 # No mods required
 mods: 
-  - mods/nemotron-nano
+  - mods/fix-nemotron-nano
 
 # Default settings (can be overridden via CLI)
 defaults:
