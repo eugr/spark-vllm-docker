@@ -1,5 +1,5 @@
-# Recipe: Qwen/Qwen3.5-35B-A3B-FP8
-# Qwen/Qwen3.5-35B-A3B model in native FP8 format
+# Recipe: Qwen/Qwen3.6-35B-A3B-FP8
+# Qwen/Qwen3.6-35B-A3B model in native FP8 format
 
 
 recipe_version: "1"
@@ -33,7 +33,7 @@ env:
 
 # The vLLM serve command template
 command: |
-  vllm serve Qwen/Qwen3.5-35B-A3B-FP8 \
+  vllm serve Qwen/Qwen3.6-35B-A3B-FP8 \
     --host {host} \
     --port {port} \
     --max-model-len {max_model_len} \
@@ -46,6 +46,6 @@ command: |
     --attention-backend flash_attn \
     --enable-prefix-caching \
     --chat-template fixed_chat_template.jinja \
-    --speculative-config '{{"method": "dflash", "model": "z-lab/Qwen3.5-35B-A3B-DFlash", "num_speculative_tokens": 15}}' \
+    --speculative-config '{{"method": "dflash", "model": "z-lab/Qwen3.6-35B-A3B-DFlash", "num_speculative_tokens": 15}}' \
     -tp {tensor_parallel} \
     --distributed-executor-backend ray
