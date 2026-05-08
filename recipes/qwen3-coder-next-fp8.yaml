@@ -15,8 +15,8 @@ model: Qwen/Qwen3-Coder-Next-FP8
 container: vllm-node
 
 # Mod required to fix slowness and crash in the cluster (tracking https://github.com/vllm-project/vllm/issues/33857)
-mods:
-  - mods/fix-qwen3-coder-next
+# mods:
+#   - mods/fix-qwen3-coder-next
 
 # Default settings (can be overridden via CLI)
 defaults:
