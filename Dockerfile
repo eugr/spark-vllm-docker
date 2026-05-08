@@ -231,6 +231,22 @@ RUN curl -fsL https://patch-diff.githubusercontent.com/raw/vllm-project/vllm/pul
        fi \
     && rm pr35568.diff
 
+# TEMPORARY PATCH: revert vLLM PR #41524 / commit c51df430,
+# which disables FlashInfer autotune and regresses DGX Spark throughput.
+RUN set -eux; \
+    patch_commit="c51df43005726a09c6eb7348e8c1b00501c70a8e"; \
+    target="vllm/config/vllm.py"; \
+    if grep -q '"enable_flashinfer_autotune": False' "$target"; then \
+        echo "FlashInfer autotune default is disabled; reverting ${patch_commit}"; \
+        git revert --no-commit "$patch_commit"; \
+        if grep -q '"enable_flashinfer_autotune": False' "$target"; then \
+            echo "ERROR: revert applied but FlashInfer autotune still appears disabled"; \
+            exit 1; \
+        fi; \
+    else \
+        echo "FlashInfer autotune regression not present; skipping revert"; \
+    fi
+
 # Prepare build requirements
 RUN --mount=type=cache,id=uv-cache,target=/root/.cache/uv \
     python3 use_existing_torch.py && \
