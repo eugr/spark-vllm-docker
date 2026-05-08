@@ -233,18 +233,23 @@ RUN curl -fsL https://patch-diff.githubusercontent.com/raw/vllm-project/vllm/pul
 
 # TEMPORARY PATCH: revert vLLM PR #41524 / commit c51df430,
 # which disables FlashInfer autotune and regresses DGX Spark throughput.
-RUN set -eux; \
+RUN RUN set -eux; \
     patch_commit="c51df43005726a09c6eb7348e8c1b00501c70a8e"; \
     target="vllm/config/vllm.py"; \
-    if grep -q '"enable_flashinfer_autotune": False' "$target"; then \
-        echo "FlashInfer autotune default is disabled; reverting ${patch_commit}"; \
-        git revert --no-commit "$patch_commit"; \
-        if grep -q '"enable_flashinfer_autotune": False' "$target"; then \
-            echo "ERROR: revert applied but FlashInfer autotune still appears disabled"; \
+    marker="https://github.com/flashinfer-ai/flashinfer/issues/3197"; \
+    if grep -q "$marker" "$target"; then \
+        echo "PR #41524 regression found; reverting ${patch_commit}"; \
+        if ! git revert --no-commit "$patch_commit"; then \
+            git revert --abort 2>/dev/null || true; \
+            echo "ERROR: PR #41524 appears present but could not be reverted"; \
+            exit 1; \
+        fi; \
+        if grep -q "$marker" "$target"; then \
+            echo "ERROR: revert completed but PR #41524 marker is still present"; \
             exit 1; \
         fi; \
     else \
-        echo "FlashInfer autotune regression not present; skipping revert"; \
+        echo "PR #41524 regression marker not present; skipping revert"; \
     fi
 
 # Prepare build requirements
