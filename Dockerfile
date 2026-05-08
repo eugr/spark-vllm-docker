@@ -233,7 +233,7 @@ RUN curl -fsL https://patch-diff.githubusercontent.com/raw/vllm-project/vllm/pul
 
 # TEMPORARY PATCH: revert vLLM PR #41524 / commit c51df430,
 # which disables FlashInfer autotune and regresses DGX Spark throughput.
-RUN RUN set -eux; \
+RUN set -eux; \
     patch_commit="c51df43005726a09c6eb7348e8c1b00501c70a8e"; \
     target="vllm/config/vllm.py"; \
     marker="https://github.com/flashinfer-ai/flashinfer/issues/3197"; \
