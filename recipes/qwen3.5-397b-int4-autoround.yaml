@@ -18,9 +18,7 @@ container: vllm-node-tf5
 build_args:
   - --tf5
 
-# Mod required to fix ROPE syntax error
 mods:
-  # - mods/fix-qwen3.5-autoround
   - mods/fix-qwen3.5-chat-template
   #- mods/gpu-mem-util-gb
   # - mods/drop-caches
@@ -36,7 +34,6 @@ defaults:
 
 # Environment variables
 env: 
-  #  PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True" 
   VLLM_MARLIN_USE_ATOMIC_ADD: 1
 
 # The vLLM serve command template
