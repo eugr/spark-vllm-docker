@@ -22,21 +22,21 @@ build_args:
 mods:
   # - mods/fix-qwen3.5-autoround
   - mods/fix-qwen3.5-chat-template
-  - mods/gpu-mem-util-gb
-  - mods/drop-caches
+  #- mods/gpu-mem-util-gb
+  # - mods/drop-caches
 
 # Default settings (can be overridden via CLI)
 defaults:
   port: 8000
   host: 0.0.0.0
   tensor_parallel: 2
-  gpu_memory_utilization: 112
+  gpu_memory_utilization: 0.9
   max_model_len: 262144
   max_num_batched_tokens: 4176
 
 # Environment variables
 env: 
-  PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True" 
+  #  PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True" 
   VLLM_MARLIN_USE_ATOMIC_ADD: 1
 
 # The vLLM serve command template
@@ -45,7 +45,7 @@ command: |
     --max-model-len {max_model_len} \
     --max-num-seqs 2 \
     --kv-cache-dtype fp8 \
-    --gpu-memory-utilization-gb {gpu_memory_utilization} \
+    --gpu-memory-utilization {gpu_memory_utilization} \
     --port {port} \
     --host {host} \
     --enable-prefix-caching \
