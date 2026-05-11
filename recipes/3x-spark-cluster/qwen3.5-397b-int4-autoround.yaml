@@ -18,9 +18,7 @@ container: vllm-node-tf5
 build_args:
   - --tf5
 
-# Mod required to fix ROPE syntax error
 mods:
-  - mods/fix-qwen3.5-autoround
   - mods/fix-qwen3.5-chat-template
 
 # Default settings (can be overridden via CLI)
@@ -34,7 +32,6 @@ defaults:
 
 # Environment variables
 env: 
-  PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True" 
   VLLM_MARLIN_USE_ATOMIC_ADD: 1
 
 # The vLLM serve command template
@@ -55,7 +52,7 @@ command: |
     --chat-template unsloth.jinja \
     -tp 1 \
     -pp {pipeline_parallel} \
-    --load-format fastsafetensors \
+    --load-format instanttensor \
     --distributed-executor-backend ray
 
   
