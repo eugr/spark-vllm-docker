@@ -1,0 +1,51 @@
+# Recipe: Qwen/Qwen3.6-35B-A3B-FP8
+# Qwen/Qwen3.6-35B-A3B model in native FP8 format
+
+
+recipe_version: "1"
+name: Qwen36-35B-A3B
+description: vLLM serving Qwen3.6-35B-A3B-FP8
+
+# HuggingFace model to download (optional, for --download-model)
+model: Qwen/Qwen3.6-35B-A3B-FP8
+
+#solo_only: true
+
+# Container image to use
+container: vllm-node
+
+# Mod required to fix slowness and crash in the cluster (tracking https://github.com/vllm-project/vllm/issues/33857)
+mods:
+  - mods/fix-qwen3.6-chat-template
+
+# Default settings (can be overridden via CLI)
+defaults:
+  port: 8000
+  host: 0.0.0.0
+  tensor_parallel: 2
+  gpu_memory_utilization: 0.7
+  max_model_len: 262144
+  max_num_batched_tokens: 16384
+
+# Environment variables
+env: 
+  VLLM_MARLIN_USE_ATOMIC_ADD: 1
+
+# The vLLM serve command template
+command: |
+  vllm serve Qwen/Qwen3.6-35B-A3B-FP8 \
+    --host {host} \
+    --port {port} \
+    --max-model-len {max_model_len} \
+    --max-num-batched-tokens {max_num_batched_tokens} \
+    --gpu-memory-utilization {gpu_memory_utilization} \
+    --enable-auto-tool-choice \
+    --tool-call-parser qwen3_xml \
+    --reasoning-parser qwen3 \
+    --load-format fastsafetensors \
+    --attention-backend flash_attn \
+    --enable-prefix-caching \
+    --chat-template fixed_chat_template.jinja \
+    --speculative-config '{{"method": "dflash", "model": "z-lab/Qwen3.6-35B-A3B-DFlash", "num_speculative_tokens": 15}}' \
+    -tp {tensor_parallel} \
+    --distributed-executor-backend ray

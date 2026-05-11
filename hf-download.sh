@@ -1,12 +1,14 @@
 #!/bin/bash
 set -e
 
-HUB_PATH="$HOME/.cache/huggingface/hub"
+HUB_PATH="${HF_HOME:-$HOME/.cache/huggingface}/hub"
 
 # Default values
 COPY_HOSTS=()
 SSH_USER="$USER"
 PARALLEL_COPY=false
+CONFIG_FILE=""
+CONFIG_FILE_SET=false
 
 # Help function
 usage() {
@@ -16,6 +18,7 @@ usage() {
     echo "      --copy-to-host          : Alias for --copy-to (backwards compatibility)."
     echo "      --copy-parallel         : Copy to all hosts in parallel instead of serially."
     echo "  -u, --user <user>           : Username for ssh commands (default: \$USER)"
+    echo "  --config <file>             : Path to .env configuration file (default: .env in script directory)"
     echo "  -h, --help                  : Show this help message"
     exit 1
 }
@@ -37,12 +40,12 @@ copy_model_to_host() {
     local host="$1"
     local model_name="$2"
     local model_dir="$3"
-    
+
     echo "Copying model '$model_name' to ${SSH_USER}@${host}..."
     local host_copy_start host_copy_end host_copy_time
     host_copy_start=$(date +%s)
-    
-    if rsync -av --progress "$model_dir" "${SSH_USER}@${host}:$HUB_PATH/"; then
+
+    if rsync -av --mkpath --progress "$model_dir" "${SSH_USER}@${host}:$HUB_PATH/"; then
         host_copy_end=$(date +%s)
         host_copy_time=$((host_copy_end - host_copy_start))
         printf "Copy to %s completed in %02d:%02d:%02d\n" "$host" $((host_copy_time/3600)) $((host_copy_time%3600/60)) $((host_copy_time%60))
@@ -53,44 +56,24 @@ copy_model_to_host() {
 }
 
 # Argument parsing
+COPY_TO_FLAG=false
 while [[ "$#" -gt 0 ]]; do
     case $1 in
         -c|--copy-to|--copy-to-host|--copy-to-hosts)
+            COPY_TO_FLAG=true
             shift
             # Consume arguments until the next flag or end of args
             while [[ "$#" -gt 0 && "$1" != -* ]]; do
                 add_copy_hosts "$1"
                 shift
             done
-
-            # If no hosts specified, use autodiscovery
-            if [ "${#COPY_HOSTS[@]}" -eq 0 ]; then
-                echo "No hosts specified. Using autodiscovery..."
-                source "$(dirname "$0")/autodiscover.sh"
-                
-                detect_nodes
-                if [ $? -ne 0 ]; then
-                    echo "Error: Autodiscovery failed."
-                    exit 1
-                fi
-                
-                # Use PEER_NODES directly
-                if [ ${#PEER_NODES[@]} -gt 0 ]; then
-                    COPY_HOSTS=("${PEER_NODES[@]}")
-                fi
-                
-                if [ "${#COPY_HOSTS[@]}" -eq 0 ]; then
-                     echo "Error: Autodiscovery found no other nodes."
-                     exit 1
-                fi
-                echo "Autodiscovered hosts: ${COPY_HOSTS[*]}"
-            fi
             continue
             ;;
         --copy-parallel) PARALLEL_COPY=true ;;
         -u|--user) SSH_USER="$2"; shift ;;
+        --config) CONFIG_FILE="$2"; CONFIG_FILE_SET=true; shift ;;
         -h|--help) usage ;;
-        *) 
+        *)
             # If positional argument is provided
             if [ -z "${MODEL_NAME:-}" ]; then
                 MODEL_NAME="$1"
@@ -103,10 +86,45 @@ while [[ "$#" -gt 0 ]]; do
     shift
 done
 
+# Export config so autodiscover.sh picks it up
+export CONFIG_FILE CONFIG_FILE_SET
+
+# Source autodiscover.sh to load .env (for DOTENV_COPY_HOSTS) and make detection functions available
+source "$(dirname "$0")/autodiscover.sh"
+
 # Validate model name is provided
 if [ -z "${MODEL_NAME:-}" ]; then
     echo "Error: Model name is required."
     usage
+fi
+
+# Resolve COPY_HOSTS if --copy-to was given without hosts, or use .env
+if [ "$COPY_TO_FLAG" = true ] && [ "${#COPY_HOSTS[@]}" -eq 0 ]; then
+    # --copy-to was specified but no hosts given: use .env or autodiscover
+    if [[ -n "$DOTENV_COPY_HOSTS" ]]; then
+        echo "Using COPY_HOSTS from .env: $DOTENV_COPY_HOSTS"
+        IFS=',' read -ra HOSTS_FROM_ENV <<< "$DOTENV_COPY_HOSTS"
+        COPY_HOSTS=("${HOSTS_FROM_ENV[@]}")
+    else
+        echo "No hosts specified. Using autodiscovery..."
+        detect_interfaces || { echo "Error: Interface detection failed."; exit 1; }
+        detect_local_ip || { echo "Error: Local IP detection failed."; exit 1; }
+        detect_nodes || { echo "Error: Node detection failed."; exit 1; }
+        detect_copy_hosts || { echo "Error: Copy host detection failed."; exit 1; }
+
+        if [ "${#COPY_PEER_NODES[@]}" -gt 0 ]; then
+            COPY_HOSTS=("${COPY_PEER_NODES[@]}")
+        fi
+
+        if [ "${#COPY_HOSTS[@]}" -eq 0 ]; then
+            echo "Error: Autodiscovery found no other nodes."
+            exit 1
+        fi
+        echo "Autodiscovered copy hosts: ${COPY_HOSTS[*]}"
+    fi
+elif [ "$COPY_TO_FLAG" = false ] && [ "${#COPY_HOSTS[@]}" -eq 0 ] && [[ -n "$DOTENV_COPY_HOSTS" ]]; then
+    # No --copy-to flag but .env has COPY_HOSTS — don't auto-copy; user must request it explicitly
+    : # intentional no-op; user didn't ask for copy
 fi
 
 # Check if uvx is installed

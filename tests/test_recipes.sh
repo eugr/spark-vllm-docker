@@ -728,6 +728,48 @@ test_launch_cmd_no_solo_in_cluster() {
     fi
 }
 
+# Test: -e / --env passthrough to launch-cluster.sh
+test_launch_cmd_env_passthrough() {
+    log_test "Launch command includes -e env vars"
+    
+    recipe_name=$(find_solo_recipe)
+    if [[ -z "$recipe_name" ]]; then
+        log_skip "No solo-capable recipes found"
+        return
+    fi
+    
+    output=$("$PROJECT_DIR/run-recipe.py" "$recipe_name" --dry-run --solo -e HF_TOKEN=test123 -e MY_VAR=hello 2>&1)
+    launch_cmd=$(extract_launch_cmd "$output")
+    
+    if echo "$launch_cmd" | grep -q "\-e HF_TOKEN=test123" && echo "$launch_cmd" | grep -q "\-e MY_VAR=hello"; then
+        log_pass "Launch command includes -e env vars"
+    else
+        log_fail "-e env vars not found in launch command"
+        log_verbose "Launch cmd: $launch_cmd"
+    fi
+}
+
+# Test: no -e flags when none specified
+test_launch_cmd_no_env_by_default() {
+    log_test "Launch command omits -e when no env vars specified"
+    
+    recipe_name=$(find_solo_recipe)
+    if [[ -z "$recipe_name" ]]; then
+        log_skip "No solo-capable recipes found"
+        return
+    fi
+    
+    output=$("$PROJECT_DIR/run-recipe.py" "$recipe_name" --dry-run --solo 2>&1)
+    launch_cmd=$(extract_launch_cmd "$output")
+    
+    if echo "$launch_cmd" | grep -q " -e "; then
+        log_fail "Unexpected -e flag in launch command"
+        log_verbose "Launch cmd: $launch_cmd"
+    else
+        log_pass "Launch command correctly omits -e when none specified"
+    fi
+}
+
 # ==============================================================================
 # README Documentation Verification Tests
 # ==============================================================================
@@ -1203,6 +1245,8 @@ main() {
     test_launch_cmd_launch_script
     test_launch_cmd_container_override
     test_launch_cmd_no_solo_in_cluster
+    test_launch_cmd_env_passthrough
+    test_launch_cmd_no_env_by_default
     echo ""
     
     # README documentation verification tests

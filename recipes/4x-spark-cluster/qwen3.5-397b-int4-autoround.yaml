@@ -1,0 +1,53 @@
+# Recipe: Qwen3.5-397B-A17B-INT4-Autoround
+# Qwen3.5-397B model in Intel INT4-Autoround quantization, TP=4 across 4 DGX Spark nodes
+# Benchmarked at 37 tok/s single-user, 103 tok/s aggregate (4 concurrent) on 4× DGX Spark
+# Requires NVIDIA driver 580.x (590.x has CUDAGraph deadlock bug on GB10)
+
+recipe_version: "1"
+name: Qwen3.5-397B-INT4-Autoround
+description: Qwen3.5-397B with TP=4 across 4 DGX Spark nodes (Marlin fix applied)
+
+# HuggingFace model to download (optional, for --download-model)
+model: Intel/Qwen3.5-397B-A17B-int4-AutoRound
+
+# Container image to use
+container: vllm-node-tf5
+
+build_args:
+  - --tf5
+
+# Mods required: coder-next tool/reasoning parser + Marlin TP fix
+mods:
+  - mods/fix-qwen3-coder-next
+  - mods/fix-qwen35-tp4-marlin
+
+# Environment variables
+env:
+  VLLM_MARLIN_USE_ATOMIC_ADD: 1
+  PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
+
+# Default settings (can be overridden via CLI, e.g. --tensor_parallel 2)
+defaults:
+  port: 8000
+  host: 0.0.0.0
+  tensor_parallel: 4
+  gpu_memory_utilization: 0.78
+  max_model_len: 32768
+  max_num_batched_tokens: 8192
+
+# The vLLM serve command template
+command: |
+  vllm serve Intel/Qwen3.5-397B-A17B-int4-AutoRound \
+    --tool-call-parser qwen3_coder \
+    --reasoning-parser qwen3 \
+    --enable-auto-tool-choice \
+    --tensor-parallel-size {tensor_parallel} \
+    --distributed-executor-backend ray \
+    --kv-cache-dtype fp8 \
+    --gpu-memory-utilization {gpu_memory_utilization} \
+    --max-model-len {max_model_len} \
+    --max-num-batched-tokens {max_num_batched_tokens} \
+    --enable-prefix-caching \
+    --trust-remote-code \
+    --host {host} \
+    --port {port}

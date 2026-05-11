@@ -1,0 +1,47 @@
+# Recipe: Qwen3.5-122B-A10B-FP8
+# Qwen3.5-122B model in native FP8 quantization
+
+recipe_version: "1"
+name: Qwen3.5-122B-FP8
+description: vLLM serving Qwen3.5-122B-FP8
+
+# HuggingFace model to download (optional, for --download-model)
+model: Qwen/Qwen3.5-122B-A10B-FP8
+
+# Only cluster is supported
+cluster_only: true
+
+# Container image to use
+container: vllm-node
+
+# No mods required
+mods:
+  - mods/fix-qwen3.5-chat-template
+
+# Default settings (can be overridden via CLI)
+defaults:
+  port: 8000
+  host: 0.0.0.0
+  tensor_parallel: 2
+  gpu_memory_utilization: 0.7
+  max_model_len: 262144
+  max_num_batched_tokens: 8192
+
+# Environment variables
+env: {}
+
+# The vLLM serve command template
+command: |
+  vllm serve Qwen/Qwen3.5-122B-A10B-FP8 \
+    --max-model-len {max_model_len} \
+    --gpu-memory-utilization {gpu_memory_utilization} \
+    --port {port} \
+    --host {host} \
+    --load-format fastsafetensors \
+    --enable-prefix-caching \
+    --enable-auto-tool-choice \
+    --tool-call-parser qwen3_coder \
+    --reasoning-parser qwen3 \
+    --chat-template unsloth.jinja \
+    -tp {tensor_parallel} --distributed-executor-backend ray \
+    --max-num-batched-tokens {max_num_batched_tokens}

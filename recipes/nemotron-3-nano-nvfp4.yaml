@@ -25,16 +25,12 @@ defaults:
   host: 0.0.0.0
   tensor_parallel: 1
   gpu_memory_utilization: 0.7
-  max_model_len: 131072
-
-# Environment variables
-env:
-  VLLM_USE_FLASHINFER_MOE_FP4: 1
-  VLLM_FLASHINFER_MOE_BACKEND: "throughput"
+  max_model_len: 262144
 
 # The vLLM serve command template
 command: |
   vllm serve nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4  \
+     --moe-backend cutlass \
      --max-model-len {max_model_len} \
      --port {port} --host {host} \
      --trust-remote-code \
@@ -44,6 +40,5 @@ command: |
      --reasoning-parser nano_v3  \
      --kv-cache-dtype fp8  \
      --enable-prefix-caching  \
-     --attention-backend flashinfer  \
      --load-format fastsafetensors  \
      --gpu-memory-utilization {gpu_memory_utilization}

@@ -1,0 +1,44 @@
+# Recipe: MiniMax-M2.7-AWQ
+# MiniMax M2.7 model with AWQ quantization
+
+recipe_version: "1"
+name: MiniMax-M2.7-AWQ
+description: vLLM serving MiniMax-M2.7-AWQ with Ray distributed backend
+
+# HuggingFace model to download (optional, for --download-model)
+model: cyankiwi/MiniMax-M2.7-AWQ-4bit
+
+# Container image to use
+container: vllm-node
+
+# Can only be run in a cluster
+cluster_only: true
+
+# No mods required
+mods: []
+
+# Default settings (can be overridden via CLI)
+defaults:
+  port: 8000
+  host: 0.0.0.0
+  tensor_parallel: 2
+  gpu_memory_utilization: 0.8
+  max_model_len: 196608
+
+# Environment variables
+env: {}
+
+# The vLLM serve command template
+command: |
+  vllm serve cyankiwi/MiniMax-M2.7-AWQ-4bit \
+      --trust-remote-code \
+      --port {port} \
+      --host {host} \
+      --gpu-memory-utilization {gpu_memory_utilization} \
+      -tp {tensor_parallel} \
+      --distributed-executor-backend ray \
+      --max-model-len {max_model_len} \
+      --load-format fastsafetensors \
+      --enable-auto-tool-choice \
+      --tool-call-parser minimax_m2 \
+      --reasoning-parser minimax_m2

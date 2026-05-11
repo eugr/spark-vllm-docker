@@ -11,6 +11,9 @@ model: openai/gpt-oss-120b
 # Container image to use
 container: vllm-node-mxfp4
 
+# Only solo now
+solo_only: true
+
 # Build arguments for build-and-copy.sh
 build_args:
   - --exp-mxfp4
@@ -22,7 +25,7 @@ mods: []
 defaults:
   port: 8000
   host: 0.0.0.0
-  tensor_parallel: 2
+  tensor_parallel: 1
   gpu_memory_utilization: 0.70
   max_num_batched_tokens: 8192
 
@@ -37,8 +40,6 @@ command: |
       --tool-call-parser openai \
       --reasoning-parser openai_gptoss \
       --enable-auto-tool-choice \
-      --tensor-parallel-size {tensor_parallel} \
-      --distributed-executor-backend ray \
       --gpu-memory-utilization {gpu_memory_utilization} \
       --enable-prefix-caching \
       --load-format fastsafetensors \

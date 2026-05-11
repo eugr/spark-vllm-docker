@@ -1,0 +1,53 @@
+# Recipe: Gemma4-26B-A4B
+# Gemma4-26B-A4B model in online FP8 quantization
+
+recipe_version: "1"
+name: Gemma4-26B-A4B
+description: vLLM serving Gemma4-26B-A4B
+
+# HuggingFace model to download (optional, for --download-model)
+model: google/gemma-4-26B-A4B-it
+
+# Only cluster is supported
+cluster_only: false
+solo_only: false
+
+# Container image to use
+container: vllm-node-tf5
+
+build_args:
+  - --tf5
+
+# Mods
+# mods:
+  # - mods/fix-gemma4-tool-parser
+
+# Default settings (can be overridden via CLI)
+defaults:
+  port: 8000
+  host: 0.0.0.0
+  tensor_parallel: 2
+  gpu_memory_utilization: 0.7
+  max_model_len: 262144
+  max_num_batched_tokens: 8192
+
+# Environment variables
+env: {}
+
+# The vLLM serve command template
+command: |
+  vllm serve google/gemma-4-26B-A4B-it  \
+    --max-model-len {max_model_len} \
+    --gpu-memory-utilization {gpu_memory_utilization} \
+    --port {port} \
+    --host {host} \
+    --load-format safetensors \
+    --enable-prefix-caching \
+    --enable-auto-tool-choice \
+    --tool-call-parser gemma4 \
+    --reasoning-parser gemma4 \
+    --quantization fp8 \
+    --kv-cache-dtype fp8 \
+    --max-num-batched-tokens {max_num_batched_tokens} \
+    -tp {tensor_parallel} --distributed-executor-backend ray
+    

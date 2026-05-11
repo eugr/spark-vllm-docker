@@ -1,0 +1,43 @@
+# Recipe: Qwen3-Coder-Next-int4-Autoround
+# Qwen3-Coder-Next model in Intel int4-Autoround format
+
+
+recipe_version: "1"
+name: Qwen3-Coder-Next-int4-Autoround
+description: Qwen3-Coder-Next-int4-Autoround
+
+# HuggingFace model to download (optional, for --download-model)
+model: Intel/Qwen3-Coder-Next-int4-AutoRound
+
+solo_only: true
+
+# Container image to use
+container: vllm-node
+
+# Mod required to fix autoround weight loading issues
+mods:
+  - mods/fix-qwen3-next-autoround
+
+# Default settings (can be overridden via CLI)
+defaults:
+  port: 8000
+  host: 0.0.0.0
+  gpu_memory_utilization: 0.7
+  max_model_len: 262144
+
+# Environment variables
+env: 
+  VLLM_MARLIN_USE_ATOMIC_ADD: 1
+
+# The vLLM serve command template
+command: |
+  vllm serve Intel/Qwen3-Coder-Next-int4-AutoRound \
+    --enable-auto-tool-choice \
+    --tool-call-parser qwen3_coder \
+    --gpu-memory-utilization {gpu_memory_utilization} \
+    --host {host} \
+    --port {port} \
+    --load-format fastsafetensors \
+    --enable-prefix-caching \
+    --max-model-len {max_model_len}
+

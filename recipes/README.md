@@ -44,11 +44,15 @@ The recipe runner can automatically discover cluster nodes:
 ```
 
 When you run `--discover`, it:
-1. Scans the network for nodes with SSH access
-2. Prompts you to select which nodes to include
-3. Saves the configuration to `.env`
+1. Detects active CX7 interfaces and determines mesh vs. standard topology.
+2. Scans the network for peers that are both SSH-reachable **and** have an NVIDIA GB10 GPU.
+3. In mesh mode, separately discovers `COPY_HOSTS` on the direct IB-attached interfaces.
+4. Prompts for per-node confirmation for `CLUSTER_NODES` and `COPY_HOSTS`.
+5. Saves the full configuration (including mesh NCCL settings if applicable) to `.env`.
 
 Future recipe runs will automatically use nodes from `.env` unless you specify `-n` or `--solo`.
+
+When distributing the container image or model files, the runner uses `COPY_HOSTS` from `.env` (which may differ from `CLUSTER_NODES` in mesh mode) to ensure transfers go over the fastest available path.
 
 ## Workflow Modes
 
@@ -169,6 +173,7 @@ Usage: ./run-recipe.sh [OPTIONS] [RECIPE]
 Cluster discovery:
   --discover                  Auto-detect cluster nodes and save to .env
   --show-env                  Show current .env configuration
+  --config FILE               Path to .env configuration file (default: .env in repo directory)
 
 Recipe overrides:
   --port PORT                 Override port
@@ -186,10 +191,25 @@ Setup options:
 
 Launch options:
   --solo                      Run in solo mode (single node, no Ray)
+  --no-ray                    Multi-node without Ray (PyTorch distributed backend)
   -n, --nodes IPS             Comma-separated node IPs (first = head)
   -d, --daemon                Run in daemon mode
   -t, --container IMAGE       Override container from recipe
+  --name NAME                 Override container name
   --nccl-debug LEVEL          NCCL debug level (VERSION, WARN, INFO, TRACE)
+  --master-port PORT          Cluster coordination port: Ray head port or PyTorch
+                              distributed master port (default: 29501).
+                              Alias: --head-port
+  --eth-if IFACE              Override Ethernet interface
+  --ib-if IFACE               Override InfiniBand interface
+  -e VAR=VALUE                Pass environment variable to container (repeatable)
+  -j N                        Number of parallel build jobs
+  --no-cache-dirs             Do not mount ~/.cache/vllm, ~/.cache/flashinfer, ~/.triton
+  --non-privileged            Run container without --privileged
+  --mem-limit-gb N            Memory limit in GB (only with --non-privileged)
+  --mem-swap-limit-gb N       Memory+swap limit in GB (only with --non-privileged)
+  --pids-limit N              Process limit (only with --non-privileged)
+  --shm-size-gb N             Shared memory size in GB (only with --non-privileged)
 
 Extra vLLM arguments:
   -- ARGS...                  Pass additional arguments directly to vLLM
@@ -261,10 +281,18 @@ command: |
 
 ```
 ┌─────────────────────────────────────────────────────────┐
+│  autodiscover.sh                                        │
+│  - Interface detection (standard / mesh topology)       │
+│  - GB10 peer verification via SSH                       │
+│  - CLUSTER_NODES and COPY_HOSTS discovery               │
+│  - Interactive .env save with per-node confirmation     │
+└──────────────────────────┬──────────────────────────────┘
+                           │ sourced by
+                           ▼
+┌─────────────────────────────────────────────────────────┐
 │  run-recipe.sh / run-recipe.py                          │
 │  - Parses YAML recipe                                   │
-│  - Auto-discovers cluster nodes (--discover)            │
-│  - Loads nodes from .env                                │
+│  - Loads / triggers cluster discovery (--discover)      │
 │  - Handles --setup (build + download + run)             │
 │  - Generates launch script from template                │
 │  - Applies CLI overrides                                │
@@ -274,15 +302,15 @@ command: |
 ┌──────────────────────┐  ┌───────────────────────────────┐
 │  build-and-copy.sh   │  │  hf-download.sh               │
 │  - Docker build      │  │  - HuggingFace model download │
-│  - Copy to workers   │  │  - Rsync to workers           │
+│  - Copy to COPY_HOSTS│  │  - Rsync to COPY_HOSTS        │
 └──────────────────────┘  └───────────────────────────────┘
-           │ 
+           │
            │ then calls (for run)
            ▼
 ┌─────────────────────────────────────────────────────────┐
 │  launch-cluster.sh                                      │
 │  - Cluster orchestration                                │
-│  - Container lifecycle                                  │
+│  - Container lifecycle (trimmed to required node count) │
 │  - Mod application                                      │
 │  - Launch script execution                              │
 └─────────────────────────────────────────────────────────┘

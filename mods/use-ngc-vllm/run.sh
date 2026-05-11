@@ -1,6 +1,5 @@
 #!/bin/bash
 set -e
 
-echo "Setting up cluster initialization script..."
-cp run-cluster-node.sh $WORKSPACE_DIR/run-cluster-node.sh
-chmod +x $WORKSPACE_DIR/run-cluster-node.sh
+# NGC vLLM mod: container initialization is now handled by launch-cluster.sh
+echo "NGC vLLM mod applied."

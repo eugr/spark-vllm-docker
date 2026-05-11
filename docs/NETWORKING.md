@@ -42,12 +42,53 @@ However, in order to get full bandwidth in NCCL RDMA mode, we need to utilize **
 Also, note that connecting two Sparks using **both** ports won't give you any noticeable advantage in bandwidth, so single connection is sufficient.
 If you connect 3 Sparks by daisy-chaining them, you will only be able to sustain 100G between each pair of Sparks.
 
-## Connecting more than 2 Sparks in the cluster
+## Connecting 3 Sparks in a mesh cluster without a switch
+
+Three Sparks can be connected together in a cluster without using a separate RoCE switch.
+However, all three Sparks need to be on the same wired network using it's 10G Ethernet port (RG-45, not QSFP). Being on a same wireless network should work too, but it's not recommended and was not tested.
+
+You need to make sure they are connected the following way: port 0 on one Spark should connect to port 1 on another Spark (unlike non-mesh configuration).
+Example diagram:
+
+```mermaid
+block-beta
+    columns 1
+    
+    block:Spark3
+        columns 2
+        Title3["Spark 3"]:2
+        s3p0["Port 0<br>192.168.187.13<br>192.168.188.13"] s3p1["Port 1<br>192.168.197.13<br>192.168.198.13"]
+    end
+    
+    space
+    
+    block:Spark2
+        columns 2
+        Title2["Spark 2"]:2
+        s2p0["Port 0<br>192.168.197.12<br>192.168.198.12"] s2p1["Port 1<br>192.168.177.12<br>192.168.178.13"]
+    end
+    
+    space
+    
+    block:Spark1
+        columns 2
+        Title1["Spark 1"]:2
+        s1p0["Port 0<br>192.168.177.11<br>192.168.178.11"] s1p1["Port 1<br>192.168.187.11<br>192.168.188.11"]
+    end
+
+    s1p0 <--> s2p1
+    s2p0 <--> s3p1
+    s3p0 <--> s1p1
+```
+
+## Connecting more than 2 Sparks in the cluster using a switch
 
 To connect more than 2 Sparks, you will need a proper switch, for example [Microtik CRS812-DDQ](https://mikrotik.com/product/crs812_ddq).
 Please refer to [this post](https://forums.developer.nvidia.com/t/6x-spark-setup/354399/56) for an example of setting up a 6-8 node Spark cluster.
 
 ## Network setup
+
+### For dual Sparks or multiple Sparks using a QSFP switch
 
 Assuming both are connected using rightmost QFSP port (when looking from the back).
 
@@ -58,15 +99,16 @@ network:
   ethernets:
     enp1s0f1np1:
       dhcp4: no
-      dhcp6: no              # Explicitly disable DHCPv6
-      link-local: [ ipv4 ]   # Restrict link-local addresses to IPv4 only
+      dhcp6: no        # Explicitly disable DHCPv6
+      link-local: []   # Restrict link-local addresses to static IPv4 only
       mtu: 9000
       addresses: [192.168.177.11/24]
     enP2p1s0f1np1:
       dhcp4: no
       dhcp6: no
-      link-local: [ ipv4 ]
+      link-local: []
       mtu: 9000
+      addresses: [192.168.178.11/24]
 ```
 
 Create `/etc/netplan/40-cx7.yaml` on `spark2`:
@@ -76,23 +118,19 @@ network:
   ethernets:
     enp1s0f1np1:
       dhcp4: no
-      dhcp6: no              # Explicitly disable DHCPv6
-      link-local: [ ipv4 ]   # Restrict link-local addresses to IPv4 only
+      dhcp6: no        # Explicitly disable DHCPv6
+      link-local: []   # Restrict link-local addresses to static IPv4 only
       mtu: 9000
       addresses: [192.168.177.12/24]
     enP2p1s0f1np1:
       dhcp4: no
       dhcp6: no
-      link-local: [ ipv4 ]
+      link-local: []
       mtu: 9000
+      addresses: [192.168.178.12/24]
 ```
 
-Please note, that only one interface of the "twin" pair needs an IP address, but MTU needs to be set on both.
-You can also assign a separate address to another "twin" if you want to utilize the second interface independently, but make sure you assign an IP address from a different subnet.
-
-For instance, for the example above, if you want to assign an IP to `enP2p1s0f1np1`, you need to use `192.168.177.12` on `spark`. **DO NOT use the same subnet on both "twins"** - it will confuse autodiscovery and mess up routing.
-
-This will not affect vLLM performance as it will use RDMA over RoCE using both "twins", even if the IP is only set on one.
+**DO NOT use the same subnet on both "twins"** - it will confuse autodiscovery and mess up routing.
 
 Then run on each node:
 
@@ -113,6 +151,122 @@ MTU setting (testing):
 
 ```bash
 sudo ip link set dev enp1s0f1np1 mtu 9000
+```
+
+### For 3-node mesh
+
+3-node mesh is configured differently than dual clusters or clusters using a QSFP switch.
+
+Assuming, your Sparks are connected according to the diagram above:
+
+Create `/etc/netplan/40-cx7.yaml` on `spark1`:
+```yaml
+network:
+  version: 2
+  ethernets:
+    enp1s0f0np0:
+      dhcp4: no
+      dhcp6: no        # Explicitly disable DHCPv6
+      link-local: []   # Restrict link-local addresses to static IPv4 only
+      mtu: 9000
+      addresses: [192.168.177.11/24]
+    enP2p1s0f0np0:
+      dhcp4: no
+      dhcp6: no
+      link-local: []
+      mtu: 9000
+      addresses: [192.168.178.11/24]
+    enp1s0f1np1:
+      dhcp4: no
+      dhcp6: no        # Explicitly disable DHCPv6
+      link-local: []   # Restrict link-local addresses to static IPv4 only
+      mtu: 9000
+      addresses: [192.168.187.11/24]
+    enP2p1s0f1np1:
+      dhcp4: no
+      dhcp6: no
+      link-local: []
+      mtu: 9000
+      addresses: [192.168.188.11/24]
+```
+
+Create `/etc/netplan/40-cx7.yaml` on `spark2`:
+```yaml
+network:
+  version: 2
+  ethernets:
+    enp1s0f0np0:
+      dhcp4: no
+      dhcp6: no        # Explicitly disable DHCPv6
+      link-local: []   # Restrict link-local addresses to static IPv4 only
+      mtu: 9000
+      addresses: [192.168.197.12/24]
+    enP2p1s0f0np0:
+      dhcp4: no
+      dhcp6: no
+      link-local: []
+      mtu: 9000
+      addresses: [192.168.198.12/24]
+    enp1s0f1np1:
+      dhcp4: no
+      dhcp6: no        # Explicitly disable DHCPv6
+      link-local: []   # Restrict link-local addresses to static IPv4 only
+      mtu: 9000
+      addresses: [192.168.177.12/24]
+    enP2p1s0f1np1:
+      dhcp4: no
+      dhcp6: no
+      link-local: []
+      mtu: 9000
+      addresses: [192.168.178.12/24]
+```
+
+Create `/etc/netplan/40-cx7.yaml` on `spark3`:
+```yaml
+network:
+  version: 2
+  ethernets:
+    enp1s0f0np0:
+      dhcp4: no
+      dhcp6: no        # Explicitly disable DHCPv6
+      link-local: []   # Restrict link-local addresses to static IPv4 only
+      mtu: 9000
+      addresses: [192.168.187.13/24]
+    enP2p1s0f0np0:
+      dhcp4: no
+      dhcp6: no
+      link-local: []
+      mtu: 9000
+      addresses: [192.168.188.13/24]
+    enp1s0f1np1:
+      dhcp4: no
+      dhcp6: no        # Explicitly disable DHCPv6
+      link-local: []   # Restrict link-local addresses to static IPv4 only
+      mtu: 9000
+      addresses: [192.168.197.13/24]
+    enP2p1s0f1np1:
+      dhcp4: no
+      dhcp6: no
+      link-local: []
+      mtu: 9000
+      addresses: [192.168.198.13/24]
+```
+
+Then run (on each Spark):
+
+```bash
+sudo chmod 600 /etc/netplan/40-cx7.yaml
+sudo netplan apply
+```
+
+### Passwordless SSH and benchmarks
+
+Set up passwordless ssh. On the first spark:
+
+```bash
+wget https://raw.githubusercontent.com/NVIDIA/dgx-spark-playbooks/refs/heads/main/nvidia/connect-two-sparks/assets/discover-sparks
+chmod +x discover-sparks
+./discover-sparks
 ```
 
 **Benchmark connection (use perftest package):**
@@ -196,7 +350,9 @@ ib_write_lat 192.168.177.12 -d rocep1s0f1 --report_gbits -R --force-link IB
 ---------------------------------------------------------------------------------------
 ```
 
-## NCCL Setup
+## NCCL Tests
+
+### Dual Sparks or Sparks via QSFP switch
 
 From https://build.nvidia.com/spark/nccl/stacked-sparks
 
@@ -239,4 +395,52 @@ mpirun -np 2 -H 192.168.177.11:1,192.168.177.12:1 \
   -x LD_LIBRARY_PATH=$LD_LIBRARY_PATH \
   $HOME/nccl-tests/build/all_gather_perf -b 16G -e 16G -f 2
 
+```
+
+### 3-node mesh
+
+```bash
+# Install dependencies and build NCCL
+sudo apt-get update && sudo apt-get install -y libopenmpi-dev
+git clone -b dgxspark-3node-ring https://github.com/zyang-dev/nccl.git ~/nccl/
+cd ~/nccl/
+make -j src.build NVCC_GENCODE="-gencode=arch=compute_121,code=sm_121"
+
+# Set environment variables
+export CUDA_HOME="/usr/local/cuda"
+export MPI_HOME="/usr/lib/aarch64-linux-gnu/openmpi"
+export NCCL_HOME="$HOME/nccl/build/"
+export LD_LIBRARY_PATH="$NCCL_HOME/lib:$CUDA_HOME/lib64/:$MPI_HOME/lib:$LD_LIBRARY_PATH"
+```
+
+Build NCCL Test Suite:
+
+```bash
+# Clone and build NCCL tests
+git clone https://github.com/NVIDIA/nccl-tests.git ~/nccl-tests/
+cd ~/nccl-tests/
+make MPI=1
+```
+
+Test on both nodes (replace spark1, spark2, spark3 with the actual hostnames or IP address on non-QSFP interface):
+
+```bash
+# Set environment variables
+export CUDA_HOME="/usr/local/cuda"
+export MPI_HOME="/usr/lib/aarch64-linux-gnu/openmpi"
+export NCCL_HOME="$HOME/nccl_spark_cluster/build/"
+export LD_LIBRARY_PATH="$NCCL_HOME/lib:$CUDA_HOME/lib64/:$MPI_HOME/lib:$LD_LIBRARY_PATH"
+
+# For 3-node mesh we have to use 10G interface for OOB communication!
+export UCX_NET_DEVICES=enP7s7
+export NCCL_SOCKET_IFNAME=enP7s7
+export OMPI_MCA_btl_tcp_if_include=enP7s7
+export NCCL_IB_HCA=rocep1s0f0,roceP2p1s0f0,rocep1s0f1,roceP2p1s0f1
+export NCCL_IB_DISABLE=0
+
+# Run the all_gather performance test across both nodes
+mpirun -np 3 -H spark1:1,spark2:1,spark3:1 \
+  --mca plm_rsh_agent "ssh -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no" \
+  -x LD_LIBRARY_PATH=$LD_LIBRARY_PATH -x NCCL_IB_MERGE_NICS=0 -x NCCL_NET_PLUGIN=none -x NCCL_IB_SUBNET_AWARE_ROUTING=1 \
+  $HOME/nccl-tests/build/all_gather_perf -b 16G -e 16G -f 3
 ```

@@ -1,0 +1,45 @@
+# Recipe: MiniMax-M2.5
+# MiniMaxAI/MiniMax-M2.5
+
+recipe_version: "1"
+name: MiniMax-M2.5
+description: vLLM serving MiniMax-M2.5 with Ray distributed backend
+
+# HuggingFace model to download (optional, for --download-model)
+model: MiniMaxAI/MiniMax-M2.5
+
+# Container image to use
+container: vllm-node
+
+# Can only be run in a cluster
+cluster_only: true
+
+# No mods required
+mods: []
+
+# Default settings (can be overridden via CLI)
+defaults:
+  port: 8000
+  host: 0.0.0.0
+  tensor_parallel: 4
+  gpu_memory_utilization: 0.90
+  max_model_len: 128000
+
+# Environment variables
+env:
+  VLLM_DISTRIBUTED_EXECUTOR_CONFIG: '{"placement_group_options":{"strategy":"SPREAD"}}'
+
+# The vLLM serve command template
+command: |
+  vllm serve MiniMaxAI/MiniMax-M2.5 \
+      --trust-remote-code \
+      --port {port} \
+      --host {host} \
+      --gpu-memory-utilization {gpu_memory_utilization} \
+      -tp {tensor_parallel} \
+      --distributed-executor-backend ray \
+      --max-model-len {max_model_len} \
+      --load-format fastsafetensors \
+      --enable-auto-tool-choice \
+      --tool-call-parser minimax_m2 \
+      --reasoning-parser minimax_m2_append_think

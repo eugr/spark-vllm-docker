@@ -30,8 +30,8 @@ build_args:
 
 # Mods to apply before running (paths relative to repo root)
 # This mod prevents severe inference speed degradation
-mods:
-  - mods/fix-glm-4.7-flash-AWQ
+# mods:
+#   - mods/fix-glm-4.7-flash-AWQ
 
 # Default settings (can be overridden via CLI)
 defaults:
