@@ -846,7 +846,14 @@ start_cluster() {
     fi
 
     # Build docker run arguments based on mode
-    local docker_args_common="--gpus all -d --rm --network host --name $CONTAINER_NAME $DOCKER_ARGS $IMAGE_NAME"
+    local docker_restart_args=""
+    if [[ "$DAEMON_MODE" == "true" ]]; then
+        docker_restart_args="--restart unless-stopped"
+    else
+        docker_restart_args="--rm"
+    fi
+    local docker_args_common="--gpus all -d $docker_restart_args --network host --name $CONTAINER_NAME $DOCKER_ARGS $IMAGE_NAME"
+
     local docker_caps_args=""
     local docker_resource_args=""
 
