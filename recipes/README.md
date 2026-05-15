@@ -24,6 +24,9 @@ Recipes provide a **one-click solution** for deploying models with pre-configure
 # Run with overrides
 ./run-recipe.sh glm-4.7-flash-awq --solo --port 9000 --gpu-mem 0.8
 
+# Run with recipe-defined benchmark (benchmark block must exist and enabled: true)
+./run-recipe.sh nemotron-3-nano-nvfp4 --solo -d
+
 # Cluster deployment
 ./run-recipe.sh glm-4.7-nvfp4 -n 192.168.1.10,192.168.1.11 --setup
 ```
@@ -133,7 +136,54 @@ defaults:
   max_model_len: 32000
 env:
   SOME_VAR: "value"
+
+# Optional benchmark configuration
+benchmark:
+  enabled: false                   # default false
+  framework: llama-benchy          # default llama-benchy
+  model: org/model-name            # optional override for benchmark request model
+  args:
+    pp: [2048]                     # default [2048]
+    depth: [0]                     # default [0]
+    enable_prefix_caching: true    # default true
+    save_result: test.md           # default test.md
 ```
+
+### Benchmark Configuration
+
+Recipes can optionally define a `benchmark` block. Benchmarking only runs when:
+
+1. the `benchmark` block is present in the recipe, and
+2. `benchmark.enabled: true` is set.
+
+When both are true, `run-recipe.sh` runs a post-launch benchmark command via `run_benchmark.py` (currently with `llama-benchy`).
+
+Example behavior:
+
+```yaml
+benchmark:
+  enabled: true
+  framework: llama-benchy
+  args:
+    pp: [2048]
+    depth: [0, 4096]
+```
+
+Generates and runs (after successful launch):
+
+```bash
+python3 ./run_benchmark.py recipes/your-recipe.yaml --dry-run
+# prints and runs:
+# llama-benchy --base-url http://localhost:8000/v1 --model your/model \
+#   --pp 2048 --depth 0 4096 --save-result test.md --enable-prefix-caching
+```
+
+Notes:
+- If `benchmark` is omitted, benchmark is skipped.
+- If `benchmark.enabled` is `false` (or missing), benchmark is skipped.
+- `framework` currently supports `llama-benchy`.
+- `benchmark.model` is optional and overrides `recipe.model` for benchmark API calls.
+- Recommended with `-d/--daemon` so launch returns and benchmark can run automatically.
 
 ### Build Arguments
 

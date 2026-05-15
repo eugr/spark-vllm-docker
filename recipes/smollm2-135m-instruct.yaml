@@ -1,0 +1,57 @@
+# Recipe: OpenAI GPT-OSS Tiny (Quick Test)
+# Minimal test recipe modeled after openai-gpt-oss-120b.yaml,
+# but using an extremely small model for fast validation.
+
+recipe_version: "1"
+name: SmolLM2 135M Instruct
+description: vLLM serving HuggingFaceTB/SmolLM2-135M-Instruct for very fast smoke testing
+
+# HuggingFace model to download (optional, for --download-model)
+model: HuggingFaceTB/SmolLM2-135M-Instruct
+
+# Container image to use
+container: vllm-node
+
+# No special build flags needed
+build_args: []
+
+# No mods required
+mods: []
+
+# Defaults tuned for quick local testing
+defaults:
+  port: 8000
+  host: 0.0.0.0
+  tensor_parallel: 1
+  gpu_memory_utilization: 0.08
+  max_model_len: 512
+  max_num_batched_tokens: 256
+  max_num_seqs: 4
+  kv_cache_memory_bytes: 1073741824
+
+# No special environment variables required
+env: {}
+
+# Optional benchmarking (run after successful launch)
+benchmark:
+  framework: llama-benchy
+  model: HuggingFaceTB/SmolLM2-135M-Instruct
+  args:
+    pp: [128]
+    depth: [0, 128, 256]
+    enable_prefix_caching: true
+    save_result: benchmark_SmolLM2-135M-Instruct.csv
+    format: csv
+
+# The vLLM serve command template
+command: |
+  vllm serve HuggingFaceTB/SmolLM2-135M-Instruct \
+      --tensor-parallel-size {tensor_parallel} \
+      --gpu-memory-utilization {gpu_memory_utilization} \
+      --kv-cache-memory-bytes {kv_cache_memory_bytes} \
+      --max-model-len {max_model_len} \
+      --max-num-batched-tokens {max_num_batched_tokens} \
+      --max-num-seqs {max_num_seqs} \
+      --host {host} \
+      --port {port}
+

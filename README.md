@@ -1475,6 +1475,8 @@ HF_HUB_OFFLINE=1 vllm serve openai/gpt-oss-120b --port 8888 --host 0.0.0.0 --tru
 
 I recommend using [llama-benchy](https://github.com/eugr/llama-benchy) - a new benchmarking tool that delivers results in the same format as llama-bench from llama.cpp suite.
 
+Recipes can run benchmarks automatically after launch when a recipe includes a `benchmark` block **and** you pass `--benchmark` in the CLI (see `recipes/README.md`).
+
 ## 11\. Downloading Models
 
 The `hf-download.sh` script provides a convenient way to download models from HuggingFace and distribute them across your cluster nodes. It uses Huggingface CLI via `uvx` for fast downloads and `rsync` for distribution across the cluster.

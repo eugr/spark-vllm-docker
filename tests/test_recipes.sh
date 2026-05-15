@@ -221,6 +221,16 @@ test_recipe_version_required() {
 # Test: All recipes load without errors
 test_all_recipes_load() {
     log_test "All recipes load without errors"
+
+    # Some recipes enable benchmark validation, which now requires llama-benchy.
+    # Provide a lightweight shim so this test validates recipe structure,
+    # not host tool installation state.
+    fake_benchy_dir=$(mktemp -d)
+    cat > "$fake_benchy_dir/llama-benchy" << 'EOF'
+#!/bin/sh
+echo "fake llama-benchy"
+EOF
+    chmod +x "$fake_benchy_dir/llama-benchy"
     
     local all_valid=true
     for recipe in "$PROJECT_DIR/recipes/"*.yaml; do
@@ -236,9 +246,9 @@ test_all_recipes_load() {
             fi
             
             if [[ "$cluster_only" == "true" ]]; then
-                output=$("$PROJECT_DIR/run-recipe.py" "$recipe_name" --dry-run -n "10.0.0.1,10.0.0.2" 2>&1 || true)
+                output=$(PATH="$fake_benchy_dir:$PATH" "$PROJECT_DIR/run-recipe.py" "$recipe_name" --dry-run -n "10.0.0.1,10.0.0.2" 2>&1 || true)
             else
-                output=$("$PROJECT_DIR/run-recipe.py" "$recipe_name" --dry-run --solo 2>&1 || true)
+                output=$(PATH="$fake_benchy_dir:$PATH" "$PROJECT_DIR/run-recipe.py" "$recipe_name" --dry-run --solo 2>&1 || true)
             fi
             
             if ! echo "$output" | grep -q "Error:"; then
@@ -249,6 +259,8 @@ test_all_recipes_load() {
             fi
         fi
     done
+
+    rm -rf "$fake_benchy_dir"
     
     if [[ "$all_valid" == "true" ]]; then
         log_pass "All recipes load successfully"
@@ -1203,6 +1215,165 @@ test_extra_args_cluster_mode() {
     fi
 }
 
+# ==============================================================================
+# Benchmark Integration Tests
+# ==============================================================================
+
+# Test: benchmark block is ignored by default when --benchmark is not provided
+test_benchmark_default_disabled() {
+    log_test "Benchmark: default disabled when --benchmark is not provided"
+
+    temp_recipe=$(mktemp)
+    cat > "$temp_recipe" << 'EOF'
+recipe_version: "1"
+name: Benchmark Default Disabled
+container: test-container
+command: |
+  vllm serve test/model \
+      --port {port} --host {host}
+defaults:
+  port: 8000
+  host: 0.0.0.0
+EOF
+
+    output=$("$PROJECT_DIR/run-recipe.py" "$temp_recipe" --dry-run --solo 2>&1)
+    rm -f "$temp_recipe"
+
+    if ! echo "$output" | grep -q "Benchmark command after launch"; then
+        log_pass "Benchmark: no benchmark command shown when not configured"
+    else
+        log_fail "Benchmark: benchmark command unexpectedly shown"
+        log_verbose "$output"
+    fi
+}
+
+# Test: benchmark enabled generates expected command
+test_benchmark_enabled_dry_run() {
+    log_test "Benchmark: --benchmark prints benchmark command"
+
+    temp_recipe=$(mktemp)
+    cat > "$temp_recipe" << 'EOF'
+recipe_version: "1"
+name: Benchmark Enabled
+container: test-container
+model: nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4
+command: |
+  vllm serve nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4 \
+      --port {port} --host {host}
+defaults:
+  port: 8000
+  host: 0.0.0.0
+benchmark:
+  enabled: true
+  framework: llama-benchy
+  args:
+    pp: [2048]
+    depth: [0, 4096]
+    enable_prefix_caching: true
+    save_result: test.md
+EOF
+
+    fake_benchy_dir=$(mktemp -d)
+    cat > "$fake_benchy_dir/llama-benchy" << 'EOF'
+#!/bin/sh
+echo "fake llama-benchy"
+EOF
+    chmod +x "$fake_benchy_dir/llama-benchy"
+
+    output=$(PATH="$fake_benchy_dir:$PATH" "$PROJECT_DIR/run-recipe.py" "$temp_recipe" --dry-run --solo --benchmark 2>&1)
+    rm -f "$temp_recipe"
+    rm -rf "$fake_benchy_dir"
+
+    local all_ok=true
+    if ! echo "$output" | grep -q -- "Benchmark command after launch"; then all_ok=false; fi
+    if ! echo "$output" | grep -q -- "llama-benchy"; then all_ok=false; fi
+    if ! echo "$output" | grep -q -- "--pp 2048"; then all_ok=false; fi
+    if ! echo "$output" | grep -q -- "--depth 0 4096"; then all_ok=false; fi
+    if ! echo "$output" | grep -q -- "--enable-prefix-caching"; then all_ok=false; fi
+    if ! echo "$output" | grep -q -- "--save-result test.md"; then all_ok=false; fi
+
+    if [[ "$all_ok" == "true" ]]; then
+        log_pass "Benchmark: enabled config rendered expected command"
+    else
+        log_fail "Benchmark: dry-run benchmark command missing expected parts"
+        log_verbose "$output"
+    fi
+}
+
+# Test: benchmark defaults are applied when args are omitted
+test_benchmark_defaults_applied() {
+    log_test "Benchmark: defaults applied for pp/depth/save_result"
+
+    temp_recipe=$(mktemp)
+    cat > "$temp_recipe" << 'EOF'
+recipe_version: "1"
+name: Benchmark Defaults
+container: test-container
+model: test/model
+command: |
+  vllm serve test/model \
+      --port {port} --host {host}
+defaults:
+  port: 8000
+  host: 0.0.0.0
+benchmark:
+  enabled: true
+EOF
+
+    fake_benchy_dir=$(mktemp -d)
+    cat > "$fake_benchy_dir/llama-benchy" << 'EOF'
+#!/bin/sh
+echo "fake llama-benchy"
+EOF
+    chmod +x "$fake_benchy_dir/llama-benchy"
+
+    output=$(PATH="$fake_benchy_dir:$PATH" "$PROJECT_DIR/run-recipe.py" "$temp_recipe" --dry-run --solo --benchmark 2>&1)
+    rm -f "$temp_recipe"
+    rm -rf "$fake_benchy_dir"
+
+    if echo "$output" | grep -q -- "llama-benchy" && \
+       echo "$output" | grep -q -- "--pp 2048" && \
+       echo "$output" | grep -q -- "--depth 0"; then
+        log_pass "Benchmark: defaults applied correctly"
+    else
+        log_fail "Benchmark: defaults not applied as expected"
+        log_verbose "$output"
+    fi
+}
+
+# Test: requesting benchmark requires llama-benchy in PATH
+test_benchmark_requires_benchy_installed() {
+    log_test "Benchmark: --benchmark requires llama-benchy in PATH"
+
+    temp_recipe=$(mktemp)
+    cat > "$temp_recipe" << 'EOF'
+recipe_version: "1"
+name: Benchmark Requires Benchy
+container: test-container
+model: test/model
+command: |
+  vllm serve test/model \
+      --port {port} --host {host}
+defaults:
+  port: 8000
+  host: 0.0.0.0
+benchmark:
+  enabled: true
+EOF
+
+    pybin=$(command -v python3)
+    output=$(PATH="/nonexistent" "$pybin" "$PROJECT_DIR/run_benchmark.py" "$temp_recipe" --dry-run --benchmark 2>&1 || true)
+    rm -f "$temp_recipe"
+
+    if echo "$output" | grep -q "'llama-benchy' not found in PATH" || \
+       echo "$output" | grep -q "requires 'llama-benchy' in PATH"; then
+        log_pass "Benchmark: missing llama-benchy is caught during recipe validation"
+    else
+        log_fail "Benchmark: missing llama-benchy was not reported"
+        log_verbose "$output"
+    fi
+}
+
 # Run all tests
 main() {
     echo "=============================================="
@@ -1281,6 +1452,14 @@ main() {
     test_extra_args_duplicate_tp_warning
     test_extra_args_ordering
     test_extra_args_cluster_mode
+    echo ""
+
+    # Benchmark integration tests
+    echo "--- Benchmark Integration ---"
+    test_benchmark_default_disabled
+    test_benchmark_enabled_dry_run
+    test_benchmark_defaults_applied
+    test_benchmark_requires_benchy_installed
     echo ""
     
     # Validation tests

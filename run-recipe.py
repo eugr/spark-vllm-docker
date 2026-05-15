@@ -69,6 +69,7 @@ RECIPE YAML SCHEMA:
     build_args: list[str]  # Optional: Args for build-and-copy.sh
     cluster_only: bool     # Optional: Require cluster mode (default: false)
     solo_only: bool        # Optional: Require solo mode (default: false)
+    benchmark: dict        # Optional: Benchmark configuration
 
 RECIPE VERSION HISTORY:
     Version 1 (default): Initial schema with all fields above supported.
@@ -80,17 +81,22 @@ RELATED FILES:
     - launch-cluster.sh: Low-level container orchestration
     - build-and-copy.sh: Docker build and distribution
     - hf-download.sh: HuggingFace model download and sync
+    - run_benchmark.py: Benchmark runner wrapper (llama-benchy)
     - autodiscover.sh: Network topology detection
 """
 
 import argparse
 import os
+import re
+import shlex
 import subprocess
 import shlex
 import sys
 import tempfile
 from pathlib import Path
 from typing import Any
+
+import run_benchmark
 
 try:
     import yaml
@@ -135,7 +141,11 @@ def load_recipe(recipe_path: Path) -> dict[str, Any]:
         build_args (list[str], optional): Extra args for build-and-copy.sh (e.g., ['-f', 'Dockerfile.mxfp4'])
         cluster_only (bool, optional): If True, recipe cannot run in solo mode
         solo_only (bool, optional): If True, recipe cannot run in cluster mode
-
+        benchmark (dict, optional): Benchmark configuration
+            enabled (bool): Run benchmark after successful launch (default: False)
+            framework (str): Benchmark framework (default: 'llama-benchy')
+            args (dict): Framework-specific args consumed by run_benchmark.py
+    
     Args:
         recipe_path: Path object pointing to YAML file or just recipe name
 
@@ -183,6 +193,9 @@ def load_recipe(recipe_path: Path) -> dict[str, Any]:
     recipe.setdefault("env", {})
     recipe.setdefault("cluster_only", False)
     recipe.setdefault("solo_only", False)
+
+    # Benchmark defaults + validation delegated to run_benchmark module
+    run_benchmark.validate_recipe_benchmark_config(recipe)
 
     # Validate recipe version compatibility
     # EXTENSIBILITY: When adding new schema versions, update SUPPORTED_VERSIONS
@@ -232,7 +245,9 @@ def list_recipes() -> None:
             mods = recipe.get("mods", [])
             cluster_only = recipe.get("cluster_only", False)
             solo_only = recipe.get("solo_only", False)
-
+            benchmark_cfg = recipe.get("benchmark", {})
+            benchmark_enabled = benchmark_cfg.get("enabled", False)
+            
             print(f"  {recipe_path.name}")
             print(f"    Name: {name}")
             if desc:
@@ -248,6 +263,10 @@ def list_recipes() -> None:
                 print(f"    Build args: {' '.join(build_args)}")
             if mods:
                 print(f"    Mods: {', '.join(mods)}")
+            if benchmark_enabled:
+                print(f"    Benchmark: {benchmark_cfg.get('framework', 'llama-benchy')}")
+            else:
+                print("    Benchmark: disabled")
             print()
         except Exception as e:
             print(f"  {recipe_path.name} (error loading: {e})")
@@ -543,6 +562,20 @@ def get_worker_nodes(nodes: list[str]) -> list[str]:
     return nodes[1:]
 
 
+def stop_cluster_after_benchmark(container: str, nodes: list[str], is_solo: bool) -> int:
+    """Stop cluster/solo container that was started for benchmarking."""
+    stop_cmd = [str(LAUNCH_SCRIPT), "-t", container]
+    if is_solo:
+        stop_cmd.append("--solo")
+    elif nodes:
+        stop_cmd.extend(["-n", ",".join(nodes)])
+    stop_cmd.append("stop")
+
+    print("\n=== Stopping VLLM After Benchmark ===")
+    print(shlex.join(stop_cmd))
+    return subprocess.run(stop_cmd).returncode
+
+
 def load_env_file() -> dict[str, str]:
     """
     Load environment variables from .env file.
@@ -746,6 +779,12 @@ Examples:
         type=int,
         dest="max_model_len",
         help="Override max model length",
+    )
+    override_group.add_argument(
+        "--benchmark",
+        type=str.lower,
+        choices=["true", "false"],
+        help="Override recipe benchmark enablement (true/false)"
     )
 
     # Launch options (passed to launch-cluster.sh)
@@ -1192,6 +1231,19 @@ Examples:
         no_ray=getattr(args, "no_ray", False),
     )
 
+    benchmark_cfg = recipe.setdefault("benchmark", {})
+    benchmark_enabled = benchmark_cfg.get("enabled", False)
+    if args.benchmark is not None:
+        benchmark_enabled = args.benchmark == "true"
+    # Keep recipe config in sync so downstream benchmark helpers
+    # (e.g., run_benchmark.run_recipe_benchmark) honor CLI override.
+    benchmark_cfg["enabled"] = benchmark_enabled
+
+    if benchmark_enabled and not args.daemon and not args.dry_run:
+        print("Error: Benchmark is enabled for this recipe, but launch is not in daemon mode.")
+        print("Use -d/--daemon so vLLM stays running and benchmark can execute automatically.")
+        return 1
+    
     if args.dry_run:
         print("=== Generated Launch Script ===")
         print(script_content)
@@ -1245,6 +1297,12 @@ Examples:
         print(" ".join(cmd_parts))
         print()
         print("3. The launch script runs inside the container")
+        if benchmark_enabled:
+            benchmark_cmd = run_benchmark.build_llama_benchy_command(recipe)
+            print(f"\n4. Benchmark command after launch:\n   {shlex.join(benchmark_cmd)}")
+            print("\n5. After benchmark completes, stop the launched vLLM cluster/container.")
+        else:
+            print("\n4. Benchmarking: disabled")
         return 0
 
     # Write temporary launch script
@@ -1329,8 +1387,18 @@ Examples:
 
         # Execute
         result = subprocess.run(cmd)
-        return result.returncode
+        if result.returncode != 0:
+            return result.returncode
 
+        if benchmark_enabled:
+            benchmark_rc = run_benchmark.run_recipe_benchmark(recipe, dry_run=False)
+            stop_rc = stop_cluster_after_benchmark(container, nodes, is_solo)
+            if stop_rc != 0:
+                print(f"Warning: Failed to stop cluster cleanly (exit code {stop_rc}).")
+            return benchmark_rc
+
+        return 0
+        
     finally:
         # Cleanup temp script
         try:

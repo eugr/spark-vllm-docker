@@ -27,6 +27,18 @@ defaults:
   gpu_memory_utilization: 0.7
   max_model_len: 262144
 
+# Optional benchmarking (run after successful launch)
+benchmark:
+  framework: llama-benchy
+  args:
+    pp: [2048]
+    tg: [128]
+    depth: [0, 4096, 8192, 16384, 32768, 65535, 100000]
+    enable_prefix_caching: true
+    concurrency: [1,2,5,10]
+    save_result: benchmark_NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4.csv
+    format: csv
+
 # The vLLM serve command template
 command: |
   vllm serve nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4  \
