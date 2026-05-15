@@ -109,6 +109,7 @@ RUN --mount=type=cache,id=git-flashinfer,target=/git-cache/flashinfer \
         echo "=== Using cached FlashInfer repo ===" && \
         cp -a /git-cache/flashinfer /workspace/flashinfer && \
         cd /workspace/flashinfer && \
+        git remote set-url origin ${FLASHINFER_REPO} 2>/dev/null || true; \
         git fetch origin && git fetch origin --tags; \
     else \
         echo "=== Cloning FlashInfer (first build) ===" && \
@@ -129,6 +130,7 @@ RUN --mount=type=cache,id=git-cutlass,target=/git-cache/cutlass \
         echo "=== Using cached CUTLASS repo ===" && \
         cp -a /git-cache/cutlass 3rdparty/cutlass && \
         cd 3rdparty/cutlass && \
+        git remote set-url origin ${CUTLASS_REPO} 2>/dev/null || true; \
         git fetch origin && git fetch origin --tags; \
     else \
         echo "=== Cloning CUTLASS (first build) ===" && \
@@ -183,6 +185,7 @@ RUN --mount=type=cache,id=repo-cache,target=/repo-cache \
     else \
         echo "Cache hit: Fetching updates..." && \
         cd vllm-mxfp4 && \
+        git remote set-url origin ${VLLM_REPO} 2>/dev/null || true; \
         git fetch origin && \
         git fetch origin --tags && \
         (git checkout --detach origin/${VLLM_SHA} 2>/dev/null || git checkout ${VLLM_SHA}) && \
