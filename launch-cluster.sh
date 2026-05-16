@@ -373,6 +373,29 @@ if [[ -n "$LAUNCH_SCRIPT_PATH" ]]; then
     fi
 fi
 
+# Resolve local model mapping (if model-mapping.json exists)
+# For exec commands like "vllm serve org/model ...", check if the model has a local path mapping.
+# If found, add a volume mount and rewrite the model ID to the container path.
+if [[ -n "$COMMAND_TO_RUN" ]]; then
+    # Extract model ID: the token after "vllm serve"
+    _model_id=$(echo "$COMMAND_TO_RUN" | grep -oP 'vllm\s+serve\s+\K\S+' || true)
+    if [[ -n "$_model_id" ]]; then
+        _resolve_output=$("$SCRIPT_DIR/resolve-model.py" "$_model_id" 2>/dev/null) && {
+            eval "$_resolve_output"
+            echo "Local model mapping found for '$_model_id'"
+            echo "  Local path: $LOCAL_PATH"
+            echo "  Container path: $CONTAINER_PATH"
+            echo "  Served model name: $SERVED_MODEL_NAME"
+            DOCKER_ARGS="$DOCKER_ARGS $DOCKER_MOUNT"
+            COMMAND_TO_RUN="${COMMAND_TO_RUN/$_model_id/$CONTAINER_PATH}"
+            # Append --served-model-name if not already present
+            if ! echo "$COMMAND_TO_RUN" | grep -q -- '--served-model-name'; then
+                COMMAND_TO_RUN="$COMMAND_TO_RUN --served-model-name '$SERVED_MODEL_NAME'"
+            fi
+        }
+    fi
+fi
+
 # Validate MOD_PATHS if set
 for i in "${!MOD_PATHS[@]}"; do
     mod_path="${MOD_PATHS[$i]}"

@@ -22,6 +22,7 @@ While it was primarily developed to support multi-node inference, it works just 
 - [9. Fastsafetensors](#9-fastsafetensors)
 - [10. Benchmarking](#10-benchmarking)
 - [11. Downloading Models](#11-downloading-models)
+- [12. Using predownloaded models](#12-using-predownloaded-models)
 
 ## DISCLAIMER
 
@@ -1486,7 +1487,7 @@ The `hf-download.sh` script provides a convenient way to download models from Hu
 
 ### Usage
 
-**Download a model (local only):**
+**Download a model (to this Spark only):**
 
 ```bash
 ./hf-download.sh QuantTrio/MiniMax-M2-AWQ
@@ -1539,3 +1540,15 @@ When `-c` is given without explicit hosts, the script checks `COPY_HOSTS` in `.e
 ### Hardware Architecture
 
 **Note:** This project targets `12.1a` architecture (NVIDIA GB10 / DGX Spark). If you are using different hardware, you can use `--gpu-arch` flag in `./build-and-copy.sh`.
+
+## 12\. Using predownloaded models
+
+This project's conventions use HuggingFace repo names to identify a model, such as `google/gemma-4-26B-A4B-it`. Recipes use HF repo names.
+
+For people who wish to use models they already downloaded, such as `/mnt/usbdrive/gemma-4-26B-A4B-it` we have a workaround: the **model-mapping.json** file.
+
+Guide:
+
+1. `cp model-mapping.json.example model-mapping.json`
+2. Edit model-mapping.json with entries for your local models. local_path is required, served_model_name is optional. Note: you cannot use environment variables like $HOME in the path. Use ~ for home, or better yet use absolute paths.
+3. If you have a Spark cluster, it's up to you to ensure on your own that the same model exists at the same local_path on all Sparks

@@ -1,0 +1,9 @@
+{
+  "google/some-imaginary-gemma-model": {
+    "local_path": "/mnt/usbdrive/google/gemma-4-26B-A4B-it",
+    "served_model_name": "Gemma 4 MoE"
+  },
+  "Qwen/some-qwen-model": {
+    "local_path": "~/models/Qwen/Qwen3.6-27B"
+  }
+}
