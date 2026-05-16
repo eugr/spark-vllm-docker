@@ -1,2 +1,4 @@
 .env
 build-metadata.yaml
+model-mapping.json
+__pycache__/

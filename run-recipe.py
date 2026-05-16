@@ -107,6 +107,12 @@ DOWNLOAD_SCRIPT = SCRIPT_DIR / "hf-download.sh"
 AUTODISCOVER_SCRIPT = SCRIPT_DIR / "autodiscover.sh"
 ENV_FILE = None  # Will be set from CLI argument or default
 
+# Import resolve-model helper for local model mapping
+import importlib.util as _imputil
+_spec = _imputil.spec_from_file_location("resolve_model", SCRIPT_DIR / "resolve-model.py")
+_resolve_model = _imputil.module_from_spec(_spec)
+_spec.loader.exec_module(_resolve_model)
+
 
 def load_recipe(recipe_path: Path) -> dict[str, Any]:
     """
@@ -937,6 +943,15 @@ Examples:
     model = recipe.get("model")
     build_args = recipe.get("build_args", [])
 
+    # Check for local model mapping
+    model_mapping = _resolve_model.resolve(model) if model else None
+    if model_mapping:
+        print(f"Local model mapping found for '{model}'")
+        print(f"  Local path: {model_mapping['local_path']}")
+        print(f"  Container path: {model_mapping['container_path']}")
+        print(f"  Served model name: {model_mapping['served_model_name']}")
+        print()
+
     # Parse nodes - check command line first, then .env file, then autodiscover
     nodes = parse_nodes(args.nodes) if not args.solo else []
     nodes_from_env = False
@@ -1094,7 +1109,17 @@ Examples:
             return 0
 
     # --- Download Phase ---
-    if model and (args.download_only or args.setup or args.force_download):
+    # Skip download if a local model mapping exists (model is already on disk)
+    if model_mapping and (args.download_only or args.setup or args.force_download):
+        if args.dry_run:
+            print(f"Skipping download: local model mapping found for '{model}'")
+            print()
+        else:
+            print(f"Skipping download: using local model at {model_mapping['local_path']}")
+            print()
+        if args.download_only:
+            return 0
+    elif model and (args.download_only or args.setup or args.force_download):
         if args.dry_run:
             model_exists = check_model_exists(model)
             if args.force_download or not model_exists:
@@ -1182,6 +1207,15 @@ Examples:
                     print(
                         f"         vLLM uses last value; extra args appear after template substitution"
                     )
+
+    # Apply local model mapping: rewrite model ID in command and add --served-model-name
+    if model_mapping and model:
+        recipe = {**recipe}  # shallow copy to avoid mutating original
+        recipe["command"] = recipe["command"].replace(model, model_mapping["container_path"])
+        if extra_args is None:
+            extra_args = []
+        if not any("--served-model-name" in a for a in extra_args):
+            extra_args.extend(["--served-model-name", model_mapping["served_model_name"]])
 
     # Generate launch script
     script_content = generate_launch_script(
@@ -1327,8 +1361,15 @@ Examples:
             print("Mode: Solo")
         print()
 
+        # Set up environment, adding local model volume mount if needed
+        run_env = None
+        if model_mapping:
+            run_env = os.environ.copy()
+            extra_docker = run_env.get("VLLM_SPARK_EXTRA_DOCKER_ARGS", "")
+            run_env["VLLM_SPARK_EXTRA_DOCKER_ARGS"] = f"{extra_docker} {model_mapping['docker_mount']}".strip()
+
         # Execute
-        result = subprocess.run(cmd)
+        result = subprocess.run(cmd, env=run_env)
         return result.returncode
 
     finally:
