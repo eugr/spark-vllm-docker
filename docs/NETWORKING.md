@@ -1,9 +1,9 @@
 # DGX Spark Networking
 
-The following guide is for two node cluster, but it is also applicable to larger clusters.
+The following guide starts with a two-node cluster, but it is also applicable to larger clusters.
 
 See [this post](https://forums.developer.nvidia.com/t/6x-spark-setup/354399/56) for an example of 6-8 node Spark cluster.
-Please keep in mind that to get the most from vLLM you need to have number of nodes that corresponds to power of 2 - e.g. 2, 4 or 8 nodes. 
+Please keep in mind that tensor-parallel vLLM deployments usually work best with a number of nodes that corresponds to a power of 2, such as 2, 4, or 8 nodes. A 3-node mesh is mainly useful for pipeline parallelism or data parallelism.
 
 The guide assumes that the nodes are named `spark` and `spark2`, but you can use any names.
 Same with IP addresses: we use `192.168.177.0/24` subnet with `.11` and `.12` assigned to both nodes, but you can use any IP addresses, as long as they are in the same subnet.
@@ -45,7 +45,7 @@ If you connect 3 Sparks by daisy-chaining them, you will only be able to sustain
 ## Connecting 3 Sparks in a mesh cluster without a switch
 
 Three Sparks can be connected together in a cluster without using a separate RoCE switch.
-However, all three Sparks need to be on the same wired network using it's 10G Ethernet port (RG-45, not QSFP). Being on a same wireless network should work too, but it's not recommended and was not tested.
+However, all three Sparks need to be on the same wired network using their 10G Ethernet ports (RJ-45, not QSFP). Being on the same wireless network should work too, but it's not recommended and was not tested.
 
 You need to make sure they are connected the following way: port 0 on one Spark should connect to port 1 on another Spark (unlike non-mesh configuration).
 Example diagram:
@@ -90,7 +90,7 @@ Please refer to [this post](https://forums.developer.nvidia.com/t/6x-spark-setup
 
 ### For dual Sparks or multiple Sparks using a QSFP switch
 
-Assuming both are connected using rightmost QFSP port (when looking from the back).
+Assuming both are connected using rightmost QSFP port (when looking from the back).
 
 Create `/etc/netplan/40-cx7.yaml` on `spark`:
 ```yaml
@@ -359,7 +359,7 @@ From https://build.nvidia.com/spark/nccl/stacked-sparks
 ```bash
 # Install dependencies and build NCCL
 sudo apt-get update && sudo apt-get install -y libopenmpi-dev
-git clone -b v2.28.3-1 https://github.com/NVIDIA/nccl.git ~/nccl/
+git clone -b v2.30u1 https://github.com/NVIDIA/nccl.git ~/nccl/
 cd ~/nccl/
 make -j src.build NVCC_GENCODE="-gencode=arch=compute_121,code=sm_121"
 
@@ -402,7 +402,7 @@ mpirun -np 2 -H 192.168.177.11:1,192.168.177.12:1 \
 ```bash
 # Install dependencies and build NCCL
 sudo apt-get update && sudo apt-get install -y libopenmpi-dev
-git clone -b dgxspark-3node-ring https://github.com/zyang-dev/nccl.git ~/nccl/
+git clone -b v2.30u1 https://github.com/NVIDIA/nccl.git ~/nccl/
 cd ~/nccl/
 make -j src.build NVCC_GENCODE="-gencode=arch=compute_121,code=sm_121"
 
@@ -422,13 +422,13 @@ cd ~/nccl-tests/
 make MPI=1
 ```
 
-Test on both nodes (replace spark1, spark2, spark3 with the actual hostnames or IP address on non-QSFP interface):
+Test on all three nodes (replace `spark1`, `spark2`, and `spark3` with the actual hostnames or IP addresses on the non-QSFP interface):
 
 ```bash
 # Set environment variables
 export CUDA_HOME="/usr/local/cuda"
 export MPI_HOME="/usr/lib/aarch64-linux-gnu/openmpi"
-export NCCL_HOME="$HOME/nccl_spark_cluster/build/"
+export NCCL_HOME="$HOME/nccl/build/"
 export LD_LIBRARY_PATH="$NCCL_HOME/lib:$CUDA_HOME/lib64/:$MPI_HOME/lib:$LD_LIBRARY_PATH"
 
 # For 3-node mesh we have to use 10G interface for OOB communication!
@@ -438,7 +438,7 @@ export OMPI_MCA_btl_tcp_if_include=enP7s7
 export NCCL_IB_HCA=rocep1s0f0,roceP2p1s0f0,rocep1s0f1,roceP2p1s0f1
 export NCCL_IB_DISABLE=0
 
-# Run the all_gather performance test across both nodes
+# Run the all_gather performance test across all three nodes
 mpirun -np 3 -H spark1:1,spark2:1,spark3:1 \
   --mca plm_rsh_agent "ssh -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no" \
   -x LD_LIBRARY_PATH=$LD_LIBRARY_PATH -x NCCL_IB_MERGE_NICS=0 -x NCCL_NET_PLUGIN=none -x NCCL_IB_SUBNET_AWARE_ROUTING=1 \
