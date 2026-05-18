@@ -73,7 +73,11 @@ ENV TRITON_PTXAS_PATH=/usr/local/cuda/bin/ptxas
 WORKDIR $VLLM_BASE_DIR
 
 # Build NCCL with mesh support (TODO: only do it if arch is 12.1) - artifacts will be in /workspace/nccl/build/pkg/deb
-RUN git clone -b dgxspark-3node-ring https://github.com/zyang-dev/nccl.git && \
+# RUN git clone -b dgxspark-3node-ring https://github.com/zyang-dev/nccl.git && \
+#     cd nccl && make -j ${BUILD_JOBS} src.build NVCC_GENCODE="-gencode=arch=compute_121,code=sm_121" && \
+#     make pkg.debian.build && apt install -y --no-install-recommends --allow-downgrades ./build/pkg/deb/*.deb
+
+RUN git clone -b v2.30u1 https://github.com/NVIDIA/nccl.git && \
     cd nccl && make -j ${BUILD_JOBS} src.build NVCC_GENCODE="-gencode=arch=compute_121,code=sm_121" && \
     make pkg.debian.build && apt install -y --no-install-recommends --allow-downgrades ./build/pkg/deb/*.deb
 
@@ -221,15 +225,15 @@ RUN if [ -n "$VLLM_PRS" ]; then \
         done; \
     fi
 
-# TEMPORARY PATCH for broken FP8 kernels - https://github.com/vllm-project/vllm/pull/35568
-RUN curl -fsL https://patch-diff.githubusercontent.com/raw/vllm-project/vllm/pull/35568.diff -o pr35568.diff \
-    && if git apply --reverse --check pr35568.diff 2>/dev/null; then \
-         echo "PR 35568 already applied, skipping."; \
-       else \
-         echo "Applying PR 35568..."; \
-         git apply -v --exclude="tests/*" pr35568.diff; \
-       fi \
-    && rm pr35568.diff
+# # TEMPORARY PATCH for broken FP8 kernels - https://github.com/vllm-project/vllm/pull/35568
+# RUN curl -fsL https://patch-diff.githubusercontent.com/raw/vllm-project/vllm/pull/35568.diff -o pr35568.diff \
+#     && if git apply --reverse --check pr35568.diff 2>/dev/null; then \
+#          echo "PR 35568 already applied, skipping."; \
+#        else \
+#          echo "Applying PR 35568..."; \
+#          git apply -v --exclude="tests/*" pr35568.diff; \
+#        fi \
+#     && rm pr35568.diff
 
 # TEMPORARY PATCH: revert vLLM PR #41524 / commit c51df430,
 # which disables FlashInfer autotune and regresses DGX Spark throughput.
