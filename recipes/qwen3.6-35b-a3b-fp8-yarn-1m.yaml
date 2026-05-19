@@ -48,6 +48,6 @@ command: |
     --attention-backend flashinfer \
     --enable-prefix-caching \
     --chat-template fixed_chat_template.jinja \
-    --hf-overrides '{{"rope_scaling":{{"rope_type":"yarn","factor":4.0,"original_max_position_embeddings":262144}}}}'
+    --hf-overrides '{{"rope_scaling":{{"rope_type":"yarn","factor":4.0,"original_max_position_embeddings":262144}}}}' \
     -tp {tensor_parallel} \
     --distributed-executor-backend ray
