@@ -1,10 +1,10 @@
 
 # vLLM Docker Optimized for DGX Spark (single or multi-node)
 
-This repository contains the Docker configuration and startup scripts to run a multi-node vLLM inference cluster using Ray. It supports InfiniBand/RDMA (NCCL) and custom environment configuration for high-performance setups.
-Cluster setup supports direct connect between dual Sparks, connecting via QSFP/RoCE switch and 3-node mesh configuration.
+This repository contains the Docker configuration and startup scripts to run vLLM on DGX Spark, from a single node to multi-node clusters using Ray or vLLM's native PyTorch distributed mode. It supports InfiniBand/RDMA (NCCL), custom environment configuration, and high-performance model loading through fastsafetensors and InstantTensor.
+Cluster setup supports direct connections between dual Sparks, QSFP/RoCE switch configurations, and 3-node mesh configurations.
 
-While it was primarily developed to support multi-node inference, it works just as well on a single node setups.
+While it was primarily developed to support multi-node inference, it works just as well on single-node setups.
 
 ## Table of Contents
 
@@ -14,14 +14,13 @@ While it was primarily developed to support multi-node inference, it works just 
 - [1. Building the Docker Image](#1-building-the-docker-image)
 - [2. Launching the Cluster (Recommended)](#2-launching-the-cluster-recommended)
 - [3. Running the Container (Manual)](#3-running-the-container-manual)
-- [4. Using `run-cluster-node.sh` (Internal)](#4-using-run-cluster-nodesh-internal)
-- [5. Configuration Details](#5-configuration-details)
-- [6. Mods and Patches](#6-mods-and-patches)
-- [7. Launch Scripts](#7-launch-scripts)
-- [8. Using cluster mode for inference](#8-using-cluster-mode-for-inference)
-- [9. Fastsafetensors](#9-fastsafetensors)
-- [10. Benchmarking](#10-benchmarking)
-- [11. Downloading Models](#11-downloading-models)
+- [4. Configuration Details](#4-configuration-details)
+- [5. Mods and Patches](#5-mods-and-patches)
+- [6. Launch Scripts](#6-launch-scripts)
+- [7. Using cluster mode for inference](#7-using-cluster-mode-for-inference)
+- [8. Model Loading](#8-model-loading)
+- [9. Benchmarking](#9-benchmarking)
+- [10. Downloading Models](#10-downloading-models)
 
 ## DISCLAIMER
 
@@ -55,8 +54,7 @@ Build the container.
 
 **On DGX Spark cluster:**
 
-Make sure you connect your Sparks together and enable passwordless SSH as described in our [Networking Guide](docs/NETWORKING.md). You can also check out NVidia's [Connect Two Sparks Playbook](https://build.nvidia.com/spark/connect-two-sparks/stacked-sparks), but using our guide is the best way to get started.
-**NEW**: the guide now includes instructions on setting up 3-node Spark mesh!
+Make sure you connect your Sparks together and enable passwordless SSH as described in our [Networking Guide](docs/NETWORKING.md). You can also check out NVIDIA's [Connect Two Sparks Playbook](https://build.nvidia.com/spark/connect-two-sparks/stacked-sparks), but using our guide is the best way to get started. The guide includes instructions for 3-node Spark mesh clusters.
 
 Then run the following command that will build and distribute image across the cluster.
 
@@ -64,7 +62,7 @@ Then run the following command that will build and distribute image across the c
 ./build-and-copy.sh -c
 ```
 
-An initial build speed depends on your Internet connection speed and whether the base image is already present on your machine. After base image pull, the build should take only 2-3 minutes. If `--rebuild-vllm` and/or `--rebuild-flashinfer` is used to trigger a build from the sourcew, it will take between 20-40 minutes, but subsequent builds will be faster. Prebuilt FlashInfer and vLLM wheels are downloaded automatically from GitHub releases, so compilation from source is usually not required.
+An initial build speed depends on your Internet connection speed and whether the base image is already present on your machine. After base image pull, the build should take only 2-3 minutes. If `--rebuild-vllm` and/or `--rebuild-flashinfer` is used to trigger a source build, it will take between 20-40 minutes, but subsequent builds will be faster. Prebuilt FlashInfer and vLLM wheels are downloaded automatically from GitHub releases, so compilation from source is usually not required.
 
 ### Run
 
@@ -107,11 +105,11 @@ To launch the model:
   --reasoning-parser minimax_m2_append_think
 ```
 
-This will run the model on all available cluster nodes.
+The launcher will use the number of nodes required by the parallelism flags. In a 2-node cluster, this command uses both nodes; in a larger configured cluster, extra nodes are not utilized.
 
 **NOTE:** do not use `--load-format fastsafetensors` if you are loading models that would take >0.85 of available RAM (without KV cache) as it may result in out of memory situation.
 
-**Also:** You can use any vLLM container that has "bash" as its default entrypoint with the launch script. It was tested with NGC vLLM, but can work with others too. To use such container in the cluster, you need to specify `--apply-mod use-ngc-vllm` argument to `./launch-cluster.sh`. However, it's recommended to build the container using this repository for best compatibility and most up-to-date features. 
+**Also:** You can use other vLLM containers with the launch script as long as they have `bash` available. The launcher clears image entrypoints by default, to prevent containers such as `vllm-openai` to start vLLM before all necessary initialization is complete. However, it's recommended to build the container using this repository for best compatibility and most up-to-date features.
 
 **IMPORTANT**
 
@@ -134,6 +132,42 @@ Don't do it every time you rebuild, because it will slow down compilation times.
 For periodic maintenance, I recommend using a filter: `docker builder prune --filter until=72h`
 
 ## CHANGELOG
+
+### 2026-05-18
+
+#### NCCL Updated to NVIDIA `v2.30u1`
+
+The Dockerfile now builds NCCL from NVIDIA's `v2.30u1` branch instead of the custom NCCL fork. This branch incorporates all features of the custom fork and is based on the latest NCCL release. The networking guide's NCCL test commands have been updated to use the same branch for 3-node mesh clusters.
+
+### 2026-05-14
+
+#### Default Entrypoint Clearing
+
+`launch-cluster.sh` now clears the Docker image entrypoint by default when starting idle cluster containers. This allows images with server-style entrypoints, such as `vllm-openai`, to work with the same cluster launcher flow. Use `--keep-entrypoint` to preserve the image entrypoint.
+
+### 2026-05-10
+
+#### Qwen3.5-397B Recipe Memory Updates
+
+Updated Qwen3.5-397B AutoRound recipes to reduce OOM risk. The dual-node recipe now uses standard fractional `--gpu-memory-utilization`, and the 3-node pipeline-parallel recipe uses InstantTensor loading with lower memory pressure.
+
+### 2026-05-06
+
+#### Qwen3.6-35B-A3B-FP8 Recipes
+
+Added `qwen3.6-35b-a3b-fp8` and `qwen3.6-35b-a3b-fp8-dflash` recipes plus a dedicated Qwen3.6 chat-template mod. The DFlash recipe has prefix caching disabled because it caused accuracy issues.
+
+### 2026-04-29
+
+#### Gemma4 Recipe Fixes and Experimental b12x Mod
+
+The Gemma4-26B-A4B recipe now uses `safetensors` loading and no longer applies the obsolete tool parser mod by default.
+
+### 2026-04-25
+
+#### MiniMax-M2.7-AWQ Recipe
+
+Added `minimax-m2.7-awq`, a cluster-only MiniMax M2.7 AWQ recipe using `cyankiwi/MiniMax-M2.7-AWQ-4bit`.
 
 ### 2026-04-14
 
@@ -1048,32 +1082,33 @@ The `launch-cluster.sh` script simplifies the process of starting the cluster no
 
 ### Basic Usage
 
-**Start the container (auto-detects everything):**
+**Start idle cluster containers (auto-detects everything):**
 
 ```bash
-./launch-cluster.sh
+./launch-cluster.sh start
 ```
 
 This will:
 1.  Auto-detect the active InfiniBand and Ethernet interfaces.
 2.  Auto-detect the node IP.
-3.  Launch the container in interactive mode.
-4.  Start the Ray cluster node (head or worker depending on the IP).
+3.  Launch idle containers on the head and worker nodes.
+4.  Start the Ray cluster unless solo mode or `--no-ray` is selected.
 
 Assumptions and limitations:
 
-- It assumes that you've already set up passwordless SSH access on all nodes. If not, follow NVidia's [Connect Two Sparks Playbook](https://build.nvidia.com/spark/connect-two-sparks/stacked-sparks). I recommend setting up static IPs in the configuration instead of automatically assigning them every time, but this script should work with automatically assigned addresses too.
+- It assumes that you've already set up passwordless SSH access on all nodes. If not, follow NVIDIA's [Connect Two Sparks Playbook](https://build.nvidia.com/spark/connect-two-sparks/stacked-sparks). I recommend setting up static IPs in the configuration instead of automatically assigning them every time, but this script should work with automatically assigned addresses too.
 - By default, it assumes that the container image name is `vllm-node`. If it differs, you need to specify it with `-t <name>` parameter.
 - If both ConnectX **physical** ports are utilized, and both have IP addresses, it will use whatever interface it finds first. Use `--eth-if` to override.
 - It will ignore IPs associated with the 2nd "clone" of the physical interface. For instance, the outermost port on Spark has two logical Ethernet interfaces: `enp1s0f1np1` and `enP2p1s0f1np1`. Only `enp1s0f1np1` will be used. To override, use `--eth-if` parameter.
 - It assumes that the same physical interfaces are named the same on all nodes (IOW, enp1s0f1np1 refers to the same physical port on all nodes). If it's not the case, you will have to launch cluster nodes manually or modify the script.
-- It will mount only `~/.cache/huggingface` to the container by default. If you want to mount other caches, you'll have to pass set `VLLM_SPARK_EXTRA_DOCKER_ARGS` environment variable, e.g.: `VLLM_SPARK_EXTRA_DOCKER_ARGS="-v $HOME/.cache/vllm:/root/.cache/vllm" ./launch-cluster.sh ...`. Please note that you must use `$HOME` instead of `~` here as the latter won't be expanded if passed through the variable to docker arguments.
+- It clears the Docker image entrypoint by default so images that define an entrypoint, such as `vllm-openai`, can still start as idle cluster containers before commands are executed. Use `--keep-entrypoint` to keep the image entrypoint.
+- It mounts `~/.cache/huggingface`, `~/.cache/vllm`, `~/.cache/flashinfer`, and `~/.triton` by default. Use `--no-cache-dirs` to skip the vLLM/FlashInfer/Triton cache mounts. Add any other mounts with the `VLLM_SPARK_EXTRA_DOCKER_ARGS` environment variable, e.g. `VLLM_SPARK_EXTRA_DOCKER_ARGS="-v $HOME/my-data:/data" ./launch-cluster.sh ...`. Use `$HOME` instead of `~` because `~` will not expand when passed through the variable to Docker arguments.
 
 
 **Start in daemon mode (background):**
 
 ```bash
-./launch-cluster.sh -d
+./launch-cluster.sh -d start
 ```
 
 **Stop the container:**
@@ -1128,6 +1163,7 @@ You can override the auto-detected values if needed:
 | `--no-ray` | No-Ray mode: run multi-node vLLM without Ray (uses PyTorch distributed backend). |
 | `--master-port` / `--head-port` | Port for cluster coordination: Ray head port or PyTorch distributed master port (default: 29501). |
 | `--no-cache-dirs` | Do not mount default cache directories (~/.cache/vllm, ~/.cache/flashinfer, ~/.triton). |
+| `--keep-entrypoint` | Keep the Docker image entrypoint instead of clearing it before launching the idle cluster container. |
 | `--launch-script` | Path to bash script to execute in the container (from examples/ directory or absolute path). If launch script is specified, action should be omitted. |
 | `-d` | Run in daemon mode (detached). |
 | `--non-privileged` | Run in non-privileged mode (removes `--privileged` and `--ipc=host`). |
@@ -1137,7 +1173,7 @@ You can override the auto-detected values if needed:
 | `--shm-size-gb` | Shared memory size in GB (default: 64, only with `--non-privileged`). |
 | `--config <file>` | Path to `.env` configuration file (default: `.env` in script directory). |
 | `--setup` | Force autodiscovery and save configuration to `.env` (even if `.env` already exists). |
-| `start \| stop \| status \| exec` | Action to perform (default: `start`). Not compatible with `--launch-script`. |
+| `start \| stop \| status \| exec` | Action to perform. Use `start` for idle containers or `exec` to run a command. Not compatible with `--launch-script`. |
 | `command` | Command to execute inside the container (only for `exec` action). |
 
 ### Non-Privileged Mode
@@ -1165,7 +1201,7 @@ These resource limits can be customized:
 
 ## 3\. Running the Container (Manual)
 
-Ray and NCCL require specific Docker flags to function correctly across multiple nodes (Shared memory, Network namespace, and Hardware access).
+Manual `docker run` can be useful if you want full control over Docker parameters, but it's not recommended even for single Sparks. For multi-node Ray or no-Ray launches, use `launch-cluster.sh`; the old standalone `run-cluster-node.sh` flow has been removed and its logic is now integrated into the launcher.
 
 ```bash
 docker run -it --rm \
@@ -1178,40 +1214,9 @@ docker run -it --rm \
   vllm-node bash
 ```
 
-Or if you want to start the cluster node (head or regular), you can launch with the run-cluster.sh script (see details below):
+Inside the container, run `vllm serve ...` directly for solo inference.
 
-**On head node:**
-
-```bash
-docker run --privileged --gpus all -it --rm \
-  --ipc=host \
-  --network host \
-  --name vllm_node \
-  -v ~/.cache/huggingface:/root/.cache/huggingface \
-  vllm-node ./run-cluster-node.sh \
-    --role head \
-    --host-ip 192.168.177.11 \
-    --eth-if enp1s0f1np1 \
-    --ib-if rocep1s0f1,roceP2p1s0f1 
-```
-
-**On worker node**
-
-```bash
-docker run --privileged --gpus all -it --rm \
-  --ipc=host \
-  --network host \
-  --name vllm_node \
-  -v ~/.cache/huggingface:/root/.cache/huggingface \
-  vllm-node ./run-cluster-node.sh \
-    --role node \
-    --host-ip 192.168.177.12 \
-    --eth-if enp1s0f1np1 \
-    --ib-if rocep1s0f1,roceP2p1s0f1 \
-    --head-ip 192.168.177.11
-```
-
-**IMPORTANT**: use the IP addresses associated with ConnectX 7 interface, not with 10G or wireless one!
+**IMPORTANT**: for cluster commands, use the IP addresses associated with ConnectX 7 interfaces, not the 10G or wireless interfaces.
 
 
 **Flags Explained:**
@@ -1222,65 +1227,7 @@ docker run --privileged --gpus all -it --rm \
 
 -----
 
-## 4\. Using `run-cluster-node.sh` (Internal)
-
-The script is used to configure the environment and launch Ray either in head or node mode.
-
-Normally you would start it with the container like in the example above, but you can launch it inside the Docker session manually if needed (but make sure it's not already running).
-
-### Syntax
-
-```bash
-./run-cluster-node.sh [OPTIONS]
-```
-
-| Flag | Long Flag | Description | Required? |
-| :--- | :--- | :--- | :--- |
-| `-r` | `--role` | Role of the machine: `head` or `node`. | **Yes** |
-| `-h` | `--host-ip` | The IP address of **this** specific machine (for ConnectX port, e.g. `enp1s0f1np1`). | **Yes** |
-| `-e` | `--eth-if` | ConnectX 7 Ethernet interface name (e.g., `enp1s0f1np1`). | **Yes** |
-| `-i` | `--ib-if` | ConnectX 7 InfiniBand interface name (e.g., `rocep1s0f1` - on Spark specifically you want to use both "twins": `rocep1s0f1,roceP2p1s0f1`). | **Yes** |
-| `-m` | `--head-ip` | The IP address of the **Head Node**. | Only if role is `node` |
-
-
-**Hint**: to decide which interfaces to use, you can run `ibdev2netdev`. You will see an output like this:
-
-```
-rocep1s0f0 port 1 ==> enp1s0f0np0 (Down)
-rocep1s0f1 port 1 ==> enp1s0f1np1 (Up)
-roceP2p1s0f0 port 1 ==> enP2p1s0f0np0 (Down)
-roceP2p1s0f1 port 1 ==> enP2p1s0f1np1 (Up)
-```
-
-Each physical port on Spark has two pairs of logical interfaces in Linux. 
-Current NVIDIA guidance recommends using only one of them, in this case it would be `enp1s0f1np1` for Ethernet, but use **both** `rocep1s0f1,roceP2p1s0f1` for IB.
-
-You need to make sure you allocate IP addresses to them (no need to allocate IP to their "twins").
-
-### Example: Starting inside the Head Node
-
-```bash
-./run-cluster-node.sh \
-  --role head \
-  --host-ip 192.168.177.11 \
-  --eth-if enp1s0f1np1 \
-  --ib-if rocep1s0f1,roceP2p1s0f1
-```
-
-### Example: Starting inside a Worker Node
-
-```bash
-./run-cluster-node.sh \
-  --role node \
-  --host-ip 192.168.177.12 \
-  --eth-if enp1s0f1np1 \
-  --ib-if rocep1s0f1,roceP2p1s0f1 \
-  --head-ip 192.168.177.11
-```
-
------
-
-## 5\. Configuration Details
+## 4\. Configuration Details
 
 ### Cluster Configuration (`.env` file)
 
@@ -1339,15 +1286,15 @@ Autodiscovery:
 
 ### Environment Persistence
 
-The script automatically appends exported variables to `~/.bashrc`. If you need to open a second terminal into the running container for debugging, simply run:
+The launcher injects node-specific environment variables with Docker `-e` flags when each container starts. If you need to open a second terminal into the running container for debugging, run:
 
 ```bash
 docker exec -it vllm_node bash
 ```
 
-All environment variables (NCCL, Ray, vLLM config) set by the startup script will be loaded automatically in this new session.
+The new shell inherits the container environment, including NCCL, Ray, and vLLM network settings.
 
-## 6\. Mods and Patches
+## 5\. Mods and Patches
 
 The vLLM Docker setup supports applying custom mods and patches to address specific model compatibility issues or apply experimental features. This functionality is primarily managed through the `--apply-mod` option in the cluster launch script.
 
@@ -1355,7 +1302,15 @@ The vLLM Docker setup supports applying custom mods and patches to address speci
 
 The repository includes several pre-configured mods in the `mods/` directory:
 
-- **fix-Salyut1-GLM-4.7-NVFP4/**: Contains patches glm4moe parser to work with fused QKV quantization scheme for Salyut1/GLM-4.7-NVFP4 quant of the newly released GLM 4.7 model.
+- **fix-Salyut1-GLM-4.7-NVFP4/**: Fixes the GLM4MoE parser for Salyut1/GLM-4.7-NVFP4 fused QKV quantization.
+- **fix-glm-4.7-flash-AWQ/**: Applies GLM-4.7-Flash-AWQ compatibility and performance fixes.
+- **fix-qwen3.5-chat-template/** and **fix-qwen3.6-chat-template/**: Install fixed chat templates used by the Qwen3.5 and Qwen3.6 recipes.
+- **fix-qwen3.5-autoround/**, **fix-qwen3-next-autoround/**, and **fix-qwen35-tp4-marlin/**: Model-specific Qwen AutoRound and Marlin compatibility fixes.
+- **fix-qwen3-coder-next/**: Qwen3-Coder-Next runtime and performance fixes.
+- **gpu-mem-util-gb/**: Adds experimental `--gpu-memory-utilization-gb` support.
+- **drop-caches/**: Periodically clears filesystem caches for large models running near the memory limit.
+- **nemotron-nano/** and **nemotron-super/**: Nemotron reasoning parser and model support helpers.
+- **exp-b12x/**: Experimental FlashInfer b12x support for builds that include the required upstream vLLM support.
 
 Each mod directory typically contains:
 - Patch files (`.patch`) for code modifications and/or other assets.
@@ -1392,14 +1347,14 @@ Mods can be used for:
 - Customizing vLLM behavior for specific workloads
 - Rapid iteration on development without rebuilding the entire image
 
-## 7\. Launch Scripts
+## 6\. Launch Scripts
 
 Launch scripts provide a simple way to define reusable model configurations. Instead of passing long command lines, you can create a bash script that is copied into the container and executed directly.
 
 ### Basic Usage
 
 ```bash
-# Use a launch script by name (looks in profiles/ directory)
+# Use a launch script by name (looks in examples/ directory)
 ./launch-cluster.sh --launch-script example-vllm-minimax
 
 # Use with explicit nodes
@@ -1440,42 +1395,50 @@ The `examples/` directory contains ready-to-use launch scripts:
 
 See [examples/README.md](examples/README.md) for detailed documentation and more examples.
 
-## 8\. Using cluster mode for inference
+## 7\. Using cluster mode for inference
 
-First, start follow the instructions above to start the head container on your first Spark, and node container on the second Spark.
-Then, on the first Spark, run vllm like this:
-
-```bash
-docker exec -it vllm_node bash -i -c "vllm serve RedHatAI/Qwen3-VL-235B-A22B-Instruct-NVFP4 --port 8888 --host 0.0.0.0 --gpu-memory-utilization 0.7 -tp 2 --distributed-executor-backend ray --max-model-len 32768"
-```
-
-Alternatively, run an interactive shell first:
+The preferred path is to let `launch-cluster.sh` start containers and run the command in one step:
 
 ```bash
-docker exec -it vllm_node
+./launch-cluster.sh exec vllm serve RedHatAI/Qwen3-VL-235B-A22B-Instruct-NVFP4 \
+  --port 8888 --host 0.0.0.0 \
+  --gpu-memory-utilization 0.7 \
+  -tp 2 \
+  --distributed-executor-backend ray \
+  --max-model-len 32768
 ```
 
-And execute vllm command inside.
+For no-Ray mode, add `--no-ray` before `exec` and omit the Ray backend flag. The launcher starts worker commands first, then runs the rank 0 command on the head node:
 
-## 9\. Fastsafetensors
+```bash
+./launch-cluster.sh --no-ray exec vllm serve RedHatAI/Qwen3-VL-235B-A22B-Instruct-NVFP4 \
+  --port 8888 --host 0.0.0.0 \
+  --gpu-memory-utilization 0.7 \
+  -tp 2 \
+  --max-model-len 32768
+```
 
-This build includes support for fastsafetensors loading which significantly improves loading speeds, especially on DGX Spark where MMAP performance is very poor currently.
-[Fasttensors](https://github.com/foundation-model-stack/fastsafetensors/) solve this issue by using more efficient multi-threaded loading while avoiding mmap.
+When parallelism flags are present, the launcher automatically trims the active node list or errors before startup if more nodes are required than configured.
 
-This build also implements an EXPERIMENTAL patch to allow use of fastsafetensors in a cluster configuration (it won't work without it!).
-Please refer to [this issue](https://github.com/foundation-model-stack/fastsafetensors/issues/36) for the details.
+## 8\. Model Loading
 
-To use this method, simply include `--load-format fastsafetensors` when running VLLM, for example:
+This build includes support for fastsafetensors and InstantTensor loading.
+
+[fastsafetensors](https://github.com/foundation-model-stack/fastsafetensors/) significantly improves loading speeds, especially on DGX Spark where MMAP performance is currently poor. It uses more efficient multi-threaded loading while avoiding mmap.
+
+To use it, include `--load-format fastsafetensors` when running vLLM:
 
 ```bash
 HF_HUB_OFFLINE=1 vllm serve openai/gpt-oss-120b --port 8888 --host 0.0.0.0 --trust_remote_code --swap-space 16 --gpu-memory-utilization 0.7 -tp 2 --distributed-executor-backend ray --load-format fastsafetensors
 ```
 
-## 10\. Benchmarking
+InstantTensor is available with `--load-format instanttensor`. Several large-model recipes use it to reduce load-time memory pressure.
+
+## 9\. Benchmarking
 
 I recommend using [llama-benchy](https://github.com/eugr/llama-benchy) - a new benchmarking tool that delivers results in the same format as llama-bench from llama.cpp suite.
 
-## 11\. Downloading Models
+## 10\. Downloading Models
 
 The `hf-download.sh` script provides a convenient way to download models from HuggingFace and distribute them across your cluster nodes. It uses Huggingface CLI via `uvx` for fast downloads and `rsync` for distribution across the cluster.
 
