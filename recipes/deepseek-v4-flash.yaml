@@ -9,7 +9,7 @@ build_args:
   - --vllm-repo
   - https://github.com/jasl/vllm.git
   - --vllm-ref
-  - b1c97ff068b23858a4759394f8d6c858d822c957
+  - codex/ds4-sm120-min-enable
   - --rebuild-vllm
 
 mods: []
@@ -19,10 +19,10 @@ defaults:
   host: 0.0.0.0
   tensor_parallel: 2
   pipeline_parallel: 1
-  gpu_memory_utilization: 0.9
+  gpu_memory_utilization: 0.85
   max_model_len: 200000
   max_num_batched_tokens: 4192
-  max_num_seqs: 20
+  max_num_seqs: 2
   block_size: 256
   served_model_name: deepseek-v4-flash
 
@@ -55,7 +55,6 @@ command: |
       --gpu-memory-utilization {gpu_memory_utilization} \
       --distributed-executor-backend mp \
       --compilation-config '{{"cudagraph_mode":"FULL_AND_PIECEWISE","custom_ops":["all"]}}' \
-      --speculative-config '{{"method":"mtp","num_speculative_tokens":2}}' \
       --tokenizer-mode deepseek_v4 \
       --tool-call-parser deepseek_v4 \
       --enable-auto-tool-choice \

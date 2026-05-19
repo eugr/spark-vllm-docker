@@ -190,6 +190,8 @@ ARG CACHEBUST_VLLM=1
 ARG VLLM_REF=main
 ARG VLLM_REPO=https://github.com/vllm-project/vllm.git
 
+# Checkout VLLM_REF whether it is passed as a branch name, tag, SHA,
+# refs/heads/<branch>, or refs/pull/<id>/head.
 # Smart Git Clone (Fetch changes instead of full re-clone)
 RUN --mount=type=cache,id=repo-cache,target=/repo-cache \
     cd /repo-cache && \
@@ -198,7 +200,11 @@ RUN --mount=type=cache,id=repo-cache,target=/repo-cache \
         git clone --recursive ${VLLM_REPO} vllm; \
         if [ "$VLLM_REF" != "main" ]; then \
             cd vllm && \
-            git checkout ${VLLM_REF}; \
+            case "${VLLM_REF}" in \
+                refs/heads/*) git checkout --detach "origin/${VLLM_REF#refs/heads/}" ;; \
+                refs/pull/*/head) git fetch origin "${VLLM_REF}:FETCH_HEAD" && git checkout --detach FETCH_HEAD ;; \
+                *) git checkout --detach "origin/${VLLM_REF}" 2>/dev/null || git checkout --detach "${VLLM_REF}" 2>/dev/null || git checkout "${VLLM_REF}" ;; \
+            esac; \
         fi; \
     else \
         echo "Cache hit: Fetching updates..." && \
@@ -206,9 +212,12 @@ RUN --mount=type=cache,id=repo-cache,target=/repo-cache \
         (git cherry-pick --abort >/dev/null 2>&1 || true) && \
         git reset --hard && \
         git remote set-url origin ${VLLM_REPO} && \
-        git fetch origin && \
-        git fetch origin --tags --force && \
-        (git checkout --detach origin/${VLLM_REF} 2>/dev/null || git checkout ${VLLM_REF}) && \
+        git fetch origin "+refs/heads/*:refs/remotes/origin/*" --tags --force && \
+        case "${VLLM_REF}" in \
+            refs/heads/*) git checkout --detach "origin/${VLLM_REF#refs/heads/}" ;; \
+            refs/pull/*/head) git fetch origin "${VLLM_REF}:FETCH_HEAD" && git checkout --detach FETCH_HEAD ;; \
+            *) git checkout --detach "origin/${VLLM_REF}" 2>/dev/null || git checkout --detach "${VLLM_REF}" 2>/dev/null || git checkout "${VLLM_REF}" ;; \
+        esac && \
         git submodule update --init --recursive && \
         git clean -fdx && \
         git gc --auto; \
