@@ -343,6 +343,17 @@ ENV PATH=$VLLM_BASE_DIR:$PATH
 RUN --mount=type=cache,id=uv-cache,target=/root/.cache/uv \
     uv pip install ray[default] fastsafetensors instanttensor
 
+# Audio modality support (iris senses).
+# vLLM is built from source above without the [audio] extra, so soundfile AND av
+# are both absent — every audio request 400s in load_audio ("Invalid or
+# unsupported audio file"), while image/video work (video uses the OpenCV loader
+# backend). soundfile (libsndfile) is vLLM's primary audio decode path; av
+# (PyAV/ffmpeg) is the fallback and also backs resample_audio_pyav; librosa
+# rounds out vLLM's `audio` extra. aarch64 binary wheels exist for all three.
+# Ref: iris plans/eval-harness.md v1.6.1 (senses modality × provider matrix).
+RUN --mount=type=cache,id=uv-cache,target=/root/.cache/uv \
+    uv pip install soundfile librosa av
+
 # Fix NCCL
 RUN rm /usr/local/lib/python3.12/dist-packages/nvidia/nccl/lib/libnccl.so.2 && \
     ln -s /usr/lib/aarch64-linux-gnu/libnccl.so.2 /usr/local/lib/python3.12/dist-packages/nvidia/nccl/lib/libnccl.so.2
