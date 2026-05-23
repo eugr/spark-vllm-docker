@@ -133,6 +133,25 @@ For periodic maintenance, I recommend using a filter: `docker builder prune --fi
 
 ## CHANGELOG
 
+### 2026-05-22
+
+#### New Mod: `use-official-vllm`
+
+Added `mods/use-official-vllm`, a prerequisite mod for applying patches inside official vLLM Docker containers (e.g. `vllm-openai`). Official containers do not ship `git`, which several mods require. This mod installs `git` via `apt-get` if it is not already present.
+
+Apply it before any other mod that requires `git`:
+
+```bash
+./launch-cluster.sh -t vllm/vllm-openai:latest \
+  --apply-mod mods/use-official-vllm \
+  --apply-mod mods/gpu-mem-util-gb \
+  exec vllm serve ...
+```
+
+#### `gpu-mem-util-gb` Updated for Latest vLLM Main
+
+Updated `mods/gpu-mem-util-gb` patch to apply cleanly against the current vLLM `main` branch. The mod now checks for `git` at startup and prints a hint to apply `mods/use-official-vllm` first if `git` is missing (relevant when using official vLLM containers).
+
 ### 2026-05-18
 
 #### NCCL Updated to NVIDIA `v2.30u1`
@@ -1311,6 +1330,7 @@ The repository includes several pre-configured mods in the `mods/` directory:
 - **drop-caches/**: Periodically clears filesystem caches for large models running near the memory limit.
 - **nemotron-nano/** and **nemotron-super/**: Nemotron reasoning parser and model support helpers.
 - **exp-b12x/**: Experimental FlashInfer b12x support for builds that include the required upstream vLLM support.
+- **use-official-vllm/**: Installs `git` inside official vLLM containers (Ubuntu/Debian-based) so that other mods that rely on `git apply` work correctly. Apply this mod first when using containers that do not ship `git` (e.g. `vllm-openai`).
 
 Each mod directory typically contains:
 - Patch files (`.patch`) for code modifications and/or other assets.
