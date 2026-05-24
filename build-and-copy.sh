@@ -145,6 +145,33 @@ data = json.load(sys.stdin)
 assets = [a for a in data.get("assets", [])
           if a["name"].startswith(prefix) and a["name"].endswith(".whl")]
 
+def local_wheels_valid(wdir, pfx):
+    """Check that local wheels matching prefix exist and are valid zip files."""
+    wheels = [os.path.join(wdir, f) for f in os.listdir(wdir)
+              if f.startswith(pfx) and f.endswith(".whl")]
+    if not wheels:
+        return False
+    for w in wheels:
+        try:
+            with open(w, "rb") as fh:
+                if fh.read(4) != b"PK\x03\x04":
+                    print("Corrupt wheel (bad zip header): " + os.path.basename(w), file=sys.stderr)
+                    return False
+        except OSError:
+            return False
+    return True
+
+def remove_corrupt_wheels(wdir, pfx):
+    """Remove corrupt wheels and their commit marker so they get re-downloaded."""
+    for f in os.listdir(wdir):
+        if f.startswith(pfx) and f.endswith(".whl"):
+            path = os.path.join(wdir, f)
+            os.remove(path)
+            print("Removed corrupt: " + f, file=sys.stderr)
+    commit_file = os.path.join(wdir, "." + pfx + "-commit")
+    if os.path.exists(commit_file):
+        os.remove(commit_file)
+
 if not assets:
     print("No assets found matching prefix: " + prefix, file=sys.stderr)
     sys.exit(1)
@@ -171,8 +198,12 @@ if os.path.exists(commit_file):
         local_commit = f.read().strip()
 
 if commit_hash and local_commit and local_commit[:len(commit_hash)] == commit_hash:
-    print("Commit hash matches (" + commit_hash + ") — wheels are up to date.", file=sys.stderr)
-    sys.exit(0)
+    if local_wheels_valid(wheels_dir, prefix):
+        print("Commit hash matches (" + commit_hash + ") — wheels are up to date.", file=sys.stderr)
+        sys.exit(0)
+    else:
+        print("Commit hash matches but local wheels are missing or corrupt — re-downloading.", file=sys.stderr)
+        remove_corrupt_wheels(wheels_dir, prefix)
 
 newest_remote_ts = max(
     datetime.strptime(a["updated_at"], "%Y-%m-%dT%H:%M:%SZ")
@@ -187,7 +218,11 @@ local_wheels = [
     if f.startswith(prefix) and f.endswith(".whl")
 ]
 if local_wheels and all(os.path.getmtime(p) >= newest_remote_ts for p in local_wheels):
-    sys.exit(0)
+    if local_wheels_valid(wheels_dir, prefix):
+        sys.exit(0)
+    else:
+        print("Local wheels are newer but corrupt — re-downloading.", file=sys.stderr)
+        remove_corrupt_wheels(wheels_dir, prefix)
 
 downloads = []
 for a in assets:
