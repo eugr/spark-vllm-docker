@@ -1,9 +1,10 @@
 # Recipe: Qwen3.5-122B-A10B-FP8
 # Qwen3.5-122B model in native FP8 quantization
+# Updated: 2026-03-27 with community optimizations
 
 recipe_version: "1"
 name: Qwen3.5-122B-FP8
-description: vLLM serving Qwen3.5-122B-FP8
+description: vLLM serving Qwen3.5-122B-FP8 with FP8 KV cache + speculative decoding
 
 # HuggingFace model to download (optional, for --download-model)
 model: Qwen/Qwen3.5-122B-A10B-FP8
@@ -27,10 +28,12 @@ defaults:
   max_model_len: 262144
   max_num_batched_tokens: 8192
 
-# Environment variables
-env: {}
+# Environment variables for optimization
+env:
+  VLLM_FLASHINFER_MOE_BACKEND: latency
+  PYTORCH_ALLOC_CONF: expandable_segments:True
 
-# The vLLM serve command template
+# The vLLM serve command template with ALL optimizations
 command: |
   vllm serve Qwen/Qwen3.5-122B-A10B-FP8 \
     --max-model-len {max_model_len} \
@@ -44,4 +47,10 @@ command: |
     --reasoning-parser qwen3 \
     --chat-template unsloth.jinja \
     -tp {tensor_parallel} --distributed-executor-backend ray \
-    --max-num-batched-tokens {max_num_batched_tokens}
+    --max-num-batched-tokens {max_num_batched_tokens} \
+    --kv-cache-dtype fp8 \
+    --swap-space 16 \
+    --max-num-seqs 4 \
+    --language-model-only \
+    --speculative-config '{"method":"mtp","num_speculative_tokens":1}' \
+    --enable-expert-parallel

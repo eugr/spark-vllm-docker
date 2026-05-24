@@ -1232,6 +1232,9 @@ Examples:
         if args.nccl_debug:
             cmd.extend(["--nccl-debug", args.nccl_debug])
 
+        for key, value in recipe.get("env", {}).items():
+            cmd.extend(["-e", f"{key}={value}"])
+
         for env_var in args.env_vars:
             cmd.extend(["-e", env_var])
 

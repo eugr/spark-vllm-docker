@@ -1,0 +1,62 @@
+# Recipe: GLM-5-INT4-AutoRound
+# Intel/GLM-5-int4-mixed-AutoRound — 744B total / 40B active MoE, mixed-precision INT4
+# Quantized by Intel AutoRound from zai-org/GLM-5 | Released: 2026-02-25
+#
+# Runs on ARK-4/6/7/8 only — ARK-1 (control node) stays 100% untouched
+# Container: vllm-node-noah-patched (transformers 5.4.0, on all 4 nodes, Marlin support)
+# conch is inert on non-Mamba architectures — GLM-5 uses standard DSA attention
+#
+# Memory math (TP=4, 121.7 GiB per node):
+#   Weights per node (INT4 mixed): ~86-93 GiB estimate
+#   gpu_memory_utilization_gb=98: requested=98 GiB
+#   Kernel headroom: 121.7 - ~15 GiB overhead - 98 = ~8.7 GiB ✓
+#   KV available: ~5-12 GiB per node (depends on actual weight load)
+#
+# Pre-launch: UVM flush on all 4 nodes (safe version — do NOT rmmod nvidia)
+#   for n in 104 106 107 108; do ssh novaadmin@192.168.1.$n \
+#     "sudo rmmod nvidia_uvm && sudo modprobe nvidia_uvm && sudo sync && echo 3 | sudo tee /proc/sys/vm/drop_caches"; done
+#
+# Model download (~372 GB, not cached): run with --download-model first
+#   ./run-recipe.sh glm-5-int4 -n 10.200.0.4,10.200.0.6,10.200.0.7,10.200.0.8 --download-model
+
+recipe_version: "1"
+name: glm-5-int4
+description: GLM-5 INT4 AutoRound - Intel 744B MoE, TP=4 on ARK-4/6/7/8
+
+model: Intel/GLM-5-int4-mixed-AutoRound
+
+cluster_only: true
+
+container: vllm-node-noah-patched
+
+mods:
+  - mods/gpu-mem-util-gb
+
+defaults:
+  port: 9000
+  host: 0.0.0.0
+  tensor_parallel: 4
+  gpu_memory_utilization: 98
+  max_model_len: 32768
+  max_num_batched_tokens: 4096
+
+env:
+  PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
+
+command: |
+  vllm serve Intel/GLM-5-int4-mixed-AutoRound \
+    --max-model-len {max_model_len} \
+    --max-num-seqs 4 \
+    --gpu-memory-utilization-gb {gpu_memory_utilization} \
+    --port {port} \
+    --host {host} \
+    --enforce-eager \
+    --enable-prefix-caching \
+    --enable-auto-tool-choice \
+    --tool-call-parser glm47 \
+    --reasoning-parser glm45 \
+    --max-num-batched-tokens {max_num_batched_tokens} \
+    --trust-remote-code \
+    --kv-cache-dtype fp8 \
+    -tp {tensor_parallel} \
+    --distributed-executor-backend ray

@@ -1,0 +1,71 @@
+# Recipe: GLM-5-FP8
+# zai-org/GLM-5-FP8 — 744B total / 40B active MoE, FP8 precision
+# Released: February 11, 2026 | License: MIT | #1 open-weight (Artificial Analysis Index: 50)
+#
+# Benchmarks: SWE-bench 77.8% | AIME 2026 92.7% | GPQA-Diamond 86.0%
+# Architecture: 256 experts / 8 activated, DeepSeek Sparse Attention (DSA), 128K context
+#
+# REQUIRES ALL 8 NODES (ARK-1 through ARK-8). TP must be 8.
+# NOTE: Running on ARK-1 displaces LiteLLM/Qdrant services for the duration.
+#
+# Memory math (TP=8, 121.69 GiB per node):
+#   Weights per node (FP8): ~88 GiB  (~704 GiB total / 8)
+#   gpu_memory_utilization=0.85 → 103.4 GiB requested
+#   Kernel headroom: 121.69 - 103.4 = ~18.3 GiB ✓ (safe, avoids kcompactd panic)
+#   KV available per node: ~10-12 GiB → ~80-96 GiB total KV cache
+#
+# Expected throughput: 8-10 tok/s (community confirmed on 8x DGX Spark)
+#   Target: ~25 tok/s once MTP speculative decoding stabilizes on SM121
+#
+# Pre-launch: Run UVM flush on all 8 nodes:
+#   sudo rmmod nvidia_uvm && sudo modprobe nvidia_uvm && sudo sync && echo 3 | sudo tee /proc/sys/vm/drop_caches
+
+recipe_version: "1"
+name: glm-5-fp8
+description: GLM-5 FP8 - zai-org 744B MoE, #1 open-weight model (TP=8, all 8 nodes)
+
+cluster_only: true
+
+container: vllm-node-tf5
+
+build_args:
+  - --tf5
+  - --rebuild-flashinfer
+  - --rebuild-vllm
+
+mods: []
+
+defaults:
+  port: 9000
+  host: 0.0.0.0
+  tensor_parallel: 8
+  gpu_memory_utilization: 0.85
+  max_model_len: 32768
+  max_num_batched_tokens: 4096
+  max_num_seqs: 4
+
+env:
+  PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
+  VLLM_USE_FLASHINFER_MOE_FP16: "1"
+  VLLM_USE_FLASHINFER_SAMPLER: "0"
+  OMP_NUM_THREADS: "4"
+
+command: |
+  vllm serve zai-org/GLM-5-FP8 \
+    --max-model-len {max_model_len} \
+    --max-num-seqs {max_num_seqs} \
+    --gpu-memory-utilization {gpu_memory_utilization} \
+    --port {port} \
+    --host {host} \
+    --load-format fastsafetensors \
+    --enable-prefix-caching \
+    --enable-auto-tool-choice \
+    --tool-call-parser glm47 \
+    --reasoning-parser glm45 \
+    --max-num-batched-tokens {max_num_batched_tokens} \
+    --trust-remote-code \
+    --kv-cache-dtype fp8 \
+    --compilation-config.cudagraph_mode none \
+    --attention-backend flashinfer \
+    -tp {tensor_parallel} \
+    --distributed-executor-backend ray

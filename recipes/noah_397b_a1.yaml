@@ -1,37 +1,38 @@
-# Recipe: Noah 397B — A0 TOPOLOGY TEST
-# Hypothesis A0: stop TP sharding entirely. Run TP=1 and use data-parallel expert
-# parallelism across 4 one-GPU nodes so in_proj_ba stays N=64 and avoids the
-# Marlin/Conch N=32 failure path without kernel patching.
+# Recipe: Noah 397B — A1 ARTIFACT TEST
+# Same topology as A0. Single change from A0: switch from Intel's AutoRound
+# checkpoint to the official Qwen GPTQ-Int4 artifact.
 #
-# Single change from baseline (noah-397b.yaml):
-#   - tensor_parallel: 1  (was 4)
-#   - data_parallel: 4
-#   - --enable-expert-parallel added
-#   - --data-parallel-backend ray added
-#   - VLLM_RAY_DP_PACK_STRATEGY=span added so one DP group can span nodes
-#   - fix-qwen35-tp4-marlin NOT included
+# Purpose:
+#   If A0 still fails, isolate whether the failure is primarily the model
+#   artifact/packing path rather than the TP topology.
+#
+# Topology (unchanged from A0):
+#   - TP=1
+#   - DP=4
+#   - --data-parallel-backend ray
+#   - --enable-expert-parallel
+#   - VLLM_RAY_DP_PACK_STRATEGY=span
+#   - no fix-qwen35-tp4-marlin
+#
+# Single change from A0:
+#   - model: Intel/Qwen3.5-397B-A17B-int4-AutoRound
+#       -> Qwen/Qwen3.5-397B-A17B-GPTQ-Int4
 #
 # Intended launch: 4 total nodes (1 head + 3 workers), 1 GPU per node.
 # Launch example:
-#   ./run-recipe.sh recipes/noah_397b_a0.yaml -n IP1,IP2,IP3,IP4
+#   ./run-recipe.sh recipes/noah_397b_a1.yaml -n IP1,IP2,IP3,IP4
 #
 # Confirmer:
-#   - startup log shows "-tp 1", "--data-parallel-size 4", "--data-parallel-backend ray"
+#   - same topology flags as A0 appear in startup log
 #   - determine_available_memory completes
 #   - Uvicorn running on http://0.0.0.0:9000
 #
 # Falsifier:
-#   - cudaErrorIllegalAddress in any kernel path after TP=1 + DP=4 is confirmed in logs
-#
-# Sources:
-#   - vLLM DP deployment docs: Ray mode supports single launch with
-#     --data-parallel-backend=ray and VLLM_RAY_DP_PACK_STRATEGY=span
-#   - vLLM EP docs: EP size is TP x DP, and TP=1 replicates attention weights
-#     while experts shard across EP ranks
+#   - same class of kernel crash under TP=1 + DP=4 + EP
 
 recipe_version: "1"
-name: noah-397b-a0
-description: Noah 397B A0 — TP=1 EP topology test (Intel AutoRound, no kernel patches)
+name: noah-397b-a1
+description: Noah 397B A1 — official Qwen GPTQ-Int4 on TP=1 DP=4 EP
 
 cluster_only: true
 container: vllm-node-noah-patched
@@ -56,7 +57,7 @@ env:
   VLLM_RAY_DP_PACK_STRATEGY: "span"
 
 command: |
-  vllm serve Intel/Qwen3.5-397B-A17B-int4-AutoRound \
+  vllm serve Qwen/Qwen3.5-397B-A17B-GPTQ-Int4 \
     --max-model-len {max_model_len} \
     --max-num-seqs 2 \
     --kv-cache-dtype fp8 \

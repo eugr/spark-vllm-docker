@@ -5,7 +5,7 @@ IMAGE_NAME="vllm-node"
 DEFAULT_CONTAINER_NAME="vllm_node"
 HF_CACHE_DIR="${HF_HOME:-$HOME/.cache/huggingface}"
 # Modify these if you want to pass additional docker args or set VLLM_SPARK_EXTRA_DOCKER_ARGS variable
-DOCKER_ARGS="-e NCCL_IGNORE_CPU_AFFINITY=1 -v $HF_CACHE_DIR:/root/.cache/huggingface"
+DOCKER_ARGS="--ulimit nofile=1048576:1048576 --ulimit nproc=1048576:1048576 -e NCCL_IGNORE_CPU_AFFINITY=1 -v $HF_CACHE_DIR:/root/.cache/huggingface"
 
 # Append additional arguments from environment variable
 if [[ -n "$VLLM_SPARK_EXTRA_DOCKER_ARGS" ]]; then
@@ -40,6 +40,7 @@ MOUNT_CACHE_DIRS="true"
 BUILD_JOBS=""
 NON_PRIVILEGED_MODE="false"
 CONTROL_IF=""
+CONTROL_IF_EXPLICIT="0"
 MEM_LIMIT_GB="110"
 MEM_SWAP_LIMIT_GB=""
 PIDS_LIMIT="4096"
@@ -89,7 +90,7 @@ while [[ "$#" -gt 0 ]]; do
         --name) CONTAINER_NAME="$2"; shift ;;
         --eth-if) ETH_IF="$2"; shift ;;
         --ib-if) IB_IF="$2"; shift ;;
-        --control-if) CONTROL_IF="$2"; shift ;;
+        --control-if) CONTROL_IF="$2"; CONTROL_IF_EXPLICIT="1"; shift ;;
         -e|--env) DOCKER_ARGS="$DOCKER_ARGS -e $2"; shift ;;
         -j) BUILD_JOBS="$2"; shift ;;
         --apply-mod) MOD_PATHS+=("$2"); shift ;;
@@ -276,6 +277,14 @@ for i in "${!MOD_PATHS[@]}"; do
     MOD_PATHS[$i]=$(realpath "$mod_path")
 done
 
+CLUSTER_LOCK_PATH="${VLLM_SPARK_CLUSTER_LOCK:-/tmp/vllm-spark-${CONTAINER_NAME}.lock}"
+CLUSTER_LOCK_WAIT_SEC="${VLLM_SPARK_CLUSTER_LOCK_WAIT_SEC:-1800}"
+exec 209>"$CLUSTER_LOCK_PATH"
+if ! flock -w "$CLUSTER_LOCK_WAIT_SEC" 209; then
+    echo "Error: cluster lock busy for '$CONTAINER_NAME': $CLUSTER_LOCK_PATH"
+    exit 1
+fi
+
 # --- Auto-Detection Logic ---
 # Source autodiscover module
 source "$(dirname "$0")/autodiscover.sh"
@@ -422,6 +431,11 @@ fi
 cleanup() {
     # Remove traps to prevent nested cleanup
     trap - EXIT INT TERM HUP
+
+    if [[ "${VLLM_SPARK_KEEP_FAILED_CONTAINERS:-0}" == "1" ]]; then
+        echo "Preserving cluster containers because VLLM_SPARK_KEEP_FAILED_CONTAINERS=1."
+        return
+    fi
 
     if [[ "$CLUSTER_WAS_RUNNING" == "true" ]]; then
         echo "Cluster was already running when script started. Skipping cleanup."
@@ -648,9 +662,19 @@ make_node_script() {
 copy_script_to_container() {
     local container="$1"; local script_path="$2"; local label="${3:-node}"
     echo "Copying launch script to $label..."
+    local expected_sha
+    expected_sha="$(sha256sum "$script_path" | awk '{print $1}')"
     docker exec "$container" mkdir -p /workspace
     docker cp "$script_path" "$container:/workspace/exec-script.sh" || { echo "Error: docker cp to $label failed"; exit 1; }
     docker exec "$container" chmod +x /workspace/exec-script.sh
+    local actual_sha
+    actual_sha="$(docker exec "$container" sha256sum /workspace/exec-script.sh | awk '{print $1}')"
+    if [[ "$actual_sha" != "$expected_sha" ]]; then
+        echo "Error: launch script checksum mismatch on $label"
+        echo "  source: $script_path $expected_sha"
+        echo "  container: /workspace/exec-script.sh $actual_sha"
+        exit 1
+    fi
 }
 
 # Copy a script file to a remote container via scp + docker cp
@@ -658,12 +682,41 @@ copy_script_to_worker() {
     local worker_ip="$1"; local container="$2"; local script_path="$3"
     echo "Copying launch script to worker $worker_ip..."
     local remote_tmp="/tmp/vllm_script_$(date +%s)_$RANDOM.sh"
+    local expected_sha
+    expected_sha="$(sha256sum "$script_path" | awk '{print $1}')"
     scp -o BatchMode=yes -o StrictHostKeyChecking=no "$script_path" "$worker_ip:$remote_tmp" || { echo "Error: scp to $worker_ip failed"; exit 1; }
     ssh -o BatchMode=yes -o StrictHostKeyChecking=no "$worker_ip" \
         "docker exec $container mkdir -p /workspace && \
          docker cp $remote_tmp $container:/workspace/exec-script.sh && \
          docker exec $container chmod +x /workspace/exec-script.sh && \
-         rm -f $remote_tmp" || { echo "Error: docker cp to worker $worker_ip failed"; exit 1; }
+         actual_sha=\$(docker exec $container sha256sum /workspace/exec-script.sh | awk '{print \$1}') && \
+         test \"\$actual_sha\" = '$expected_sha' && \
+         rm -f $remote_tmp" || { echo "Error: docker cp/checksum to worker $worker_ip failed"; exit 1; }
+}
+
+refresh_launch_script_on_running_cluster() {
+    if [[ -z "$LAUNCH_SCRIPT_PATH" ]]; then
+        return
+    fi
+
+    echo "Refreshing launch script on existing cluster before exec..."
+    local total_nodes=$(( 1 + ${#PEER_NODES[@]} ))
+    if [[ "$NO_RAY_MODE" == "true" ]]; then
+        local head_script; head_script=$(make_node_script "$LAUNCH_SCRIPT_PATH" "$total_nodes" "0" "$HEAD_CONTROL_IP")
+        copy_script_to_container "$CONTAINER_NAME" "$head_script" "head node ($HEAD_IP)"
+        rm -f "$head_script"
+
+        local rank=1
+        for i in "${!PEER_NODES[@]}"; do
+            worker_control="${PEER_CONTROL_NODES[$i]}"
+            local worker_script; worker_script=$(make_node_script "$LAUNCH_SCRIPT_PATH" "$total_nodes" "$rank" "$HEAD_CONTROL_IP")
+            copy_script_to_worker "$worker_control" "$CONTAINER_NAME" "$worker_script"
+            rm -f "$worker_script"
+            (( rank++ ))
+        done
+    else
+        copy_script_to_container "$CONTAINER_NAME" "$LAUNCH_SCRIPT_PATH" "head node"
+    fi
 }
 
 # Resolve the data-plane network interface for a node.
@@ -675,8 +728,8 @@ resolve_socket_if() {
     local if_name=""
 
     if [[ -z "$control_host" || "$control_host" == "$HEAD_CONTROL_IP" ]]; then
-        if [[ -n "$ETH_IF" ]] && ip -o link show "$ETH_IF" >/dev/null 2>&1; then
-            if_name="$ETH_IF"
+        if [[ -n "$ETH_IF" ]]; then
+            if_name=$(ip -o link show "$ETH_IF" 2>/dev/null | awk -F': ' '{print $2; exit}')
         fi
         if [[ -z "$if_name" ]]; then
             if_name=$(ip -o -4 addr show | awk -v ip="$node_ip" '$4 ~ "^" ip "/" {print $2; exit}')
@@ -684,7 +737,7 @@ resolve_socket_if() {
     else
         if [[ -n "$ETH_IF" ]]; then
             if_name=$(ssh -o BatchMode=yes -o StrictHostKeyChecking=no "$control_host" \
-                "if ip -o link show '$ETH_IF' >/dev/null 2>&1; then printf '%s' '$ETH_IF'; fi")
+                "ip -o link show '$ETH_IF' 2>/dev/null | awk -F': ' '{print \$2; exit}'")
         fi
         if [[ -z "$if_name" ]]; then
             if_name=$(ssh -o BatchMode=yes -o StrictHostKeyChecking=no "$control_host" \
@@ -708,8 +761,8 @@ resolve_control_socket_if() {
     local if_name=""
 
     if [[ -z "$control_host" || "$control_host" == "$HEAD_CONTROL_IP" ]]; then
-        if [[ -n "$CONTROL_IF" ]] && ip -o link show "$CONTROL_IF" >/dev/null 2>&1; then
-            if_name="$CONTROL_IF"
+        if [[ "$CONTROL_IF_EXPLICIT" == "1" && -n "$CONTROL_IF" ]]; then
+            if_name=$(ip -o link show "$CONTROL_IF" 2>/dev/null | awk -F': ' '{print $2; exit}')
         fi
         if [[ -z "$if_name" && -n "$control_host" ]]; then
             if_name=$(ip -o -4 addr show | awk -v ip="$control_host" '$4 ~ "^" ip "/" {print $2; exit}')
@@ -718,11 +771,11 @@ resolve_control_socket_if() {
             if_name=$(ip route get "$HEAD_CONTROL_IP" 2>/dev/null | awk '/dev/ {for (i = 1; i <= NF; ++i) if ($i == "dev") {print $(i + 1); exit}}')
         fi
     else
-        if [[ -n "$CONTROL_IF" ]]; then
+        if [[ "$CONTROL_IF_EXPLICIT" == "1" && -n "$CONTROL_IF" ]]; then
             if_name=$(ssh -o BatchMode=yes -o StrictHostKeyChecking=no "$control_host" \
-                "if ip -o link show '$CONTROL_IF' >/dev/null 2>&1; then printf '%s' '$CONTROL_IF'; fi")
+                "ip -o link show '$CONTROL_IF' 2>/dev/null | awk -F': ' '{print \$2; exit}'")
         fi
-        if [[ -z "$if_name" ]]; then
+        if [[ -z "$if_name" && -n "$control_host" ]]; then
             if_name=$(ssh -o BatchMode=yes -o StrictHostKeyChecking=no "$control_host" \
                 "ip -o -4 addr show | awk -v ip='$control_host' '\$4 ~ \"^\" ip \"/\" {print \$2; exit}'")
         fi
@@ -742,6 +795,13 @@ resolve_control_socket_if() {
 
 resolve_ib_hca_for_socket_if() {
     local socket_if="$1"
+
+    # Honor an explicit IB fabric override when the caller knows which RoCE
+    # plane is actually end-to-end reachable across a mixed cluster.
+    if [[ -n "$IB_IF" ]]; then
+        echo "$IB_IF"
+        return
+    fi
 
     case "$socket_if" in
         enp1s0f0np0|enP2p1s0f0np0)
@@ -784,7 +844,11 @@ get_env_flags() {
     local node_host_ip
     socket_if="$(resolve_socket_if "$node_ip" "$control_host")"
     control_socket_if="$(resolve_control_socket_if "$control_host")"
-    socket_ib_if="$(resolve_ib_hca_for_socket_if "$socket_if")"
+    if [[ -n "$IB_IF" ]]; then
+        socket_ib_if="$IB_IF"
+    else
+        socket_ib_if="$(resolve_ib_hca_for_socket_if "$socket_if")"
+    fi
     socket_ucx_devices="$(resolve_ucx_devices_for_ib_hca "$socket_ib_if")"
     node_host_ip="${control_host:-$node_ip}"
     printf -- '-e %s ' \
@@ -830,11 +894,19 @@ start_cluster() {
     check_cluster_running
 
     if [[ "$CLUSTER_WAS_RUNNING" == "true" ]]; then
+        if [[ "$ACTION" == "exec" && -n "$LAUNCH_SCRIPT_PATH" ]]; then
+            refresh_launch_script_on_running_cluster
+        fi
         return
     fi
 
-    # Build docker run arguments based on mode
-    local docker_args_common="--gpus all -d --rm --network host --name $CONTAINER_NAME $DOCKER_ARGS $IMAGE_NAME"
+    # Preserve containers by default. Startup failures are operational evidence;
+    # auto-removing them hides the logs needed to repair a failed lane.
+    local docker_rm_arg=""
+    if [[ "${VLLM_SPARK_AUTO_REMOVE_CONTAINERS:-0}" == "1" ]]; then
+        docker_rm_arg="--rm"
+    fi
+    local docker_args_common="--gpus all -d $docker_rm_arg --network host --name $CONTAINER_NAME $DOCKER_ARGS $IMAGE_NAME"
     local docker_caps_args=""
     local docker_resource_args=""
 
