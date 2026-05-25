@@ -29,3 +29,7 @@ echo "git not found; installing git with apt-get."
 run_as_root apt-get update
 run_as_root env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends git ca-certificates
 echo "Installed $(git --version)"
+
+# Install pytest (in case some mods/patches/PR require it for some reason)
+echo "Installing additional Python dependencies..."
+pip install pytest
