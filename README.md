@@ -1062,6 +1062,9 @@ Using a different username:
 | `--gpu-arch <arch>` | Target GPU architecture (default: `12.1a`) |
 | `--rebuild-flashinfer` | Skip prebuilt wheel download; force a fresh local FlashInfer build |
 | `--rebuild-vllm` | Force rebuild vLLM from source |
+| `--force-flashinfer-download` | Force download FlashInfer wheels, skipping cached wheel version checks |
+| `--force-vllm-download` | Force download vLLM wheels, skipping cached wheel version checks |
+| `--force-download` | Force download all prebuilt wheels, skipping cached wheel version checks |
 | `--vllm-ref <ref>` | vLLM commit SHA, branch or tag (default: `main`) |
 | `--flashinfer-ref <ref>` | FlashInfer commit SHA, branch or tag (default: `main`) |
 | `--apply-vllm-pr <pr-num>` | Apply a vLLM PR patch during build. Can be specified multiple times. |
