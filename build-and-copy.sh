@@ -106,13 +106,38 @@ copy_to_host() {
     fi
 }
 
+get_local_mtime() {
+    local path="$1"
+    stat -c %Y "$path" 2>/dev/null || stat -f %m "$path"
+}
+
+get_remote_asset_mtime() {
+    local url="$1"
+    curl -fsIL --connect-timeout 10 "$url" | python3 -c '
+import email.utils
+import sys
+
+last_modified = None
+for line in sys.stdin:
+    if line.lower().startswith("last-modified:"):
+        last_modified = line.split(":", 1)[1].strip()
+
+if not last_modified:
+    sys.exit(1)
+
+try:
+    print(int(email.utils.parsedate_to_datetime(last_modified).timestamp()))
+except Exception:
+    sys.exit(1)
+'
+}
+
 # try_download_wheels TAG PREFIX FORCE_DOWNLOAD
 # Downloads wheels matching PREFIX*.whl from a GitHub release.
-# Skip conditions (either is sufficient):
-#   1. Commit hash in release name matches ./wheels/.{PREFIX}-commit and matching wheels exist.
-#   2. All local wheels are newer than the latest GitHub asset (freshly built).
-# Unless FORCE_DOWNLOAD is true, only downloads a file when the remote asset is
-# newer than the local copy and the above skip conditions are not met.
+# Uses GitHub release pages and HTTP Last-Modified headers instead of GitHub API metadata.
+# Skips download only when all matching release assets are already present and
+# the release commit hash or asset timestamps indicate the local wheels are current.
+# When FORCE_DOWNLOAD is true, downloads every matching release asset.
 # On success, persists the release commit hash to ./wheels/.{PREFIX}-commit.
 # Returns 0 if all matching wheels are now available, 1 on any error.
 try_download_wheels() {
@@ -131,99 +156,118 @@ try_download_wheels() {
         return 1
     fi
 
-    local RELEASE_JSON
-    RELEASE_JSON=$(curl -sf --connect-timeout 10 \
-        "https://api.github.com/repos/$WHEELS_REPO/releases/tags/$TAG") || {
-        echo "Could not fetch release metadata for '$TAG' — skipping download."
+    local RELEASE_ASSETS_HTML
+    RELEASE_ASSETS_HTML=$(curl -sfL --connect-timeout 10 \
+        "https://github.com/$WHEELS_REPO/releases/expanded_assets/$TAG") || {
+        echo "Could not fetch release assets for '$TAG' — skipping download."
         return 1
     }
 
-    local DOWNLOAD_LIST
-    DOWNLOAD_LIST=$(echo "$RELEASE_JSON" | python3 -c '
-import json, sys, os, re
-from datetime import datetime, timezone
+    local RELEASE_ENTRIES
+    RELEASE_ENTRIES=$(printf '%s' "$RELEASE_ASSETS_HTML" | python3 -c '
+import html.parser, os, sys
+from urllib.parse import unquote, urlparse
 
-wheels_dir, prefix = sys.argv[1], sys.argv[2]
-force_download = sys.argv[3] == "true"
-data = json.load(sys.stdin)
-assets = [a for a in data.get("assets", [])
-          if a["name"].startswith(prefix) and a["name"].endswith(".whl")]
+repo, tag, prefix = sys.argv[1], sys.argv[2], sys.argv[3]
+asset_path_prefix = "/" + repo + "/releases/download/" + tag + "/"
 
-if not assets:
+class ReleaseAssetParser(html.parser.HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.hrefs = []
+
+    def handle_starttag(self, tag, attrs):
+        if tag != "a":
+            return
+        attrs = dict(attrs)
+        href = attrs.get("href")
+        if href:
+            self.hrefs.append(href)
+
+parser = ReleaseAssetParser()
+parser.feed(sys.stdin.read())
+
+seen = set()
+for href in parser.hrefs:
+    if not href.startswith(asset_path_prefix):
+        continue
+    name = unquote(os.path.basename(urlparse(href).path))
+    if not name.startswith(prefix) or not name.endswith(".whl"):
+        continue
+    if name in seen:
+        continue
+    seen.add(name)
+    print("https://github.com" + href + " " + name)
+
+if not seen:
     print("No assets found matching prefix: " + prefix, file=sys.stderr)
     sys.exit(1)
+' "$WHEELS_REPO" "$TAG" "$PREFIX") || return 1
 
-# Extract commit hash from the release name:
-#   FlashInfer: "Prebuilt FlashInfer Wheels (0.6.5-124a2d32-d20260305) - DGX Spark Only"
-#   vLLM:       "Prebuilt vLLM Wheels (0.16.1rc1.dev296+ga73af584f.d20260305.cu131) - DGX Spark only"
-release_name = data.get("name", "")
-commit_hash = None
+    local RELEASE_PAGE_HTML REMOTE_COMMIT
+    REMOTE_COMMIT=""
+    if RELEASE_PAGE_HTML=$(curl -sfL --connect-timeout 10 \
+        "https://github.com/$WHEELS_REPO/releases/tag/$TAG"); then
+        REMOTE_COMMIT=$(printf '%s' "$RELEASE_PAGE_HTML" | python3 -c '
+import re, sys
+
+prefix = sys.argv[1]
+html = sys.stdin.read()
+match = None
 if prefix.startswith("flashinfer"):
-    m = re.search(r"\([\d.]+\w*-([0-9a-f]{6,})-d\d{8}\)", release_name, re.IGNORECASE)
-    if m:
-        commit_hash = m.group(1)
+    match = re.search(r"\([\d.]+\w*-([0-9a-f]{6,})-d\d{8}\)", html, re.IGNORECASE)
 else:
-    m = re.search(r"\+g([0-9a-f]{6,})\.", release_name, re.IGNORECASE)
-    if m:
-        commit_hash = m.group(1)
-
-# Compare against the locally stored commit hash
-commit_file = os.path.join(wheels_dir, "." + prefix + "-commit")
-local_commit = None
-if os.path.exists(commit_file):
-    with open(commit_file) as f:
-        local_commit = f.read().strip()
-
-local_wheels = [
-    os.path.join(wheels_dir, f) for f in os.listdir(wheels_dir)
-    if f.startswith(prefix) and f.endswith(".whl")
-]
-
-if not force_download and local_wheels and commit_hash and local_commit and local_commit[:len(commit_hash)] == commit_hash:
-    print("Commit hash matches (" + commit_hash + ") — wheels are up to date.", file=sys.stderr)
-    sys.exit(0)
-
-newest_remote_ts = max(
-    datetime.strptime(a["updated_at"], "%Y-%m-%dT%H:%M:%SZ")
-            .replace(tzinfo=timezone.utc).timestamp()
-    for a in assets
-)
-
-# If local wheels (any version matching prefix) are all newer than the latest
-# GitHub asset, they were freshly built and should not be replaced.
-if not force_download and local_wheels and all(os.path.getmtime(p) >= newest_remote_ts for p in local_wheels):
-    sys.exit(0)
-
-downloads = []
-for a in assets:
-    local_path = os.path.join(wheels_dir, a["name"])
-    remote_ts = datetime.strptime(a["updated_at"], "%Y-%m-%dT%H:%M:%SZ") \
-                    .replace(tzinfo=timezone.utc).timestamp()
-    if force_download or not os.path.exists(local_path) or remote_ts > os.path.getmtime(local_path):
-        downloads.append(a["browser_download_url"] + " " + a["name"])
-
-if downloads:
-    if commit_hash:
-        print("#commit:" + commit_hash)
-    for d in downloads:
-        print(d)
-' "$WHEELS_DIR" "$PREFIX" "$FORCE_DOWNLOAD") || return 1
-
-    if [ -z "$DOWNLOAD_LIST" ]; then
-        echo "All $PREFIX wheels are up to date — skipping download."
-        return 0
+    match = re.search(r"\+g([0-9a-f]{6,})\.", html, re.IGNORECASE)
+if match:
+    print(match.group(1))
+' "$PREFIX")
     fi
 
-    # Parse the optional '#commit:HASH' sentinel emitted by the Python script
-    local REMOTE_COMMIT=""
     local DOWNLOAD_ENTRIES=""
-    while IFS= read -r LINE; do
-        if [[ "$LINE" == "#commit:"* ]]; then
-            REMOTE_COMMIT="${LINE#"#commit:"}"
-        elif [[ -n "$LINE" ]]; then
-            DOWNLOAD_ENTRIES+="$LINE"$'\n'
+    if [ "$FORCE_DOWNLOAD" = true ]; then
+        echo "Force downloading $PREFIX wheels from release '$TAG'..."
+        DOWNLOAD_ENTRIES="$RELEASE_ENTRIES"
+    else
+        local LOCAL_COMMIT=""
+        if [ -f "$WHEELS_DIR/.${PREFIX}-commit" ]; then
+            LOCAL_COMMIT=$(cat "$WHEELS_DIR/.${PREFIX}-commit")
         fi
-    done <<< "$DOWNLOAD_LIST"
+
+        local NEED_DOWNLOAD=false
+        local URL NAME
+        while IFS=' ' read -r URL NAME; do
+            [ -z "$URL" ] && continue
+            if [ ! -f "$WHEELS_DIR/$NAME" ]; then
+                NEED_DOWNLOAD=true
+                break
+            fi
+        done <<< "$RELEASE_ENTRIES"
+
+        if [ "$NEED_DOWNLOAD" = false ]; then
+            if [ -n "$REMOTE_COMMIT" ] && [ -n "$LOCAL_COMMIT" ] && [[ "$LOCAL_COMMIT" == "$REMOTE_COMMIT"* ]]; then
+                echo "Commit hash matches ($REMOTE_COMMIT) — wheels are up to date."
+                return 0
+            fi
+        fi
+
+        while [ "$NEED_DOWNLOAD" = false ] && IFS=' ' read -r URL NAME; do
+            [ -z "$URL" ] && continue
+            local LOCAL_TS REMOTE_TS
+            LOCAL_TS=$(get_local_mtime "$WHEELS_DIR/$NAME" 2>/dev/null || echo 0)
+            REMOTE_TS=$(get_remote_asset_mtime "$URL" 2>/dev/null || true)
+            if [ -z "$REMOTE_TS" ] || [ "$REMOTE_TS" -gt "$LOCAL_TS" ]; then
+                NEED_DOWNLOAD=true
+                break
+            fi
+        done <<< "$RELEASE_ENTRIES"
+
+        if [ "$NEED_DOWNLOAD" = false ]; then
+            echo "All $PREFIX wheels are up to date — skipping download."
+            return 0
+        fi
+
+        DOWNLOAD_ENTRIES="$RELEASE_ENTRIES"
+    fi
 
     if [ -z "$DOWNLOAD_ENTRIES" ]; then
         echo "All $PREFIX wheels are up to date — skipping download."
@@ -280,9 +324,9 @@ usage() {
     echo "  --gpu-arch <arch>             : GPU architecture (default: '12.1a')"
     echo "  --rebuild-flashinfer          : Force rebuild of FlashInfer wheels (ignore cached wheels)"
     echo "  --rebuild-vllm                : Force rebuild of vLLM wheels (ignore cached wheels)"
-    echo "  --force-flashinfer-download   : Force download of FlashInfer wheels (skip version checks)"
-    echo "  --force-vllm-download         : Force download of vLLM wheels (skip version checks)"
-    echo "  --force-download              : Force download of all prebuilt wheels (skip version checks)"
+    echo "  --force-flashinfer-download   : Force download of FlashInfer wheels (skip cached wheel checks)"
+    echo "  --force-vllm-download         : Force download of vLLM wheels (skip cached wheel checks)"
+    echo "  --force-download              : Force download of all prebuilt wheels (skip cached wheel checks)"
     echo "  --vllm-ref <ref>              : vLLM commit SHA, branch or tag (default: 'main')"
     echo "  --flashinfer-ref <ref>        : FlashInfer commit SHA, branch or tag (default: 'main')"
     echo "  -c, --copy-to <hosts>         : Host(s) to copy the image to. Accepts comma or space-delimited lists."
