@@ -347,12 +347,12 @@ RUN --mount=type=cache,id=uv-cache,target=/root/.cache/uv \
 # With --tf5: override vLLM's transformers<5 constraint to get transformers>=5
 RUN --mount=type=bind,source=wheels,target=/workspace/wheels \
     --mount=type=cache,id=uv-cache,target=/root/.cache/uv \
+    PINNED_TORCH=$(python3 -c "import torch; print(torch.__version__)") && \
+    echo "torch==${PINNED_TORCH}" > /tmp/wheel-override.txt && \
     if [ "$PRE_TRANSFORMERS" = "1" ]; then \
-        echo "transformers>=5.0.0" > /tmp/tf-override.txt && \
-        uv pip install /workspace/wheels/*.whl --override /tmp/tf-override.txt; \
-    else \
-        uv pip install /workspace/wheels/*.whl; \
-    fi
+        echo "transformers>=5.0.0" >> /tmp/wheel-override.txt; \
+    fi && \
+    uv pip install /workspace/wheels/*.whl --override /tmp/wheel-override.txt
 
 # Setup environment for runtime
 ARG TORCH_CUDA_ARCH_LIST="12.1a"
@@ -365,8 +365,13 @@ ENV PATH=$VLLM_BASE_DIR:$PATH
 
 
 # Final extra deps
+# Pin torch via --override so transitive deps (e.g. instanttensor) can't trigger
+# a re-resolve that swaps the CUDA-built torch for PyPI's CPU wheel.
 RUN --mount=type=cache,id=uv-cache,target=/root/.cache/uv \
-    uv pip install ray[default] fastsafetensors instanttensor
+    PINNED_TORCH=$(python3 -c "import torch; print(torch.__version__)") && \
+    echo "torch==${PINNED_TORCH}" > /tmp/torch-override.txt && \
+    uv pip install ray[default] fastsafetensors instanttensor \
+        --override /tmp/torch-override.txt
 
 # Fix NCCL
 RUN rm /usr/local/lib/python3.12/dist-packages/nvidia/nccl/lib/libnccl.so.2 && \
