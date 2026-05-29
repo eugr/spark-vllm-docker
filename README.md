@@ -153,7 +153,7 @@ To run NVFP4 version:
 Download the model:
 
 ```bash
-./hf-download stepfun-ai/Step-3.7-Flash-NVFP4 -c
+./hf-download.sh stepfun-ai/Step-3.7-Flash-NVFP4 -c
 ```
 
 Run:
