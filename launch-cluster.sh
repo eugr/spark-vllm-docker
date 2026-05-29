@@ -129,7 +129,10 @@ while [[ "$#" -gt 0 ]]; do
             fi
             ACTION="exec"
             shift
-            COMMAND_TO_RUN=$(printf "%q " "$@")
+            # This value is passed to `bash -c` inside the container. Quoting
+            # every token with `%q` turns `python3 -m ...` into one executable
+            # name (`python3 -m ...`) instead of a command plus arguments.
+            COMMAND_TO_RUN="$*"
             break
             ;;
         *) 
@@ -240,6 +243,62 @@ if [[ -n "$LAUNCH_SCRIPT_PATH" ]]; then
         ACTION="exec"
     fi
 fi
+
+launch_script_meta_value() {
+    local key="$1"
+    if [[ -z "$LAUNCH_SCRIPT_PATH" ]]; then
+        return 1
+    fi
+
+    awk -F: -v key="$key" '
+        $0 ~ "^# vllm-spark-" key ":" {
+            sub("^[^:]*:[[:space:]]*", "", $0)
+            print $0
+            exit
+        }
+    ' "$LAUNCH_SCRIPT_PATH"
+}
+
+preflight_launch_script_safety() {
+    if [[ -z "$LAUNCH_SCRIPT_PATH" ]]; then
+        return 0
+    fi
+    if [[ "$ACTION" != "start" && "$ACTION" != "exec" && "$CHECK_CONFIG" != "true" ]]; then
+        return 0
+    fi
+
+    local total_nodes=$(( 1 + ${#PEER_NODES[@]} ))
+    local blocked
+    blocked="$(launch_script_meta_value "blocked" || true)"
+    local min_nodes
+    min_nodes="$(launch_script_meta_value "min-nodes" || true)"
+    local safety_note
+    safety_note="$(launch_script_meta_value "safety-note" || true)"
+
+    if [[ "${blocked,,}" == "true" || "$blocked" == "1" ]]; then
+        if [[ "${VLLM_SPARK_ALLOW_UNSAFE_LAUNCH:-0}" != "1" ]]; then
+            echo "Error: launch script is blocked by safety metadata."
+            if [[ -n "$safety_note" ]]; then
+                echo "  Safety note: $safety_note"
+            fi
+            echo "  Override only for controlled experiments with VLLM_SPARK_ALLOW_UNSAFE_LAUNCH=1."
+            exit 78
+        fi
+        echo "Warning: overriding blocked launch script safety metadata."
+    fi
+
+    if [[ -n "$min_nodes" && "$min_nodes" =~ ^[0-9]+$ && "$total_nodes" -lt "$min_nodes" ]]; then
+        if [[ "${VLLM_SPARK_ALLOW_UNSAFE_LAUNCH:-0}" != "1" ]]; then
+            echo "Error: launch script requires at least $min_nodes nodes; configured $total_nodes."
+            if [[ -n "$safety_note" ]]; then
+                echo "  Safety note: $safety_note"
+            fi
+            echo "  Override only for controlled experiments with VLLM_SPARK_ALLOW_UNSAFE_LAUNCH=1."
+            exit 78
+        fi
+        echo "Warning: overriding launch script min-nodes=$min_nodes with configured nodes=$total_nodes."
+    fi
+}
 
 # Validate MOD_PATHS if set
 for i in "${!MOD_PATHS[@]}"; do
@@ -394,6 +453,7 @@ echo "Worker Control Nodes: ${PEER_CONTROL_NODES[*]}"
 echo "Container Name: $CONTAINER_NAME"
 echo "Image Name: $IMAGE_NAME"
 echo "Action: $ACTION"
+preflight_launch_script_safety
 
 # Check SSH connectivity to worker nodes
 if [[ "$ACTION" == "start" || "$ACTION" == "exec" || "$CHECK_CONFIG" == "true" ]]; then
