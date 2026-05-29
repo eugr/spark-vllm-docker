@@ -26,6 +26,7 @@ defaults:
   tensor_parallel: 2
   gpu_memory_utilization: 108
   max_model_len: 262144
+  max_num_seqs: 2
 
 # Environment variables
 env: {}
@@ -43,4 +44,6 @@ command: |
       --enable-auto-tool-choice \
       --reasoning-parser step3p5 \
       --tool-call-parser step3p5 \
-      --load-format safetensors
+      --load-format safetensors \
+      --kv-cache-dtype fp8 \
+      --max-num-seqs {max_num_seqs}
