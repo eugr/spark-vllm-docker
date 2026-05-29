@@ -141,13 +141,36 @@ Added support for StepFun [Step 3.7 Flash multimodal model](https://developer.nv
 
 Requires at least 2 Sparks in a cluster. Both FP8 and NVFP4 checkpoints are supported. FP8 requires more memory, so using NVFP4 is recommended.
 
+Update the repo and build a fresh container first:
+
+```bash
+git pull
+./build-and-copy.sh -c
+```
+
 To run NVFP4 version:
+
+Download the model:
+
+```bash
+./hf-download stepfun-ai/Step-3.7-Flash-NVFP4 -c
+```
+
+Run:
 
 ```bash
 ./run-recipe.sh step-3.7-flash-nvfp4 --no-ray
 ```
 
 To run FP8 version:
+
+Download the model:
+
+```bash
+./hf-download.sh stepfun-ai/Step-3.7-Flash-FP8 -c
+```
+
+Run:
 
 ```bash
 ./run-recipe.sh step-3.7-flash-fp8 --no-ray
