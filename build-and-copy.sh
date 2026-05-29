@@ -132,11 +132,50 @@ except Exception:
 '
 }
 
+local_wheels_are_newer_than_release() {
+    local wheels_dir="$1"
+    local prefix="$2"
+    local release_entries="$3"
+
+    local local_oldest_ts=""
+    local f local_ts
+    for f in "$wheels_dir/${prefix}"*.whl; do
+        [ -f "$f" ] || continue
+        local_ts=$(get_local_mtime "$f" 2>/dev/null || echo 0)
+        if [ -z "$local_oldest_ts" ] || [ "$local_ts" -lt "$local_oldest_ts" ]; then
+            local_oldest_ts="$local_ts"
+        fi
+    done
+
+    if [ -z "$local_oldest_ts" ] || [ "$local_oldest_ts" -eq 0 ]; then
+        return 1
+    fi
+
+    local remote_newest_ts=0
+    local url name remote_ts
+    while IFS=' ' read -r url name; do
+        [ -z "$url" ] && continue
+        remote_ts=$(get_remote_asset_mtime "$url" 2>/dev/null || true)
+        if [ -z "$remote_ts" ]; then
+            return 1
+        fi
+        if [ "$remote_ts" -gt "$remote_newest_ts" ]; then
+            remote_newest_ts="$remote_ts"
+        fi
+    done <<< "$release_entries"
+
+    if [ "$remote_newest_ts" -eq 0 ]; then
+        return 1
+    fi
+
+    [ "$local_oldest_ts" -ge "$remote_newest_ts" ]
+}
+
 # try_download_wheels TAG PREFIX FORCE_DOWNLOAD
 # Downloads wheels matching PREFIX*.whl from a GitHub release.
 # Uses GitHub release pages and HTTP Last-Modified headers instead of GitHub API metadata.
-# Skips download only when all matching release assets are already present and
-# the release commit hash or asset timestamps indicate the local wheels are current.
+# Skips download when exact release assets are current, or when a newer locally
+# built wheel set is present even if its filenames differ from the release.
 # When FORCE_DOWNLOAD is true, downloads every matching release asset.
 # On success, persists the release commit hash to ./wheels/.{PREFIX}-commit.
 # Returns 0 if all matching wheels are now available, 1 on any error.
@@ -234,14 +273,23 @@ if match:
         fi
 
         local NEED_DOWNLOAD=false
+        local RELEASE_ASSETS_PRESENT=true
         local URL NAME
         while IFS=' ' read -r URL NAME; do
             [ -z "$URL" ] && continue
             if [ ! -f "$WHEELS_DIR/$NAME" ]; then
-                NEED_DOWNLOAD=true
+                RELEASE_ASSETS_PRESENT=false
                 break
             fi
         done <<< "$RELEASE_ENTRIES"
+
+        if [ "$RELEASE_ASSETS_PRESENT" = false ]; then
+            if local_wheels_are_newer_than_release "$WHEELS_DIR" "$PREFIX" "$RELEASE_ENTRIES"; then
+                echo "Local $PREFIX wheels are newer than release '$TAG' — skipping download."
+                return 0
+            fi
+            NEED_DOWNLOAD=true
+        fi
 
         if [ "$NEED_DOWNLOAD" = false ]; then
             if [ -n "$REMOTE_COMMIT" ] && [ -n "$LOCAL_COMMIT" ] && [[ "$LOCAL_COMMIT" == "$REMOTE_COMMIT"* ]]; then
