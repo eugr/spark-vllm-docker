@@ -145,7 +145,7 @@ Update the repo and build a fresh container first:
 
 ```bash
 git pull
-./build-and-copy.sh -c
+./build-and-copy.sh --cleanup -c
 ```
 
 To run NVFP4 version:
