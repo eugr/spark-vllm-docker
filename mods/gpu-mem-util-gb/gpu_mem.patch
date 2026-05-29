@@ -23,8 +23,8 @@ index 4fa7e1cfc..2ba591e84 100644
              "is_attention_free",
              "num_gpu_blocks_override",
              "enable_prefix_caching",
-@@ -235,6 +242,18 @@ class CacheConfig:
-             object.__setattr__(self, "user_specified_mamba_block_size", True)
+@@ -242,6 +249,18 @@ class CacheConfig:
+             self.user_specified_mamba_block_size = True
          return self
  
 +    @model_validator(mode="after")
