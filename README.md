@@ -135,6 +135,26 @@ For periodic maintenance, I recommend using a filter: `docker builder prune --fi
 
 ### 2026-05-28
 
+#### StepFun Step 3.7 Flash Support
+
+Added support for StepFun [Step 3.7 Flash multimodal model](https://developer.nvidia.com/blog/run-step-3-7-flash-on-nvidia-gpus-with-enterprise-ready-multimodal-ai).
+
+Requires at least 2 Sparks in a cluster. Both FP8 and NVFP4 checkpoints are supported. FP8 requires more memory, so using NVFP4 is recommended.
+
+To run NVFP4 version:
+
+```bash
+./run-recipe.sh step-3.7-flash-nvfp4 --no-ray
+```
+
+To run FP8 version:
+
+```bash
+./run-recipe.sh step-3.7-flash-fp8 --no-ray
+```
+
+Please note that `--no-ray` is required for FP8 to fit with full context!
+
 #### `use-official-vllm` NCCL Workaround
 
 Updated `mods/use-official-vllm` to also handle the NCCL load-order bug tracked in [vllm-project/vllm#42354](https://github.com/vllm-project/vllm/issues/42354). When both the pip-installed `nvidia/nccl/lib/libnccl.so.2` and system `libnccl2` are present, the mod redirects the pip-installed NCCL path to the system `/usr/lib` soname, matching the manual workaround that fixes multi-node DGX Spark hangs.

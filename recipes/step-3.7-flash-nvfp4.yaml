@@ -1,0 +1,45 @@
+# Recipe: Step-3.7-Flash-NVFP4
+# Step 3.7 Flash model with NVFP4 quantization (2+ sparks only)
+
+recipe_version: "1"
+name: Step-3.7-Flash-NVFP4
+description: vLLM serving Step-3.7-Flash-NVFP4 on two Sparks
+
+# HuggingFace model to download (optional, for --download-model)
+model: stepfun-ai/Step-3.7-Flash-NVFP4
+
+# Container image to use
+container: vllm-node
+
+# Can only be run in a cluster
+cluster_only: true
+
+# No mods required
+mods:
+  - mods/step-3.7-flash
+
+# Default settings (can be overridden via CLI)
+defaults:
+  port: 8000
+  host: 0.0.0.0
+  tensor_parallel: 2
+  gpu_memory_utilization: 0.8
+  max_model_len: 262144
+
+# Environment variables
+env: {}
+
+# The vLLM serve command template
+command: |
+  vllm serve stepfun-ai/Step-3.7-Flash-NVFP4 \
+      --trust-remote-code \
+      --port {port} \
+      --host {host} \
+      --gpu-memory-utilization {gpu_memory_utilization} \
+      -tp {tensor_parallel} \
+      --distributed-executor-backend ray \
+      --max-model-len {max_model_len} \
+      --enable-auto-tool-choice \
+      --reasoning-parser step3p5 \
+      --tool-call-parser step3p5 \
+      --load-format instanttensor
