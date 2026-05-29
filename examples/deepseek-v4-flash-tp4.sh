@@ -7,9 +7,19 @@ set -euo pipefail
 MODEL_PATH="${MODEL_PATH:-/models/deepseek-v4-flash}"
 SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-deepseek-ai/DeepSeek-V4-Flash}"
 TP_SIZE="${TP_SIZE:-4}"
-MAX_MODEL_LEN="${MAX_MODEL_LEN:-65536}"
-MAX_NUM_SEQS="${MAX_NUM_SEQS:-1}"
-GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.72}"
+MAX_MODEL_LEN="${MAX_MODEL_LEN:-32768}"
+MAX_NUM_SEQS="${MAX_NUM_SEQS:-2}"
+GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.60}"
+ENFORCE_EAGER="${ENFORCE_EAGER:-1}"
+LINEAR_BACKEND="${LINEAR_BACKEND:-triton}"
+EAGER_ARGS=()
+if [[ "$ENFORCE_EAGER" == "1" || "$ENFORCE_EAGER" == "true" ]]; then
+    EAGER_ARGS+=(--enforce-eager)
+fi
+LINEAR_BACKEND_ARGS=()
+if [[ -n "$LINEAR_BACKEND" && "$LINEAR_BACKEND" != "auto" ]]; then
+    LINEAR_BACKEND_ARGS+=(--linear-backend "$LINEAR_BACKEND")
+fi
 
 if [[ ! -d "$MODEL_PATH" ]]; then
     echo "model path not mounted: $MODEL_PATH" >&2
@@ -23,6 +33,8 @@ python3 -m vllm.entrypoints.openai.api_server \
     --trust-remote-code \
     --tokenizer-mode deepseek_v4 \
     --reasoning-parser deepseek_v4 \
+    --enable-auto-tool-choice \
+    --tool-call-parser deepseek_v4 \
     --host 0.0.0.0 \
     --port 30000 \
     --tensor-parallel-size "$TP_SIZE" \
@@ -33,4 +45,6 @@ python3 -m vllm.entrypoints.openai.api_server \
     --block-size 256 \
     --enable-expert-parallel \
     --enable-prefix-caching \
+    "${EAGER_ARGS[@]}" \
+    "${LINEAR_BACKEND_ARGS[@]}" \
     --distributed-executor-backend ray
