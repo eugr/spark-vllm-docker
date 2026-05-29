@@ -17,7 +17,7 @@ cluster_only: true
 # No mods required
 mods:
   - mods/step-3.7-flash
-  - mods/gpu-memory-utilization-gb
+  - mods/gpu-mem-util-gb
 
 # Default settings (can be overridden via CLI)
 defaults:
