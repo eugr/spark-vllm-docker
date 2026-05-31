@@ -955,3 +955,30 @@ index d51bf22..1c608ef 100644
                  self.drafter.set_per_group_block_table(
                      kv_cache_gid, cm.block_table_tensor
                  )
+diff --git a/vllm/model_executor/models/step3p5_mtp.py b/vllm/model_executor/models/step3p5_mtp.py
+--- a/vllm/model_executor/models/step3p5_mtp.py
++++ b/vllm/model_executor/models/step3p5_mtp.py
+@@ -52,9 +52,21 @@
+         self.enorm = GemmaRMSNorm(config.hidden_size, config.rms_norm_eps)
+         self.hnorm = GemmaRMSNorm(config.hidden_size, config.rms_norm_eps)
+         self.eh_proj = nn.Linear(config.hidden_size * 2, config.hidden_size, bias=False)
+-        self.shared_head = SharedHead(config=config, quant_config=quant_config)
++        # NVFP4 checkpoints ship no MTP (next-n predict) weights; when grafted back
++        # they are BF16, so the MTP block must stay unquantized. FP8 checkpoints ship
++        # FP8 MTP weights and keep their quant config. (vLLM filters the draft model's
++        # quant config to target-model modules, so hf_quant_config exclude_modules
++        # cannot reach these layers -- hence the explicit override here.)
++        import copy as _copy
++        _mtp_unquant = quant_config is not None and "NvFp4" in type(quant_config).__name__
++        _vc = _copy.copy(vllm_config)
++        if _mtp_unquant:
++            _vc.quant_config = None
++        self.shared_head = SharedHead(
++            config=config, quant_config=(None if _mtp_unquant else quant_config)
++        )
+         self.mtp_block = Step3p5DecoderLayer(
+-            vllm_config,
++            _vc,
+             prefix=f"{prefix}.mtp_block",
+         )
+ 
