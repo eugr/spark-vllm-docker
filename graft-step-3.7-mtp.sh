@@ -32,8 +32,9 @@ fi
 # Resolve the snapshot referenced by refs/main (the current revision) so every
 # cluster node grafts the same one; fall back to the newest snapshot.
 REF_FILE="$REPO_DIR/refs/main"
-if [ -f "$REF_FILE" ] && [ -d "$REPO_DIR/snapshots/$(cat "$REF_FILE")" ]; then
-  SNAP_HOST="$REPO_DIR/snapshots/$(cat "$REF_FILE")/"
+REV="$([ -f "$REF_FILE" ] && cat "$REF_FILE" || true)"
+if [ -n "$REV" ] && [ -d "$REPO_DIR/snapshots/$REV" ]; then
+  SNAP_HOST="$REPO_DIR/snapshots/$REV/"
 else
   SNAP_HOST="$(ls -dt "$REPO_DIR"/snapshots/*/ 2>/dev/null | head -1)"
 fi

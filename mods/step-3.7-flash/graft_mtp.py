@@ -17,7 +17,6 @@ container (needs torch + safetensors + huggingface_hub).
 Usage: graft_mtp.py <nvfp4-snapshot-dir>
 """
 import json, os, sys
-import torch
 from huggingface_hub import hf_hub_download
 from safetensors import safe_open
 from safetensors.torch import save_file
@@ -45,7 +44,10 @@ def write_json_into_snapshot(name, obj):
 
 
 def num_hidden_layers(cfg):
-    for node in (cfg, cfg.get("text_config", {}) if isinstance(cfg, dict) else {}):
+    # Prefer the language-model sub-config (this is a multimodal config); the MTP
+    # layers live in the LM, so its num_hidden_layers is the right cutoff.
+    tc = cfg.get("text_config", {}) if isinstance(cfg, dict) else {}
+    for node in (tc, cfg):
         if isinstance(node, dict) and "num_hidden_layers" in node:
             return int(node["num_hidden_layers"])
     raise ValueError("num_hidden_layers not found in config.json")
