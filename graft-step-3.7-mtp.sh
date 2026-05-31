@@ -29,7 +29,17 @@ if [ ! -d "$REPO_DIR/snapshots" ]; then
   exit 1
 fi
 
-SNAP_HOST="$(ls -d "$REPO_DIR"/snapshots/*/ | head -1)"
+# Resolve the snapshot referenced by refs/main (the current revision) so every
+# cluster node grafts the same one; fall back to the newest snapshot.
+REF_FILE="$REPO_DIR/refs/main"
+if [ -f "$REF_FILE" ] && [ -d "$REPO_DIR/snapshots/$(cat "$REF_FILE")" ]; then
+  SNAP_HOST="$REPO_DIR/snapshots/$(cat "$REF_FILE")/"
+else
+  SNAP_HOST="$(ls -dt "$REPO_DIR"/snapshots/*/ 2>/dev/null | head -1)"
+fi
+if [ -z "${SNAP_HOST:-}" ] || [ ! -d "$SNAP_HOST" ]; then
+  echo "Error: no snapshot found under $REPO_DIR/snapshots"; exit 1
+fi
 SNAP_NAME="$(basename "$SNAP_HOST")"
 SNAP_CTR="/root/.cache/huggingface/hub/models--stepfun-ai--Step-3.7-Flash-NVFP4/snapshots/$SNAP_NAME"
 
