@@ -1,12 +1,13 @@
 #!/bin/bash
 
 # Default Configuration
+CONTAINER_RT="${CONTAINER_RT:-docker}"
 IMAGE_NAME="vllm-node"
 DEFAULT_CONTAINER_NAME="vllm_node"
 HF_CACHE_DIR="${HF_HOME:-$HOME/.cache/huggingface}"
 CONTAINER_WORKSPACE_DIR="/workspace"
 CONTAINER_EXEC_SCRIPT="$CONTAINER_WORKSPACE_DIR/exec-script.sh"
-# Modify these if you want to pass additional docker args or set VLLM_SPARK_EXTRA_DOCKER_ARGS variable
+# Modify these if you want to pass additional docker/podman args or set VLLM_SPARK_EXTRA_DOCKER_ARGS variable
 DOCKER_ARGS="-e NCCL_IGNORE_CPU_AFFINITY=1 -v $HF_CACHE_DIR:/root/.cache/huggingface"
 
 # Append additional arguments from environment variable
@@ -301,6 +302,10 @@ if [[ -z "$CONTAINER_NAME" || "$CONTAINER_NAME" == "vllm_node" ]] && [[ -n "$DOT
     CONTAINER_NAME="$DOTENV_CONTAINER_NAME"
 fi
 
+if [[ "$CONTAINER_RT" == "docker" ]] && [[ -n "$DOTENV_CONTAINER_RT" ]]; then
+    CONTAINER_RT="$DOTENV_CONTAINER_RT"
+fi
+
 if [[ -n "$DOTENV_LOCAL_IP" ]]; then
     export LOCAL_IP="$DOTENV_LOCAL_IP"
 fi
@@ -349,8 +354,9 @@ fi
 # Add container environment variables from .env (CONTAINER_* pattern)
 # Excludes CONTAINER_NAME which is a configuration variable, not an env var
 for env_var in $(compgen -v DOTENV_CONTAINER_); do
-    # Skip CONTAINER_NAME as it's a configuration variable
+    # Skip configuration variables
     [[ "$env_var" == "DOTENV_CONTAINER_NAME" ]] && continue
+    [[ "$env_var" == "DOTENV_CONTAINER_RT" ]] && continue
     
     # Get the value
     value="${!env_var}"
@@ -416,7 +422,7 @@ if [[ -n "$LAUNCH_SCRIPT_PATH" ]]; then
     
     echo "Using launch script: $LAUNCH_SCRIPT_PATH"
     
-    # Set command to run the copied script (use absolute path since docker exec may not be in /workspace)
+    # Set command to run the copied script (use absolute path since container exec may not be in /workspace)
     COMMAND_TO_RUN="$CONTAINER_EXEC_SCRIPT"
     LAUNCH_SCRIPT_MODE="true"
 
@@ -619,14 +625,15 @@ cleanup() {
     
     # Stop Head
     echo "Stopping head node ($HEAD_IP)..."
-    docker stop "$CONTAINER_NAME" >/dev/null 2>&1 || true
-    
+    $CONTAINER_RT stop "$CONTAINER_NAME" >/dev/null 2>&1 || true
+    $CONTAINER_RT rm "$CONTAINER_NAME" >/dev/null 2>&1 || true
+
     # Stop Workers
     for worker in "${PEER_NODES[@]}"; do
         echo "Stopping worker node ($worker)..."
-        ssh "$worker" "docker stop $CONTAINER_NAME" >/dev/null 2>&1 || true
+        ssh "$worker" "$CONTAINER_RT stop $CONTAINER_NAME && $CONTAINER_RT rm $CONTAINER_NAME" >/dev/null 2>&1 || true
     done
-    
+
     echo "Cluster stopped."
 }
 
@@ -641,11 +648,11 @@ if [[ "$ACTION" == "status" ]]; then
     echo "Checking status..."
     
     # Check Head
-    if docker ps | grep -q "$CONTAINER_NAME"; then
+    if $CONTAINER_RT ps | grep -q "$CONTAINER_NAME"; then
         echo "[HEAD] $HEAD_IP: Container '$CONTAINER_NAME' is RUNNING."
         if [[ "$NO_RAY_MODE" == "false" ]]; then
             echo "--- Ray Status ---"
-            docker exec "$CONTAINER_NAME" ray status || echo "Failed to get ray status."
+            $CONTAINER_RT exec "$CONTAINER_NAME" ray status || echo "Failed to get ray status."
             echo "------------------"
         fi
     else
@@ -654,7 +661,7 @@ if [[ "$ACTION" == "status" ]]; then
     
     # Check Workers
     for worker in "${PEER_NODES[@]}"; do
-        if ssh "$worker" "docker ps | grep -q '$CONTAINER_NAME'"; then
+        if ssh "$worker" "$CONTAINER_RT ps | grep -q '$CONTAINER_NAME'"; then
              echo "[WORKER] $worker: Container '$CONTAINER_NAME' is RUNNING."
         else
              echo "[WORKER] $worker: Container '$CONTAINER_NAME' is NOT running."
@@ -674,14 +681,14 @@ check_cluster_running() {
     local running=false
     
     # Check Head
-    if docker ps --format '{{.Names}}' | grep -q "^${CONTAINER_NAME}$"; then
+    if $CONTAINER_RT ps --format '{{.Names}}' | grep -q "^${CONTAINER_NAME}$"; then
         echo "Warning: Container '$CONTAINER_NAME' is already running on head node ($HEAD_IP)."
         running=true
     fi
     
     # Check Workers
     for worker in "${PEER_NODES[@]}"; do
-        if ssh "$worker" "docker ps --format '{{.Names}}' | grep -q '^${CONTAINER_NAME}$'"; then
+        if ssh "$worker" "$CONTAINER_RT ps --format '{{.Names}}' | grep -q '^${CONTAINER_NAME}$'"; then
              echo "Warning: Container '$CONTAINER_NAME' is already running on worker node ($worker)."
              running=true
         fi
@@ -751,8 +758,8 @@ apply_mod_to_container() {
     fi
 
     # Create workspace in container. Run from / because some images configure
-    # /workspace as WORKDIR but do not create it, which breaks docker exec.
-    $cmd_prefix docker exec -w / "$container" mkdir -p "$container_dest" || {
+    # /workspace as WORKDIR but do not create it, which breaks container exec.
+    $cmd_prefix $CONTAINER_RT exec -w / "$container" mkdir -p "$container_dest" || {
         echo "Error: Failed to create $container_dest in container on $node_ip"
         exit 1
     }
@@ -760,25 +767,25 @@ apply_mod_to_container() {
     if [[ "$mod_type" == "zip" ]]; then
         local zip_name=$(basename "$mod_path")
         echo "  Copying zip to container..."
-        $cmd_prefix docker cp "$target_mod_path" "$container:$container_dest/$zip_name"
+        $cmd_prefix $CONTAINER_RT cp "$target_mod_path" "$container:$container_dest/$zip_name"
         
         # Unzip in container using python
         echo "  Extracting zip..."
         local py_unzip="import zipfile, sys; zipfile.ZipFile(sys.argv[1], 'r').extractall(sys.argv[2])"
         if [[ "$is_local" == "true" ]]; then
-            docker exec "$container" python3 -c "$py_unzip" "$container_dest/$zip_name" "$container_dest"
+            $CONTAINER_RT exec "$container" python3 -c "$py_unzip" "$container_dest/$zip_name" "$container_dest"
         else
-            $cmd_prefix docker exec "$container" python3 -c "\"$py_unzip\"" "$container_dest/$zip_name" "$container_dest"
+            $cmd_prefix $CONTAINER_RT exec "$container" python3 -c "\"$py_unzip\"" "$container_dest/$zip_name" "$container_dest"
         fi
     else
         # Directory
         echo "  Copying directory content to container..."
         if [[ "$is_local" == "true" ]]; then
-             docker cp "$mod_path/." "$container:$container_dest/"
+             $CONTAINER_RT cp "$mod_path/." "$container:$container_dest/"
         else
              # For remote, we copied contents to $target_mod_path.
              # We want to copy contents of $target_mod_path to $container_dest.
-             $cmd_prefix docker cp "$target_mod_path/." "$container:$container_dest/"
+             $cmd_prefix $CONTAINER_RT cp "$target_mod_path/." "$container:$container_dest/"
         fi
     fi
 
@@ -793,10 +800,10 @@ apply_mod_to_container() {
     local ret_code=0
 
     if [[ "$is_local" == "true" ]]; then
-        docker exec "$container" bash -c "$local_exec_cmd"
+        $CONTAINER_RT exec "$container" bash -c "$local_exec_cmd"
         ret_code=$?
     else
-        $cmd_prefix docker exec "$container" bash -c "\"$remote_exec_cmd\""
+        $cmd_prefix $CONTAINER_RT exec "$container" bash -c "\"$remote_exec_cmd\""
         ret_code=$?
     fi
 
@@ -900,13 +907,13 @@ ensure_container_workspace() {
     local node_ip="$1"; local container="$2"; local is_local="$3"
 
     if [[ "$is_local" == "true" ]]; then
-        docker exec -w / "$container" mkdir -p "$CONTAINER_WORKSPACE_DIR" || {
+        $CONTAINER_RT exec -w / "$container" mkdir -p "$CONTAINER_WORKSPACE_DIR" || {
             echo "Error: Failed to create $CONTAINER_WORKSPACE_DIR in container on $node_ip"
             exit 1
         }
     else
         ssh -o BatchMode=yes -o StrictHostKeyChecking=no "$node_ip" \
-            "docker exec -w / $container mkdir -p $CONTAINER_WORKSPACE_DIR" || {
+            "$CONTAINER_RT exec -w / $container mkdir -p $CONTAINER_WORKSPACE_DIR" || {
             echo "Error: Failed to create $CONTAINER_WORKSPACE_DIR in container on $node_ip"
             exit 1
         }
@@ -918,11 +925,11 @@ copy_script_to_container() {
     local container="$1"; local script_path="$2"; local label="${3:-node}"
     echo "Copying launch script to $label..."
     ensure_container_workspace "$HEAD_IP" "$container" "true"
-    docker cp "$script_path" "$container:$CONTAINER_EXEC_SCRIPT" || { echo "Error: docker cp to $label failed"; exit 1; }
-    docker exec -w / "$container" chmod +x "$CONTAINER_EXEC_SCRIPT"
+    $CONTAINER_RT cp "$script_path" "$container:$CONTAINER_EXEC_SCRIPT" || { echo "Error: $CONTAINER_RT cp to $label failed"; exit 1; }
+    $CONTAINER_RT exec -w / "$container" chmod +x "$CONTAINER_EXEC_SCRIPT"
 }
 
-# Copy a script file to a remote container via scp + docker cp
+# Copy a script file to a remote container via scp + container cp
 copy_script_to_worker() {
     local worker_ip="$1"; local container="$2"; local script_path="$3"
     echo "Copying launch script to worker $worker_ip..."
@@ -930,12 +937,12 @@ copy_script_to_worker() {
     ensure_container_workspace "$worker_ip" "$container" "false"
     scp -o BatchMode=yes -o StrictHostKeyChecking=no "$script_path" "$worker_ip:$remote_tmp" || { echo "Error: scp to $worker_ip failed"; exit 1; }
     ssh -o BatchMode=yes -o StrictHostKeyChecking=no "$worker_ip" \
-        "docker cp $remote_tmp $container:$CONTAINER_EXEC_SCRIPT && \
-         docker exec -w / $container chmod +x $CONTAINER_EXEC_SCRIPT && \
-         rm -f $remote_tmp" || { echo "Error: docker cp to worker $worker_ip failed"; exit 1; }
+        "$CONTAINER_RT cp $remote_tmp $container:$CONTAINER_EXEC_SCRIPT && \
+         $CONTAINER_RT exec -w / $container chmod +x $CONTAINER_EXEC_SCRIPT && \
+         rm -f $remote_tmp" || { echo "Error: $CONTAINER_RT cp to worker $worker_ip failed"; exit 1; }
 }
 
-# Build -e KEY=VALUE flags for a given node IP (used in docker run and docker exec)
+# Build -e KEY=VALUE flags for a given node IP (used in container run and exec)
 get_env_flags() {
     local node_ip="$1"
     printf -- '-e %s ' \
@@ -959,7 +966,7 @@ get_env_flags() {
 start_ray_head() {
     local container="$1"
     echo "Starting Ray HEAD node on $HEAD_IP..."
-    docker exec -d "$container" bash -c \
+    $CONTAINER_RT exec -d "$container" bash -c \
         "ray start --block --head --port $MASTER_PORT --object-store-memory 1073741824 --num-cpus 2 \
          --node-ip-address $HEAD_IP --include-dashboard=false --disable-usage-stats \
          >> /proc/1/fd/1 2>&1"
@@ -970,7 +977,7 @@ start_ray_worker() {
     local worker_ip="$1"; local container="$2"
     echo "Starting Ray WORKER node on $worker_ip..."
     ssh -o BatchMode=yes -o StrictHostKeyChecking=no "$worker_ip" \
-        "docker exec -d $container bash -c \
+        "$CONTAINER_RT exec -d $container bash -c \
          'ray start --block --object-store-memory 1073741824 --num-cpus 2 --disable-usage-stats \
           --address=$HEAD_IP:$MASTER_PORT --node-ip-address $worker_ip >> /proc/1/fd/1 2>&1'"
 }
@@ -991,7 +998,7 @@ start_cluster() {
         return
     fi
 
-    # Build docker run arguments based on mode
+    # Build container run arguments based on mode
     local docker_entrypoint_args=""
     if [[ "$KEEP_ENTRYPOINT" != "true" ]]; then
         docker_entrypoint_args="--entrypoint="
@@ -1005,7 +1012,7 @@ start_cluster() {
         done
     fi
 
-    local docker_args_common="--gpus all -d --rm $docker_network_args --name $CONTAINER_NAME $docker_entrypoint_args $DOCKER_ARGS $IMAGE_NAME"
+    local docker_args_common="--gpus all -d $docker_network_args --name $CONTAINER_NAME $docker_entrypoint_args $DOCKER_ARGS $IMAGE_NAME"
     local docker_caps_args=""
     local docker_resource_args=""
 
@@ -1027,7 +1034,9 @@ start_cluster() {
             mkdir -p "$dir"
         done
     fi
-    docker run $docker_caps_args $docker_resource_args \
+    # Remove any stopped container with the same name
+    $CONTAINER_RT rm "$CONTAINER_NAME" >/dev/null 2>&1 || true
+    $CONTAINER_RT run $docker_caps_args $docker_resource_args \
         $(get_env_flags "$HEAD_IP") $docker_args_common $keepalive_cmd
 
     # Start Worker Nodes
@@ -1036,8 +1045,8 @@ start_cluster() {
         if [[ "$MOUNT_CACHE_DIRS" == "true" ]]; then
             ssh "$worker" "mkdir -p ${CACHE_DIRS_TO_CREATE[*]}"
         fi
-        local docker_run_cmd="docker run $docker_caps_args $docker_resource_args $(get_env_flags "$worker") $docker_args_common"
-        ssh "$worker" "$docker_run_cmd $keepalive_cmd"
+        local docker_run_cmd="$CONTAINER_RT run $docker_caps_args $docker_resource_args $(get_env_flags "$worker") $docker_args_common"
+        ssh "$worker" "$CONTAINER_RT rm $CONTAINER_NAME >/dev/null 2>&1 || true; $docker_run_cmd $keepalive_cmd"
     done
 
     # Apply mods (containers are idle — no mod_done sync needed)
@@ -1103,7 +1112,7 @@ wait_for_cluster() {
     
     while [[ $count -lt $retries ]]; do
         # Check if ray is responsive
-        if docker exec "$CONTAINER_NAME" ray status >/dev/null 2>&1; then
+        if $CONTAINER_RT exec "$CONTAINER_NAME" ray status >/dev/null 2>&1; then
              echo "Cluster head is responsive."
              # Give workers a moment to connect
              sleep 5
@@ -1122,11 +1131,11 @@ wait_for_cluster() {
 _exec_on_head() {
     local cmd="$1"
     if [[ "$DAEMON_MODE" == "true" ]]; then
-        docker exec -d "$CONTAINER_NAME" bash -c "$cmd >> /proc/1/fd/1 2>&1"
+        $CONTAINER_RT exec -d "$CONTAINER_NAME" bash -c "$cmd >> /proc/1/fd/1 2>&1"
         echo "Command dispatched in background (Daemon mode). Container: $CONTAINER_NAME"
     else
         if [ -t 0 ]; then DOCKER_EXEC_FLAGS="-it"; else DOCKER_EXEC_FLAGS="-i"; fi
-        docker exec $DOCKER_EXEC_FLAGS "$CONTAINER_NAME" bash -c "$cmd"
+        $CONTAINER_RT exec $DOCKER_EXEC_FLAGS "$CONTAINER_NAME" bash -c "$cmd"
     fi
 }
 
@@ -1149,7 +1158,7 @@ exec_no_ray_cluster() {
         echo "Launching worker (rank $rank) on $worker..."
         local remote_payload remote_cmd
         remote_payload="$worker_cmd >> /proc/1/fd/1 2>&1"
-        printf -v remote_cmd 'docker exec -d %q bash -c %q' "$CONTAINER_NAME" "$remote_payload"
+        printf -v remote_cmd '%s exec -d %q bash -c %q' "$CONTAINER_RT" "$CONTAINER_NAME" "$remote_payload"
         ssh -o BatchMode=yes -o StrictHostKeyChecking=no "$worker" "$remote_cmd"
         (( rank++ ))
     done
@@ -1166,11 +1175,11 @@ exec_no_ray_cluster() {
 
     echo "Executing command on head node (rank 0): $head_cmd"
     if [[ "$DAEMON_MODE" == "true" ]]; then
-        docker exec -d "$CONTAINER_NAME" bash -c "$head_cmd >> /proc/1/fd/1 2>&1"
+        $CONTAINER_RT exec -d "$CONTAINER_NAME" bash -c "$head_cmd >> /proc/1/fd/1 2>&1"
         echo "Command dispatched in background (Daemon mode). Container: $CONTAINER_NAME"
     else
         if [ -t 0 ]; then DOCKER_EXEC_FLAGS="-it"; else DOCKER_EXEC_FLAGS="-i"; fi
-        docker exec $DOCKER_EXEC_FLAGS "$CONTAINER_NAME" bash -c "$head_cmd"
+        $CONTAINER_RT exec $DOCKER_EXEC_FLAGS "$CONTAINER_NAME" bash -c "$head_cmd"
     fi
 }
 
@@ -1221,7 +1230,7 @@ elif [[ "$ACTION" == "start" ]]; then
     else
         echo "Cluster started. Tailing logs from head node..."
         echo "Press Ctrl+C to stop the cluster."
-        docker logs -f "$CONTAINER_NAME" &
+        $CONTAINER_RT logs -f "$CONTAINER_NAME" &
         wait $!
     fi
 fi
