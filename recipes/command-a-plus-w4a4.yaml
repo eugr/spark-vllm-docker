@@ -14,8 +14,9 @@ container: vllm-node-tf5
 build_args:
   - --tf5
 
-# No mods required
-mods: []
+# Mods required for Cohere tool parser
+mods:
+  - mods/fix-cohere-command-a
 
 # Default settings (can be overridden via CLI)
 defaults:
