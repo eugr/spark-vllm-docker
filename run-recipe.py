@@ -320,7 +320,6 @@ def check_image_exists(image: str, host: str | None = None) -> bool:
     Used to avoid redundant builds and to verify cluster nodes have the image.
 
     EXTENSIBILITY:
-    - To support other container runtimes (podman): Modify the docker command
     - To add image version/digest checking: Parse 'docker image inspect' JSON output
     - For custom SSH options: Modify the ssh command array
 
@@ -331,6 +330,7 @@ def check_image_exists(image: str, host: str | None = None) -> bool:
     Returns:
         True if image exists, False otherwise
     """
+    container_rt = os.environ.get("CONTAINER_RT", "docker")
     if host:
         result = subprocess.run(
             [
@@ -340,13 +340,13 @@ def check_image_exists(image: str, host: str | None = None) -> bool:
                 "-o",
                 "StrictHostKeyChecking=no",
                 host,
-                f"docker image inspect '{image}'",
+                f"{container_rt} image inspect '{image}'",
             ],
             capture_output=True,
         )
     else:
         result = subprocess.run(
-            ["docker", "image", "inspect", image], capture_output=True
+            [container_rt, "image", "inspect", image], capture_output=True
         )
     return result.returncode == 0
 
