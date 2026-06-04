@@ -372,6 +372,13 @@ test_launch_cluster_help() {
         log_fail "--help did not show usage"
         log_verbose "$output"
     fi
+
+    if echo "$output" | grep -q -- "--keep-entrypoint"; then
+        log_pass "--help documents --keep-entrypoint"
+    else
+        log_fail "--help does not document --keep-entrypoint"
+        log_verbose "$output"
+    fi
 }
 
 # Test: launch-cluster.sh references examples/ not profiles/
