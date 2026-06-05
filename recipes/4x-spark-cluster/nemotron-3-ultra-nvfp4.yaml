@@ -1,0 +1,74 @@
+# Recipe: Nemotron-3-Ultra-NVFP4 (4-node TP=4 over Ray)
+#
+# Engine isolation: this recipe runs on its OWN container image
+# (vllm-node-eugr022) built from eugr's prebuilt 0.22.1rc1 wheel. The shared
+# vllm-node image (vLLM 0.18.1) and every existing recipe stay untouched.
+# Ultra needs vLLM >= 0.22 for the LatentMoE architecture + nemotron_h_mtp MTP.
+#
+# Flags = Nemotron-3-Super's Spark-adapted baseline (CUTLASS MoE + TRITON attention
+# + fastsafetensors — NOT FlashInfer, which lacks reliable NVFP4 on sm121/GB10)
+# PLUS Ultra deltas: TP=4, cluster_only, expert-parallel, MTP speculative decoding.
+#
+# FLAGS VERIFIED against the built 0.22.1rc1 engine (vllm serve --help=all +
+# registry probes inside vllm-node-eugr022):
+#   --moe-backend cutlass            OK (valid choice)
+#   --mamba-ssm-cache-dtype float32  OK (valid choice; mamba-backend left at TRITON default)
+#   --attention-backend TRITON_ATTN  OK
+#   --reasoning-parser nemotron_v3   OK (resolves to NemotronV3ReasoningParser)
+#   --tool-call-parser qwen3_coder   OK
+#   --kv-cache-dtype fp8             OK
+#   --load-format safetensors      instanttensor hit Errno24 (too many open fds on 113 shards)
+# MTP (--speculative-config nemotron_h_mtp) is DISABLED: the MTP draft layers carry an
+# *unquantized* MoE, and --moe-backend cutlass is quantized-only — vLLM rejects it for the
+# MTP MoE on sm121 ("not supported for unquantized MoE; expected triton/flashinfer_*/aiter").
+# A single global --moe-backend can't satisfy both the NVFP4 main experts (need cutlass on
+# sm121) and the unquantized MTP experts. Re-enabling MTP is a follow-up (needs a backend
+# that serves both, or per-layer backend selection). speculative_config kept below, unused.
+# Runtime-tuning candidates (deploy loop): gpu_memory_utilization / max_model_len
+# (conservative seeds — raise once stable).
+
+recipe_version: "1"
+name: Nemotron-3-Ultra-NVFP4
+description: vLLM serving Nemotron 3 Ultra (550B-A55B NVFP4) across a 4-node TP=4 Spark cluster
+
+model: nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-NVFP4
+container: vllm-node-eugr022
+cluster_only: true
+
+env:
+  VLLM_FLASHINFER_ALLREDUCE_BACKEND: trtllm
+  VLLM_ALLOW_LONG_MAX_MODEL_LEN: 1
+  VLLM_DISTRIBUTED_EXECUTOR_CONFIG: '{"placement_group_options":{"strategy":"SPREAD"}}'
+
+defaults:
+  port: 8000
+  host: 0.0.0.0
+  tensor_parallel: 4
+  gpu_memory_utilization: 0.8      # Super uses 0.7@TP2; conservative first launch
+  max_model_len: 65536             # Super uses 262144; start low on 4x128GB, raise once stable
+  max_num_seqs: 10
+  # JSON kept as a defaults value (referenced as one {speculative_config} token) because
+  # run-recipe.py does a single-pass str.format() — inline JSON braces in `command` would
+  # be misread as {placeholders}. This is the v2 community-recipe pattern.
+  speculative_config: '{"method": "nemotron_h_mtp", "num_speculative_tokens": 5}'
+
+command: |
+  vllm serve nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-NVFP4 \
+    --trust-remote-code \
+    --tensor-parallel-size {tensor_parallel} \
+    --distributed-executor-backend ray \
+    --moe-backend cutlass \
+    --kv-cache-dtype fp8 \
+    --mamba-ssm-cache-dtype float32 \
+    --attention-backend TRITON_ATTN \
+    --enable-prefix-caching \
+    --enable-chunked-prefill \
+    --load-format safetensors \
+    --enable-auto-tool-choice \
+    --tool-call-parser qwen3_coder \
+    --reasoning-parser nemotron_v3 \
+    --gpu-memory-utilization {gpu_memory_utilization} \
+    --max-model-len {max_model_len} \
+    --max-num-seqs {max_num_seqs} \
+    --host {host} \
+    --port {port}
