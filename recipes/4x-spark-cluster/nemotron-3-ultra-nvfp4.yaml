@@ -18,12 +18,12 @@
 #   --tool-call-parser qwen3_coder   OK
 #   --kv-cache-dtype fp8             OK
 #   --load-format safetensors      instanttensor hit Errno24 (too many open fds on 113 shards)
-# MTP (--speculative-config nemotron_h_mtp) is DISABLED: the MTP draft layers carry an
-# *unquantized* MoE, and --moe-backend cutlass is quantized-only — vLLM rejects it for the
-# MTP MoE on sm121 ("not supported for unquantized MoE; expected triton/flashinfer_*/aiter").
-# A single global --moe-backend can't satisfy both the NVFP4 main experts (need cutlass on
-# sm121) and the unquantized MTP experts. Re-enabling MTP is a follow-up (needs a backend
-# that serves both, or per-layer backend selection). speculative_config kept below, unused.
+# MTP (--speculative-config nemotron_h_mtp) is ENABLED via per-MoE-type backend selection:
+# the MTP draft layers carry an *unquantized* MoE that rejects cutlass, while the main
+# experts are NVFP4 and need cutlass on sm121 (FlashInfer NVFP4 is unreliable here). A single
+# global --moe-backend can't serve both. Instead: leave --moe-backend unset (so the
+# unquantized MTP MoE auto-selects triton) and set VLLM_USE_FLASHINFER_MOE_FP4=0 (read only by
+# the FP4 oracle) so the NVFP4 main experts deterministically land on VLLM_CUTLASS.
 # Runtime-tuning candidates (deploy loop): gpu_memory_utilization / max_model_len
 # (conservative seeds — raise once stable).
 
@@ -39,6 +39,11 @@ env:
   VLLM_FLASHINFER_ALLREDUCE_BACKEND: trtllm
   VLLM_ALLOW_LONG_MAX_MODEL_LEN: 1
   VLLM_DISTRIBUTED_EXECUTOR_CONFIG: '{"placement_group_options":{"strategy":"SPREAD"}}'
+  # Force the NVFP4 MoE oracle to drop FlashInfer (unreliable on sm121) so it lands on
+  # VLLM_CUTLASS — WITHOUT a global --moe-backend, which would also (wrongly) force cutlass
+  # onto the unquantized MTP MoE. This env is read ONLY by the FP4 oracle, so the unquantized
+  # MTP MoE still auto-selects triton. Net: cutlass for main experts, triton for MTP experts.
+  VLLM_USE_FLASHINFER_MOE_FP4: "0"
 
 defaults:
   port: 8000
@@ -57,7 +62,6 @@ command: |
     --trust-remote-code \
     --tensor-parallel-size {tensor_parallel} \
     --distributed-executor-backend ray \
-    --moe-backend cutlass \
     --kv-cache-dtype fp8 \
     --mamba-ssm-cache-dtype float32 \
     --attention-backend TRITON_ATTN \
@@ -67,6 +71,7 @@ command: |
     --enable-auto-tool-choice \
     --tool-call-parser qwen3_coder \
     --reasoning-parser nemotron_v3 \
+    --speculative-config '{speculative_config}' \
     --gpu-memory-utilization {gpu_memory_utilization} \
     --max-model-len {max_model_len} \
     --max-num-seqs {max_num_seqs} \
