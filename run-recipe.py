@@ -181,6 +181,7 @@ def load_recipe(recipe_path: Path) -> dict[str, Any]:
     recipe.setdefault("mods", [])
     recipe.setdefault("defaults", {})
     recipe.setdefault("env", {})
+    recipe.setdefault("container_name", None)
     recipe.setdefault("cluster_only", False)
     recipe.setdefault("solo_only", False)
 
@@ -500,6 +501,9 @@ def generate_launch_script(
         extra_args_str = " ".join(shlex.quote(a) for a in extra_args)
         command = command + " " + extra_args_str
 
+    lines.append("# Patch vLLM to enable FlashInfer autotune persistent cache")
+    lines.append("sed -i 's/_FLASHINFER_USE_PERSISTENT_CACHE = False/_FLASHINFER_USE_PERSISTENT_CACHE = True/g' /usr/local/lib/python3.12/dist-packages/vllm/model_executor/warmup/kernel_warmup.py 2>/dev/null || true")
+    lines.append("")
     lines.append("# Run the model")
     lines.append(command.strip())
     lines.append("")
@@ -936,6 +940,10 @@ Examples:
     container = args.container_override or recipe["container"]
     model = recipe.get("model")
     build_args = recipe.get("build_args", [])
+
+    # Determine container name (CLI override takes precedence over recipe)
+    if not args.container_name and recipe.get("container_name"):
+        args.container_name = recipe["container_name"]
 
     # Parse nodes - check command line first, then .env file, then autodiscover
     nodes = parse_nodes(args.nodes) if not args.solo else []
