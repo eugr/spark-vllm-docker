@@ -53,6 +53,14 @@ defaults:
   gpu_memory_utilization: 0.8      # Super uses 0.7@TP2; conservative first launch
   max_model_len: 65536             # Super uses 262144; start low on 4x128GB, raise once stable
   max_num_seqs: 10
+  # CAUTION (Spark unified memory, 124GB/node): weights ~85GB leave only ~22GB headroom at
+  # gpu_memory_utilization=0.8 — and dgx-spark-01 is BOTH manager and a TP=4 node, tightening
+  # it further. Empirically: 32768 token batch HUNG nodes during capture (hard reset); 4096
+  # came up + served then got OOM-killed (exit 137 / NVRM NO_MEMORY) ~1min in. So leave the
+  # batch on vLLM's auto default (~2048), which is stable (~15.3 tok/s single-stream w/ MTP).
+  # Raising it needs a lower gpu_memory_utilization first. fp8 KV is the best option here:
+  # turboquant_* KV was tested (k8v4) and is WORSE on this model — its per-block centroid
+  # overhead makes KV *larger* than fp8 (KV budget 236K vs 776K tokens) AND ~33% slower.
   # JSON kept as a defaults value (referenced as one {speculative_config} token) because
   # run-recipe.py does a single-pass str.format() — inline JSON braces in `command` would
   # be misread as {placeholders}. This is the v2 community-recipe pattern.
