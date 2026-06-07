@@ -2,7 +2,7 @@
 
 # Limit build parallelism to reduce OOM situations
 ARG BUILD_JOBS=16
-ARG CUDA_IMAGE=nvidia/cuda:13.3.0-devel-ubuntu24.04
+ARG CUDA_IMAGE=nvidia/cuda:13.0.2-devel-ubuntu24.04
 
 # =========================================================
 # STAGE 1: Base Build Image
@@ -46,7 +46,6 @@ RUN apt update && \
     python3-dev python3-pip git wget \
     libibverbs1 libibverbs-dev rdma-core \
     ccache devscripts debhelper fakeroot \
-    cuda-compat-13-3 \
     && rm -rf /var/lib/apt/lists/* \
     && pip install uv
 
@@ -65,8 +64,6 @@ ENV CCACHE_COMPRESS=1
 # Tell CMake to use ccache for compilation
 ENV CMAKE_CXX_COMPILER_LAUNCHER=ccache
 ENV CMAKE_CUDA_COMPILER_LAUNCHER=ccache
-# Use CUDA 13.3 user-mode driver/JIT libraries on older host drivers.
-ENV LD_LIBRARY_PATH=/usr/local/cuda-13.3/compat:${LD_LIBRARY_PATH}
 
 # 2. Set Environment Variables
 ARG TORCH_CUDA_ARCH_LIST="12.1a"
@@ -348,7 +345,6 @@ RUN --mount=type=bind,from=base,source=/workspace/vllm/nccl/build/pkg/deb,target
     libcudnn9-cuda-13 \
     libibverbs1 libibverbs-dev rdma-core \
     libxcb1 \
-    cuda-compat-13-3 \
     && cd /workspace/nccl-pkg && apt install -y --no-install-recommends --allow-downgrades ./*.deb \
     && rm -rf /var/lib/apt/lists/* \
     && pip install uv
@@ -385,7 +381,6 @@ ENV TORCH_CUDA_ARCH_LIST=${TORCH_CUDA_ARCH_LIST}
 ARG FLASHINFER_CUDA_ARCH_LIST="12.1a"
 ENV FLASHINFER_CUDA_ARCH_LIST=${FLASHINFER_CUDA_ARCH_LIST}
 ENV TRITON_PTXAS_PATH=/usr/local/cuda/bin/ptxas
-ENV LD_LIBRARY_PATH=/usr/local/cuda-13.3/compat:${LD_LIBRARY_PATH}
 ENV TIKTOKEN_ENCODINGS_BASE=$VLLM_BASE_DIR/tiktoken_encodings
 ENV PATH=$VLLM_BASE_DIR:$PATH
 
