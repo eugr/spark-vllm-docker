@@ -2,11 +2,12 @@
 
 # Limit build parallelism to reduce OOM situations
 ARG BUILD_JOBS=16
+ARG CUDA_IMAGE=nvidia/cuda:13.3.0-devel-ubuntu24.04
 
 # =========================================================
 # STAGE 1: Base Build Image
 # =========================================================
-FROM nvidia/cuda:13.3.0-devel-ubuntu26.04 AS base
+FROM ${CUDA_IMAGE} AS base
 
 # Build parallemism
 ARG BUILD_JOBS
@@ -314,7 +315,7 @@ COPY --from=vllm-builder /workspace/wheels /
 # =========================================================
 # STAGE 6: Runner (Installs wheels from host ./wheels/)
 # =========================================================
-FROM nvidia/cuda:13.3.0-devel-ubuntu26.04 AS runner
+FROM ${CUDA_IMAGE} AS runner
 
 # Transferring build settings from build image because of ptxas/jit compilation during vLLM startup
 # Build parallemism
