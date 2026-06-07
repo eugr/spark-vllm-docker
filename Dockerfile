@@ -257,27 +257,25 @@ RUN if [ -n "$VLLM_PRS" ]; then \
 #         echo "PR #41524 regression marker not present; skipping revert"; \
 #     fi
 
-# TEMPORARY PATCH: revert vLLM PR #43410 / commit 6e503868,
-# which moves MiniMax QK RMSNorm to an automatic CUDA IPC-backed fused path.
-# That path fails when tensor parallelism spans DGX Spark nodes.
-# RUN set -eux; \
-#     patch_commit="6e503868caa46f3afa87e8d3365495464fd75fb3"; \
-#     target="vllm/model_executor/layers/minimax_rms_norm/rms_norm_tp.py"; \
-#     marker="torch.ops.vllm.minimax_qk_norm_fusion"; \
-#     if [ -f "$target" ] && grep -q "$marker" "$target"; then \
-#         echo "PR #43410 regression found; reverting ${patch_commit}"; \
-#         if ! git revert --no-commit "$patch_commit"; then \
-#             git revert --abort 2>/dev/null || true; \
-#             echo "ERROR: PR #43410 appears present but could not be reverted"; \
-#             exit 1; \
-#         fi; \
-#         if [ -f "$target" ] && grep -q "$marker" "$target"; then \
-#             echo "ERROR: revert completed but PR #43410 marker is still present"; \
-#             exit 1; \
-#         fi; \
-#     else \
-#         echo "PR #43410 regression marker not present; skipping revert"; \
-#     fi
+# TEMPORARY PATCH: disable the MiniMax QK RMSNorm CUDA IPC fusion from vLLM
+# PR #43410. A full git revert now conflicts with current upstream, and the
+# runtime failure happens while allocating the Lamport workspace.
+RUN set -eux; \
+    target="vllm/model_executor/layers/minimax_rms_norm/rms_norm_tp.py"; \
+    marker='_MINIMAX_FUSED_AR_RMS_QK = getattr(torch.ops._C, "minimax_allreduce_rms_qk", None)'; \
+    replacement='_MINIMAX_FUSED_AR_RMS_QK = None  # Disabled for DGX Spark multi-node TP'; \
+    if [ -f "$target" ] && grep -Fq "$marker" "$target"; then \
+        echo "MiniMax QK norm fusion found; disabling CUDA IPC fused path"; \
+        sed -i "s|$marker|$replacement|" "$target"; \
+    elif [ -f "$target" ] && grep -Fq "$replacement" "$target"; then \
+        echo "MiniMax QK norm fusion already disabled"; \
+    else \
+        echo "MiniMax QK norm fusion marker not present; skipping patch"; \
+    fi; \
+    if [ -f "$target" ] && grep -Fq "$marker" "$target"; then \
+        echo "ERROR: MiniMax QK norm fusion marker is still present"; \
+        exit 1; \
+    fi
 
 # Prepare build requirements
 RUN --mount=type=cache,id=uv-cache,target=/root/.cache/uv \
