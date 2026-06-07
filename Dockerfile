@@ -6,7 +6,7 @@ ARG BUILD_JOBS=16
 # =========================================================
 # STAGE 1: Base Build Image
 # =========================================================
-FROM nvidia/cuda:13.2.0-devel-ubuntu24.04 AS base
+FROM nvidia/cuda:13.3.0-devel-ubuntu26.04 AS base
 
 # Build parallemism
 ARG BUILD_JOBS
@@ -237,46 +237,46 @@ RUN if [ -n "$VLLM_PRS" ]; then \
 
 # TEMPORARY PATCH: revert vLLM PR #41524 / commit c51df430,
 # which disables FlashInfer autotune and regresses DGX Spark throughput.
-RUN set -eux; \
-    patch_commit="c51df43005726a09c6eb7348e8c1b00501c70a8e"; \
-    target="vllm/config/vllm.py"; \
-    marker="https://github.com/flashinfer-ai/flashinfer/issues/3197"; \
-    if grep -q "$marker" "$target"; then \
-        echo "PR #41524 regression found; reverting ${patch_commit}"; \
-        if ! git revert --no-commit "$patch_commit"; then \
-            git revert --abort 2>/dev/null || true; \
-            echo "ERROR: PR #41524 appears present but could not be reverted"; \
-            exit 1; \
-        fi; \
-        if grep -q "$marker" "$target"; then \
-            echo "ERROR: revert completed but PR #41524 marker is still present"; \
-            exit 1; \
-        fi; \
-    else \
-        echo "PR #41524 regression marker not present; skipping revert"; \
-    fi
+# RUN set -eux; \
+#     patch_commit="c51df43005726a09c6eb7348e8c1b00501c70a8e"; \
+#     target="vllm/config/vllm.py"; \
+#     marker="https://github.com/flashinfer-ai/flashinfer/issues/3197"; \
+#     if grep -q "$marker" "$target"; then \
+#         echo "PR #41524 regression found; reverting ${patch_commit}"; \
+#         if ! git revert --no-commit "$patch_commit"; then \
+#             git revert --abort 2>/dev/null || true; \
+#             echo "ERROR: PR #41524 appears present but could not be reverted"; \
+#             exit 1; \
+#         fi; \
+#         if grep -q "$marker" "$target"; then \
+#             echo "ERROR: revert completed but PR #41524 marker is still present"; \
+#             exit 1; \
+#         fi; \
+#     else \
+#         echo "PR #41524 regression marker not present; skipping revert"; \
+#     fi
 
 # TEMPORARY PATCH: revert vLLM PR #43410 / commit 6e503868,
 # which moves MiniMax QK RMSNorm to an automatic CUDA IPC-backed fused path.
 # That path fails when tensor parallelism spans DGX Spark nodes.
-RUN set -eux; \
-    patch_commit="6e503868caa46f3afa87e8d3365495464fd75fb3"; \
-    target="vllm/model_executor/layers/minimax_rms_norm/rms_norm_tp.py"; \
-    marker="torch.ops.vllm.minimax_qk_norm_fusion"; \
-    if [ -f "$target" ] && grep -q "$marker" "$target"; then \
-        echo "PR #43410 regression found; reverting ${patch_commit}"; \
-        if ! git revert --no-commit "$patch_commit"; then \
-            git revert --abort 2>/dev/null || true; \
-            echo "ERROR: PR #43410 appears present but could not be reverted"; \
-            exit 1; \
-        fi; \
-        if [ -f "$target" ] && grep -q "$marker" "$target"; then \
-            echo "ERROR: revert completed but PR #43410 marker is still present"; \
-            exit 1; \
-        fi; \
-    else \
-        echo "PR #43410 regression marker not present; skipping revert"; \
-    fi
+# RUN set -eux; \
+#     patch_commit="6e503868caa46f3afa87e8d3365495464fd75fb3"; \
+#     target="vllm/model_executor/layers/minimax_rms_norm/rms_norm_tp.py"; \
+#     marker="torch.ops.vllm.minimax_qk_norm_fusion"; \
+#     if [ -f "$target" ] && grep -q "$marker" "$target"; then \
+#         echo "PR #43410 regression found; reverting ${patch_commit}"; \
+#         if ! git revert --no-commit "$patch_commit"; then \
+#             git revert --abort 2>/dev/null || true; \
+#             echo "ERROR: PR #43410 appears present but could not be reverted"; \
+#             exit 1; \
+#         fi; \
+#         if [ -f "$target" ] && grep -q "$marker" "$target"; then \
+#             echo "ERROR: revert completed but PR #43410 marker is still present"; \
+#             exit 1; \
+#         fi; \
+#     else \
+#         echo "PR #43410 regression marker not present; skipping revert"; \
+#     fi
 
 # Prepare build requirements
 RUN --mount=type=cache,id=uv-cache,target=/root/.cache/uv \
@@ -314,7 +314,7 @@ COPY --from=vllm-builder /workspace/wheels /
 # =========================================================
 # STAGE 6: Runner (Installs wheels from host ./wheels/)
 # =========================================================
-FROM nvidia/cuda:13.2.0-devel-ubuntu24.04 AS runner
+FROM nvidia/cuda:13.3.0-devel-ubuntu26.04 AS runner
 
 # Transferring build settings from build image because of ptxas/jit compilation during vLLM startup
 # Build parallemism
