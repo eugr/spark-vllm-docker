@@ -403,6 +403,23 @@ test_launch_cluster_examples_path() {
     fi
 }
 
+# Test: launch-cluster.sh accepts --mount-volume and adds docker -v args
+test_launch_cluster_mount_volume_check_config() {
+    log_test "launch-cluster.sh --mount-volume appears in Docker args"
+
+    output=$("$PROJECT_DIR/launch-cluster.sh" --solo --check-config \
+        --mount-volume /host/data:/container/data \
+        --mount-volume /host/cache:/container/cache 2>&1)
+
+    if echo "$output" | grep -q "Docker Args: .* -v /host/data:/container/data" && \
+       echo "$output" | grep -q "Docker Args: .* -v /host/cache:/container/cache"; then
+        log_pass "launch-cluster.sh adds custom volume mounts to Docker args"
+    else
+        log_fail "launch-cluster.sh did not include custom volume mounts in Docker args"
+        log_verbose "$output"
+    fi
+}
+
 # Test: Unsupported recipe version shows warning
 test_unsupported_recipe_version() {
     log_test "Unsupported recipe_version shows warning"
@@ -759,6 +776,30 @@ test_launch_cmd_env_passthrough() {
         log_pass "Launch command includes -e env vars"
     else
         log_fail "-e env vars not found in launch command"
+        log_verbose "Launch cmd: $launch_cmd"
+    fi
+}
+
+# Test: --mount-volume passthrough to launch-cluster.sh
+test_launch_cmd_mount_volume_passthrough() {
+    log_test "Launch command includes --mount-volume mounts"
+
+    recipe_name=$(find_solo_recipe)
+    if [[ -z "$recipe_name" ]]; then
+        log_skip "No solo-capable recipes found"
+        return
+    fi
+
+    output=$("$PROJECT_DIR/run-recipe.py" "$recipe_name" --dry-run --solo \
+        --mount-volume /host/one:/container/one \
+        --mount-volume /host/two:/container/two 2>&1)
+    launch_cmd=$(extract_launch_cmd "$output")
+
+    if echo "$launch_cmd" | grep -q "\-\-mount-volume /host/one:/container/one" && \
+       echo "$launch_cmd" | grep -q "\-\-mount-volume /host/two:/container/two"; then
+        log_pass "Launch command includes --mount-volume mounts"
+    else
+        log_fail "--mount-volume mounts not found in launch command"
         log_verbose "Launch cmd: $launch_cmd"
     fi
 }
@@ -1260,6 +1301,7 @@ main() {
     test_launch_cmd_container_override
     test_launch_cmd_no_solo_in_cluster
     test_launch_cmd_env_passthrough
+    test_launch_cmd_mount_volume_passthrough
     test_launch_cmd_no_env_by_default
     echo ""
     
@@ -1281,6 +1323,7 @@ main() {
     # launch-cluster.sh tests
     test_launch_cluster_help
     test_launch_cluster_examples_path
+    test_launch_cluster_mount_volume_check_config
     echo ""
     
     # Extra vLLM arguments tests (-- pass-through)

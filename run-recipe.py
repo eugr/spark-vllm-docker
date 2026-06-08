@@ -810,6 +810,14 @@ Examples:
         help="InfiniBand interface (overrides .env and auto-detection)",
     )
     launch_group.add_argument(
+        "--mount-volume",
+        action="append",
+        dest="mount_volumes",
+        default=[],
+        metavar="HOST_PATH:CONTAINER_PATH",
+        help="Additional Docker volume mount to pass through to launch-cluster.sh. Can be used multiple times.",
+    )
+    launch_group.add_argument(
         "-j",
         dest="build_jobs",
         type=int,
@@ -1217,6 +1225,8 @@ Examples:
             cmd_parts.extend(["--nccl-debug", args.nccl_debug])
         for env_var in args.env_vars:
             cmd_parts.extend(["-e", env_var])
+        for mount_volume in args.mount_volumes:
+            cmd_parts.extend(["--mount-volume", mount_volume])
         if args.master_port:
             cmd_parts.extend(["--master-port", str(args.master_port)])
         if args.container_name:
@@ -1287,6 +1297,8 @@ Examples:
 
         for env_var in args.env_vars:
             cmd.extend(["-e", env_var])
+        for mount_volume in args.mount_volumes:
+            cmd.extend(["--mount-volume", mount_volume])
 
         if args.master_port:
             cmd.extend(["--master-port", str(args.master_port)])

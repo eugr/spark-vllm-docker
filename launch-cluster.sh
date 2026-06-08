@@ -55,6 +55,7 @@ usage() {
     echo "  --eth-if        Ethernet interface (Optional, auto-detected)"
     echo "  --ib-if         InfiniBand interface (Optional, auto-detected)"
     echo "  -e, --env       Environment variable to pass to container (e.g. -e VAR=val)"
+    echo "  --mount-volume  Additional volume mount to pass to Docker (e.g. --mount-volume /host/path:/container/path). Can be specified multiple times."
     echo "  -j              Number of parallel jobs for build environment variables (optional)"
     echo "  --nccl-debug    NCCL debug level (Optional, one of: VERSION, WARN, INFO, TRACE). If no level is provided, defaults to INFO."
     echo "  --apply-mod     Path to directory or zip file containing run.sh to apply before launch (Can be specified multiple times)"
@@ -112,6 +113,7 @@ while [[ "$#" -gt 0 ]]; do
         --eth-if) ETH_IF="$2"; shift ;;
         --ib-if) IB_IF="$2"; shift ;;
         -e|--env) DOCKER_ARGS="$DOCKER_ARGS -e $2"; shift ;;
+        --mount-volume) DOCKER_ARGS="$DOCKER_ARGS -v $2"; shift ;;
         -j) BUILD_JOBS="$2"; shift ;;
         --apply-mod) MOD_PATHS+=("$2"); shift ;;
         --launch-script) LAUNCH_SCRIPT_PATH="$2"; shift ;;
