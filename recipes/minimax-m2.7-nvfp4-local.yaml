@@ -1,0 +1,48 @@
+# Recipe: MiniMax-M2.7-NVFP4-Local
+# Serves lukealonso/MiniMax-M2.7-NVFP4 using locally vetted code instead of
+# --trust-remote-code. Reuses the same vetted MiniMaxM2Config plugin as the
+# M2.5 recipe — the config class is identical between the two models.
+#
+# SETUP:
+#   1. Download the model first (only needed once):
+#      ./run-recipe.py minimax-m2.7-nvfp4-local --download-model
+#   2. Review the vetted code in ../vetted-vllm-code/minimax-m2.5-awq/ if desired
+#   3. Run this recipe:
+#      ./run-recipe.py minimax-m2.7-nvfp4-local
+
+recipe_version: "1"
+name: MiniMax-M2.7-NVFP4-Local
+description: vLLM serving MiniMax-M2.7-NVFP4 using local vetted code (no trust-remote-code, offline HF)
+
+model: lukealonso/MiniMax-M2.7-NVFP4
+container: vllm-node
+cluster_only: true
+solo_only: false
+
+vetted_local_code: ../vetted-vllm-code/minimax-m2.5-awq
+
+defaults:
+  port: 8000
+  host: 0.0.0.0
+  tensor_parallel: 2
+  gpu_memory_utilization: 0.7
+  max_model_len: 196600
+
+env:
+  VLLM_FLASHINFER_ALLREDUCE_BACKEND: trtllm
+  HF_HUB_OFFLINE: "1"
+
+command: |
+  vllm serve lukealonso/MiniMax-M2.7-NVFP4 \
+      --kv-cache-dtype fp8 \
+      --moe-backend cutlass \
+      --gpu-memory-utilization {gpu_memory_utilization} \
+      --max-model-len {max_model_len} \
+      --port {port} \
+      --host {host} \
+      --enable-auto-tool-choice \
+      --load-format fastsafetensors \
+      --tool-call-parser minimax_m2 \
+      --reasoning-parser minimax_m2 \
+      -tp {tensor_parallel} \
+      --distributed-executor-backend ray

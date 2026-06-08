@@ -85,10 +85,12 @@ RELATED FILES:
 
 import argparse
 import os
-import subprocess
 import shlex
+import shutil
+import subprocess
 import sys
 import tempfile
+import urllib.parse
 from pathlib import Path
 from typing import Any
 
@@ -130,6 +132,11 @@ def load_recipe(recipe_path: Path) -> dict[str, Any]:
         description (str, optional): Brief description shown in --list
         model (str, optional): HuggingFace model ID for --setup downloads
         mods (list[str], optional): List of mod directories to apply (e.g., 'mods/fix-glm')
+        vetted_local_code (str, optional): Local path or git URL pointing to a directory of
+            vetted model code that will be applied as a mod, replacing --trust-remote-code.
+            - Local path: resolved relative to SCRIPT_DIR. E.g. '../vetted-vllm-code/nemotron-super'
+            - Git URL: cloned to a temp dir each run. Use '#subpath' to specify a subdirectory
+              within the repo. E.g. 'https://github.com/user/vetted-vllm-code.git#nemotron-super'
         defaults (dict, optional): Default values for command placeholders
         env (dict, optional): Environment variables to export before running
         build_args (list[str], optional): Extra args for build-and-copy.sh (e.g., ['-f', 'Dockerfile.mxfp4'])
@@ -179,6 +186,7 @@ def load_recipe(recipe_path: Path) -> dict[str, Any]:
     recipe.setdefault("description", "")
     recipe.setdefault("model", None)
     recipe.setdefault("mods", [])
+    recipe.setdefault("vetted_local_code", None)
     recipe.setdefault("defaults", {})
     recipe.setdefault("env", {})
     recipe.setdefault("cluster_only", False)
@@ -196,6 +204,58 @@ def load_recipe(recipe_path: Path) -> dict[str, Any]:
         print("Some features may not work correctly. Consider updating run-recipe.py.")
 
     return recipe
+
+
+def resolve_vetted_local_code(value: str, cleanup_dirs: list) -> Path:
+    """
+    Resolve a vetted_local_code value to a local directory path.
+
+    Supports two forms:
+      - Local path (absolute or relative to SCRIPT_DIR):
+          ../vetted-vllm-code/nemotron-super
+      - Git URL with optional '#subpath' fragment:
+          https://github.com/user/vetted-vllm-code.git#nemotron-super
+
+    For git URLs, the repo is cloned into a temporary directory which is
+    added to cleanup_dirs so it is removed after the launch command runs.
+
+    Args:
+        value: The vetted_local_code string from the recipe.
+        cleanup_dirs: List to append temp dirs that should be deleted on exit.
+
+    Returns:
+        Resolved Path to the mod directory.
+    """
+    parsed = urllib.parse.urlparse(value)
+    is_git_url = parsed.scheme in ("http", "https", "ssh", "git") or value.startswith("git@")
+
+    if is_git_url:
+        # Split off '#subpath' fragment if present
+        if "#" in value:
+            url, subpath = value.split("#", 1)
+        else:
+            url, subpath = value, ""
+
+        tmpdir = tempfile.mkdtemp(prefix="spark-vllm-vetted-")
+        cleanup_dirs.append(tmpdir)
+        print(f"Cloning vetted_local_code from {url} ...")
+        result = subprocess.run(
+            ["git", "clone", "--depth=1", url, tmpdir],
+            capture_output=True, text=True
+        )
+        if result.returncode != 0:
+            print(f"Error: Failed to clone {url}")
+            print(result.stderr)
+            sys.exit(1)
+
+        mod_path = Path(tmpdir) / subpath if subpath else Path(tmpdir)
+        if not mod_path.exists():
+            print(f"Error: subpath '{subpath}' not found in cloned repo {url}")
+            sys.exit(1)
+        return mod_path
+    else:
+        # Local path — resolve relative to SCRIPT_DIR
+        return (SCRIPT_DIR / value).resolve()
 
 
 def list_recipes() -> None:
@@ -1203,6 +1263,8 @@ Examples:
         cmd_parts = ["   ./launch-cluster.sh", "-t", container]
         for mod in recipe.get("mods", []):
             cmd_parts.extend(["--apply-mod", mod])
+        if recipe.get("vetted_local_code"):
+            cmd_parts.extend(["--apply-mod", recipe["vetted_local_code"]])
         if args.solo:
             cmd_parts.append("--solo")
         elif not is_cluster:
@@ -1252,6 +1314,7 @@ Examples:
         f.write(script_content)
         temp_script = f.name
 
+    vetted_cleanup_dirs: list = []
     try:
         os.chmod(temp_script, 0o755)
 
@@ -1264,6 +1327,13 @@ Examples:
             if not mod_path.exists():
                 print(f"Warning: Mod path not found: {mod_path}")
             cmd.extend(["--apply-mod", str(mod_path)])
+
+        # Add vetted_local_code as a mod (alternative to --trust-remote-code)
+        if recipe.get("vetted_local_code"):
+            vetted_path = resolve_vetted_local_code(recipe["vetted_local_code"], vetted_cleanup_dirs)
+            if not vetted_path.exists():
+                print(f"Warning: vetted_local_code path not found: {vetted_path}")
+            cmd.extend(["--apply-mod", str(vetted_path)])
 
         # Add launch options
         if args.solo:
@@ -1337,6 +1407,12 @@ Examples:
             os.unlink(temp_script)
         except OSError:
             pass
+        # Cleanup any temp dirs created by resolve_vetted_local_code (git clones)
+        for tmpdir in vetted_cleanup_dirs:
+            try:
+                shutil.rmtree(tmpdir)
+            except OSError:
+                pass
 
 
 if __name__ == "__main__":
