@@ -1,0 +1,67 @@
+# Recipe: Gemma 4 31B FP8
+# Google Gemma 4 31B dense model with runtime dynamic FP8 quantization
+# Multimodal (text + image + video), 256K context, Apache 2.0
+#
+# Uses BF16 base model with --quantization fp8 for dynamic online quantization.
+# The protoLabsAI/gemma-4-31B-it-FP8 checkpoint has a weight_scale KeyError
+# in gemma4.py load_weights (same class of bug as vllm #38912). Using the
+# base BF16 model with runtime FP8 avoids this entirely and is confirmed
+# working on DGX Spark.
+#
+# vLLM support merged 2026-04-02 (PR #38826)
+# Known issues as of 2026-04-05:
+#   - Tool call streaming may produce invalid JSON (#38946)
+#   - Reasoning parser may fail to separate thinking content (#38855)
+#   - Pre-quantized FP8 checkpoints fail to load (weight_scale KeyError)
+
+recipe_version: "1"
+name: Gemma-4-31B-FP8
+description: vLLM serving Google Gemma 4 31B with runtime FP8 quantization
+
+# HuggingFace model to download (optional, for --download-model)
+model: google/gemma-4-31B-it
+
+# Container image to use (tf5 = transformers>=5 baked in, required for Gemma 4)
+container: vllm-node-tf5
+
+build_args:
+  - --tf5
+
+# Fix reasoning parser skip_special_tokens bug (vllm #38855)
+# Fix streaming tool call duplication (vllm PR #38909)
+mods:
+  - mods/fix-gemma4-reasoning
+  - mods/fix-gemma4-tool-parser
+
+# Default settings (can be overridden via CLI)
+defaults:
+  port: 8000
+  host: 0.0.0.0
+  tensor_parallel: 1
+  gpu_memory_utilization: 0.85
+  max_model_len: 65536
+  max_num_batched_tokens: 8192
+
+# Environment variables
+# Disable compile cache to avoid AOTAutogradCache pickle error (vllm #36103)
+# while keeping torch.compile + CUDA graphs active for performance
+env:
+  VLLM_DISABLE_COMPILE_CACHE: 1
+
+# The vLLM serve command template
+# Uses runtime dynamic FP8 quantization (no calibration data needed)
+# and FP8 KV cache for additional memory savings
+command: |
+  vllm serve google/gemma-4-31B-it \
+    --quantization fp8 \
+    --kv-cache-dtype fp8 \
+    --max-model-len {max_model_len} \
+    --gpu-memory-utilization {gpu_memory_utilization} \
+    --port {port} \
+    --host {host} \
+    --load-format fastsafetensors \
+    --enable-prefix-caching \
+    --enable-auto-tool-choice \
+    --tool-call-parser gemma4 \
+    --reasoning-parser gemma4 \
+    -tp {tensor_parallel} --distributed-executor-backend ray

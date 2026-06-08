@@ -19,8 +19,9 @@ build_args:
   - --tf5
 
 # Mods
-# mods:
-  # - mods/fix-gemma4-tool-parser
+mods:
+  - mods/fix-gemma4-reasoning
+  - mods/fix-gemma4-tool-parser
 
 # Default settings (can be overridden via CLI)
 defaults:

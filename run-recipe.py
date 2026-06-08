@@ -147,10 +147,15 @@ def load_recipe(recipe_path: Path) -> dict[str, Any]:
     """
     if not recipe_path.exists():
         # Try candidates in order: add extension to original path first,
-        # then fall back to flat recipes/ directory (for bare recipe names)
+        # then resolve subdir-relative paths against RECIPES_DIR (so
+        # "4x-spark-cluster/foo" finds RECIPES_DIR/4x-spark-cluster/foo.yaml),
+        # then fall back to flat recipes/ directory (for bare recipe names).
         candidates = [
             Path(str(recipe_path) + ".yaml"),
             Path(str(recipe_path) + ".yml"),
+            RECIPES_DIR / recipe_path,
+            RECIPES_DIR / f"{recipe_path}.yaml",
+            RECIPES_DIR / f"{recipe_path}.yml",
             RECIPES_DIR / recipe_path.name,
             RECIPES_DIR / f"{recipe_path.name}.yaml",
             RECIPES_DIR / f"{recipe_path.name}.yml",

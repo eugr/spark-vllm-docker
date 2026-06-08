@@ -145,7 +145,12 @@ START_TIME=$(date +%s)
 # Download model
 echo "Downloading model '$MODEL_NAME' using uvx..."
 DOWNLOAD_START=$(date +%s)
-if uvx hf download "$MODEL_NAME"; then
+# PYTHONUNBUFFERED=1: stdout is block-buffered when not a TTY; without this
+# tqdm progress accumulates 4-8 KB before flushing, so the deployment log
+# stays mostly empty even though the download is making progress.
+# TQDM_MININTERVAL=1: huggingface_hub.tqdm defaults to 10s between updates
+# when piped (non-TTY); 1s gives the dashboard a usable refresh rate.
+if PYTHONUNBUFFERED=1 TQDM_MININTERVAL=1 uvx hf download "$MODEL_NAME"; then
     DOWNLOAD_END=$(date +%s)
     DOWNLOAD_TIME=$((DOWNLOAD_END - DOWNLOAD_START))
     printf "Download completed in %02d:%02d:%02d\n" $((DOWNLOAD_TIME/3600)) $((DOWNLOAD_TIME%3600/60)) $((DOWNLOAD_TIME%60))

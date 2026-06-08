@@ -1,0 +1,127 @@
+--- gdn_linear_attn.py	2026-05-03 16:56:06.590165263 +0200
++++ gdn_linear_attn.py	2026-05-03 16:57:49.502993979 +0200
+@@ -34,6 +34,7 @@
+ from vllm.model_executor.layers.linear import (
+     ColumnParallelLinear,
+     MergedColumnParallelLinear,
++    ReplicatedLinear,
+     RowParallelLinear,
+ )
+ from vllm.model_executor.layers.mamba.abstract import MambaBase
+@@ -318,12 +319,51 @@
+         # ba_proj doesn't support blockwise fp8 quantization.
+         # Qwen3-Next and Qwen3.5 have different in_proj_ba checkpoint
+         # layouts, so we use a factory method to create the projection.
+-        self.in_proj_ba = self.create_ba_proj(
+-            hidden_size=self.hidden_size,
+-            num_v_heads=self.num_v_heads,
+-            quant_config=quant_config,
+-            prefix=f"{prefix}.in_proj_ba",
+-        )
++        #
++        # MARLIN TP=4 WORKAROUND (Qwen3.5, gqa_interleaved_layout=False).
++        # The standard MergedColumnParallelLinear with output_sizes=
++        # [num_v_heads]*2 produces a per-rank output_size_per_partition of
++        # num_v_heads/tp_size, which falls below Marlin's MIN_THREAD_N=64
++        # at TP=4 (e.g. 64/4=16). Quantized weights then have no usable
++        # kernel and vLLM aborts with "Failed to find a kernel that can
++        # implement the WNA16 linear layer".
++        #
++        # Sidestep this by holding the full b/a weights replicated on every
++        # rank (two ReplicatedLinear modules) and slicing the local TP
++        # portion in forward (see _project_ba). The module prefixes are
++        # `{prefix}.in_proj_ba.0` and `{prefix}.in_proj_ba.1` — NOT
++        # `{prefix}.in_proj_b` / `{prefix}.in_proj_a` — so the parent
++        # model's `packed_modules_mapping["in_proj_ba"] = ["in_proj_ba.0",
++        # "in_proj_ba.1"]` continues to route the checkpoint's packed
++        # `in_proj_ba.{scales,qweight,qzeros,...}` tensors correctly into
++        # the two split modules. This is exactly upstream issue #35924's
++        # proposed fix, ported to the post-refactor gdn_linear_attn.py
++        # location (vLLM 0.18+).
++        #
++        # Qwen3-Next interleaved layout keeps the original packed module —
++        # it has its own constraints and isn't the target of this fix.
++        if self.gqa_interleaved_layout:
++            self.in_proj_ba = self.create_ba_proj(
++                hidden_size=self.hidden_size,
++                num_v_heads=self.num_v_heads,
++                quant_config=quant_config,
++                prefix=f"{prefix}.in_proj_ba",
++            )
++        else:
++            self.in_proj_b = ReplicatedLinear(
++                input_size=self.hidden_size,
++                output_size=self.num_v_heads,
++                bias=False,
++                quant_config=quant_config,
++                prefix=f"{prefix}.in_proj_ba.0",
++            )
++            self.in_proj_a = ReplicatedLinear(
++                input_size=self.hidden_size,
++                output_size=self.num_v_heads,
++                bias=False,
++                quant_config=quant_config,
++                prefix=f"{prefix}.in_proj_ba.1",
++            )
+ 
+         query_key_settings = (self.key_dim, 0, False)
+         value_settings = (self.value_dim, 0, False)
+@@ -439,6 +479,31 @@
+             prefix=prefix,
+         )
+ 
++    def _project_ba(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, None]:
++        """Compute the in_proj_ba projection.
++
++        For Qwen3-Next (gqa_interleaved_layout=True) this delegates to the
++        original MergedColumnParallelLinear, which already produces the
++        per-rank shape downstream code expects.
++
++        For Qwen3.5 (gqa_interleaved_layout=False) this is the Marlin TP=4
++        workaround: project hidden_states through two replicated b/a linears
++        (full output on every rank), slice this rank's TP portion, and
++        concatenate so the returned tensor matches the shape that
++        MergedColumnParallelLinear with output_sizes=[num_v_heads]*2 would
++        have produced (i.e. last dim = 2 * num_v_heads / tp_size).
++        """
++        if self.gqa_interleaved_layout:
++            return self.in_proj_ba(hidden_states)
++        full_b, _ = self.in_proj_b(hidden_states)
++        full_a, _ = self.in_proj_a(hidden_states)
++        chunk = self.num_v_heads // self.tp_size
++        start = self.tp_rank * chunk
++        end = start + chunk
++        b = full_b[..., start:end].contiguous()
++        a = full_a[..., start:end].contiguous()
++        return torch.cat([b, a], dim=-1), None
++
+     def fix_query_key_value_ordering(
+         self,
+         mixed_qkvz: torch.Tensor,
+@@ -534,7 +599,7 @@
+         if hasattr(self, "in_proj_qkv"):
+             # LoRA path (Qwen3.5 only): separate in_proj_qkv and in_proj_z
+             mixed_qkv, _ = self.in_proj_qkv(hidden_states)
+-            ba, _ = self.in_proj_ba(hidden_states)
++            ba, _ = self._project_ba(hidden_states)
+             z, _ = self.in_proj_z(hidden_states)
+             z = z.reshape(z.size(0), -1, self.head_v_dim)
+             b, a = ba.chunk(2, dim=-1)
+@@ -542,7 +607,7 @@
+             a = a.contiguous()
+         else:
+             mixed_qkvz, _ = self.in_proj_qkvz(hidden_states)
+-            ba, _ = self.in_proj_ba(hidden_states)
++            ba, _ = self._project_ba(hidden_states)
+ 
+             if self.gqa_interleaved_layout:
+                 # Qwen3-Next: unpack the interleaved GQA layout
+@@ -613,7 +678,7 @@
+         # Part 1: Input Projection
+         # ============================================================
+         projected_states_qkvz, _ = self.in_proj_qkvz(hidden_states)
+-        projected_states_ba, _ = self.in_proj_ba(hidden_states)
++        projected_states_ba, _ = self._project_ba(hidden_states)
+ 
+         # ============================================================
+         # Part 2: Core Attention

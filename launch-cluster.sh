@@ -5,7 +5,8 @@ IMAGE_NAME="vllm-node"
 DEFAULT_CONTAINER_NAME="vllm_node"
 HF_CACHE_DIR="${HF_HOME:-$HOME/.cache/huggingface}"
 # Modify these if you want to pass additional docker args or set VLLM_SPARK_EXTRA_DOCKER_ARGS variable
-DOCKER_ARGS="-e NCCL_IGNORE_CPU_AFFINITY=1 -v $HF_CACHE_DIR:/root/.cache/huggingface"
+SHARED_STORAGE="${SHARED_STORAGE_PATH:-/mnt/tank}"
+DOCKER_ARGS="-e NCCL_IGNORE_CPU_AFFINITY=1 -v $HF_CACHE_DIR:/root/.cache/huggingface -v $SHARED_STORAGE:/workspace"
 
 # Append additional arguments from environment variable
 if [[ -n "$VLLM_SPARK_EXTRA_DOCKER_ARGS" ]]; then
@@ -835,22 +836,29 @@ get_env_flags() {
 }
 
 # Start Ray head node inside the container
+# --num-gpus 1: explicit GPU count for the head. Ray's auto-detection has been
+# observed to under-report (e.g. worker registers with 0 GPUs on GB10), which
+# causes vLLM placement groups with TP>1 to hang forever. Passing --num-gpus
+# explicitly is reliable on this hardware.
 start_ray_head() {
     local container="$1"
     echo "Starting Ray HEAD node on $HEAD_IP..."
     docker exec -d "$container" bash -c \
-        "ray start --block --head --port $MASTER_PORT --object-store-memory 1073741824 --num-cpus 2 \
+        "ray start --block --head --port $MASTER_PORT --object-store-memory 1073741824 --num-cpus 2 --num-gpus 1 \
          --node-ip-address $HEAD_IP --include-dashboard=false --disable-usage-stats \
          >> /proc/1/fd/1 2>&1"
 }
 
 # Start Ray worker node inside the container on a remote host
+# --num-gpus 1 is the same defensive fix as start_ray_head — without it, the
+# worker registered 0 GPUs and the Ray placement group hung forever (vLLM's
+# TP=2 needs both head + worker GPU).
 start_ray_worker() {
     local worker_ip="$1"; local container="$2"
     echo "Starting Ray WORKER node on $worker_ip..."
     ssh -o BatchMode=yes -o StrictHostKeyChecking=no "$worker_ip" \
         "docker exec -d $container bash -c \
-         'ray start --block --object-store-memory 1073741824 --num-cpus 2 --disable-usage-stats \
+         'ray start --block --object-store-memory 1073741824 --num-cpus 2 --num-gpus 1 --disable-usage-stats \
           --address=$HEAD_IP:$MASTER_PORT --node-ip-address $worker_ip >> /proc/1/fd/1 2>&1'"
 }
 
@@ -945,6 +953,18 @@ start_cluster() {
 
     # Start Ray cluster (unless solo or no-ray)
     if [[ "$SOLO_MODE" == "false" && "$NO_RAY_MODE" == "false" ]]; then
+        # Pre-Ray GPU visibility check inside each container. Multi-node TP
+        # silently hangs on the placement group if a worker container can't
+        # see its GPU; this diagnostic surfaces the cause to the deployment log.
+        echo "--- nvidia-smi (head $HEAD_IP) ---"
+        docker exec "$CONTAINER_NAME" bash -c "nvidia-smi -L 2>&1 || echo 'nvidia-smi failed in head container'" | sed 's/^/  /'
+        for worker in "${PEER_NODES[@]}"; do
+            echo "--- nvidia-smi (worker $worker) ---"
+            ssh -o BatchMode=yes -o StrictHostKeyChecking=no "$worker" \
+                "docker exec $CONTAINER_NAME bash -c 'nvidia-smi -L 2>&1 || echo nvidia-smi-failed-in-worker-container'" | sed 's/^/  /'
+        done
+        echo "------------------"
+
         start_ray_head "$CONTAINER_NAME"
         for worker in "${PEER_NODES[@]}"; do
             start_ray_worker "$worker" "$CONTAINER_NAME"
@@ -960,20 +980,59 @@ wait_for_cluster() {
     echo "Waiting for cluster to be ready..."
     local retries=30
     local count=0
-    
+    local expected_nodes=$(( 1 + ${#PEER_NODES[@]} ))
+
     while [[ $count -lt $retries ]]; do
         # Check if ray is responsive
         if docker exec "$CONTAINER_NAME" ray status >/dev/null 2>&1; then
              echo "Cluster head is responsive."
-             # Give workers a moment to connect
-             sleep 5
+             # Give workers up to 30s to register, polling every 3s. The previous
+             # blind 5s sleep was not enough for worker GPU registration on GB10
+             # — vLLM would launch and hit "TP=N exceeds available GPUs (1)"
+             # while the worker was still mid-handshake.
+             # Wait up to 30s for the head's ray status to report the expected
+             # GPU count from all nodes, not just node count.
+             local node_wait=10
+             local node_count=0
+             local expected_gpus=$expected_nodes
+             local total_gpu_avail=0
+             while [[ $node_count -lt $node_wait ]]; do
+                 # Pull total GPU capacity from `ray status`. Format: "0.0/2.0 GPU"
+                 total_gpu_avail=$(docker exec "$CONTAINER_NAME" ray status 2>/dev/null \
+                     | grep -oE '[0-9]+(\.[0-9]+)?/[0-9]+(\.[0-9]+)?\s*GPU' \
+                     | head -1 | sed -E 's@^[^/]+/([0-9]+(\.[0-9]+)?)\s*GPU@\1@' | head -1)
+                 total_gpu_avail=${total_gpu_avail:-0}
+                 if (( $(echo "$total_gpu_avail >= $expected_gpus" | bc -l 2>/dev/null || echo 0) )); then
+                     echo "All $expected_gpus GPU(s) registered with Ray."
+                     echo "--- ray status ---"
+                     docker exec "$CONTAINER_NAME" ray status 2>&1 | sed 's/^/  /' || true
+                     echo "------------------"
+                     return 0
+                 fi
+                 sleep 3
+                 ((node_count++))
+             done
+             echo "WARNING: Ray sees only $total_gpu_avail/$expected_gpus GPU(s) after waiting."
+             echo "--- ray status (head) ---"
+             docker exec "$CONTAINER_NAME" ray status 2>&1 | sed 's/^/  /' || true
+             # Per-worker: show whether its Ray is alive. A failure here usually
+             # means version mismatch with the head (see
+             # syncContainerImage in dgx-manager agent) or networking.
+             for w in "${PEER_NODES[@]}"; do
+                 echo "--- worker $w: ray status (local) ---"
+                 ssh -o BatchMode=yes -o StrictHostKeyChecking=no "$w" \
+                     "docker exec $CONTAINER_NAME ray status 2>&1 | head -20" | sed 's/^/  /' || true
+             done
+             echo "----------------------"
+             # Don't fail hard — let vLLM try; the failure mode (placement
+             # group hang) is informative enough.
              return 0
         fi
-        
+
         sleep 2
         ((count++))
     done
-    
+
     echo "Timeout waiting for cluster to start."
     exit 1
 }

@@ -1,0 +1,65 @@
+# Recipe: Qwen/Qwen3.6-27B (BF16)
+# Native BF16 weights (~54 GB on disk). Solo on a single GB10 with
+# room to spare for KV cache.
+#
+# Architecture: 27B DENSE, hybrid 16 × (3× Gated-DeltaNet → FFN,
+# 1× Gated-Attention → FFN). Multimodal (image + video + text in,
+# text out). Apache-2.0.
+#
+# Note on quantization: this model uses the same Gated-DeltaNet
+# in_proj_ba layout as Qwen3.5-397B (num_v_heads = 48). At any TP > 1
+# with INT4-AutoRound the Marlin MIN_THREAD_N=64 floor is violated
+# (48/tp < 64) and engine init fails — see mods/fix-qwen35-tp4-marlin.
+# BF16 doesn't go through Marlin, so this recipe (TP=1, BF16) avoids
+# the issue entirely.
+
+recipe_version: "1"
+name: Qwen3.6-27B-BF16
+description: vLLM serving Qwen3.6-27B in native BF16
+
+# HuggingFace model id
+model: Qwen/Qwen3.6-27B
+
+# Container image (standard vllm-node, no --tf5 needed)
+container: vllm-node
+
+# Mods
+mods:
+  # Coder tool-call parser fix
+  - mods/fix-qwen3-coder-next
+
+# Default settings (can be overridden via CLI)
+defaults:
+  port: 8000
+  host: 0.0.0.0
+  tensor_parallel: 1
+  # 27B BF16 weights = ~54 GB; with util=0.85 the vLLM pool is ~104 GB,
+  # leaving ~50 GB for KV cache and activations on a 122 GB GB10.
+  gpu_memory_utilization: 0.85
+  # Native context is 262144 (extensible to ~1M via YaRN). 32k is the
+  # default for serving; bump via --max-model-len if you need more.
+  max_model_len: 32768
+  max_num_batched_tokens: 8192
+
+# Environment variables
+env:
+  # Safe to leave on for any Qwen3.x recipe.
+  VLLM_MARLIN_USE_ATOMIC_ADD: 1
+
+# vLLM serve command template
+command: |
+  vllm serve Qwen/Qwen3.6-27B \
+    --host {host} \
+    --port {port} \
+    --max-model-len {max_model_len} \
+    --max-num-batched-tokens {max_num_batched_tokens} \
+    --gpu-memory-utilization {gpu_memory_utilization} \
+    --enable-auto-tool-choice \
+    --tool-call-parser qwen3_coder \
+    --reasoning-parser qwen3 \
+    --kv-cache-dtype fp8 \
+    --load-format fastsafetensors \
+    --attention-backend flashinfer \
+    --enable-prefix-caching \
+    --trust-remote-code \
+    -tp {tensor_parallel}
