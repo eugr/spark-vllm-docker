@@ -1,0 +1,75 @@
+# Recipe: Nemotron-3-Super-NVFP4 + MTP  (experimental — MTP with the sm121 crash-fix applied)
+#
+# Modernized Super recipe (0.22.1rc1 engine) WITH Multi-Token Prediction speculative
+# decoding. Super carries MTP draft layers (unlike Nano).
+#
+# BACKGROUND: MTP via the *default* mixed-backend drafter intermittently CORRUPTS GPU MEMORY
+# on sm121/GB10 — on Ultra (identical mechanism) it caused two `CUDA error: illegal memory
+# access` crashes on Worker_TP0 (~4.5h & ~29h uptime; NOT OOM — one at 37% KV cache), root-
+# caused to the MTP draft layers' UNQUANTIZED MoE running on FlashInfer (unreliable on sm121).
+#
+# FIX APPLIED HERE: the env VLLM_USE_FLASHINFER_MOE_FP16=0 (below) forces that unquantized
+# MoE onto TRITON instead of FlashInfer, removing the crash path entirely. Both MoE paths are
+# now off FlashInfer (NVFP4 main → VLLM_CUTLASS, unquantized MTP → TRITON), all sm121-safe
+# kernels. Long-term stability still warrants a soak test before production; the stable
+# MTP-OFF recipe (nemotron-3-super-nvfp4.yaml) remains the conservative default.
+#
+# MTP backend handling (same resolution as Ultra): a single global --moe-backend can't serve
+# both the NVFP4 main experts (need cutlass on sm121) and the unquantized MTP MoE (rejects
+# cutlass). So: drop --moe-backend, and set VLLM_USE_FLASHINFER_MOE_FP4=0 so the FP4 oracle
+# strips FlashInfer and the main experts land on VLLM_CUTLASS; the unquantized MTP MoE then
+# auto-selects (observed: FlashInfer CUTLASS — the unreliable path above).
+
+recipe_version: "1"
+name: Nemotron-3-Super-NVFP4-MTP-EXPERIMENTAL
+description: vLLM serving Nemotron-3-Super-120B with MTP speculative decoding (EXPERIMENTAL, unstable on sm121)
+
+model: nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4
+container: vllm-node-eugr022
+cluster_only: false
+solo_only: false
+
+env:
+  VLLM_FLASHINFER_ALLREDUCE_BACKEND: trtllm
+  VLLM_ALLOW_LONG_MAX_MODEL_LEN: 1
+  # Strip FlashInfer from the FP4 MoE oracle so NVFP4 main experts land on VLLM_CUTLASS,
+  # WITHOUT a global --moe-backend (which would wrongly force cutlass onto the unquantized
+  # MTP MoE). Read only by the FP4 oracle; the unquantized MTP MoE auto-selects separately.
+  VLLM_USE_FLASHINFER_MOE_FP4: "0"
+  # MTP CRASH FIX (sm121): the MTP draft layers' UNQUANTIZED MoE otherwise auto-selects
+  # FlashInfer CUTLASS — the path that intermittently caused CUDA illegal-memory-access on
+  # Ultra. This env strips FlashInfer from the unquantized MoE oracle (unquantized.py:234),
+  # forcing it to TRITON (sm121-safe). Net: BOTH MoE paths off FlashInfer — NVFP4 main on
+  # VLLM_CUTLASS, unquantized MTP on TRITON. (Long-term stability still needs a soak test.)
+  VLLM_USE_FLASHINFER_MOE_FP16: "0"
+
+defaults:
+  port: 8000
+  host: 0.0.0.0
+  tensor_parallel: 2
+  gpu_memory_utilization: 0.7
+  max_model_len: 262144
+  max_num_seqs: 10
+  # JSON kept as a defaults value (referenced as one {speculative_config} token) because
+  # run-recipe.py does single-pass str.format() — inline JSON braces would be misread.
+  speculative_config: '{"method": "nemotron_h_mtp", "num_speculative_tokens": 5}'
+
+command: |
+  vllm serve nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4 \
+  --kv-cache-dtype fp8 \
+  --trust-remote-code \
+  --gpu-memory-utilization {gpu_memory_utilization} \
+  --max-model-len {max_model_len} \
+  --max-num-seqs {max_num_seqs} \
+  --enable-prefix-caching \
+  --host {host} \
+  --port {port} \
+  --enable-auto-tool-choice \
+  --load-format safetensors \
+  --tool-call-parser qwen3_coder \
+  --reasoning-parser nemotron_v3 \
+  --mamba-ssm-cache-dtype float32 \
+  --speculative-config '{speculative_config}' \
+  --tensor-parallel-size {tensor_parallel} \
+  --attention-backend TRITON_ATTN \
+  --distributed-executor-backend ray

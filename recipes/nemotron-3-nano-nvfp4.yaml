@@ -9,14 +9,17 @@ description: vLLM serving Nemotron-3-Nano-NVFP4 on a SINGLE NODE ONLY!
 # HuggingFace model to download (optional, for --download-model)
 model: nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4
 
-# Container image to use
-container: vllm-node
+# Container image to use. Modernized 2026-06-08 to the 0.22.1rc1 engine
+# (vllm-node-eugr022, shared with Super/Ultra) off the old vllm-node (0.18.1).
+container: vllm-node-eugr022
 
 # This model can only run on single node (solo)
 solo_only: true
 
-# No mods required
-mods: 
+# Nano's reasoning parser (nano_v3) is NOT built into vLLM 0.22.1 (verified) — this mod
+# wgets nano_v3_reasoning_parser.py for --reasoning-parser-plugin below. (Nano has no MTP
+# draft layers, so no speculative decoding here — only Super/Ultra carry MTP.)
+mods:
   - mods/nemotron-nano
 
 # Default settings (can be overridden via CLI)
@@ -40,5 +43,5 @@ command: |
      --reasoning-parser nano_v3  \
      --kv-cache-dtype fp8  \
      --enable-prefix-caching  \
-     --load-format fastsafetensors  \
+     --load-format safetensors  \
      --gpu-memory-utilization {gpu_memory_utilization}

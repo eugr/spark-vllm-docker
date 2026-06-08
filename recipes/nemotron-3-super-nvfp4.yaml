@@ -5,7 +5,10 @@ name: Nemotron-3-Super-NVFP4-CUTLASS-Optimized
 description: vLLM serving Nemotron-3-Super-120B using CUTLASS kernels
 
 model: nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4
-container: vllm-node
+# Modernized 2026-06-08 to the 0.22.1rc1 engine (vllm-node-eugr022, shared with Ultra) off
+# the old vllm-node (0.18.1). Stable config: MTP OFF (see nemotron-3-super-nvfp4-mtp.yaml for
+# the experimental MTP variant — MTP intermittently CUDA-crashes on sm121, see that file).
+container: vllm-node-eugr022
 cluster_only: false
 solo_only: false
 
@@ -16,7 +19,6 @@ env:
   VLLM_FLASHINFER_ALLREDUCE_BACKEND: trtllm
   VLLM_ALLOW_LONG_MAX_MODEL_LEN: 1
 
-container: vllm-node
 defaults:
   port: 8000
   host: 0.0.0.0
@@ -37,10 +39,10 @@ command: |
   --host {host} \
   --port {port} \
   --enable-auto-tool-choice \
-  --load-format fastsafetensors \
+  --load-format safetensors \
   --tool-call-parser qwen3_coder \
   --reasoning-parser nemotron_v3 \
-  --mamba_ssm_cache_dtype float32 \
+  --mamba-ssm-cache-dtype float32 \
   --tensor-parallel-size {tensor_parallel} \
   --attention-backend TRITON_ATTN \
   --distributed-executor-backend ray
