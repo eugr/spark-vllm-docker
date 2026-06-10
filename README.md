@@ -146,7 +146,7 @@ For periodic maintenance, I recommend using a filter: `docker builder prune --fi
 
 #### DiffusionGemma Recipes and Mod
 
-Added day0 support for Google DeepMind's DiffusionGemma model via `mods/diffusiongemma`. Check out [NVIDIA blog](https://developer.nvidia.com/blog/run-diffusiongemma-on-nvidia-for-developer-ready-high-throughput-…) for details!
+Added day0 support for Google DeepMind's DiffusionGemma model via `mods/diffusiongemma`. Check out [NVIDIA blog](https://developer.nvidia.com/blog/run-diffusiongemma-on-nvidia-for-developer-ready-high-throughput-text-generation/) for details!
 
 Added four solo-only DiffusionGemma recipes:
 
