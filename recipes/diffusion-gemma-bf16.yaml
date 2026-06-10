@@ -31,7 +31,7 @@ env: {}
 
 # The vLLM serve command template
 command: |
-  vllm serve google/diffusiongemma-4-26b-a4b-it \
+  vllm serve google/diffusiongemma-26B-A4B-it \
     --max-model-len {max_model_len} \
     --gpu-memory-utilization {gpu_memory_utilization} \
     --port {port} \
