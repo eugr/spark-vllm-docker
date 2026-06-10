@@ -150,8 +150,8 @@ Added day0 support for Google DeepMind's DiffusionGemma model via `mods/diffusio
 
 Added four solo-only DiffusionGemma recipes:
 
-- `diffusion-gemma-bf16-thinking` for `google/diffusiongemma-4-26b-a4b-it` with thinking enabled.
-- `diffusion-gemma-bf16` for `google/diffusiongemma-4-26b-a4b-it` with thinking disabled.
+- `diffusion-gemma-bf16-thinking` for `google/diffusiongemma-26B-A4B-it` with thinking enabled.
+- `diffusion-gemma-bf16` for `google/diffusiongemma-26B-A4B-it` with thinking disabled.
 - `diffusion-gemma-nvfp4-thinking` for `nvidia/diffusiongemma-26B-A4B-it-NVFP4` with thinking enabled.
 - `diffusion-gemma-nvfp4` for `nvidia/diffusiongemma-26B-A4B-it-NVFP4` with thinking disabled.
 
@@ -160,7 +160,7 @@ The non-thinking variants still keep `--reasoning-parser gemma4`, since these mo
 Example:
 
 ```bash
-./hf-download.sh google/diffusiongemma-4-26b-a4b-it
+./hf-download.sh google/diffusiongemma-26B-A4B-it
 ./run-recipe.sh diffusion-gemma-bf16-thinking --solo
 ```
 
