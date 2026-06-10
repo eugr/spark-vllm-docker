@@ -2,12 +2,14 @@
 set -euo pipefail
 
 PYTHON_ROOT="${PYTHON_ROOT:-/usr/local/lib/python3.12/dist-packages}"
+START_DIR="$PWD"
 MOD_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PATCH_FILE="$MOD_DIR/diffusiongemma-support.patch"
 ATTENTION_LEGACY_PATCH_FILE="$MOD_DIR/diffusiongemma-attention-legacy.patch"
 ATTENTION_MAIN_PATCH_FILE="$MOD_DIR/diffusiongemma-attention-main.patch"
 STREAMING_REASONING_PATCH_FILE="$MOD_DIR/gemma4-streaming-reasoning.patch"
 CONTENT_CHANNEL_SANITIZER_PATCH_FILE="$MOD_DIR/gemma4-content-channel-sanitizer.patch"
+CHAT_TEMPLATE_FILE="$MOD_DIR/chat_template_no_think.jinja"
 PATCH_EXCLUDES=(
   --exclude="benchmarks/*"
   --exclude="cmake/*"
@@ -146,4 +148,13 @@ elif git apply --check "$CONTENT_CHANNEL_SANITIZER_PATCH_FILE"; then
 else
   echo "[diffusiongemma] Gemma4 content channel sanitizer patch could not be applied to installed vLLM." >&2
   exit 1
+fi
+
+if [ ! -f "$CHAT_TEMPLATE_FILE" ]; then
+  echo "[diffusiongemma] chat template not found: $CHAT_TEMPLATE_FILE" >&2
+  exit 1
+else
+  CHAT_TEMPLATE_TARGET_DIR="${WORKSPACE_DIR:-$START_DIR}"
+  cp "$CHAT_TEMPLATE_FILE" "$CHAT_TEMPLATE_TARGET_DIR/fixed_chat_template.jinja"
+  echo "[diffusiongemma]=======> to apply chat template, use --chat-template fixed_chat_template.jinja"
 fi

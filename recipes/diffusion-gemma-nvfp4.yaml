@@ -43,5 +43,6 @@ command: |
     --enable-prefix-caching \
     --diffusion-config '{{"canvas_length":256}}' \
     --override-generation-config '{{"max_new_tokens": null}}' \
+    --chat-template fixed_chat_template.jinja \
     --reasoning-parser gemma4 \
     --default-chat-template-kwargs '{{"enable_thinking": false}}'

@@ -47,4 +47,5 @@ command: |
     --override-generation-config '{{"max_new_tokens": null}}' \
     --reasoning-parser gemma4 \
     --default-chat-template-kwargs '{{"enable_thinking": false}}' \
-    --moe-backend triton
+    --chat-template fixed_chat_template.jinja \
+    --moe-backend triton 
