@@ -6,7 +6,7 @@ name: Diffusion-Gemma-BF16
 description: vLLM serving DiffusionGemma-4-26B-A4B-IT in BF16 on a single node
 
 # HuggingFace model to download (optional, for --download-model)
-model: google/diffusiongemma-4-26b-a4b-it
+model: google/diffusiongemma-26B-A4B-it
 
 # Container image to use
 container: vllm-node
