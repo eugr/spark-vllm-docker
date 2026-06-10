@@ -160,6 +160,7 @@ The non-thinking variants still keep `--reasoning-parser gemma4`, since these mo
 Example:
 
 ```bash
+./hf-download.sh google/diffusiongemma-4-26b-a4b-it
 ./run-recipe.sh diffusion-gemma-bf16-thinking --solo
 ```
 
