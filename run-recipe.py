@@ -853,6 +853,20 @@ Examples:
         help="Shared memory size in GB (only with --non-privileged, default: 64)",
     )
 
+    launch_group.add_argument(
+        "--network",
+        dest="docker_network",
+        help="Docker network to use (default: host). Useful with --publish.",
+    )
+    launch_group.add_argument(
+        "-p", "--publish",
+        action="append",
+        dest="publish_ports",
+        default=[],
+        metavar="HOST:CONTAINER",
+        help="Publish a container port (can be specified multiple times). Solo mode only.",
+    )
+
     # Config file option
     parser.add_argument(
         "--config",
@@ -972,6 +986,15 @@ Examples:
                 eth_if = env["ETH_IF"]
             if not ib_if and env.get("IB_IF"):
                 ib_if = env["IB_IF"]
+
+
+
+    # Resolve docker network: CLI > .env (works for both solo and cluster)
+    docker_network = args.docker_network or None
+    if not docker_network:
+        env_net = load_env_file().get("NETWORK")
+        if env_net:
+            docker_network = env_net
 
     worker_nodes = get_worker_nodes(nodes) if nodes else []
     is_cluster = len(nodes) > 1
@@ -1241,6 +1264,10 @@ Examples:
             cmd_parts.extend(["--shm-size-gb", str(args.shm_size_gb)])
         if args.config_file:
             cmd_parts.extend(["--config", args.config_file])
+        if docker_network:
+            cmd_parts.extend(["--network", docker_network])
+        for port in getattr(args, "publish_ports", []):
+            cmd_parts.extend(["-p", port])
         cmd_parts.extend(["\\", "\n      --launch-script", "/tmp/tmpXXXXXX.sh"])
         print(" ".join(cmd_parts))
         print()
@@ -1313,6 +1340,10 @@ Examples:
 
         if args.config_file:
             cmd.extend(["--config", args.config_file])
+        if docker_network:
+            cmd.extend(["--network", docker_network])
+        for port in getattr(args, "publish_ports", []):
+            cmd.extend(["-p", port])
 
         # Add launch script
         cmd.extend(["--launch-script", temp_script])

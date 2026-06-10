@@ -386,6 +386,13 @@ test_launch_cluster_help() {
         log_fail "--help does not document --publish"
         log_verbose "$output"
     fi
+
+    if echo "$output" | grep -q -- "--network"; then
+        log_pass "--help documents --network"
+    else
+        log_fail "--help does not document --network"
+        log_verbose "$output"
+    fi
 }
 
 # Test: launch-cluster.sh references examples/ not profiles/
