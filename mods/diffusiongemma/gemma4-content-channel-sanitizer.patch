@@ -1,0 +1,108 @@
+diff --git a/vllm/entrypoints/openai/chat_completion/serving.py b/vllm/entrypoints/openai/chat_completion/serving.py
+--- a/vllm/entrypoints/openai/chat_completion/serving.py
++++ b/vllm/entrypoints/openai/chat_completion/serving.py
+@@ -78,6 +78,37 @@ if TYPE_CHECKING:
+ 
+ logger = init_logger(__name__)
+ 
++_GEMMA4_REASONING_START = "<|channel>"
++_GEMMA4_REASONING_END = "<channel|>"
++_GEMMA4_THOUGHT_PREFIX = "thought\n"
++
++
++def _strip_gemma4_content_channels(content: str | None) -> str | None:
++    """Remove Gemma4 thought-channel spans from user-visible content."""
++    if content is None or _GEMMA4_REASONING_START not in content:
++        return content
++
++    result: list[str] = []
++    remaining = content
++    while True:
++        prefix, start, rest = remaining.partition(_GEMMA4_REASONING_START)
++        result.append(prefix)
++        if not start:
++            break
++
++        thought, end, suffix = rest.partition(_GEMMA4_REASONING_END)
++        if not end:
++            # Incomplete channel span. The reasoning parser buffers this path;
++            # the serving-level sanitizer only removes complete spans.
++            result.append(start + rest)
++            break
++
++        if not thought.startswith(_GEMMA4_THOUGHT_PREFIX):
++            result.append(start + thought + end)
++        remaining = suffix
++
++    return "".join(result) or None
++
+ 
+ class OpenAIServingChat(OpenAIServing):
+     def __init__(
+@@ -759,6 +788,9 @@ class OpenAIServingChat(OpenAIServing):
+                             continue
+                         delta_message = DeltaMessage()
+ 
++                    if delta_message.content is not None:
++                        delta_message.content = _strip_gemma4_content_channels(
++                            delta_message.content)
+                     if (
+                         not request.include_reasoning
+                         and delta_message.reasoning is not None
+diff --git a/vllm/reasoning/gemma4_reasoning_parser.py b/vllm/reasoning/gemma4_reasoning_parser.py
+--- a/vllm/reasoning/gemma4_reasoning_parser.py
++++ b/vllm/reasoning/gemma4_reasoning_parser.py
+@@ -115,7 +115,9 @@ class Gemma4ReasoningParser(BaseThinkingReasoningParser):
+     ) -> tuple[str | None, str | None]:
+         """Extract reasoning, stripping the ``thought\\n`` role label."""
+         if not self._thinking_enabled:
+-            content = _strip_disabled_thinking_channel(model_output)
++            content = _strip_disabled_thinking_channel(
++                model_output, wait_for_end=False
++            )
+             return None, content or None
+ 
+         if self.start_token not in model_output and self.end_token not in model_output:
+@@ -158,7 +160,11 @@ class Gemma4ReasoningParser(BaseThinkingReasoningParser):
+         """
+         if not self._thinking_enabled:
+             self._disabled_raw_text += delta_text
+-            content = _strip_disabled_thinking_channel(self._disabled_raw_text)
++            content = _strip_disabled_thinking_channel(
++                self._disabled_raw_text, wait_for_end=True
++            )
++            if content is None:
++                return None
+             if content.startswith(self._disabled_emitted_content):
+                 delta_content = content[len(self._disabled_emitted_content) :]
+             else:
+@@ -257,18 +263,22 @@ def _strip_reasoning_start_token(text: str) -> str:
+     return text
+ 
+ 
+-def _strip_disabled_thinking_channel(text: str) -> str:
+-    """Treat Gemma4 channel-wrapped text as content when thinking is disabled."""
++def _strip_disabled_thinking_channel(
++    text: str, *, wait_for_end: bool = False
++) -> str | None:
++    """Strip Gemma4 channel-wrapped thinking when thinking is disabled."""
+     prefix, start, rest = text.partition(_REASONING_START)
+     if not start:
+         return text
+ 
+-    rest = _strip_thought_label(rest)
+-    if _REASONING_END in rest:
+-        _, _, content = rest.partition(_REASONING_END)
+-        return prefix + content
++    if _REASONING_END not in rest:
++        if wait_for_end and not prefix:
++            return None
++        return prefix or None
+ 
+-    return prefix + rest
++    rest = _strip_thought_label(rest)
++    _, _, content = rest.partition(_REASONING_END)
++    return prefix + content
+ 
+ 
+ def _strip_thought_label(text: str) -> str:

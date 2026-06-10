@@ -1,0 +1,47 @@
+# Recipe: Diffusion-Gemma-NVFP4-Thinking
+# DiffusionGemma NVFP4 model with Gemma4 thinking enabled
+
+recipe_version: "1"
+name: Diffusion-Gemma-NVFP4-Thinking
+description: vLLM serving DiffusionGemma-26B-A4B-IT-NVFP4 with thinking enabled on a single node
+
+# HuggingFace model to download (optional, for --download-model)
+model: nvidia/diffusiongemma-26B-A4B-it-NVFP4
+
+# Container image to use
+container: vllm-node
+
+# This model can only run on single node (solo)
+solo_only: true
+
+# Mods
+mods:
+  - mods/diffusiongemma
+
+# Default settings (can be overridden via CLI)
+defaults:
+  port: 8000
+  host: 0.0.0.0
+  gpu_memory_utilization: 0.8
+  max_model_len: 262144
+
+# Environment variables
+env: {}
+
+# The vLLM serve command template
+command: |
+  vllm serve nvidia/diffusiongemma-26B-A4B-it-NVFP4 \
+    --max-model-len {max_model_len} \
+    --gpu-memory-utilization {gpu_memory_utilization} \
+    --port {port} \
+    --host {host} \
+    --trust-remote-code \
+    --enable-auto-tool-choice \
+    --tool-call-parser gemma4 \
+    --load-format fastsafetensors \
+    --attention-backend TRITON_ATTN \
+    --enable-prefix-caching \
+    --diffusion-config '{{"canvas_length":256}}' \
+    --override-generation-config '{{"max_new_tokens": null}}' \
+    --reasoning-parser gemma4 \
+    --default-chat-template-kwargs '{{"enable_thinking": true}}'

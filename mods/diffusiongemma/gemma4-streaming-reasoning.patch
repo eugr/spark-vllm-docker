@@ -1,0 +1,132 @@
+diff --git a/vllm/entrypoints/openai/chat_completion/serving.py b/vllm/entrypoints/openai/chat_completion/serving.py
+--- a/vllm/entrypoints/openai/chat_completion/serving.py
++++ b/vllm/entrypoints/openai/chat_completion/serving.py
+@@ -759,6 +759,25 @@ class OpenAIServingChat(OpenAIServing):
+                             continue
+                         delta_message = DeltaMessage()
+ 
++                    if (
++                        not request.include_reasoning
++                        and delta_message.reasoning is not None
++                    ):
++                        replacement_delta: dict[str, Any] = {}
++                        if delta_message.role is not None:
++                            replacement_delta["role"] = delta_message.role
++                        if delta_message.content is not None:
++                            replacement_delta["content"] = delta_message.content
++                        if delta_message.tool_calls:
++                            replacement_delta["tool_calls"] = delta_message.tool_calls
++                        delta_message = DeltaMessage(**replacement_delta)
++                        if (
++                            output.finish_reason is None
++                            and not request.return_token_ids
++                            and not replacement_delta
++                        ):
++                            continue
++
+                     # Log streaming delta if output logging is enabled
+                     if self.enable_log_outputs and self.request_logger:
+                         delta_content_parts = []
+diff --git a/vllm/reasoning/gemma4_reasoning_parser.py b/vllm/reasoning/gemma4_reasoning_parser.py
+--- a/vllm/reasoning/gemma4_reasoning_parser.py
++++ b/vllm/reasoning/gemma4_reasoning_parser.py
+@@ -15,7 +15,9 @@ if TYPE_CHECKING:
+ # Role label that Gemma4 emits at the start of the thinking channel.
+ # The model generates: <|channel>thought\n...reasoning...<channel|>
+ # This prefix must be stripped to expose only the actual reasoning content.
++_REASONING_START = "<|channel>"
+ _THOUGHT_PREFIX = "thought\n"
++_REASONING_END = "<channel|>"
+ 
+ 
+ class Gemma4ReasoningParser(BaseThinkingReasoningParser):
+@@ -49,6 +51,10 @@ class Gemma4ReasoningParser(BaseThinkingReasoningParser):
+         # skip_special_tokens=True).
+         self._reasoning_text: str = ""
+         self._prefix_stripped: bool = False
++        chat_template_kwargs = kwargs.get("chat_template_kwargs") or {}
++        self._thinking_enabled = bool(chat_template_kwargs.get("enable_thinking"))
++        self._disabled_raw_text: str = ""
++        self._disabled_emitted_content: str = ""
+         self.new_turn_token_id = self.vocab["<|turn>"]
+         self.tool_call_token_id = self.vocab["<|tool_call>"]
+         self.tool_response_token_id = self.vocab["<|tool_response>"]
+@@ -62,7 +68,7 @@ class Gemma4ReasoningParser(BaseThinkingReasoningParser):
+     @property
+     def start_token(self) -> str:
+         """The token that starts reasoning content."""
+-        return "<|channel>"
++        return _REASONING_START
+ 
+     @property
+     def end_token(self) -> str:
+@@ -107,5 +113,9 @@ class Gemma4ReasoningParser(BaseThinkingReasoningParser):
+     ) -> tuple[str | None, str | None]:
+         """Extract reasoning, stripping the ``thought\\n`` role label."""
++        if not self._thinking_enabled:
++            content = _strip_disabled_thinking_channel(model_output)
++            return None, content or None
++
+         if self.start_token not in model_output and self.end_token not in model_output:
+             # Default to content history if no tags are present
+             # (or if they were stripped)
+@@ -147,6 +157,18 @@ class Gemma4ReasoningParser(BaseThinkingReasoningParser):
+         making it impossible to separate pre-reasoning content from
+         reasoning content via string matching.
+         """
++        if not self._thinking_enabled:
++            self._disabled_raw_text += delta_text
++            content = _strip_disabled_thinking_channel(self._disabled_raw_text)
++            if content.startswith(self._disabled_emitted_content):
++                delta_content = content[len(self._disabled_emitted_content) :]
++            else:
++                delta_content = content
++            self._disabled_emitted_content = content
++            if delta_content:
++                return DeltaMessage(content=delta_content)
++            return None
++
+         result = super().extract_reasoning_streaming(
+             previous_text,
+             current_text,
+@@ -160,9 +186,15 @@ class Gemma4ReasoningParser(BaseThinkingReasoningParser):
+         if result.reasoning is None:
+             return result
+ 
++        # If the start token and reasoning text arrive in the same streaming
++        # delta without the end token, the base parser returns the full delta.
++        # Normalize it to match the non-streaming parser.
++        reasoning_delta = _strip_reasoning_start_token(result.reasoning)
++        result.reasoning = reasoning_delta
++
+         # Accumulate ONLY the reasoning text from base parser results.
+         # This is immune to pre-reasoning content pollution.
+-        self._reasoning_text += result.reasoning
++        self._reasoning_text += reasoning_delta
+ 
+         # Once the prefix has been handled, all subsequent reasoning
+         # deltas pass through unchanged.
+@@ -217 +249,23 @@ class Gemma4ReasoningParser(BaseThinkingReasoningParser):
++def _strip_reasoning_start_token(text: str) -> str:
++    """Remove a leading Gemma4 reasoning channel start token."""
++    _, start, reasoning = text.partition(_REASONING_START)
++    if start:
++        return reasoning
++    return text
++
++
++def _strip_disabled_thinking_channel(text: str) -> str:
++    """Treat Gemma4 channel-wrapped text as content when thinking is disabled."""
++    prefix, start, rest = text.partition(_REASONING_START)
++    if not start:
++        return text
++
++    rest = _strip_thought_label(rest)
++    if _REASONING_END in rest:
++        _, _, content = rest.partition(_REASONING_END)
++        return prefix + content
++
++    return prefix + rest
++
++
+ def _strip_thought_label(text: str) -> str:

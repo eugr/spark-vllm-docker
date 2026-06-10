@@ -1,0 +1,69 @@
+diff --git a/docs/design/attention_backends.md b/docs/design/attention_backends.md
+index 1960bf4f6..8883a0730 100644
+--- a/docs/design/attention_backends.md
++++ b/docs/design/attention_backends.md
+@@ -172,7 +172,7 @@ Priority is **1 = highest** (tried first).
+ | `CPU_ATTN` | | fp16, bf16, fp32 | `auto`, `fp8`, `fp8_e4m3`, `fp8_e5m2` | %16 | 32, 64, 80, 96, 112, 128, 160, 192, 224, 256, 512 | ❌ | ❌ | ❌ | ❌ | All | N/A |
+ | `FLASHINFER` | Native† | fp16, bf16 | `auto`, `float16`, `bfloat16`, `fp8`, `fp8_e4m3`, `fp8_e5m2` | 16, 32, 64 | 64, 128, 256, 512 | ❌ | ❌ | ❌ | ✅ | Decoder | 7.x-9.x |
+ | `FLASHINFER` | TRTLLM† | fp16, bf16 | `auto`, `float16`, `bfloat16`, `fp8`, `fp8_e4m3`, `fp8_e5m2`, `nvfp4` | 16, 32, 64 | 64, 128, 256, 512 | ✅ | ❌ | ❌ | ✅ | Decoder | 10.x |
+-| `FLASHINFER_FMHA_V2` | | fp16, bf16 | `auto`, `float16`, `bfloat16`, `fp8`, `fp8_e4m3`, `fp8_e5m2` | %16 | Any | ❌ | ✅ | ❌ | ❌ | Decoder | 12.x |
++| `FLASHINFER_FMHA_V2` | | fp16, bf16 | `auto`, `float16`, `bfloat16`, `fp8`‡, `fp8_e4m3`‡, `fp8_e5m2`‡ | %16 | Any | ❌ | ✅ | ❌ | ❌ | Decoder | 12.x |
+ | `FLASH_ATTN` | FA2* | fp16, bf16 | `auto`, `float16`, `bfloat16` | %16 | Any | ❌ | ✅ | ❌ | ✅ | All | ≥8.0 |
+ | `FLASH_ATTN` | FA3* | fp16, bf16 | `auto`, `float16`, `bfloat16`, `fp8`, `fp8_e4m3`, `fp8_e5m2` | %16 | Any | ✅ | ✅ | ❌ | ✅ | All | 9.x |
+ | `FLASH_ATTN` | FA4* | fp16, bf16 | `auto`, `float16`, `bfloat16` | %16 | Any | ✅ | ✅ | ❌ | ✅ | All | ≥10.0 |
+@@ -186,6 +186,8 @@ Priority is **1 = highest** (tried first).
+ 
+ > **†** FlashInfer uses TRTLLM attention on Blackwell (SM100), which supports sinks. Disable via `--attention-config.use_trtllm_attention=0`.
+ >
++> **‡** `FLASHINFER_FMHA_V2` keeps the fp8 KV-cache only for memory savings: K/V are dequantized to BF16 on the fly (using the per-tensor k/v scales) and the attention kernel runs in BF16. There is no fp8 attention compute, so expect added per-step dequant overhead rather than a matmul speedup.
++>
+ > **\*** Specify the FlashAttention version via `--attention-config.flash_attn_version=2`, `3`, or `4`. Default is FA4 on SM100+ (Blackwell), FA3 on SM90 (Hopper), FA2 otherwise.
+ 
+ ## MLA (Multi-head Latent Attention) Backends
+diff --git a/tools/pre_commit/generate_attention_backend_docs.py b/tools/pre_commit/generate_attention_backend_docs.py
+index 1f7150ce6..2781f25c9 100644
+--- a/tools/pre_commit/generate_attention_backend_docs.py
++++ b/tools/pre_commit/generate_attention_backend_docs.py
+@@ -1295,10 +1295,23 @@ TableColumn = tuple[str, Callable[[dict[str, Any]], str]]
+ _COL_BACKEND: TableColumn = ("Backend", lambda b: f"`{b['name']}`")
+ _COL_VERSION: TableColumn = ("Version", lambda b: b.get("version", ""))
+ _COL_DTYPES: TableColumn = ("Dtypes", lambda b: b["dtypes"])
+-_COL_KV_DTYPES: TableColumn = (
+-    "KV Dtypes",
+-    lambda b: add_literal_quotes(b["kv_cache_dtypes"]),
+-)
++
++
++def _fmt_kv_dtypes(b: dict[str, Any]) -> str:
++    """Render the KV Dtypes cell, flagging FMHAv2's fp8 dtypes with a footnote.
++
++    FLASHINFER_FMHA_V2 advertises fp8 KV-cache support but dequantizes K/V to
++    BF16 on the fly (no fp8 attention compute), so its fp8 entries carry a `‡`
++    marker explained in a footnote below the table.
++    """
++    if b["name"] != "FLASHINFER_FMHA_V2":
++        return add_literal_quotes(b["kv_cache_dtypes"])
++    items = [item.strip() for item in b["kv_cache_dtypes"].split(",")]
++    cells = [f"`{item}`‡" if item.startswith("fp8") else f"`{item}`" for item in items]
++    return ", ".join(cells)
++
++
++_COL_KV_DTYPES: TableColumn = ("KV Dtypes", _fmt_kv_dtypes)
+ _COL_BLOCK_SIZES: TableColumn = ("Block Sizes", lambda b: b["block_sizes"])
+ _COL_HEAD_SIZES: TableColumn = ("Head Sizes", lambda b: b["head_sizes"])
+ _COL_SINK: TableColumn = ("Sink", lambda b: bool_to_emoji(b["supports_sink"]))
+@@ -1716,6 +1729,14 @@ def generate_docs() -> str:
+             "> **†** FlashInfer uses TRTLLM attention on Blackwell (SM100), which "
+             "supports sinks. Disable via `--attention-config.use_trtllm_attention=0`."
+         )
++    if any(b["name"] == "FLASHINFER_FMHA_V2" for b in non_mla_backends):
++        footnotes.append(
++            "> **‡** `FLASHINFER_FMHA_V2` keeps the fp8 KV-cache only for memory "
++            "savings: K/V are dequantized to BF16 on the fly (using the per-tensor "
++            "k/v scales) and the attention kernel runs in BF16. There is no fp8 "
++            "attention compute, so expect added per-step dequant overhead rather "
++            "than a matmul speedup."
++        )
+     if fa_features:
+         footnotes.append(
+             "> **\\*** Specify the FlashAttention version via "
