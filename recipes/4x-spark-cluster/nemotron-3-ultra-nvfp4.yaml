@@ -79,7 +79,15 @@ defaults:
   # JSON kept as a defaults value (referenced as one {speculative_config} token) because
   # run-recipe.py does a single-pass str.format() — inline JSON braces in `command` would
   # be misread as {placeholders}. This is the v2 community-recipe pattern.
-  speculative_config: '{"method": "nemotron_h_mtp", "num_speculative_tokens": 5}'
+  # num_speculative_tokens=2 (NOT 5): at depth 5 the spec-decode token-prep emits
+  # invalid (-1) draft token ids on long sequences (>~25k tokens), causing an
+  # out-of-bounds CUDA illegal-memory-access crash (vLLM issue #40756 — verified our
+  # crash dump showed scheduled_spec_decode_tokens=[-1,-1,-1,-1,-1] at ~30k tokens).
+  # The bug bites the DEEP draft positions (pos-5 acceptance was only ~0.4-0.5 anyway),
+  # so depth 2 keeps the high-value positions while avoiding the crash. NVIDIA's
+  # DGX Spark GB10 forum reports depth-2 as the working MTP config for Nemotron-3 NVFP4.
+  # Restore to 5 once a newer eugr wheel ships the upstream fix ("latest vLLM has fixes").
+  speculative_config: '{"method": "nemotron_h_mtp", "num_speculative_tokens": 2}'
 
 command: |
   vllm serve nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-NVFP4 \
