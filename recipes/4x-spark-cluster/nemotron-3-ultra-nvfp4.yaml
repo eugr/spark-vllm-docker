@@ -25,6 +25,16 @@
 # unquantized MTP MoE auto-selects its own backend — observed: FlashInfer CUTLASS) and set
 # VLLM_USE_FLASHINFER_MOE_FP4=0 (read only by the FP4 oracle) so the NVFP4 main experts
 # deterministically land on VLLM_CUTLASS. Verified: main=VLLM_CUTLASS, MTP=FlashInfer CUTLASS.
+# NO --enable-prefix-caching with MTP: NemotronH (Mamba2 hybrid) prefix caching sets
+# mamba_cache_mode="all", and vLLM does NOT support spec-decode + Mamba prefix caching
+# (see mamba_attn.py "Speculative decoding not supported with prefix caching" + vLLM issue
+# #39809). With both on, mamba_mixer2.conv_ssm_forward hits
+# `assert block_idx_last_scheduled_token_prev_step_d is not None` and the engine dies
+# (observed 2026-06-11 at 3.37h uptime under load). That assert lives entirely inside the
+# `if is_mamba_cache_all:` branch, so dropping prefix caching makes the faulty path
+# unreachable. Costs nothing on single-stream decode (prefix caching only saves cross-request
+# shared-prefix prefill — itself unsupported with MTP here). Re-enable only after the upstream
+# Triton-kernel fix lands in a newer eugr wheel.
 # Runtime-tuning candidates (deploy loop): gpu_memory_utilization / max_model_len
 # (conservative seeds — raise once stable).
 
@@ -79,7 +89,6 @@ command: |
     --kv-cache-dtype fp8 \
     --mamba-ssm-cache-dtype float32 \
     --attention-backend TRITON_ATTN \
-    --enable-prefix-caching \
     --enable-chunked-prefill \
     --load-format safetensors \
     --enable-auto-tool-choice \
