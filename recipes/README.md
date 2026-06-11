@@ -197,6 +197,9 @@ Launch options:
   -t, --container IMAGE       Override container from recipe
   --name NAME                 Override container name
   --nccl-debug LEVEL          NCCL debug level (VERSION, WARN, INFO, TRACE)
+  --apply-mod PATH            Apply an extra mod directory or zip (repeatable)
+  -p, --publish HOST:CONTAINER
+                              Publish a container port in solo mode (repeatable)
   --master-port PORT          Cluster coordination port: Ray head port or PyTorch
                               distributed master port (default: 29501).
                               Alias: --head-port
@@ -205,6 +208,7 @@ Launch options:
   -e VAR=VALUE                Pass environment variable to container (repeatable)
   -j N                        Number of parallel build jobs
   --no-cache-dirs             Do not mount ~/.cache/vllm, ~/.cache/flashinfer, ~/.triton
+  --keep-entrypoint           Keep the Docker image entrypoint
   --non-privileged            Run container without --privileged
   --mem-limit-gb N            Memory limit in GB (only with --non-privileged)
   --mem-swap-limit-gb N       Memory+swap limit in GB (only with --non-privileged)

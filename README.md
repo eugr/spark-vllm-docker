@@ -164,6 +164,13 @@ Example:
 ./run-recipe.sh diffusion-gemma-bf16-thinking --solo
 ```
 
+#### `run-recipe.sh` Launch Flag Passthrough
+
+`run-recipe.sh` now passes additional `launch-cluster.sh` flags through when running recipes:
+`--apply-mod`, `-p` / `--publish`, and `--keep-entrypoint`.
+
+Port publishing is still solo-only, matching `launch-cluster.sh` behavior.
+
 ### 2026-06-09
 
 #### Recipe Memory Defaults
@@ -788,6 +795,12 @@ Example:
 
 # Run with overrides
 ./run-recipe.sh glm-4.7-flash-awq --solo --port 9000 --gpu-mem 0.8
+
+# Apply an extra launch-cluster mod on top of recipe mods
+./run-recipe.sh glm-4.7-flash-awq --solo --apply-mod mods/use-official-vllm
+
+# Publish ports in solo mode
+./run-recipe.sh glm-4.7-flash-awq --solo -p 8000:8000
 
 # Cluster deployment
 ./run-recipe.sh glm-4.7-nvfp4 --setup
@@ -1454,7 +1467,7 @@ The new shell inherits the container environment, including NCCL, Ray, and vLLM 
 
 ## 5\. Mods and Patches
 
-The vLLM Docker setup supports applying custom mods and patches to address specific model compatibility issues or apply experimental features. This functionality is primarily managed through the `--apply-mod` option in the cluster launch script.
+The vLLM Docker setup supports applying custom mods and patches to address specific model compatibility issues or apply experimental features. This functionality is primarily managed through the `--apply-mod` option in the cluster launch script, and `run-recipe.sh` can pass additional `--apply-mod` flags through to `launch-cluster.sh`.
 
 ### Available Mods
 
@@ -1490,6 +1503,12 @@ You can apply multiple mods by specifying additional `--apply-mod` flags:
 
 ```bash
 ./launch-cluster.sh --apply-mod ./mods/fix-Salyut1-GLM-4.7-NVFP4 --apply-mod ./mods/other-mod
+```
+
+When using recipes, any mods listed in the recipe are applied first, followed by mods supplied on the command line:
+
+```bash
+./run-recipe.sh glm-4.7-flash-awq --solo --apply-mod ./mods/other-mod
 ```
 
 ### Creating Custom Mods
