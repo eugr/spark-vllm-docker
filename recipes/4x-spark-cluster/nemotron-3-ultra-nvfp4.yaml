@@ -40,11 +40,16 @@ env:
   VLLM_FLASHINFER_ALLREDUCE_BACKEND: trtllm
   VLLM_ALLOW_LONG_MAX_MODEL_LEN: 1
   VLLM_DISTRIBUTED_EXECUTOR_CONFIG: '{"placement_group_options":{"strategy":"SPREAD"}}'
-  # Force the NVFP4 MoE oracle to drop FlashInfer (unreliable on sm121) so it lands on
-  # VLLM_CUTLASS — WITHOUT a global --moe-backend, which would also (wrongly) force cutlass
-  # onto the unquantized MTP MoE. This env is read ONLY by the FP4 oracle, so the unquantized
-  # MTP MoE still auto-selects triton. Net: cutlass for main experts, triton for MTP experts.
+  # Keep BOTH MoE paths off FlashInfer (unreliable NVFP4/unquantized kernels on sm121/GB10) —
+  # WITHOUT a global --moe-backend, which would (wrongly) force cutlass onto the unquantized
+  # MTP MoE that rejects it. Two independent oracles, two envs:
+  #   FP4=0  → read only by the NVFP4 oracle → main experts land on VLLM_CUTLASS.
+  #   FP16=0 → read only by the unquantized oracle → MTP draft-layer MoE falls through to TRITON.
+  # Net: main experts = VLLM_CUTLASS, MTP experts = TRITON, neither on FlashInfer.
+  # (Validated on Super-MTP; without FP16=0 the MTP MoE auto-selects FlashInfer CUTLASS, which
+  # is implicated in the sm121 illegal-memory crashes — see the ultra-recipe memory note.)
   VLLM_USE_FLASHINFER_MOE_FP4: "0"
+  VLLM_USE_FLASHINFER_MOE_FP16: "0"
 
 defaults:
   port: 8000

@@ -1,0 +1,71 @@
+# Recipe: Nemotron-3-Ultra-NVFP4 — NO MTP (4-node TP=4 over Ray)
+#
+# This is the no-speculative-decoding variant of nemotron-3-ultra-nvfp4.yaml.
+# It is IDENTICAL to that recipe except that MTP (--speculative-config
+# nemotron_h_mtp) is removed. Created 2026-06-08 after the MTP build crashed
+# twice with `CUDA error: an illegal memory access` on Worker_TP0 (06-07 19:42
+# ~29h uptime; 06-08 09:38 ~4.5h uptime). The fault surfaced at a DIFFERENT
+# CUDA sync point each time (flashinfer seq_lens.to('cpu') / mamba2
+# has_initial_states.item()), i.e. an async out-of-bounds GPU write from an
+# earlier kernel — and it crashed at low load (37% KV cache), so it is not
+# OOM/overload. The only thing common to both crashes was the MTP drafter
+# (its draft MoE runs on FlashInfer, flagged unreliable on sm121/GB10). This
+# variant isolates that variable: drop MTP, change nothing else.
+#
+# The main NVFP4 experts still land on VLLM_CUTLASS via the FP4 oracle env
+# (VLLM_USE_FLASHINFER_MOE_FP4=0) exactly as in the MTP recipe — there is no
+# unquantized MTP MoE here, so no per-MoE-type backend juggling is needed.
+#
+# Everything below this point is unchanged from nemotron-3-ultra-nvfp4.yaml
+# except the two removed MTP lines (the `speculative_config` default and the
+# `--speculative-config` command flag).
+
+recipe_version: "1"
+name: Nemotron-3-Ultra-NVFP4-noMTP
+description: vLLM serving Nemotron 3 Ultra (550B-A55B NVFP4) across a 4-node TP=4 Spark cluster — no MTP
+
+model: nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-NVFP4
+container: vllm-node-eugr022
+cluster_only: true
+
+env:
+  VLLM_FLASHINFER_ALLREDUCE_BACKEND: trtllm
+  VLLM_ALLOW_LONG_MAX_MODEL_LEN: 1
+  VLLM_DISTRIBUTED_EXECUTOR_CONFIG: '{"placement_group_options":{"strategy":"SPREAD"}}'
+  # Force the NVFP4 MoE oracle to drop FlashInfer (unreliable on sm121) so it lands on
+  # VLLM_CUTLASS — WITHOUT a global --moe-backend. Kept identical to the MTP recipe.
+  VLLM_USE_FLASHINFER_MOE_FP4: "0"
+
+defaults:
+  port: 8000
+  host: 0.0.0.0
+  tensor_parallel: 4
+  gpu_memory_utilization: 0.8      # Super uses 0.7@TP2; conservative first launch
+  max_model_len: 65536             # Super uses 262144; start low on 4x128GB, raise once stable
+  max_num_seqs: 10
+  # CAUTION (Spark unified memory, 124GB/node): weights ~85GB leave only ~22GB headroom at
+  # gpu_memory_utilization=0.8 — and dgx-spark-01 is BOTH manager and a TP=4 node, tightening
+  # it further. Empirically: 32768 token batch HUNG nodes during capture (hard reset); 4096
+  # came up + served then got OOM-killed (exit 137 / NVRM NO_MEMORY) ~1min in. So leave the
+  # batch on vLLM's auto default (~2048), which is stable. Raising it needs a lower
+  # gpu_memory_utilization first. fp8 KV is the best option here.
+
+command: |
+  vllm serve nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-NVFP4 \
+    --trust-remote-code \
+    --tensor-parallel-size {tensor_parallel} \
+    --distributed-executor-backend ray \
+    --kv-cache-dtype fp8 \
+    --mamba-ssm-cache-dtype float32 \
+    --attention-backend TRITON_ATTN \
+    --enable-prefix-caching \
+    --enable-chunked-prefill \
+    --load-format safetensors \
+    --enable-auto-tool-choice \
+    --tool-call-parser qwen3_coder \
+    --reasoning-parser nemotron_v3 \
+    --gpu-memory-utilization {gpu_memory_utilization} \
+    --max-model-len {max_model_len} \
+    --max-num-seqs {max_num_seqs} \
+    --host {host} \
+    --port {port}
