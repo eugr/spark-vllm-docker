@@ -44,10 +44,11 @@ MEM_LIMIT_GB="110"
 MEM_SWAP_LIMIT_GB=""
 PIDS_LIMIT="4096"
 SHM_SIZE_GB="64"
+PORT_MAPPINGS=()
 
 # Function to print usage
 usage() {
-    echo "Usage: $0 [-n <node_ips>] [-t <image_name>] [--name <container_name>] [--eth-if <if_name>] [--ib-if <if_name>] [--nccl-debug <level>] [--check-config] [--solo] [-d] [action] [command]"
+    echo "Usage: $0 [-n <node_ips>] [-t <image_name>] [--name <container_name>] [--eth-if <if_name>] [--ib-if <if_name>] [--nccl-debug <level>] [--check-config] [--solo] [-p <host:container>] [-d] [action] [command]"
     echo "  -n, --nodes     Comma-separated list of node IPs (Optional, auto-detected if omitted)"
     echo "  -t              Docker image name (Optional, default: $IMAGE_NAME)"
     echo "  --name          Container name (Optional, default: $DEFAULT_CONTAINER_NAME)"
@@ -61,6 +62,7 @@ usage() {
     echo "  --check-config  Check configuration and auto-detection without launching"
     echo "  --solo          Solo mode: skip autodetection, launch only on current node, do not launch Ray cluster"
     echo "  --master-port   Port for cluster coordination: Ray head port or PyTorch distributed master port (default: 29501)"
+    echo "  -p, --publish   Publish a container port in Docker format (e.g. -p 8000:8000). Solo mode only; can be specified multiple times."
     echo "  --no-ray        No-Ray mode: run multi-node vLLM without Ray (uses PyTorch distributed backend)"
     echo "  --no-cache-dirs Do not mount default cache directories (~/.cache/vllm, ~/.cache/flashinfer, ~/.triton)"
     echo "  --keep-entrypoint Keep the Docker image entrypoint instead of clearing it by default"
@@ -122,6 +124,8 @@ while [[ "$#" -gt 0 ]]; do
             fi
             ;;
         --master-port|--head-port) MASTER_PORT="$2"; shift ;;
+        -p|--publish) PORT_MAPPINGS+=("$2"); shift ;;
+        -p=*|--publish=*) PORT_MAPPINGS+=("${1#*=}") ;;
         --check-config) CHECK_CONFIG="true" ;;
         --solo) SOLO_MODE="true" ;;
         --no-ray) NO_RAY_MODE="true" ;;
@@ -493,6 +497,11 @@ if [[ "$NO_RAY_MODE" == "true" && "$SOLO_MODE" == "true" ]]; then
     NO_RAY_MODE="false"
 fi
 
+if [[ ${#PORT_MAPPINGS[@]} -gt 0 && "$SOLO_MODE" != "true" ]]; then
+    echo "Error: -p/--publish port forwarding is only supported in solo mode. Use --solo or remove port mappings for cluster mode."
+    exit 1
+fi
+
 echo "Head Node: $HEAD_IP"
 echo "Worker Nodes: ${PEER_NODES[*]}"
 echo "Container Name: $CONTAINER_NAME"
@@ -526,6 +535,11 @@ if [[ "$CHECK_CONFIG" == "true" ]]; then
     echo "  ETH Interface: $ETH_IF"
     echo "  IB Interface: $IB_IF"
     echo "  Docker Args: $DOCKER_ARGS"
+    if [[ ${#PORT_MAPPINGS[@]} -gt 0 ]]; then
+        echo "  Docker Network: default bridge with published ports: ${PORT_MAPPINGS[*]}"
+    else
+        echo "  Docker Network: host"
+    fi
     if [[ "$MOUNT_CACHE_DIRS" == "true" ]]; then
          echo "  Mounting Cache Dirs: ${CACHE_DIRS_TO_CREATE[*]}"
     else
@@ -854,7 +868,15 @@ start_cluster() {
         docker_entrypoint_args="--entrypoint="
     fi
 
-    local docker_args_common="--gpus all -d --rm --network host --name $CONTAINER_NAME $docker_entrypoint_args $DOCKER_ARGS $IMAGE_NAME"
+    local docker_network_args="--network host"
+    if [[ ${#PORT_MAPPINGS[@]} -gt 0 ]]; then
+        docker_network_args=""
+        for mapping in "${PORT_MAPPINGS[@]}"; do
+            docker_network_args="$docker_network_args -p $mapping"
+        done
+    fi
+
+    local docker_args_common="--gpus all -d --rm $docker_network_args --name $CONTAINER_NAME $docker_entrypoint_args $DOCKER_ARGS $IMAGE_NAME"
     local docker_caps_args=""
     local docker_resource_args=""
 

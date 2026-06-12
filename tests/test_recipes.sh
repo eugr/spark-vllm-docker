@@ -379,6 +379,13 @@ test_launch_cluster_help() {
         log_fail "--help does not document --keep-entrypoint"
         log_verbose "$output"
     fi
+
+    if echo "$output" | grep -q -- "--publish"; then
+        log_pass "--help documents --publish"
+    else
+        log_fail "--help does not document --publish"
+        log_verbose "$output"
+    fi
 }
 
 # Test: launch-cluster.sh references examples/ not profiles/
@@ -636,6 +643,33 @@ test_launch_cmd_mods() {
     fi
 }
 
+# Test: CLI --apply-mod is passed through to launch-cluster.sh, not vLLM
+test_launch_cmd_cli_apply_mod_passthrough() {
+    log_test "Launch command includes CLI --apply-mod flags"
+
+    recipe_name=$(find_solo_recipe)
+    if [[ -z "$recipe_name" ]]; then
+        log_skip "No solo-capable recipes found"
+        return
+    fi
+
+    output=$("$PROJECT_DIR/run-recipe.py" "$recipe_name" --dry-run --solo \
+        --apply-mod mods/use-official-vllm \
+        --apply-mod mods/gpu-mem-util-gb 2>&1)
+    launch_cmd=$(extract_launch_cmd "$output")
+    vllm_cmd=$(extract_vllm_command "$output")
+
+    if echo "$launch_cmd" | grep -q "\-\-apply-mod mods/use-official-vllm" \
+        && echo "$launch_cmd" | grep -q "\-\-apply-mod mods/gpu-mem-util-gb" \
+        && ! echo "$vllm_cmd" | grep -q "\-\-apply-mod"; then
+        log_pass "CLI --apply-mod flags passed only to launch-cluster.sh"
+    else
+        log_fail "CLI --apply-mod passthrough failed"
+        log_verbose "Launch cmd: $launch_cmd"
+        log_verbose "vLLM cmd: $vllm_cmd"
+    fi
+}
+
 # Test: Daemon mode flag is passed through
 test_launch_cmd_daemon_flag() {
     log_test "Launch command includes -d flag in daemon mode"
@@ -774,6 +808,66 @@ test_launch_cmd_no_env_by_default() {
         log_verbose "Launch cmd: $launch_cmd"
     else
         log_pass "Launch command correctly omits -e when none specified"
+    fi
+}
+
+# Test: -p / --publish passthrough to launch-cluster.sh
+test_launch_cmd_publish_passthrough() {
+    log_test "Launch command includes -p port mappings"
+
+    recipe_name=$(find_solo_recipe)
+    if [[ -z "$recipe_name" ]]; then
+        log_skip "No solo-capable recipes found"
+        return
+    fi
+
+    output=$("$PROJECT_DIR/run-recipe.py" "$recipe_name" --dry-run --solo \
+        -p 8000:8000 --publish 9000:8000 2>&1)
+    launch_cmd=$(extract_launch_cmd "$output")
+
+    if echo "$launch_cmd" | grep -q "\-p 8000:8000" \
+        && echo "$launch_cmd" | grep -q "\-p 9000:8000"; then
+        log_pass "Launch command includes -p port mappings"
+    else
+        log_fail "-p port mappings not found in launch command"
+        log_verbose "Launch cmd: $launch_cmd"
+    fi
+}
+
+# Test: -p / --publish is rejected in cluster mode
+test_launch_cmd_publish_rejects_cluster() {
+    log_test "-p port mappings are rejected in cluster mode"
+
+    output=$("$PROJECT_DIR/run-recipe.py" minimax-m2-awq --dry-run \
+        -n "10.0.0.1,10.0.0.2" -p 8000:8000 2>&1 || true)
+
+    if echo "$output" | grep -q "\-p/--publish port forwarding is only supported in solo mode"; then
+        log_pass "-p port mappings rejected in cluster mode"
+    else
+        log_fail "-p port mappings were not rejected in cluster mode"
+        log_verbose "$output"
+    fi
+}
+
+# Test: --keep-entrypoint passthrough to launch-cluster.sh
+test_launch_cmd_keep_entrypoint_passthrough() {
+    log_test "Launch command includes --keep-entrypoint"
+
+    recipe_name=$(find_solo_recipe)
+    if [[ -z "$recipe_name" ]]; then
+        log_skip "No solo-capable recipes found"
+        return
+    fi
+
+    output=$("$PROJECT_DIR/run-recipe.py" "$recipe_name" --dry-run --solo \
+        --keep-entrypoint 2>&1)
+    launch_cmd=$(extract_launch_cmd "$output")
+
+    if echo "$launch_cmd" | grep -q "\-\-keep-entrypoint"; then
+        log_pass "Launch command includes --keep-entrypoint"
+    else
+        log_fail "--keep-entrypoint not found in launch command"
+        log_verbose "Launch cmd: $launch_cmd"
     fi
 }
 
@@ -1247,6 +1341,7 @@ main() {
     test_launch_cmd_nodes_flag
     test_launch_cmd_container_image
     test_launch_cmd_mods
+    test_launch_cmd_cli_apply_mod_passthrough
     test_launch_cmd_daemon_flag
     test_launch_cmd_nccl_debug
     test_launch_cmd_launch_script
@@ -1254,6 +1349,9 @@ main() {
     test_launch_cmd_no_solo_in_cluster
     test_launch_cmd_env_passthrough
     test_launch_cmd_no_env_by_default
+    test_launch_cmd_publish_passthrough
+    test_launch_cmd_publish_rejects_cluster
+    test_launch_cmd_keep_entrypoint_passthrough
     echo ""
     
     # README documentation verification tests

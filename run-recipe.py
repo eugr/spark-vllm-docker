@@ -674,6 +674,12 @@ Examples:
   %(prog)s glm-4.7-nvfp4 --solo -- --load-format safetensors
   %(prog)s glm-4.7-nvfp4 --solo -- --served-model-name my-api
 
+  # Apply additional launch-cluster mods
+  %(prog)s glm-4.7-nvfp4 --apply-mod mods/use-official-vllm
+
+  # Publish ports in solo mode
+  %(prog)s glm-4.7-nvfp4 --solo -p 8000:8000
+
   # List available recipes
   %(prog)s --list
 
@@ -782,6 +788,23 @@ Examples:
         help="Environment variable to pass to container (e.g. -e HF_TOKEN=xxx). Can be used multiple times.",
     )
     launch_group.add_argument(
+        "--apply-mod",
+        action="append",
+        dest="apply_mods",
+        default=[],
+        metavar="PATH",
+        help="Mod directory or zip to pass to launch-cluster.sh. Can be used multiple times.",
+    )
+    launch_group.add_argument(
+        "-p",
+        "--publish",
+        action="append",
+        dest="port_mappings",
+        default=[],
+        metavar="HOST:CONTAINER",
+        help="Publish a container port in solo mode, e.g. -p 8000:8000. Can be used multiple times.",
+    )
+    launch_group.add_argument(
         "--no-ray",
         action="store_true",
         dest="no_ray",
@@ -821,6 +844,12 @@ Examples:
         action="store_true",
         dest="no_cache_dirs",
         help="Do not mount ~/.cache/vllm, ~/.cache/flashinfer, ~/.triton",
+    )
+    launch_group.add_argument(
+        "--keep-entrypoint",
+        action="store_true",
+        dest="keep_entrypoint",
+        help="Keep the Docker image entrypoint instead of clearing it before launch",
     )
     launch_group.add_argument(
         "--non-privileged",
@@ -932,6 +961,8 @@ Examples:
         print(f"  {recipe['description']}")
     print()
 
+    cli_mods = args.apply_mods or []
+
     # Determine container image
     container = args.container_override or recipe["container"]
     model = recipe.get("model")
@@ -1005,6 +1036,13 @@ Examples:
         print("Options:")
         print(f"  1. Run solo:                {sys.argv[0]} {args.recipe} --solo")
         print(f"  2. Remove nodes from .env:  {sys.argv[0]} --show-env")
+        return 1
+
+    if args.port_mappings and not is_solo:
+        print(
+            "Error: -p/--publish port forwarding is only supported in solo mode."
+        )
+        print("Use --solo or remove port mappings for cluster mode.")
         return 1
 
     # Determine copy targets for build/model distribution.
@@ -1203,6 +1241,8 @@ Examples:
         cmd_parts = ["   ./launch-cluster.sh", "-t", container]
         for mod in recipe.get("mods", []):
             cmd_parts.extend(["--apply-mod", mod])
+        for mod in cli_mods:
+            cmd_parts.extend(["--apply-mod", mod])
         if args.solo:
             cmd_parts.append("--solo")
         elif not is_cluster:
@@ -1217,6 +1257,8 @@ Examples:
             cmd_parts.extend(["--nccl-debug", args.nccl_debug])
         for env_var in args.env_vars:
             cmd_parts.extend(["-e", env_var])
+        for port_mapping in args.port_mappings:
+            cmd_parts.extend(["-p", port_mapping])
         if args.master_port:
             cmd_parts.extend(["--master-port", str(args.master_port)])
         if args.container_name:
@@ -1229,6 +1271,8 @@ Examples:
             cmd_parts.extend(["-j", str(args.build_jobs)])
         if args.no_cache_dirs:
             cmd_parts.append("--no-cache-dirs")
+        if args.keep_entrypoint:
+            cmd_parts.append("--keep-entrypoint")
         if args.non_privileged:
             cmd_parts.append("--non-privileged")
         if args.mem_limit_gb:
@@ -1264,6 +1308,13 @@ Examples:
             if not mod_path.exists():
                 print(f"Warning: Mod path not found: {mod_path}")
             cmd.extend(["--apply-mod", str(mod_path)])
+        for mod in cli_mods:
+            mod_path = Path(mod).expanduser()
+            if not mod_path.is_absolute():
+                mod_path = Path.cwd() / mod_path
+            if not mod_path.exists():
+                print(f"Warning: Mod path not found: {mod_path}")
+            cmd.extend(["--apply-mod", str(mod_path)])
 
         # Add launch options
         if args.solo:
@@ -1288,6 +1339,9 @@ Examples:
         for env_var in args.env_vars:
             cmd.extend(["-e", env_var])
 
+        for port_mapping in args.port_mappings:
+            cmd.extend(["-p", port_mapping])
+
         if args.master_port:
             cmd.extend(["--master-port", str(args.master_port)])
         if args.container_name:
@@ -1300,6 +1354,8 @@ Examples:
             cmd.extend(["-j", str(args.build_jobs)])
         if args.no_cache_dirs:
             cmd.append("--no-cache-dirs")
+        if args.keep_entrypoint:
+            cmd.append("--keep-entrypoint")
         if args.non_privileged:
             cmd.append("--non-privileged")
         if args.mem_limit_gb:
@@ -1319,8 +1375,9 @@ Examples:
 
         print(f"=== Launching ===")
         print(f"Container: {container}")
-        if recipe.get("mods"):
-            print(f"Mods: {', '.join(recipe['mods'])}")
+        all_mods = recipe.get("mods", []) + cli_mods
+        if all_mods:
+            print(f"Mods: {', '.join(all_mods)}")
         if is_cluster:
             print(f"Cluster: {len(nodes)} nodes")
         else:

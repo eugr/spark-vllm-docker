@@ -1,6 +1,11 @@
+# Recipe: DeepSeek-V4-Flash official FP8 on dual DGX Spark
+# Based on vLLM PR #41834 latest head f32247a5 (2026-06-11), including sparse MLA stats env fix.
+# Keep CUDA graphs enabled; do not add --enforce-eager.
+
 recipe_version: "1"
 name: DeepSeek-V4-Flash
-description: DeepSeek V4 Flash FP8 on dual DGX Spark TP=2 with PR 41834 SM12x support
+# Official DeepSeek V4 Flash FP8 model on dual DGX Spark TP=2.
+description: DeepSeek V4 Flash FP8 on dual DGX Spark TP=2 with PR 41834 SM12x support, MTP disabled for stable concurrent serving
 model: deepseek-ai/DeepSeek-V4-Flash
 container: vllm-node-dsv4
 cluster_only: true
@@ -9,7 +14,7 @@ build_args:
   - --vllm-repo
   - https://github.com/jasl/vllm.git
   - --vllm-ref
-  - codex/ds4-sm120-min-enable
+  - f32247a5a695fa8979d61837bf6b87da897dcb7d
   - --rebuild-vllm
 
 mods: []
@@ -21,7 +26,7 @@ defaults:
   pipeline_parallel: 1
   gpu_memory_utilization: 0.85
   max_model_len: 200000
-  max_num_batched_tokens: 4192
+  max_num_batched_tokens: 4096
   max_num_seqs: 2
   block_size: 256
   served_model_name: deepseek-v4-flash
@@ -49,11 +54,12 @@ command: |
       --kv-cache-dtype fp8 \
       --block-size {block_size} \
       --enable-prefix-caching \
+      --enable-flashinfer-autotune \
       --max-model-len {max_model_len} \
       --max-num-seqs {max_num_seqs} \
       --max-num-batched-tokens {max_num_batched_tokens} \
       --gpu-memory-utilization {gpu_memory_utilization} \
-      --distributed-executor-backend mp \
+      --distributed-executor-backend ray \
       --compilation-config '{{"cudagraph_mode":"FULL_AND_PIECEWISE","custom_ops":["all"]}}' \
       --tokenizer-mode deepseek_v4 \
       --tool-call-parser deepseek_v4 \
