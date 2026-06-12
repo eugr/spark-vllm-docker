@@ -3486,23 +3486,17 @@ diff --git a/vllm/v1/worker/gpu/attn_utils.py b/vllm/v1/worker/gpu/attn_utils.py
 index 6fc55ee32..d7acc9496 100644
 --- a/vllm/v1/worker/gpu/attn_utils.py
 +++ b/vllm/v1/worker/gpu/attn_utils.py
-@@ -392,6 +392,7 @@ def build_attn_metadata(
+@@ -392,9 +392,9 @@ def build_attn_metadata(
      seq_lens_cpu_upper_bound: torch.Tensor | None = None,
      dcp_local_seq_lens: torch.Tensor | None = None,
      positions: torch.Tensor | None = None,
-+    causal: bool | torch.Tensor = True,
      model_specific_attn_metadata: ModelSpecificAttnMetadata | None = None,
      for_cudagraph_capture: bool = False,
+-    causal: bool = True,
++    causal: bool | torch.Tensor = True,
  ) -> dict[str, Any]:
-@@ -423,7 +424,7 @@ def build_attn_metadata(
-             max_query_len=max_query_len,
-             block_table_tensor=block_table,
-             slot_mapping=slot_mapping,
--            causal=True,
-+            causal=causal,
-             dcp_local_seq_lens=dcp_local_seq_lens,
-             positions=positions,
-             **common_attn_metadata_extra_kwargs,
+     seq_lens = seq_lens[:num_reqs]
+     if dcp_local_seq_lens is not None:
 diff --git a/vllm/v1/worker/gpu/input_batch.py b/vllm/v1/worker/gpu/input_batch.py
 index f905d09e4..6b750fe7e 100644
 --- a/vllm/v1/worker/gpu/input_batch.py
@@ -3777,11 +3771,10 @@ diff --git a/vllm/v1/worker/gpu/model_states/__init__.py b/vllm/v1/worker/gpu/mo
 index 06b5a92c3..983be393e 100644
 --- a/vllm/v1/worker/gpu/model_states/__init__.py
 +++ b/vllm/v1/worker/gpu/model_states/__init__.py
-@@ -13,7 +13,14 @@ def init_model_state(
+@@ -13,10 +13,17 @@ def init_model_state(
      encoder_cache: EncoderCache | None,
      device: torch.device,
  ):
--    if "WhisperForConditionalGeneration" in vllm_config.model_config.architectures:
 +    # Let the model provide its own ModelState if it defines one.
 +    if hasattr(model, "get_model_state_cls"):
 +        cls = model.get_model_state_cls()
@@ -3789,7 +3782,12 @@ index 06b5a92c3..983be393e 100644
 +
 +    architectures = vllm_config.model_config.architectures
 +
-+    if "WhisperForConditionalGeneration" in architectures:
+     if (
+-        "WhisperForConditionalGeneration" in vllm_config.model_config.architectures
+-        or "CohereAsrForConditionalGeneration" in vllm_config.model_config.architectures
++        "WhisperForConditionalGeneration" in architectures
++        or "CohereAsrForConditionalGeneration" in architectures
+     ):
          from vllm.v1.worker.gpu.model_states.whisper import WhisperModelState
 
          return WhisperModelState(vllm_config, model, encoder_cache, device)
