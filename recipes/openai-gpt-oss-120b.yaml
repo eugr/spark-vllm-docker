@@ -26,7 +26,7 @@ defaults:
   port: 8000
   host: 0.0.0.0
   tensor_parallel: 1
-  gpu_memory_utilization: 0.70
+  gpu_memory_utilization: 0.8
   max_num_batched_tokens: 8192
 
 # Environment variables to set in the container

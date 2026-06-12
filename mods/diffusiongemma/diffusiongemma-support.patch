@@ -1,0 +1,4066 @@
+diff --git a/benchmarks/kernels/benchmark_moe.py b/benchmarks/kernels/benchmark_moe.py
+index f885b1e09..5d0876f91 100644
+--- a/benchmarks/kernels/benchmark_moe.py
++++ b/benchmarks/kernels/benchmark_moe.py
+@@ -792,6 +792,12 @@ def get_model_params(config):
+         topk = text_config.num_experts_per_tok
+         intermediate_size = text_config.moe_intermediate_size
+         hidden_size = text_config.hidden_size
++    elif architecture == "DiffusionGemmaForBlockDiffusion":
++        text_config = config.get_text_config()
++        E = text_config.num_experts
++        topk = text_config.top_k_experts
++        intermediate_size = text_config.moe_intermediate_size
++        hidden_size = text_config.hidden_size
+     elif architecture == "HunYuanMoEV1ForCausalLM":
+         E = config.num_experts
+         topk = config.moe_topk[0]
+diff --git a/cmake/external_projects/vllm_flash_attn.cmake b/cmake/external_projects/vllm_flash_attn.cmake
+index 1e4feb0ff..47662160e 100644
+--- a/cmake/external_projects/vllm_flash_attn.cmake
++++ b/cmake/external_projects/vllm_flash_attn.cmake
+@@ -39,7 +39,7 @@ else()
+   FetchContent_Declare(
+           vllm-flash-attn
+           GIT_REPOSITORY https://github.com/vllm-project/flash-attention.git
+-          GIT_TAG dd62dac706b1cf7895bd99b18c6cb7e7e117ee25
++          GIT_TAG 561ac78113287df1b6705d38cb5de3ccff6eb293
+           GIT_PROGRESS TRUE
+           # Don't share the vllm-flash-attn build between build types
+           BINARY_DIR ${CMAKE_BINARY_DIR}/vllm-flash-attn
+diff --git a/docs/design/attention_backends.md b/docs/design/attention_backends.md
+index 5d366253e..27c3e3ae7 100644
+--- a/docs/design/attention_backends.md
++++ b/docs/design/attention_backends.md
+@@ -180,7 +180,7 @@ Priority is **1 = highest** (tried first).
+ | `ROCM_AITER_FA` | | fp16, bf16 | `auto`, `float16`, `bfloat16`, `fp8`, `fp8_e4m3`, `fp8_e5m2` | 16, 32 | 64, 128, 256 | ✅ | ✅ | ❌ | ❌ | Decoder | N/A |
+ | `ROCM_AITER_UNIFIED_ATTN` | | fp16, bf16 | `auto` | %16 | Any | ✅ | ❌ | ✅ | ❌ | All | N/A |
+ | `ROCM_ATTN` | | fp16, bf16, fp32 | `auto`, `float16`, `bfloat16`, `fp8`, `fp8_e4m3`, `fp8_e5m2` | %16 | 32, 64, 80, 96, 128, 160, 192, 224, 256 | ❌ | ✅ | ✅ | ❌ | Decoder, Encoder, Encoder Only | N/A |
+-| `TRITON_ATTN` | | fp16, bf16, fp32 | `auto`, `float16`, `bfloat16`, `fp8`, `fp8_e4m3`, `fp8_e5m2`, `int8_per_token_head`, `fp8_per_token_head` | %16 | Any | ✅ | ❌ | ✅ | ❌ | All | Any |
++| `TRITON_ATTN` | | fp16, bf16, fp32 | `auto`, `float16`, `bfloat16`, `fp8`, `fp8_e4m3`, `fp8_e5m2`, `int8_per_token_head`, `fp8_per_token_head` | %16 | Any | ✅ | ✅ | ✅ | ❌ | All | Any |
+ | `TURBOQUANT` | | fp16, bf16 | `turboquant_k8v4`, `turboquant_4bit_nc`, `turboquant_k3v4_nc`, `turboquant_3bit_nc` | 16, 32, 64, 128 | Any | ❌ | ❌ | ❌ | ❌ | Decoder | Any |
+
+ > **†** FlashInfer uses TRTLLM attention on Blackwell (SM100), which supports sinks. Disable via `--attention-config.use_trtllm_attention=0`.
+diff --git a/tests/kernels/attention/test_mixed_causal_attn.py b/tests/kernels/attention/test_mixed_causal_attn.py
+new file mode 100644
+index 000000000..3e8c52be0
+--- /dev/null
++++ b/tests/kernels/attention/test_mixed_causal_attn.py
+@@ -0,0 +1,303 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Tests for per-request causal/non-causal attention (mixed batches).
++
++Validates that both triton and flash-attention backends correctly handle
++batches where some sequences use causal masking and others use non-causal
++(bidirectional) masking — needed by DiffusionGemma.
++"""
++
++import pytest
++import torch
++
++from vllm.platforms import current_platform
++from vllm.utils.torch_utils import set_random_seed
++
++NUM_HEADS = [(4, 4), (8, 2)]
++HEAD_SIZES = [128]
++BLOCK_SIZES = [16]
++DTYPES = [torch.bfloat16]
++
++
++def ref_paged_attn(
++    query: torch.Tensor,
++    key_cache: torch.Tensor,
++    value_cache: torch.Tensor,
++    query_lens: list[int],
++    kv_lens: list[int],
++    block_tables: torch.Tensor,
++    scale: float,
++    per_seq_causal: list[bool],
++    sliding_window: int | None = None,
++) -> torch.Tensor:
++    num_seqs = len(query_lens)
++    block_tables_np = block_tables.cpu().numpy()
++    _, block_size, num_kv_heads, head_size = key_cache.shape
++
++    outputs: list[torch.Tensor] = []
++    start_idx = 0
++    for i in range(num_seqs):
++        query_len = query_lens[i]
++        kv_len = kv_lens[i]
++        q = query[start_idx : start_idx + query_len]
++        q = q * scale
++
++        num_kv_blocks = (kv_len + block_size - 1) // block_size
++        block_indices = block_tables_np[i, :num_kv_blocks]
++        k = key_cache[block_indices].view(-1, num_kv_heads, head_size)[:kv_len]
++        v = value_cache[block_indices].view(-1, num_kv_heads, head_size)[:kv_len]
++
++        if q.shape[1] != k.shape[1]:
++            k = torch.repeat_interleave(k, q.shape[1] // k.shape[1], dim=1)
++            v = torch.repeat_interleave(v, q.shape[1] // v.shape[1], dim=1)
++
++        attn = torch.einsum("qhd,khd->hqk", q, k).float()
++
++        if per_seq_causal[i]:
++            mask = torch.triu(
++                torch.ones(query_len, kv_len),
++                diagonal=kv_len - query_len + 1,
++            ).bool()
++        else:
++            mask = torch.zeros(query_len, kv_len).bool()
++
++        if sliding_window is not None:
++            sw_mask = (
++                torch.triu(
++                    torch.ones(query_len, kv_len),
++                    diagonal=kv_len - (query_len + sliding_window) + 1,
++                )
++                .bool()
++                .logical_not()
++            )
++            mask |= sw_mask
++
++        attn.masked_fill_(mask, float("-inf"))
++        attn = torch.softmax(attn, dim=-1).to(v.dtype)
++        out = torch.einsum("hqk,khd->qhd", attn, v)
++        outputs.append(out)
++        start_idx += query_len
++
++    return torch.cat(outputs, dim=0)
++
++
++# ---- Triton backend test ----
++
++
++@pytest.mark.parametrize(
++    "seq_lens",
++    [[(1, 128), (5, 64), (1, 256)]],
++)
++@pytest.mark.parametrize(
++    "per_seq_causal",
++    [[True, False, True], [False, True, False], [True, True, False]],
++)
++@pytest.mark.parametrize("num_heads", NUM_HEADS)
++@pytest.mark.parametrize("head_size", HEAD_SIZES)
++@pytest.mark.parametrize("block_size", BLOCK_SIZES)
++@pytest.mark.parametrize("dtype", DTYPES)
++@torch.inference_mode()
++def test_triton_mixed_causal(
++    seq_lens: list[tuple[int, int]],
++    per_seq_causal: list[bool],
++    num_heads: tuple[int, int],
++    head_size: int,
++    dtype: torch.dtype,
++    block_size: int,
++):
++    if not current_platform.is_cuda():
++        pytest.skip("Triton attention requires CUDA")
++
++    from vllm.v1.attention.ops.triton_unified_attention import unified_attention
++
++    set_random_seed(42)
++    device = "cuda"
++
++    num_query_heads, num_kv_heads = num_heads
++    assert len(seq_lens) == len(per_seq_causal)
++
++    query_lens = [s[0] for s in seq_lens]
++    kv_lens = [s[1] for s in seq_lens]
++    num_seqs = len(seq_lens)
++
++    num_query_tokens = sum(query_lens)
++    max_kv_len = max(kv_lens)
++    max_num_blocks = (max_kv_len + block_size - 1) // block_size
++    num_blocks = max_num_blocks * num_seqs + 10
++
++    scale = head_size**-0.5
++    query = torch.randn(
++        num_query_tokens, num_query_heads, head_size, dtype=dtype, device=device
++    )
++    key_cache = torch.randn(
++        num_blocks, block_size, num_kv_heads, head_size, dtype=dtype, device=device
++    )
++    value_cache = torch.randn(
++        num_blocks, block_size, num_kv_heads, head_size, dtype=dtype, device=device
++    )
++
++    block_tables_list = []
++    for i in range(num_seqs):
++        n_blocks = (kv_lens[i] + block_size - 1) // block_size
++        blocks = list(range(i * max_num_blocks, i * max_num_blocks + n_blocks))
++        blocks += [0] * (max_num_blocks - n_blocks)
++        block_tables_list.append(blocks)
++    block_tables = torch.tensor(block_tables_list, dtype=torch.int32, device=device)
++
++    cu_seqlens_q = torch.zeros(num_seqs + 1, dtype=torch.int32, device=device)
++    for i, ql in enumerate(query_lens):
++        cu_seqlens_q[i + 1] = cu_seqlens_q[i] + ql
++
++    seqused_k = torch.tensor(kv_lens, dtype=torch.int32, device=device)
++    max_seqlen_q = max(query_lens)
++    max_seqlen_k = max(kv_lens)
++
++    causal_tensor = torch.tensor(per_seq_causal, dtype=torch.bool, device=device)
++
++    output = torch.empty_like(query)
++    unified_attention(
++        q=query,
++        k=key_cache,
++        v=value_cache,
++        out=output,
++        cu_seqlens_q=cu_seqlens_q,
++        max_seqlen_q=max_seqlen_q,
++        seqused_k=seqused_k,
++        max_seqlen_k=max_seqlen_k,
++        softmax_scale=scale,
++        causal=causal_tensor,
++        window_size=(-1, -1),
++        block_table=block_tables,
++        softcap=0.0,
++        q_descale=None,
++        k_descale=1.0,
++        v_descale=1.0,
++    )
++
++    ref_output = ref_paged_attn(
++        query,
++        key_cache,
++        value_cache,
++        query_lens,
++        kv_lens,
++        block_tables,
++        scale,
++        per_seq_causal,
++    )
++
++    torch.testing.assert_close(output, ref_output, atol=1e-2, rtol=1e-2)
++
++
++# ---- Flash Attention 4 backend test (native per_seq_causal) ----
++
++
++@pytest.mark.parametrize(
++    "seq_lens",
++    [[(1, 128), (5, 64), (1, 256)]],
++)
++@pytest.mark.parametrize(
++    "per_seq_causal",
++    [[True, False, True], [False, True, False]],
++)
++@pytest.mark.parametrize("num_heads", NUM_HEADS)
++@pytest.mark.parametrize("head_size", HEAD_SIZES)
++@pytest.mark.parametrize("block_size", BLOCK_SIZES)
++@pytest.mark.parametrize("dtype", DTYPES)
++@torch.inference_mode()
++def test_flash_attn4_mixed_causal(
++    seq_lens: list[tuple[int, int]],
++    per_seq_causal: list[bool],
++    num_heads: tuple[int, int],
++    head_size: int,
++    dtype: torch.dtype,
++    block_size: int,
++):
++    if not current_platform.is_cuda():
++        pytest.skip("Flash attention requires CUDA")
++
++    try:
++        from vllm.vllm_flash_attn import (
++            fa_version_unsupported_reason,
++            flash_attn_varlen_func,
++            is_fa_version_supported,
++        )
++    except ImportError:
++        pytest.skip("vllm_flash_attn not available")
++
++    if not is_fa_version_supported(4):
++        reason = fa_version_unsupported_reason(4)
++        pytest.skip(f"FA4 not supported: {reason}")
++
++    set_random_seed(42)
++    device = "cuda"
++
++    num_query_heads, num_kv_heads = num_heads
++    assert len(seq_lens) == len(per_seq_causal)
++
++    query_lens = [s[0] for s in seq_lens]
++    kv_lens = [s[1] for s in seq_lens]
++    num_seqs = len(seq_lens)
++
++    num_query_tokens = sum(query_lens)
++    max_kv_len = max(kv_lens)
++    max_num_blocks = (max_kv_len + block_size - 1) // block_size
++    num_blocks = max_num_blocks * num_seqs + 10
++
++    scale = head_size**-0.5
++    query = torch.randn(
++        num_query_tokens, num_query_heads, head_size, dtype=dtype, device=device
++    )
++    key_cache = torch.randn(
++        num_blocks, block_size, num_kv_heads, head_size, dtype=dtype, device=device
++    )
++    value_cache = torch.randn(
++        num_blocks, block_size, num_kv_heads, head_size, dtype=dtype, device=device
++    )
++
++    block_tables_list = []
++    for i in range(num_seqs):
++        n_blocks = (kv_lens[i] + block_size - 1) // block_size
++        blocks = list(range(i * max_num_blocks, i * max_num_blocks + n_blocks))
++        blocks += [0] * (max_num_blocks - n_blocks)
++        block_tables_list.append(blocks)
++    block_tables = torch.tensor(block_tables_list, dtype=torch.int32, device=device)
++
++    cu_seqlens_q = torch.zeros(num_seqs + 1, dtype=torch.int32, device=device)
++    for i, ql in enumerate(query_lens):
++        cu_seqlens_q[i + 1] = cu_seqlens_q[i] + ql
++
++    seqused_k = torch.tensor(kv_lens, dtype=torch.int32, device=device)
++    per_seq_causal_tensor = torch.tensor(
++        per_seq_causal, dtype=torch.int32, device=device
++    )
++
++    ref_output = ref_paged_attn(
++        query,
++        key_cache,
++        value_cache,
++        query_lens,
++        kv_lens,
++        block_tables,
++        scale,
++        per_seq_causal,
++    )
++
++    output = torch.empty_like(query)
++    flash_attn_varlen_func(
++        q=query,
++        k=key_cache,
++        v=value_cache,
++        out=output,
++        cu_seqlens_q=cu_seqlens_q,
++        max_seqlen_q=max(query_lens),
++        seqused_k=seqused_k,
++        max_seqlen_k=max(kv_lens),
++        softmax_scale=scale,
++        causal=False,
++        block_table=block_tables,
++        softcap=0.0,
++        per_seq_causal=per_seq_causal_tensor,
++        fa_version=4,
++    )
++
++    torch.testing.assert_close(output, ref_output, atol=1e-2, rtol=1e-2)
+diff --git a/tests/tool_parsers/test_gemma4_tool_parser.py b/tests/tool_parsers/test_gemma4_tool_parser.py
+index 6f3709e19..eea084a2b 100644
+--- a/tests/tool_parsers/test_gemma4_tool_parser.py
++++ b/tests/tool_parsers/test_gemma4_tool_parser.py
+@@ -702,6 +702,88 @@ class TestStreamingExtraction:
+             '    <meta name="viewport" content="width=device-width">\n'
+         )
+
++    def _collect_tool_calls_by_index(self, results):
++        """Group streamed tool-call fragments by their ``index``.
++
++        Returns ``{index: {"name": str | None, "arguments": str}}`` where
++        ``arguments`` is the concatenation of every streamed argument
++        fragment for that index (which should form valid JSON once complete).
++        """
++        by_index: dict[int, dict[str, Any]] = {}
++        for delta, _ in results:
++            if not (delta and delta.tool_calls):
++                continue
++            for tc in delta.tool_calls:
++                entry = by_index.setdefault(tc.index, {"name": None, "arguments": ""})
++                func = tc.function
++                if isinstance(func, dict):
++                    name = func.get("name")
++                    arg = func.get("arguments", "")
++                else:
++                    name = getattr(func, "name", None)
++                    arg = getattr(func, "arguments", "") or ""
++                if name:
++                    entry["name"] = name
++                if arg:
++                    entry["arguments"] += arg
++        return by_index
++
++    def test_streaming_single_chunk_complete_tool_call(self, parser, mock_request):
++        """A backend may deliver a whole tool call in one streaming delta.
++
++        The start token, ``call:name{...}`` payload and the end token all
++        arrive in a single chunk. The parser must still emit one
++        ``DeltaToolCall`` with the correct name + complete arguments JSON
++        (rather than swallowing it and finishing with finish_reason="stop").
++        """
++        chunks = [
++            '<|tool_call>call:name_a_color{color_hex:<|"|>00ff11<|"|>}<tool_call|>',
++        ]
++
++        results = self._simulate_streaming(parser, mock_request, chunks)
++
++        # Exactly one delta should carry tool_calls, and it must not be
++        # emitted as plain content (which would yield finish_reason="stop").
++        tool_call_deltas = [
++            delta for delta, _ in results if delta is not None and delta.tool_calls
++        ]
++        assert len(tool_call_deltas) == 1, (
++            "Expected exactly one delta carrying the batched tool call"
++        )
++        assert all(
++            delta.content is None for delta, _ in results if delta is not None
++        ), "Complete tool call must not leak as content"
++
++        by_index = self._collect_tool_calls_by_index(results)
++        assert set(by_index) == {0}
++        assert by_index[0]["name"] == "name_a_color"
++        assert json.loads(by_index[0]["arguments"]) == {"color_hex": "00ff11"}
++
++    def test_streaming_multi_chunk_batched_tool_calls(self, parser, mock_request):
++        """A single delta may batch MULTIPLE complete tool calls.
++
++        ``<|tool_call>...<tool_call|><|tool_call>...<tool_call|>`` arriving in
++        one chunk must emit BOTH calls (one DeltaToolCall each, with distinct
++        indices), not just the first.
++        """
++        chunks = [
++            '<|tool_call>call:get_weather{location:<|"|>London<|"|>}<tool_call|>'
++            '<|tool_call>call:get_time{timezone:<|"|>GMT<|"|>}<tool_call|>',
++        ]
++
++        results = self._simulate_streaming(parser, mock_request, chunks)
++
++        by_index = self._collect_tool_calls_by_index(results)
++        assert set(by_index) == {0, 1}, (
++            f"Expected two tool calls (indices 0 and 1), got {sorted(by_index)}"
++        )
++
++        assert by_index[0]["name"] == "get_weather"
++        assert json.loads(by_index[0]["arguments"]) == {"location": "London"}
++
++        assert by_index[1]["name"] == "get_time"
++        assert json.loads(by_index[1]["arguments"]) == {"timezone": "GMT"}
++
+     def test_streaming_trailing_bare_bool_not_duplicated(self, parser, mock_request):
+         """Trailing bare boolean must not be streamed twice."""
+         chunks = [
+diff --git a/vllm/benchmarks/serve.py b/vllm/benchmarks/serve.py
+index 8fa29f4df..8d50e9072 100644
+--- a/vllm/benchmarks/serve.py
++++ b/vllm/benchmarks/serve.py
+@@ -248,6 +248,68 @@ async def fetch_spec_decode_metrics(
+         return None
+
+
++@dataclass
++class DiffusionMetrics:
++    """Diffusion (dLLM) decoding metrics from the server's Prometheus endpoint."""
++
++    num_denoising_steps: int
++    num_canvas_positions: int
++    num_committed_tokens: int
++
++
++async def fetch_diffusion_metrics(
++    base_url: str, session: aiohttp.ClientSession
++) -> DiffusionMetrics | None:
++    """Fetch diffusion decoding metrics from the server's Prometheus endpoint.
++
++    Returns None if the model is not a diffusion model or metrics are not
++    available.
++    """
++    metrics_url = f"{base_url}/metrics"
++    try:
++        async with session.get(metrics_url) as response:
++            if response.status != 200:
++                return None
++            text = await response.text()
++
++            num_denoising_steps = 0
++            num_canvas_positions = 0
++            num_committed_tokens = 0
++            found_diffusion = False
++
++            for line in text.split("\n"):
++                line = line.strip()
++                if not line or line.startswith("#"):
++                    continue
++
++                if line.startswith("vllm:diffusion"):
++                    # Extract metric name (before labels) to avoid matching
++                    # substrings inside label values.
++                    parts = line.split(None, 1)
++                    metric_name = parts[0].split("{")[0]
++                    if not metric_name.endswith("_total"):
++                        continue
++                    found_diffusion = True
++                    with contextlib.suppress(ValueError):
++                        if "num_denoising_steps" in metric_name:
++                            num_denoising_steps += int(float(parts[-1]))
++                        elif "num_canvas_positions" in metric_name:
++                            num_canvas_positions += int(float(parts[-1]))
++                        elif "num_committed_tokens" in metric_name:
++                            num_committed_tokens += int(float(parts[-1]))
++
++            if not found_diffusion:
++                return None
++
++            return DiffusionMetrics(
++                num_denoising_steps=num_denoising_steps,
++                num_canvas_positions=num_canvas_positions,
++                num_committed_tokens=num_committed_tokens,
++            )
++    except (aiohttp.ClientError, asyncio.TimeoutError):
++        return None
++
++
+ class TaskType(Enum):
+     GENERATION = "generation"
+     POOLING = "pooling"
+@@ -887,6 +949,7 @@ async def benchmark(
+         print("Self timing is set, using the timestamps from the trace file.")
+
+     spec_decode_metrics_before = await fetch_spec_decode_metrics(base_url, session)
++    diffusion_metrics_before = await fetch_diffusion_metrics(base_url, session)
+
+     pbar = None if disable_tqdm else tqdm(total=len(input_requests))
+
+@@ -1016,6 +1079,34 @@ async def benchmark(
+                 "per_position_acceptance_rates": per_pos_rates,
+             }
+
++    diffusion_metrics_after = await fetch_diffusion_metrics(base_url, session)
++    diffusion_stats: dict[str, Any] | None = None
++    if diffusion_metrics_before is not None and diffusion_metrics_after is not None:
++        delta_steps = (
++            diffusion_metrics_after.num_denoising_steps
++            - diffusion_metrics_before.num_denoising_steps
++        )
++        delta_positions = (
++            diffusion_metrics_after.num_canvas_positions
++            - diffusion_metrics_before.num_canvas_positions
++        )
++        delta_committed = (
++            diffusion_metrics_after.num_committed_tokens
++            - diffusion_metrics_before.num_committed_tokens
++        )
++        if delta_steps > 0 and delta_committed > 0:
++            block_size = delta_positions / delta_steps  # canvas length (CL)
++            num_canvases = delta_committed / block_size  # = number of commit steps
++            denoising_steps = delta_steps - num_canvases  # exclude commit steps
++            diffusion_stats = {
++                "denoising_steps": denoising_steps,
++                "canvas_positions": delta_positions,
++                "committed_tokens": delta_committed,
++                "committed_throughput": delta_committed / benchmark_duration,
++                "steps_per_canvas": denoising_steps / num_canvases,
++                "committed_per_step": delta_committed / denoising_steps,
++            }
++
+     if task_type == TaskType.GENERATION:
+         metrics, actual_output_lens = calculate_metrics(
+             input_requests=input_requests,
+@@ -1134,6 +1225,16 @@ async def benchmark(
+             "per_position_acceptance_rates", []
+         )
+
++    if diffusion_stats is not None:
++        result["diffusion_committed_throughput"] = diffusion_stats[
++            "committed_throughput"
++        ]
++        result["diffusion_steps_per_canvas"] = diffusion_stats["steps_per_canvas"]
++        result["diffusion_committed_per_step"] = diffusion_stats["committed_per_step"]
++        result["diffusion_committed_tokens"] = int(diffusion_stats["committed_tokens"])
++        result["diffusion_denoising_steps"] = int(diffusion_stats["denoising_steps"])
++        result["diffusion_canvas_positions"] = int(diffusion_stats["canvas_positions"])
++
+     def process_one_metric(
+         # E.g., "ttft"
+         metric_attribute_name: str,
+@@ -1179,7 +1280,22 @@ async def benchmark(
+         process_one_metric("itl", "ITL", "Inter-token Latency")
+     process_one_metric("e2el", "E2EL", "End-to-end Latency")
+
+-    if spec_decode_stats is not None:
++    if diffusion_stats is not None:
++        print("{s:{c}^{n}}".format(s="Diffusion Decoding", n=50, c="-"))
++        for label, key, value_fmt in (
++            ("Committed throughput (tok/s):", "committed_throughput", "{:<10.2f}"),
++            ("Denoising steps per canvas:", "steps_per_canvas", "{:<10.2f}"),
++            ("Committed per denoising step:", "committed_per_step", "{:<10.2f}"),
++            ("Committed tokens:", "committed_tokens", "{:<10d}"),
++            ("Denoising steps:", "denoising_steps", "{:<10d}"),
++            ("Canvas positions evaluated:", "canvas_positions", "{:<10d}"),
++        ):
++            value = diffusion_stats[key]
++            if value_fmt.endswith("d}"):
++                value = int(value)
++            print("{:<40} ".format(label) + value_fmt.format(value))
++
++    if spec_decode_stats is not None and diffusion_stats is None:
+         print("{s:{c}^{n}}".format(s="Speculative Decoding", n=50, c="-"))
+         print(
+             "{:<40} {:<10.2f}".format(
+diff --git a/vllm/config/__init__.py b/vllm/config/__init__.py
+index b189c45c8..82ab1842f 100644
+--- a/vllm/config/__init__.py
++++ b/vllm/config/__init__.py
+@@ -10,6 +10,7 @@ from vllm.config.compilation import (
+     PassConfig,
+ )
+ from vllm.config.device import DeviceConfig
++from vllm.config.diffusion import DiffusionConfig
+ from vllm.config.ec_transfer import ECTransferConfig
+ from vllm.config.kernel import KernelConfig
+ from vllm.config.kv_events import KVEventsConfig
+@@ -72,6 +73,8 @@ __all__ = [
+     "PassConfig",
+     # From vllm.config.device
+     "DeviceConfig",
++    # From vllm.config.diffusion
++    "DiffusionConfig",
+     # From vllm.config.ec_transfer
+     "ECTransferConfig",
+     # From vllm.config.kernel
+diff --git a/vllm/config/diffusion.py b/vllm/config/diffusion.py
+new file mode 100644
+index 000000000..1cb4fe51d
+--- /dev/null
++++ b/vllm/config/diffusion.py
+@@ -0,0 +1,25 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Configuration for discrete diffusion (dLLM) models."""
++
++from pydantic import Field
++
++from vllm.config.utils import config
++
++
++@config
++class DiffusionConfig:
++    """Configuration for discrete diffusion language models (dLLMs).
++
++    dLLMs generate tokens via iterative denoising over a fixed-length canvas
++    rather than left-to-right autoregressive decoding. They reuse the
++    speculative-decoding data path (draft token ids, scheduled spec decode
++    tokens) with overloaded semantics for block-based generation.
++    """
++
++    canvas_length: int = Field(default=None, gt=0)  # type: ignore[assignment]
++    """Length of the denoising canvas (block).  Also determines the number of
++    speculative tokens scheduled per step."""
++
++    max_denoising_steps: int = 48
++    """Maximum number of denoising iterations per canvas block."""
+diff --git a/vllm/config/model.py b/vllm/config/model.py
+index 2f22140be..de3cb1d0a 100644
+--- a/vllm/config/model.py
++++ b/vllm/config/model.py
+@@ -1550,6 +1550,11 @@ class ModelConfig:
+         """Extract the HF encoder/decoder model flag."""
+         return is_encoder_decoder(self.hf_config)
+
++    @cached_property
++    def is_diffusion(self) -> bool:
++        """Detect discrete diffusion (dLLM) models from HF config."""
++        return getattr(self.hf_config, "canvas_length", None) is not None
++
+     @property
+     def uses_alibi(self) -> bool:
+         cfg = self.hf_text_config
+diff --git a/vllm/config/vllm.py b/vllm/config/vllm.py
+index fee1d2035..cbff68cb5 100644
+--- a/vllm/config/vllm.py
++++ b/vllm/config/vllm.py
+@@ -33,6 +33,7 @@ from .attention import AttentionConfig
+ from .cache import CacheConfig
+ from .compilation import CompilationConfig, CompilationMode, CUDAGraphMode
+ from .device import DeviceConfig
++from .diffusion import DiffusionConfig
+ from .ec_transfer import ECTransferConfig
+ from .kernel import KernelConfig
+ from .kv_events import KVEventsConfig
+@@ -325,6 +326,9 @@ class VllmConfig:
+     """LoRA configuration."""
+     speculative_config: SpeculativeConfig | None = None
+     """Speculative decoding configuration."""
++    diffusion_config: DiffusionConfig | None = None
++    """Diffusion LLM (dLLM) configuration."""
++
+     structured_outputs_config: StructuredOutputsConfig = Field(
+         default_factory=StructuredOutputsConfig
+     )
+@@ -513,6 +517,11 @@ class VllmConfig:
+             and self.speculative_config.num_speculative_tokens is not None
+         ):
+             return self.speculative_config.num_speculative_tokens
++        if (
++            self.diffusion_config is not None
++            and self.diffusion_config.canvas_length is not None
++        ):
++            return self.diffusion_config.canvas_length
+         return 0
+
+     @property
+@@ -521,6 +530,9 @@ class VllmConfig:
+         if use_v2_model_runner is not None:
+             return use_v2_model_runner
+
++        if self.model_config is not None and self.model_config.is_diffusion:
++            return True
++
+         if not self._is_default_v2_model_runner_model():
+             return False
+
+@@ -1669,12 +1681,7 @@ class VllmConfig:
+                 self.compilation_config.max_cudagraph_capture_size
+             )
+             if max_cudagraph_capture_size is None:
+-                decode_query_len = 1
+-                if (
+-                    self.speculative_config
+-                    and self.speculative_config.num_speculative_tokens
+-                ):
+-                    decode_query_len += self.speculative_config.num_speculative_tokens
++                decode_query_len = 1 + self.num_speculative_tokens
+                 max_cudagraph_capture_size = min(
+                     self.scheduler_config.max_num_seqs * decode_query_len * 2, 512
+                 )
+diff --git a/vllm/engine/arg_utils.py b/vllm/engine/arg_utils.py
+index 0490cbc3e..e15c2c439 100644
+--- a/vllm/engine/arg_utils.py
++++ b/vllm/engine/arg_utils.py
+@@ -38,6 +38,7 @@ from vllm.config import (
+     CompilationConfig,
+     ConfigType,
+     DeviceConfig,
++    DiffusionConfig,
+     ECTransferConfig,
+     EPLBConfig,
+     KernelConfig,
+@@ -614,6 +615,7 @@ class EngineArgs:
+     spec_method: str | None = None
+     spec_model: str | None = None
+     spec_tokens: int | None = None
++    diffusion_config: dict[str, Any] | None = None
+
+     show_hidden_metrics_for_version: str | None = (
+         ObservabilityConfig.show_hidden_metrics_for_version
+@@ -1470,6 +1472,10 @@ class EngineArgs:
+         vllm_group.add_argument(
+             "--spec-tokens", **speculative_kwargs["num_speculative_tokens"]
+         )
++        vllm_kwargs["diffusion_config"]["type"] = optional_type(json.loads)
++        vllm_group.add_argument(
++            "--diffusion-config", "-dc", **vllm_kwargs["diffusion_config"]
++        )
+         vllm_group.add_argument(
+             "--kv-transfer-config", **vllm_kwargs["kv_transfer_config"]
+         )
+@@ -1699,6 +1705,14 @@ class EngineArgs:
+         )
+         return SpeculativeConfig(**self.speculative_config)
+
++    def create_diffusion_config(self) -> DiffusionConfig | None:
++        if self.diffusion_config is None:
++            return None
++        cfg = self.diffusion_config
++        if isinstance(cfg, str):
++            cfg = json.loads(cfg)
++        return DiffusionConfig(**cfg)
++
+     def create_engine_config(
+         self,
+         usage_context: UsageContext | None = None,
+@@ -2013,6 +2027,7 @@ class EngineArgs:
+             target_model_config=model_config,
+             target_parallel_config=parallel_config,
+         )
++        diffusion_config = self.create_diffusion_config()
+
+         self._set_default_max_num_seqs_and_batched_tokens_args(
+             usage_context,
+@@ -2239,6 +2254,7 @@ class EngineArgs:
+             kernel_config=kernel_config,
+             lora_config=lora_config,
+             speculative_config=speculative_config,
++            diffusion_config=diffusion_config,
+             structured_outputs_config=self.structured_outputs_config,
+             observability_config=observability_config,
+             compilation_config=compilation_config,
+diff --git a/vllm/model_executor/layers/fused_moe/experts/flashinfer_cutlass_moe.py b/vllm/model_executor/layers/fused_moe/experts/flashinfer_cutlass_moe.py
+index ff259c828..76cd15ff5 100644
+--- a/vllm/model_executor/layers/fused_moe/experts/flashinfer_cutlass_moe.py
++++ b/vllm/model_executor/layers/fused_moe/experts/flashinfer_cutlass_moe.py
+@@ -188,6 +188,7 @@ class FlashInferExperts(mk.FusedMoEExpertsModular):
+     def _supports_activation(activation: MoEActivation) -> bool:
+         return activation in [
+             MoEActivation.SILU,
++            MoEActivation.GELU_TANH,
+             MoEActivation.RELU2_NO_MUL,
+             MoEActivation.SWIGLUOAI,
+         ]
+@@ -267,6 +268,7 @@ class FlashInferExperts(mk.FusedMoEExpertsModular):
+
+         activation_str_to_value_map = {
+             MoEActivation.SILU: ActivationType.Swiglu,  # This is the default
++            MoEActivation.GELU_TANH: ActivationType.Geglu,
+             MoEActivation.SWIGLUOAI: ActivationType.Swiglu,  # gpt-oss alias
+             MoEActivation.RELU2_NO_MUL: ActivationType.Relu2,
+         }
+diff --git a/vllm/model_executor/layers/fused_moe/experts/trtllm_nvfp4_moe.py b/vllm/model_executor/layers/fused_moe/experts/trtllm_nvfp4_moe.py
+index e90c4d664..e45fc77ad 100644
+--- a/vllm/model_executor/layers/fused_moe/experts/trtllm_nvfp4_moe.py
++++ b/vllm/model_executor/layers/fused_moe/experts/trtllm_nvfp4_moe.py
+@@ -142,6 +142,7 @@ class TrtLlmNvFp4ExpertsBase:
+             MoEActivation.SILU,
+             MoEActivation.RELU2_NO_MUL,
+             MoEActivation.GELU,
++            MoEActivation.GELU_TANH,
+         ]
+
+     @staticmethod
+diff --git a/vllm/model_executor/layers/quantization/utils/flashinfer_utils.py b/vllm/model_executor/layers/quantization/utils/flashinfer_utils.py
+index 973f75969..1db48d446 100644
+--- a/vllm/model_executor/layers/quantization/utils/flashinfer_utils.py
++++ b/vllm/model_executor/layers/quantization/utils/flashinfer_utils.py
+@@ -36,6 +36,7 @@ def activation_to_flashinfer_type(activation: MoEActivation) -> "ActivationType"
+         MoEActivation.GELU_NO_MUL: ActivationType.Gelu,
+         MoEActivation.SILU: ActivationType.Swiglu,
+         MoEActivation.GELU: ActivationType.Geglu,
++        MoEActivation.GELU_TANH: ActivationType.Geglu,
+         MoEActivation.RELU2_NO_MUL: ActivationType.Relu2,
+     }
+     return ACTIVATION_TO_FI_ACTIVATION[activation]
+diff --git a/vllm/model_executor/models/config.py b/vllm/model_executor/models/config.py
+index 64d606c28..702ef1548 100644
+--- a/vllm/model_executor/models/config.py
++++ b/vllm/model_executor/models/config.py
+@@ -105,6 +105,43 @@ class Gemma4Config(VerifyAndUpdateConfig):
+             )
+
+
++class DiffusionGemmaModelForBlockDiffusionConfig(VerifyAndUpdateConfig):
++    @classmethod
++    def verify_and_update_config(cls, vllm_config: "VllmConfig") -> None:
++        """Set up the diffusion config and defaults for DiffusionGemma.
++
++        Auto-creates DiffusionConfig from the HF config when the user
++        didn't pass ``--diffusion-config``. Diffusion sampling params are
++        read straight from generation_config.json at sampler-build time
++        (see DiffusionGemma's custom_sampler), not injected here.
++        """
++        # Inherit Gemma4's attention backend selection (FA4 on Hopper,
++        # TRITON_ATTN fallback for heterogeneous head dims).
++        Gemma4Config.verify_and_update_config(vllm_config)
++
++        # Auto-create DiffusionConfig from HF config if not provided.
++        if vllm_config.diffusion_config is None:
++            from vllm.config.diffusion import DiffusionConfig
++
++            hf_config = vllm_config.model_config.hf_config
++            canvas_length = getattr(hf_config, "canvas_length", 256)
++            vllm_config.diffusion_config = DiffusionConfig(
++                canvas_length=canvas_length,
++            )
++
++        # The diffusion sampler materializes [num_seqs, canvas_length, vocab]
++        # fp32 transients, so concurrency is memory-bound (>8 OOMs a single H200).
++        # Default to 8 when the user didn't pass --max-num-seqs.
++        # We can't see the original None here (the engine already filled a generic
++        # default), so use >= DEFAULT_MAX_NUM_SEQS as a proxy, (the default is much
++        # larger than any deliberate value for this model)
++        from vllm.config.scheduler import SchedulerConfig
++
++        sc = vllm_config.scheduler_config
++        if sc is not None and sc.max_num_seqs >= SchedulerConfig.DEFAULT_MAX_NUM_SEQS:
++            sc.max_num_seqs = 8
++
++
+ class DeepseekV4ForCausalLMConfig(VerifyAndUpdateConfig):
+     @staticmethod
+     def verify_and_update_model_config(model_config: "ModelConfig") -> None:
+@@ -591,6 +628,7 @@ MODELS_CONFIG_MAP: dict[str, type[VerifyAndUpdateConfig]] = {
+     "ColQwen3_5": Qwen3_5ForConditionalGenerationConfig,
+     "DeepseekV4ForCausalLM": DeepseekV4ForCausalLMConfig,
+     "DeepseekV32ForCausalLM": DeepseekV32ForCausalLM,
++    "DiffusionGemmaForBlockDiffusion": DiffusionGemmaModelForBlockDiffusionConfig,  # noqa: E501
+     "Ernie4_5_VLMoeForConditionalGeneration": Ernie4_5_VLMoeForConditionalGenerationConfig,  # noqa: E501
+     "FalconMambaForCausalLM": MambaModelConfig,
+     "Gemma3TextModel": Gemma3TextModelConfig,
+diff --git a/vllm/model_executor/models/diffusion_gemma.py b/vllm/model_executor/models/diffusion_gemma.py
+new file mode 100644
+index 000000000..8e49ef123
+--- /dev/null
++++ b/vllm/model_executor/models/diffusion_gemma.py
+@@ -0,0 +1,1369 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""DiffusionGemma model, ModelState, and Sampler for vLLM.
++
++Single Gemma4 backbone run in two modes (like YOCO):
++- encoder mode: causal attention, writes KV cache
++- decoder mode: bidirectional attention, reads encoder KV, doesn't write
++
++Same weights, same layers. The only decoder-unique component is a
++self-conditioning MLP.
++
++Multimodal support: the model always includes a vision tower (shared with
++Gemma4). Images are encoded through the vision tower and projected into
++the LM embedding space via Gemma4MultimodalEmbedder.
++
++Design doc: docs/design/diffusion_gemma_summary.md
++"""
++
++from __future__ import annotations
++
++from collections.abc import Iterable, Mapping
++from types import SimpleNamespace
++from typing import Any
++
++import numpy as np
++import torch
++from torch import nn
++from torch.nn import functional as F
++from transformers import AutoModel
++
++from vllm.config import VllmConfig
++from vllm.config.compilation import CUDAGraphMode
++from vllm.logger import init_logger
++from vllm.model_executor.layers.layernorm import RMSNorm
++from vllm.model_executor.layers.logits_processor import LogitsProcessor
++from vllm.model_executor.layers.vocab_parallel_embedding import (
++    ParallelLMHead,
++)
++
++# Reuse Gemma4 components directly
++from vllm.model_executor.models.gemma4 import (
++    Gemma4Model,
++)
++from vllm.model_executor.models.gemma4_mm import (
++    Gemma4DummyInputsBuilder,
++    Gemma4ForConditionalGeneration,
++    Gemma4MultimodalEmbedder,
++    Gemma4MultiModalProcessor,
++    Gemma4ProcessingInfo,
++)
++from vllm.model_executor.models.module_mapping import MultiModelKeys
++from vllm.model_executor.models.transformers.utils import recursive_replace_linear
++from vllm.model_executor.models.utils import WeightsMapper, maybe_prefix
++from vllm.multimodal import MULTIMODAL_REGISTRY
++from vllm.v1.outputs import LogprobsTensors
++from vllm.v1.worker.gpu.attn_utils import build_attn_metadata
++from vllm.v1.worker.gpu.buffer_utils import UvaBackedTensor, async_copy_to_gpu
++from vllm.v1.worker.gpu.model_states.interface import ModelState
++from vllm.v1.worker.gpu.sample.logprob import compute_topk_logprobs
++from vllm.v1.worker.gpu.sample.output import SamplerOutput
++from vllm.v1.worker.gpu.sample.penalties import use_penalty
++
++from .interfaces import (
++    SupportsMultiModal,
++    SupportsPP,
++    SupportsQuant,
++)
++
++logger = init_logger(__name__)
++
++
++class DiffusionGemmaSelfConditioning(nn.Module):
++    """Gated MLP that processes soft embeddings from the previous denoising step.
++
++    Structurally identical to Gemma4MLP but with self_conditioning_size
++    and post_norm without learned scale.
++    """
++
++    def __init__(
++        self, hidden_size: int, self_conditioning_size: int, eps: float = 1e-6
++    ):
++        super().__init__()
++        self.pre_norm = RMSNorm(hidden_size, eps=eps)
++        self.post_norm = RMSNorm(hidden_size, eps=eps, has_weight=False)
++        self.gate_proj = nn.Linear(hidden_size, self_conditioning_size, bias=False)
++        self.up_proj = nn.Linear(hidden_size, self_conditioning_size, bias=False)
++        self.down_proj = nn.Linear(self_conditioning_size, hidden_size, bias=False)
++
++    def forward(
++        self,
++        inputs_embeds: torch.Tensor,
++        soft_embeds: torch.Tensor,
++    ) -> torch.Tensor:
++        x = self.pre_norm(soft_embeds)
++        sc_signal = self.down_proj(
++            F.gelu(self.gate_proj(x), approximate="tanh") * self.up_proj(x)
++        )
++        return self.post_norm(inputs_embeds + sc_signal)
++
++
++# ---------------------------------------------------------------------------
++# Multimodal processing info (overrides Gemma4 config type check)
++# ---------------------------------------------------------------------------
++
++
++class DiffusionGemmaProcessingInfo(Gemma4ProcessingInfo):
++    """Processing info for DiffusionGemma.
++
++    Overrides ``get_hf_config`` to accept ``DiffusionGemmaConfig``
++    (which inherits from ``PretrainedConfig``, not ``Gemma4Config``).
++    Supports image and video modalities.
++    """
++
++    def get_hf_config(self):
++        # DiffusionGemmaConfig doesn't inherit from Gemma4Config, so we
++        # accept any PretrainedConfig here.
++        return self.ctx.get_hf_config()
++
++    def get_supported_mm_limits(self) -> Mapping[str, int | None]:
++        # DiffusionGemma supports image and video inputs.
++        return {"image": None, "video": None}
++
++    def get_mm_max_tokens_per_item(
++        self, seq_len: int, mm_counts: Mapping[str, int]
++    ) -> Mapping[str, int] | None:
++        config = self.get_hf_config()
++        vision_config = getattr(config, "vision_config", None)
++        if vision_config is None:
++            # TODO(diffusion): backward-compat for the pre-RC0.1
++            # architecture name. Remove once old checkpoints are gone.
++            return {"image": 0, "video": 0}
++
++        return super().get_mm_max_tokens_per_item(seq_len, mm_counts)
++
++
++@torch.compile(dynamic=True)
++def _softcap_logits(logits: torch.Tensor, cap: float) -> torch.Tensor:
++    # fp32 before tanh for numerical stability (matches HF DiffusionGemma).
++    # Compiling fuses the cast/div/tanh/mul into one elementwise kernel over
++    # the [num_tokens, vocab] logits instead of four separate passes.
++    logits = logits.float()
++    return torch.tanh(logits / cap) * cap
++
++
++@MULTIMODAL_REGISTRY.register_processor(
++    Gemma4MultiModalProcessor,
++    info=DiffusionGemmaProcessingInfo,
++    dummy_inputs=Gemma4DummyInputsBuilder,
++)
++class DiffusionGemmaForConditionalGeneration(
++    nn.Module,
++    SupportsMultiModal,
++    SupportsQuant,
++    SupportsPP,
++):
++    """DiffusionGemma for vLLM.
++
++    Single Gemma4 backbone that switches between encoder and decoder mode.
++    The encoder path uses standard Gemma4 layers (causal attention, KV write).
++    The decoder path uses the same weights with bidirectional attention and
++    KV read-only, plus self-conditioning.
++
++    Always includes a vision tower (same as Gemma4) for image understanding.
++
++    In practice, the model's forward() dispatches based on the `mode` kwarg
++    set by DiffusionGemmaModelState.prepare_inputs().
++    """
++
++    hf_to_vllm_mapper = WeightsMapper(
++        orig_to_new_prefix={
++            "model.decoder.": "model.",
++            "model.encoder.language_model.": "model.",
++            "model.encoder.vision_tower.": "vision_tower.",
++            "model.encoder.embed_vision.": "embed_vision.",
++        },
++        orig_to_new_substr={
++            ".experts.": ".moe.experts.",
++        },
++    )
++
++    packed_modules_mapping = {
++        "qkv_proj": ["q_proj", "k_proj", "v_proj"],
++        "gate_up_proj": ["gate_proj", "up_proj"],
++    }
++
++    @staticmethod
++    def get_model_state_cls():
++        return DiffusionGemmaModelState
++
++    def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
++        super().__init__()
++        config = vllm_config.model_config.hf_config
++        text_config = vllm_config.model_config.hf_text_config
++        self.config = config
++        self.model_dtype = vllm_config.model_config.dtype
++
++        # DiffusionGemma feeds raw (non-prenormed) input to the MoE router,
++        # matching the HF decoder which does router(residual) not
++        # router(pre_norm(residual)).
++        text_config.router_uses_prenormed_input = False
++
++        # DiffusionGemma's full-attention layers have NO v_proj — V is
++        # computed from k_proj's output (`value_states = key_states` before
++        # k_norm in `DiffusionGemmaDecoderTextAttention.forward`). This is
++        # the "k_eq_v" variant in our Gemma4 backbone. The checkpoint has no
++        # v_proj weights for full-attention layers; without this flag they
++        # would silently load with random V projections.
++        text_config.attention_k_eq_v = True
++
++        # ---- Vision tower ----
++        vision_config = getattr(config, "vision_config", None)
++        if vision_config is not None:
++            quant_config = vllm_config.quant_config
++            if quant_config and quant_config.get_name() in [
++                "bitsandbytes",
++                "torchao",
++                "compressed-tensors",
++            ]:
++                tower_quant = quant_config
++            else:
++                quantizable = (
++                    vision_config.hidden_size % 64 == 0
++                    and vision_config.intermediate_size % 64 == 0
++                )
++                tower_quant = quant_config if quantizable else None
++
++            with self._mark_tower_model(vllm_config, {"image", "video"}):
++                self.vision_tower = AutoModel.from_config(config=vision_config)
++                self.embed_vision = Gemma4MultimodalEmbedder(
++                    vision_config,
++                    text_config,
++                    quant_config=tower_quant,
++                    prefix=maybe_prefix(prefix, "embed_vision"),
++                )
++                recursive_replace_linear(
++                    self.vision_tower,
++                    tower_quant,
++                    prefix=maybe_prefix(prefix, "vision_tower"),
++                )
++        else:
++            # TODO(diffusion): backward-compat for the pre-RC0.1
++            # architecture name. Remove once old checkpoints are gone.
++            self.vision_tower = None
++            self.embed_vision = None
++
++        # ---- Language backbone (Gemma4Model) ----
++        # Use maybe_prefix to ensure correct weight name prefixes for
++        # quantization. The quantization config uses hf_to_vllm_mapper to
++        # match checkpoint weight names to model parameter names.
++        self.model = Gemma4Model(
++            vllm_config=vllm_config,
++            prefix=maybe_prefix(prefix, "model"),
++        )
++
++        self.lm_head = ParallelLMHead(
++            num_embeddings=text_config.vocab_size,
++            embedding_dim=text_config.hidden_size,
++        )
++
++        if text_config.tie_word_embeddings:
++            self.lm_head = self.lm_head.tie_weights(self.model.embed_tokens)
++
++        # HF DiffusionGemma applies the final-logit softcap in fp32, before
++        # any other processing. Do it manually in `compute_logits` so the
++        # LogitsProcessor only handles the lm_head GEMM.
++        self.final_logit_softcapping = getattr(
++            text_config, "final_logit_softcapping", None
++        )
++        self.logits_processor = LogitsProcessor(
++            text_config.vocab_size,
++            soft_cap=None,
++        )
++
++        sc_size = (
++            getattr(config, "self_conditioning_size", None)
++            or text_config.intermediate_size
++        )
++        self.self_conditioning = DiffusionGemmaSelfConditioning(
++            hidden_size=text_config.hidden_size,
++            self_conditioning_size=sc_size,
++            eps=getattr(text_config, "rms_norm_eps", 1e-6),
++        )
++
++        self.make_empty_intermediate_tensors = (
++            self.model.make_empty_intermediate_tensors
++        )
++
++    def compute_self_conditioning(
++        self,
++        inputs_embeds: torch.Tensor,
++        probs: torch.Tensor,
++    ) -> torch.Tensor:
++        embed_weight = self.model.embed_tokens.weight
++        soft_embeds = torch.matmul(
++            probs.to(embed_weight.dtype), embed_weight
++        ) * self.model.normalizer.to(inputs_embeds.dtype)
++        return self.self_conditioning(inputs_embeds, soft_embeds)
++
++    # ------------------------------------------------------------------ #
++    # Multimodal: reuse Gemma4's image parsing, processing & embedding
++    # ------------------------------------------------------------------ #
++    # The vision tower, pooler, embed_vision, and their processing logic
++    # are architecturally identical to Gemma4.  Delegate to avoid
++    # maintaining a duplicate copy.
++
++    _parse_and_validate_image_input = (
++        Gemma4ForConditionalGeneration._parse_and_validate_image_input
++    )
++    _parse_and_validate_video_input = (
++        Gemma4ForConditionalGeneration._parse_and_validate_video_input
++    )
++    _parse_and_validate_multimodal_inputs = (
++        Gemma4ForConditionalGeneration._parse_and_validate_multimodal_inputs
++    )
++    _encoder_chunk = staticmethod(Gemma4ForConditionalGeneration._encoder_chunk)
++    _process_image_input = Gemma4ForConditionalGeneration._process_image_input
++    _process_video_input = Gemma4ForConditionalGeneration._process_video_input
++    embed_multimodal = Gemma4ForConditionalGeneration.embed_multimodal
++
++    def get_mm_mapping(self) -> MultiModelKeys:
++        """Get the module prefix mapping for multimodal models."""
++        return MultiModelKeys.from_string_field(
++            language_model="model",
++            connector=["embed_vision"],
++            tower_model=["vision_tower"],
++        )
++
++    # ------------------------------------------------------------------ #
++    # Forward
++    # ------------------------------------------------------------------ #
++
++    def forward(
++        self,
++        input_ids: torch.Tensor,
++        positions: torch.Tensor,
++        intermediate_tensors: Any | None = None,
++        inputs_embeds: torch.Tensor | None = None,
++        **kwargs: Any,
++    ) -> torch.Tensor:
++        if intermediate_tensors is not None:
++            inputs_embeds = None
++        return self.model(
++            input_ids=input_ids,
++            positions=positions,
++            intermediate_tensors=intermediate_tensors,
++            inputs_embeds=inputs_embeds,
++            **kwargs,
++        )
++
++    def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor | None:
++        logits = self.logits_processor(self.lm_head, hidden_states)
++        if logits is not None and self.final_logit_softcapping is not None:
++            logits = _softcap_logits(logits, self.final_logit_softcapping)
++        return logits
++
++    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
++        """Load weights from checkpoint.
++
++        Checkpoint layout (HF DiffusionGemma):
++          model.encoder.vision_tower.*            → vision tower
++          model.encoder.embed_vision.*            → vision embedder
++          model.encoder.language_model.layers.*   → backbone
++          model.decoder.layers.*                  → backbone (tied)
++          model.decoder.embed_tokens.*            → embeddings
++          model.decoder.self_conditioning.*       → self-conditioning MLP
++          lm_head.*                               → LM head (tied)
++
++        We load encoder weights into our single ``Gemma4Model`` backbone,
++        skip duplicate decoder backbone weights, handle vision tower and
++        self-conditioning separately.
++        """
++
++        sc_params = dict(
++            (n, p)
++            for n, p in self.named_parameters()
++            if n.startswith("self_conditioning.")
++        )
++
++        # Collect vision tower + embedder parameters AND buffers for manual
++        # loading.  The HF vision tower registers std_bias / std_scale as
++        # buffers (not parameters) when config.standardize is True, so we
++        # must include named_buffers() to avoid "not found in model" warnings.
++        vision_params: dict[str, torch.Tensor] = {}
++        for n, p in self.named_parameters():
++            if n.startswith(("vision_tower.", "embed_vision.")):
++                vision_params[n] = p
++        for n, b in self.named_buffers():
++            if n.startswith(("vision_tower.", "embed_vision.")):
++                vision_params[n] = b
++
++        def _remap_weights():
++            # Use full weight names (including suffixes like .weight_scale,
++            # .weight_packed) for dedup instead of just the base layer name. Critical
++            # for quantized checkpoints where each weight has multiple tensors;
++            # tracking only base names skips scales as duplicates.
++            seen_weights: set[str] = set()
++            for name, weight in weights:
++                # Self-conditioning lives under model.decoder.self_conditioning.*
++                # in the checkpoint but at self_conditioning.* in our model.
++                if "self_conditioning" in name:
++                    sc_name = name.split("self_conditioning.", 1)[1]
++                    sc_name = "self_conditioning." + sc_name
++                    if sc_name in sc_params:
++                        sc_params[sc_name].data.copy_(weight)
++                    continue
++
++                # Vision tower: model.encoder.vision_tower.* → vision_tower.*
++                # In HF, the vision tower is a sibling of language_model
++                # under the encoder module.
++                if name.startswith("model.encoder.vision_tower."):
++                    vt_name = name[len("model.encoder.") :]
++                    if vt_name in vision_params:
++                        vision_params[vt_name].data.copy_(weight)
++                    else:
++                        logger.warning(
++                            "Vision tower weight %s (mapped to %s) not found in model",
++                            name,
++                            vt_name,
++                        )
++                    continue
++
++                # Vision embedder: model.encoder.embed_vision.* → embed_vision.*
++                if name.startswith("model.encoder.embed_vision."):
++                    ev_name = name[len("model.encoder.") :]
++                    if ev_name in vision_params:
++                        vision_params[ev_name].data.copy_(weight)
++                    else:
++                        logger.warning(
++                            "Embed vision weight %s (mapped to %s) not found in model",
++                            name,
++                            ev_name,
++                        )
++                    continue
++
++                # Skip vestigial embed_vision.embedding weights.
++                if "embed_vision.embedding." in name:
++                    continue
++
++                # Encoder backbone → model.*
++                if name.startswith("model.encoder.language_model."):
++                    name = name.replace("model.encoder.language_model.", "model.")
++                # Decoder backbone → model.* (skip exact duplicates)
++                elif name.startswith("model.decoder."):
++                    name = name.replace("model.decoder.", "model.")
++
++                # Skip only if we've seen the exact same weight name (including scales)
++                if name in seen_weights:
++                    continue
++                seen_weights.add(name)
++                yield name, weight
++
++        # Delegate to Gemma4ForCausalLM.load_weights for the backbone,
++        # which handles stacked params, MoE, k_eq_v, etc.
++        # Temporarily set self.config to text_config since Gemma4's
++        # load_weights expects it (e.g. tie_word_embeddings, layer_types).
++        from vllm.model_executor.models.gemma4 import Gemma4ForCausalLM
++
++        saved_config = self.config
++        self.config = self.model.config
++        try:
++            Gemma4ForCausalLM.load_weights(self, _remap_weights())
++        finally:
++            self.config = saved_config
++
++    @classmethod
++    def get_placeholder_str(cls, modality: str, i: int) -> str | None:
++        if modality == "image":
++            return "<image_soft_token>"
++        if modality == "video":
++            return "<|video|>"
++        raise ValueError(f"Unsupported modality: {modality}")
++
++
++DEFAULT_STABILITY_THRESHOLD = 2
++DEFAULT_CONFIDENCE_THRESHOLD = 0.005
++
++
++@torch.compile(dynamic=True)
++def _compute_num_rejected(
++    num_logits: torch.Tensor,
++    num_sampled: torch.Tensor,
++    query_start_loc: torch.Tensor,
++) -> torch.Tensor:
++    query_lens = query_start_loc[1:] - query_start_loc[:-1]
++    num_rejected = num_logits - num_sampled
++    is_denoise = (num_logits > 0) & (num_sampled == 0)
++    return torch.where(is_denoise, query_lens, num_rejected)
++
++
++@torch.compile(dynamic=True)
++def _compiled_sample_step(
++    # Logits from the model [num_decode * CL, vocab]
++    logits: torch.Tensor,
++    # Request mapping
++    decode_slots: torch.Tensor,  # [num_decode] int64 → slot indices
++    decode_idx: torch.Tensor,  # [num_decode] int64 → position in num_reqs
++    all_slots: torch.Tensor,  # [num_reqs] int64 → all slot indices
++    valid_canvas_len: torch.Tensor,  # [num_decode] int64 → real canvas length (<=CL)
++    # State tensors (modified in-place)
++    canvas: torch.Tensor,  # [max_num_reqs, CL]
++    argmax_canvas: torch.Tensor,  # [max_num_reqs, CL]
++    step_tensor: torch.Tensor,  # [max_num_reqs]
++    is_encoder_phase: torch.Tensor,  # [max_num_reqs]
++    confident_tensor: torch.Tensor,  # [max_num_reqs]
++    sc_embeds: torch.Tensor,  # [max_num_reqs, CL, hidden]
++    embed_weight: torch.Tensor,  # [vocab, hidden]
++    normalizer: torch.Tensor,
++    history: torch.Tensor,  # [max_num_reqs, ST, CL]
++    history_len_tensor: torch.Tensor,  # [max_num_reqs]
++    # Output tensors (modified in-place)
++    sampled: torch.Tensor,  # [num_reqs, CL]
++    num_sampled: torch.Tensor,  # [num_reqs]
++    draft_tokens: torch.Tensor,  # [max_num_reqs, >=CL]
++    # Scalar config
++    max_denoising_steps: float,
++    t_min: float,
++    t_max: float,
++    confidence_threshold: float,
++    vocab_size: int,
++    CL: int,
++    ST: int,
++    # Sampler config
++    entropy_bound: float,
++) -> torch.Tensor:
++    """Compiled decode step: temperature → Gumbel sample → probs/confidence →
++    accept/renoise → convergence, all as vectorized PyTorch ops.
++
++    Returns the temperature-scaled logits ``[num_decode, CL, vocab]`` so the
++    caller can compute logprobs outside the compiled region."""
++    num_decode = decode_slots.shape[0]
++    device = decode_slots.device
++
++    # Clear outputs so prefill / non-decode slots report 0 (decode slots are
++    # overwritten below).
++    sampled.zero_()
++    num_sampled.zero_()
++
++    # ---- Phase 1: Temperature schedule ----
++    steps_f = step_tensor[decode_slots].float()
++    remaining = (max_denoising_steps - steps_f).clamp(min=1.0)
++    temp = t_min + (t_max - t_min) * (remaining / max_denoising_steps)
++
++    # ---- Phase 2: Temperature scaling + Gumbel-max sampling ----
++    logits_3d = logits.reshape(num_decode, CL, -1).float()
++    scaled = logits_3d / temp[:, None, None].clamp(min=1e-10)
++
++    # Gumbel-max trick: argmax(logits/T + Gumbel) ~ sample from softmax(logits/T)
++    u = torch.rand_like(scaled).clamp(min=1e-20)
++    gumbel = -torch.log(-torch.log(u))
++    # Zero noise when temp==0 (greedy)
++    noisy = scaled + gumbel * (temp[:, None, None] > 0).float()
++    new_tokens = noisy.view(-1, noisy.shape[-1]).argmax(dim=-1).view(num_decode, CL)
++    argmax_tokens = (
++        scaled.view(-1, scaled.shape[-1]).argmax(dim=-1).view(num_decode, CL)
++    )
++
++    # ---- Phase 3: Probs, self-conditioning, confidence ----
++    log_probs = scaled.log_softmax(dim=-1)
++    probs = log_probs.exp()
++
++    token_entropy = -(probs * log_probs).sum(dim=-1)  # [num_decode, CL]
++    # A canvas truncated near max_model_len is zero-padded up to CL by the
++    # caller; those padded rows are uniform (max entropy, argmax 0), so they
++    # never trigger early convergence and are stable, and only the real
++    # ``valid_canvas_len`` tokens are committed (num_sampled below).
++    mean_entropy = token_entropy.mean(dim=-1)  # [num_decode]
++    confident_tensor[decode_slots] = mean_entropy < confidence_threshold
++
++    # ---- Phase 4: Entropy-bound acceptance mask ----
++    sorted_ent, sorted_idx = torch.sort(token_entropy, dim=-1)
++    cumsum_ent = torch.cumsum(sorted_ent, dim=-1)
++    cummax_ent = torch.cummax(sorted_ent, dim=-1).values
++    sorted_mask = (cumsum_ent - cummax_ent) <= entropy_bound
++    eb_mask = torch.zeros_like(sorted_mask)
++    eb_mask.scatter_(1, sorted_idx, sorted_mask)
++
++    # ---- Phase 5: Post-sample ----
++    is_commit = is_encoder_phase[decode_slots]  # [num_decode]
++    is_denoise = ~is_commit
++    cur_step = step_tensor[decode_slots].float()
++
++    # Step update: +1 for denoise, reset to 0 for commit
++    new_step_val = torch.where(
++        is_denoise,
++        (cur_step + 1).to(step_tensor.dtype),
++        step_tensor.new_zeros(num_decode),
++    )
++    step_tensor[decode_slots] = new_step_val
++
++    # Random tokens for renoise / canvas reinit
++    random_tokens = torch.randint(
++        0, vocab_size, (num_decode, CL), device=device, dtype=canvas.dtype
++    )
++
++    # Compute denoise canvas (accept/renoise)
++    denoise_canvas = torch.where(eb_mask, new_tokens, random_tokens)
++
++    # Canvas: commit → random reinit, denoise → accept/renoise result
++    canvas[decode_slots] = torch.where(
++        is_commit.unsqueeze(1), random_tokens, denoise_canvas
++    )
++
++    # History: write argmax_tokens for denoise requests at circular position
++    hist_len = history_len_tensor[decode_slots]
++    write_pos = hist_len % ST
++    for i in range(ST):
++        write_here = ((write_pos == i) & is_denoise).unsqueeze(1)
++        history[decode_slots, i] = torch.where(
++            write_here, argmax_tokens, history[decode_slots, i]
++        )
++
++    # Argmax canvas: update for denoise, preserve for commit
++    argmax_canvas[decode_slots] = torch.where(
++        is_denoise.unsqueeze(1), argmax_tokens, argmax_canvas[decode_slots]
++    )
++
++    # History length: increment for denoise, reset for commit
++    new_hist_len = torch.where(is_denoise, hist_len + 1, hist_len.new_zeros(num_decode))
++    history_len_tensor[decode_slots] = new_hist_len
++
++    # Sampled output: commit → emit argmax_canvas, denoise → 0 (pre-zeroed)
++    sampled[decode_idx] = argmax_canvas[decode_slots].to(
++        sampled.dtype
++    ) * is_commit.unsqueeze(1).to(sampled.dtype)
++    # Commit only the real canvas length (== CL except for a canvas truncated
++    # near max_model_len); the padded tail positions are never emitted.
++    num_sampled[decode_idx] = is_commit.to(num_sampled.dtype) * valid_canvas_len.to(
++        num_sampled.dtype
++    )
++
++    # ---- Phase 6: Stability + convergence ----
++    ref = history[decode_slots, 0]
++    mismatch = torch.zeros(num_decode, device=device, dtype=torch.int32)
++    for h in range(1, ST):
++        mismatch = mismatch + (ref != history[decode_slots, h]).sum(dim=-1).int()
++    stable = mismatch == 0
++
++    step_after = step_tensor[decode_slots]
++    converged = (stable & confident_tensor[decode_slots] & (new_hist_len >= ST)) | (
++        step_after >= max_denoising_steps
++    )
++    # Commit done → denoise next (False); denoise converged → commit next (True)
++    is_encoder_phase[decode_slots] = torch.where(
++        is_commit, is_commit.new_zeros(num_decode), converged
++    )
++
++    # SC soft embedding: store ``probs @ embed_weight`` (the value the next step's
++    # self-conditioning MLP consumes) only for slots that will denoise next — i.e.
++    # this step denoised AND it isn't about to commit (is_encoder_phase now False).
++    # Masking here (rather than in the consumer) lets _apply_self_conditioning read
++    # sc_embeds directly. Storing the [.., hidden] soft embed instead of the full
++    # [.., vocab] probs avoids a giant persistent buffer.
++    sc_keep = (is_denoise & ~is_encoder_phase[decode_slots])[:, None, None]
++    soft_embeds = torch.matmul(probs.to(embed_weight.dtype), embed_weight) * normalizer
++    sc_embeds[decode_slots] = soft_embeds * sc_keep
++
++    # Overwrite canvas with argmax for newly converged denoise requests
++    newly_converged = (converged & is_denoise).unsqueeze(1)
++    canvas[decode_slots] = torch.where(
++        newly_converged, argmax_canvas[decode_slots], canvas[decode_slots]
++    )
++
++    # ---- Phase 7: Copy canvas → draft_tokens for all slots ----
++    draft_tokens[all_slots, :CL] = canvas[all_slots]
++
++    return scaled
++
++
++class DiffusionGemmaRequestStates:
++    """Pre-allocated GPU tensors for DiffusionGemma per-request state.
++
++    Follows the indexed-slot pattern used by ``RequestState``.
++    """
++
++    def __init__(
++        self,
++        max_num_reqs: int,
++        canvas_length: int,
++        vocab_size: int,
++        max_denoising_steps: int,
++        device: torch.device,
++        hidden_size: int,
++        stability_threshold: int,
++    ):
++        self.max_num_reqs = max_num_reqs
++        self.canvas_length = canvas_length
++        self.vocab_size = vocab_size
++        self.max_denoising_steps = max_denoising_steps
++        self.stability_threshold = stability_threshold
++        self.device = device
++
++        self.is_encoder_phase = torch.zeros(
++            max_num_reqs, dtype=torch.bool, device=device
++        )
++        # Canvas tokens [max_num_reqs, canvas_length]
++        self.canvas = torch.zeros(
++            max_num_reqs, canvas_length, dtype=torch.int64, device=device
++        )
++        # Step counter (counts up from 0 to max_denoising_steps)
++        self.step = torch.zeros(
++            max_num_reqs,
++            dtype=torch.int32,
++            device=device,
++        )
++        # Accepted canvas history for stability check
++        self.accepted_canvas_history = torch.zeros(
++            max_num_reqs,
++            stability_threshold,
++            canvas_length,
++            dtype=torch.int64,
++            device=device,
++        )
++        self.accepted_canvas_history_len = torch.zeros(
++            max_num_reqs, dtype=torch.int32, device=device
++        )
++        # Latest argmax(processed_logits) per slot — what we COMMIT.
++        # HF reference commits `argmax_canvas` (argmax of latest step's logits),
++        # NOT `current_canvas` (which is the post-renoise stochastic input for
++        # the next denoise step). We keep this separate from `canvas` because
++        # canvas gets renoised in-place during denoise, while argmax_canvas is
++        # the deterministic best-guess we ultimately emit.
++        self.argmax_canvas = torch.zeros(
++            max_num_reqs, canvas_length, dtype=torch.int64, device=device
++        )
++
++        # Per-slot prompt length (set by add_request).
++        self.prompt_len = torch.zeros(
++            max_num_reqs,
++            dtype=torch.int32,
++            device=device,
++        )
++
++        # Per-slot confidence flag, set by the sampler each step.
++        self.confident = torch.zeros(max_num_reqs, dtype=torch.bool, device=device)
++
++        # Per-slot self-conditioning soft embedding (probs @ embed_weight) from
++        # the previous denoise step. Storing the [.., hidden] soft embed instead
++        # of the full [.., vocab] distribution shrinks this buffer by
++        # vocab/hidden (~170x) and moves the matmul to denoise time; the result
++        # is identical (SC consumes probs @ embed_weight anyway).
++        self.self_conditioning_embeds = torch.zeros(
++            max_num_reqs, canvas_length, hidden_size, dtype=torch.float32, device=device
++        )
++
++    def init_canvas(self, slot_indices_np: np.ndarray) -> None:
++        """Initialize canvas with random tokens for the given slots."""
++        n = slot_indices_np.shape[0]
++        self.canvas[slot_indices_np] = torch.randint(
++            0,
++            self.vocab_size,
++            (n, self.canvas_length),
++            dtype=torch.int64,
++            device=self.device,
++        )
++
++    def add_request(self, slot_idx: int) -> None:
++        self.is_encoder_phase[slot_idx] = True
++        self.init_canvas(torch.tensor([slot_idx], device=self.device))
++        self.step[slot_idx] = 0
++        self.accepted_canvas_history_len[slot_idx] = 0
++        self.self_conditioning_embeds[slot_idx] = 0
++
++    def remove_request(self, slot_idx: int) -> None:
++        self.is_encoder_phase[slot_idx] = False
++        self.accepted_canvas_history_len[slot_idx] = 0
++        self.self_conditioning_embeds[slot_idx] = 0
++
++
++class DiffusionGemmaModelState(ModelState):
++    """ModelState for DiffusionGemma.
++
++    Single Gemma4 backbone in two modes:
++    - encoder mode (num_draft_tokens == 0): causal attention, writes KV
++    - decoder mode (num_draft_tokens > 0): bidirectional attention, reads KV
++    """
++
++    def __init__(
++        self,
++        vllm_config: VllmConfig,
++        model: nn.Module,
++        encoder_cache: Any,
++        device: torch.device,
++    ) -> None:
++        self.vllm_config = vllm_config
++        self.model_config = vllm_config.model_config
++        self.scheduler_config = vllm_config.scheduler_config
++        self.model = model
++        self.device = device
++
++        self.supports_mm_inputs = encoder_cache is not None
++        self.max_num_reqs = self.scheduler_config.max_num_seqs
++        self.max_num_tokens = self.scheduler_config.max_num_batched_tokens
++        self.max_model_len = self.model_config.max_model_len
++        self.inputs_embeds_size = self.model_config.get_inputs_embeds_size()
++        self.dtype = self.model_config.dtype
++
++        if self.supports_mm_inputs:
++            from vllm.v1.worker.gpu.mm.encoder_cache import EncoderCache
++            from vllm.v1.worker.gpu.mm.encoder_runner import EncoderRunner
++
++            assert isinstance(encoder_cache, EncoderCache)
++            self.encoder_cache = encoder_cache
++            self.encoder_runner = EncoderRunner(
++                model=self.model,
++                max_num_tokens=self.max_num_tokens,
++                hidden_size=self.inputs_embeds_size,
++                encoder_cache=encoder_cache,
++                dtype=self.dtype,
++                device=self.device,
++            )
++
++        # Per-step MM data produced by get_mm_embeddings and consumed by
++        # prepare_inputs.  Stored as raw (mm_embeds, is_mm_embed) so that
++        # prepare_inputs can call embed_input_ids directly into the
++        # persistent _inputs_embeds_buf, avoiding the intermediate copy
++        # through encoder_runner.inputs_embeds.
++        self._pending_mm_embeds: tuple[list[torch.Tensor], torch.Tensor] | None = None
++
++        diffusion_config = vllm_config.diffusion_config
++        canvas_length = diffusion_config.canvas_length if diffusion_config else 32
++        max_denoising_steps = (
++            diffusion_config.max_denoising_steps if diffusion_config else 48
++        )
++
++        text_config = self.model_config.hf_text_config
++        # Diffusion sampling params come straight from generation_config.json
++        # (RC0.1 flat layout); the checkpoint is the source of truth.
++        self.gen_config = self.model_config.try_get_generation_config()
++        self.diffusion_states = DiffusionGemmaRequestStates(
++            max_num_reqs=self.max_num_reqs,
++            canvas_length=canvas_length,
++            vocab_size=self.model_config.get_vocab_size(),
++            max_denoising_steps=max_denoising_steps,
++            device=device,
++            hidden_size=text_config.hidden_size,
++            stability_threshold=self.gen_config["stability_threshold"],
++        )
++        self._req_id_to_index: dict[str, int] = {}
++
++        # Persistent buffer for per-request causal flags, updated in-place
++        # so FULL CUDA graph replay sees the latest values.
++        self._causal_buf = torch.zeros(
++            self.max_num_reqs, dtype=torch.bool, device=device
++        )
++
++        # Persistent inputs_embeds buffer — required so FULL CUDA graph
++        # capture and runtime point at the SAME memory address.
++        # `prepare_dummy_inputs` (capture path) and `prepare_inputs` (runtime
++        # path) both must hand the captured graph a tensor at this address.
++        self._inputs_embeds_buf = torch.zeros(
++            self.max_num_tokens,
++            text_config.hidden_size,
++            dtype=self.model_config.dtype,
++            device=device,
++        )
++
++    def get_supported_generation_tasks(self):
++        return ("generate",)
++
++    def custom_sampler(self, sampler: Any) -> tuple[Any, Any] | None:
++        diffusion_config = self.vllm_config.diffusion_config
++        gen = self.gen_config
++        sampler_cfg = gen.get("sampler_config") or {}
++        if "EntropyBound" not in sampler_cfg.get("_cls_name", ""):
++            raise ValueError("DiffusionGemma requires an EntropyBound sampler_config")
++        entropy_bound = sampler_cfg.get("entropy_bound")
++        if entropy_bound is None or entropy_bound <= 0:
++            raise ValueError(
++                f"entropy_bound must be a positive float (got {entropy_bound})"
++            )
++        return DiffusionSampler(
++            sampler=sampler,
++            diffusion_config=diffusion_config,
++            vocab_size=self.model_config.get_vocab_size(),
++            diffusion_states=self.diffusion_states,
++            t_min=gen["t_min"],
++            t_max=gen["t_max"],
++            entropy_bound=entropy_bound,
++            confidence_threshold=gen["confidence_threshold"],
++            embed_weight=self.model.model.embed_tokens.weight,
++            normalizer=self.model.model.normalizer,
++        ), None
++
++    def apply_staged_writes(self) -> None:
++        pass
++
++    def add_request(self, req_index: int, new_req_data: Any) -> None:
++        self._req_id_to_index[new_req_data.req_id] = req_index
++        self.diffusion_states.add_request(req_index)
++        if not new_req_data.req_id.startswith("_warmup_"):
++            prompt_len = len(new_req_data.prompt_token_ids)
++            self.diffusion_states.prompt_len[req_index] = prompt_len
++
++    def remove_request(self, req_id: str) -> None:
++        idx = self._req_id_to_index.pop(req_id, None)
++        if idx is not None:
++            self.diffusion_states.remove_request(idx)
++
++    def get_mm_embeddings(self, scheduled_encoder_inputs, input_batch):
++        if not self.supports_mm_inputs:
++            return None
++
++        mm_hashes, mm_kwargs = self.encoder_runner.prepare_mm_inputs(
++            scheduled_encoder_inputs
++        )
++        if mm_kwargs:
++            encoder_outputs = self.encoder_runner.execute_mm_encoder(mm_kwargs)
++            self.encoder_cache.encoder_outputs.update(zip(mm_hashes, encoder_outputs))
++
++        mm_embeds, is_mm_embed = self.encoder_runner.gather_mm_embeddings(
++            input_batch.req_ids,
++            input_batch.num_tokens,
++            input_batch.num_scheduled_tokens,
++            input_batch.query_start_loc_np,
++            input_batch.prefill_len_np,
++            input_batch.num_computed_prefill_tokens_np,
++        )
++
++        if not mm_embeds:
++            # No MM tokens in this batch (e.g. all-decode step).
++            # prepare_inputs will use embed_input_ids (text-only) directly.
++            self._pending_mm_embeds = None
++            return None
++
++        # Stash raw MM ingredients for prepare_inputs to merge directly
++        # into the persistent buffer, avoiding the intermediate copy
++        # through encoder_runner.inputs_embeds.
++        self._pending_mm_embeds = (mm_embeds, is_mm_embed)
++        return None
++
++    def _apply_self_conditioning(
++        self,
++        decode_slots_np: np.ndarray,
++        decode_idx_np: np.ndarray,
++        query_start_loc_np: np.ndarray,
++        inputs_embeds: torch.Tensor,
++        sc_embeds: torch.Tensor,
++    ) -> None:
++        # One self-conditioning MLP call per decode request, over that request's
++        # query span [start, end) = its canvas. The span is the full canvas (CL)
++        # or, for the final canvas truncated near max_model_len, fewer than CL
++        # positions. sc_embeds already holds probs @ embed_weight from the prior
++        # denoise step, masked to zero by the sampler for slots not denoising
++        # this step; only the MLP runs here. CPU metadata -> no GPU syncs.
++        for slot, idx in zip(decode_slots_np.tolist(), decode_idx_np.tolist()):
++            start = int(query_start_loc_np[idx])
++            end = int(query_start_loc_np[idx + 1])
++            canvas = slice(start, end)
++            soft = sc_embeds[slot, : end - start]
++            inputs_embeds[canvas] = self.model.self_conditioning(
++                inputs_embeds[canvas], soft.to(inputs_embeds.dtype)
++            )
++
++    def prepare_inputs(self, input_batch, req_states) -> dict[str, Any]:
++        states = self.diffusion_states
++        num_tokens = input_batch.num_tokens
++        num_reqs = input_batch.num_reqs
++
++        # Write into the PERSISTENT inputs_embeds buffer so FULL CUDA graph
++        # replay sees the latest values at the captured address.
++        num_tokens_padded = input_batch.num_tokens_after_padding
++        inputs_embeds = self._inputs_embeds_buf[:num_tokens_padded]
++
++        # Populate embeddings: merge MM features when available,
++        # otherwise embed input_ids as text-only.
++        input_ids = input_batch.input_ids[:num_tokens]
++        if self._pending_mm_embeds is not None:
++            mm_embeds, is_mm_embed = self._pending_mm_embeds
++            self._pending_mm_embeds = None
++            inputs_embeds[:num_tokens].copy_(
++                self.model.embed_input_ids(
++                    input_ids,
++                    multimodal_embeddings=mm_embeds,
++                    is_multimodal=is_mm_embed,
++                )
++            )
++        else:
++            inputs_embeds[:num_tokens].copy_(self.model.embed_input_ids(input_ids))
++
++        # Apply self-conditioning ONLY for denoising decode requests.
++        if input_batch.num_draft_tokens > 0 and self._req_id_to_index:
++            slots_np = input_batch.idx_mapping_np[:num_reqs]
++            num_logits_np = np.diff(input_batch.cu_num_logits_np[: num_reqs + 1])
++            is_decode_indices_np = np.where(num_logits_np > 0)[0]
++            self._apply_self_conditioning(
++                slots_np[is_decode_indices_np],
++                is_decode_indices_np,
++                input_batch.query_start_loc_np,
++                inputs_embeds,
++                states.self_conditioning_embeds,
++            )
++
++        return {"inputs_embeds": inputs_embeds}
++
++    def prepare_dummy_inputs(self, num_reqs: int, num_tokens: int) -> dict[str, Any]:
++        # CUDA graph capture path — return a slice of the SAME persistent
++        # inputs_embeds buffer that `prepare_inputs` writes to at runtime,
++        # so the captured graph and runtime point to identical addresses.
++        return {"inputs_embeds": self._inputs_embeds_buf[:num_tokens]}
++
++    def postprocess_state(self, idx_mapping, num_sampled) -> None:
++        return None
++
++    def prepare_attn(
++        self,
++        input_batch,
++        cudagraph_mode,
++        block_tables,
++        slot_mappings,
++        attn_groups,
++        kv_cache_config,
++        for_capture=False,
++    ) -> dict[str, Any]:
++        if cudagraph_mode == CUDAGraphMode.FULL:
++            num_reqs = input_batch.num_reqs_after_padding
++            num_tokens = input_batch.num_tokens_after_padding
++        else:
++            num_reqs = input_batch.num_reqs
++            num_tokens = input_batch.num_tokens
++
++        query_start_loc_cpu = torch.from_numpy(input_batch.query_start_loc_np)
++        max_query_len = input_batch.num_scheduled_tokens.max().item()
++
++        # Per-request causal mode: encoder (commit) = causal,
++        # denoise = bidirectional. Pass GPU tensor so the attention
++        # backend can handle mixed batches.
++        actual_num_reqs = input_batch.num_reqs
++        slots = input_batch.idx_mapping[:actual_num_reqs]
++        self._causal_buf[:actual_num_reqs] = self.diffusion_states.is_encoder_phase[
++            slots
++        ]
++        if actual_num_reqs < num_reqs:
++            self._causal_buf[actual_num_reqs:num_reqs] = False
++        causal: bool | torch.Tensor = self._causal_buf[:num_reqs]
++
++        return build_attn_metadata(
++            attn_groups=attn_groups,
++            num_reqs=num_reqs,
++            num_tokens=num_tokens,
++            query_start_loc_gpu=input_batch.query_start_loc,
++            query_start_loc_cpu=query_start_loc_cpu,
++            max_query_len=max_query_len,
++            seq_lens=input_batch.seq_lens,
++            max_seq_len=self.max_model_len,
++            block_tables=block_tables,
++            slot_mappings=slot_mappings,
++            kv_cache_config=kv_cache_config,
++            causal=causal,
++        )
++
++    num_new_sampled_tokens_per_step: int = 0
++
++
++# Penalty stub for the diffusion path: the runner reads
++# penalties_state.output_bin_counts, and post_update treats None as
++# "no penalty bookkeeping".
++_NO_PENALTIES_STATE = SimpleNamespace(output_bin_counts=None)
++
++
++class DiffusionSampler:
++    """Batched accept/renoise sampler for DiffusionGemma.
++
++    Follows the same structure as ``vllm.v1.worker.gpu.sample.sampler.Sampler``:
++    decomposed into named methods, all GPU state in pre-allocated buffers,
++    no GPU→CPU syncs on the hot path.
++    """
++
++    def __init__(
++        self,
++        sampler: Any,
++        diffusion_config: Any,
++        vocab_size: int,
++        diffusion_states: DiffusionGemmaRequestStates | None = None,
++        *,
++        confidence_threshold: float,
++        t_min: float,
++        t_max: float,
++        entropy_bound: float,
++        embed_weight: torch.Tensor,
++        normalizer: torch.Tensor,
++    ):
++        self.sampling_states = sampler.sampling_states
++        self.req_states = sampler.req_states
++        # Self-conditioning soft embed = probs @ embed_weight * normalizer,
++        # computed in the sampler (see _compiled_sample_step).
++        self.embed_weight = embed_weight
++        self.normalizer = normalizer
++        self.canvas_length = (
++            diffusion_config.canvas_length if diffusion_config is not None else 32
++        )
++        self.t_min = t_min
++        self.t_max = t_max
++        self.confidence_threshold = confidence_threshold
++        self.vocab_size = vocab_size
++        self.diffusion_states = diffusion_states
++        self.entropy_bound = entropy_bound
++
++        max_num_reqs = diffusion_states.max_num_reqs
++        device = diffusion_states.device
++        self._sampled = torch.zeros(
++            max_num_reqs,
++            self.canvas_length,
++            dtype=torch.int32,
++            device=device,
++        )
++        self._num_sampled = torch.zeros(
++            max_num_reqs,
++            dtype=torch.int32,
++            device=device,
++        )
++        self._decode_slots = UvaBackedTensor(max_num_reqs, dtype=torch.int64)
++        self._decode_idx = UvaBackedTensor(max_num_reqs, dtype=torch.int64)
++        self._query_lens = UvaBackedTensor(max_num_reqs, dtype=torch.int32)
++        self._num_logits = UvaBackedTensor(max_num_reqs, dtype=torch.int32)
++
++        # Per-slot stash for logprobs computed on the converging denoise step.
++        # Populated after the post-sample kernel detects convergence; consumed
++        # on the subsequent commit step when num_sampled=CANVAS_LEN.
++        self._pending_logprobs: dict[int, LogprobsTensors] = {}
++
++    def add_request(self, req_idx: int, prompt_len: int, sampling_params: Any) -> None:
++        if use_penalty(sampling_params):
++            logger.warning_once(
++                "DiffusionGemma does not support repetition/frequency/presence "
++                "penalties; ignoring them for this request."
++            )
++        self.sampling_states.add_request(req_idx, sampling_params)
++
++    def apply_staged_writes(self) -> None:
++        self.sampling_states.apply_staged_writes()
++
++    @property
++    def penalties_state(self):
++        # Diffusion applies no penalties. The runner reads
++        # penalties_state.output_bin_counts, so expose a stub holding None;
++        # post_update treats None bin counts as "no penalty bookkeeping".
++        return _NO_PENALTIES_STATE
++
++    # ------------------------------------------------------------------
++    # Prefill
++    # ------------------------------------------------------------------
++
++    def _handle_prefill(
++        self,
++        input_batch: Any,
++        device: torch.device,
++    ) -> SamplerOutput:
++        states = self.diffusion_states
++        num_reqs = input_batch.num_reqs
++        CL = self.canvas_length
++        slots = input_batch.idx_mapping[:num_reqs]
++        states.init_canvas(slots)
++        self.req_states.draft_tokens[slots, :CL] = states.canvas[slots]
++        states.is_encoder_phase.index_fill_(0, slots.long(), False)
++        sampled = self._sampled[:num_reqs, :1]
++        sampled.zero_()
++        num_sampled = self._num_sampled[:num_reqs]
++        num_sampled.zero_()
++        return SamplerOutput(
++            sampled_token_ids=sampled,
++            logprobs_tensors=None,
++            num_nans=None,
++            num_sampled=num_sampled,
++            num_rejected=num_sampled,
++        )
++
++    # ------------------------------------------------------------------
++    # Decode helpers
++    # ------------------------------------------------------------------
++
++    def _build_output(
++        self,
++        input_batch: Any,
++        sampled: torch.Tensor,
++        num_sampled: torch.Tensor,
++        per_req_nlogits_np: np.ndarray,
++        device: torch.device,
++        logprobs_tensors: LogprobsTensors | None = None,
++    ) -> SamplerOutput:
++        """Compute num_rejected and build SamplerOutput."""
++        num_reqs = input_batch.num_reqs
++
++        self._query_lens.np[:num_reqs] = np.diff(
++            input_batch.query_start_loc_np[: num_reqs + 1]
++        )
++        self._num_logits.np[:num_reqs] = per_req_nlogits_np
++        self._query_lens.copy_to_uva()
++        self._num_logits.copy_to_uva()
++
++        num_rejected = _compute_num_rejected(
++            self._num_logits.gpu[:num_reqs],
++            num_sampled,
++            input_batch.query_start_loc[: num_reqs + 1],
++        )
++
++        return SamplerOutput(
++            sampled_token_ids=sampled,
++            logprobs_tensors=logprobs_tensors,
++            num_nans=None,
++            num_sampled=num_sampled,
++            num_rejected=num_rejected,
++        )
++
++    # ------------------------------------------------------------------
++    # Main entry point
++    # ------------------------------------------------------------------
++
++    def __call__(
++        self,
++        logits: torch.Tensor,
++        input_batch: Any,
++        draft_logits: torch.Tensor | None = None,
++    ) -> SamplerOutput:
++        num_reqs = input_batch.num_reqs
++        device = logits.device
++
++        if input_batch.num_draft_tokens == 0:
++            return self._handle_prefill(input_batch, device)
++
++        # --- CPU/NumPy setup (outside compile): split decode vs prefill, init
++        # canvas for any new prefills, and stage decode slot indices to GPU. ---
++        states = self.diffusion_states
++        CL = self.canvas_length
++        slots_np = input_batch.idx_mapping_np[:num_reqs]
++        per_req_nlogits_np = np.diff(input_batch.cu_num_logits_np[: num_reqs + 1])
++
++        decode_indices_np = np.where(per_req_nlogits_np > 0)[0]
++        prefill_indices_np = np.where(per_req_nlogits_np == 0)[0]
++        decode_slots_np = slots_np[decode_indices_np]
++
++        if len(prefill_indices_np) > 0:
++            ps = slots_np[prefill_indices_np]
++            states.init_canvas(ps)
++            self.req_states.draft_tokens[ps, :CL] = states.canvas[ps]
++            ps_gpu = async_copy_to_gpu(
++                ps.astype(np.int64), device=states.is_encoder_phase.device
++            )
++            states.is_encoder_phase.index_fill_(0, ps_gpu, False)
++
++        num_decode = len(decode_indices_np)
++        self._decode_slots.np[:num_decode] = decode_slots_np
++        self._decode_idx.np[:num_decode] = decode_indices_np
++        self._decode_slots.copy_to_uva()
++        self._decode_idx.copy_to_uva()
++        decode_slots = self._decode_slots.gpu[:num_decode]
++        decode_idx = self._decode_idx.gpu[:num_decode]
++
++        # Real canvas length per decode request. Equals CL except when a canvas
++        # was truncated near max_model_len, in which case the scheduler gave us
++        # fewer than CL logits for that request.
++        valid_canvas_len_np = per_req_nlogits_np[per_req_nlogits_np > 0]
++        valid_canvas_len = async_copy_to_gpu(
++            valid_canvas_len_np.astype(np.int64), device=device
++        )
++
++        # Pad any truncated canvas back to CL so the uniform-CL sampler math
++        # holds. Phantom (padded) positions are zeroed → uniform logits → high
++        # entropy (no premature convergence) and argmax 0 (stable); they are
++        # never committed (num_sampled == real length).
++        if num_decode > 0 and valid_canvas_len_np.min() < CL:
++            ar = torch.arange(CL, device=device)
++            starts = valid_canvas_len.cumsum(0) - valid_canvas_len  # row offset per req
++            valid = ar.unsqueeze(0) < valid_canvas_len.unsqueeze(1)  # [num_decode, CL]
++            src = (starts.unsqueeze(1) + ar.unsqueeze(0)).clamp_max(logits.shape[0] - 1)
++            logits = logits[src.reshape(-1)] * valid.reshape(-1, 1).to(logits.dtype)
++
++        # Cleared inside _compiled_sample_step so prefill/non-decode slots stay 0.
++        sampled = self._sampled[:num_reqs]
++        num_sampled = self._num_sampled[:num_reqs]
++
++        all_slots = input_batch.idx_mapping[:num_reqs]
++
++        # Snapshot which slots are committing BEFORE the compiled step runs,
++        # since it mutates is_encoder_phase (commit→False, converge→True).
++        is_committing = states.is_encoder_phase[decode_slots].clone()
++
++        # --- Single compiled call: temp → sample → probs → post-process ---
++        scaled = _compiled_sample_step(
++            logits,
++            decode_slots,
++            decode_idx,
++            all_slots,
++            valid_canvas_len,
++            # State
++            states.canvas,
++            states.argmax_canvas,
++            states.step,
++            states.is_encoder_phase,
++            states.confident,
++            states.self_conditioning_embeds,
++            self.embed_weight,
++            self.normalizer,
++            states.accepted_canvas_history,
++            states.accepted_canvas_history_len,
++            # Output
++            sampled,
++            num_sampled,
++            self.req_states.draft_tokens,
++            # Config
++            max_denoising_steps=float(states.max_denoising_steps),
++            t_min=self.t_min,
++            t_max=self.t_max,
++            confidence_threshold=self.confidence_threshold,
++            vocab_size=self.vocab_size,
++            CL=self.canvas_length,
++            ST=states.stability_threshold,
++            entropy_bound=self.entropy_bound,
++        )
++
++        # --- Logprobs: stash on convergence, return on commit ---
++        slots_np = input_batch.idx_mapping_np[:num_reqs]
++        is_decode_np = per_req_nlogits_np > 0
++
++        logprobs_tensors = None
++        max_num_logprobs = self.sampling_states.max_num_logprobs(slots_np)
++        if max_num_logprobs >= 0:
++            # Denoise steps that just converged: the compiled step flipped
++            # is_encoder_phase from False→True. Detect as slots where
++            # is_encoder_phase is now True but is_committing was False.
++            converged_mask = states.is_encoder_phase[decode_slots]
++            just_converged = converged_mask & ~is_committing
++            if just_converged.any():
++                flat_logits = scaled.reshape(-1, scaled.shape[-1])
++                argmax_tokens = scaled.argmax(dim=-1)
++                for local_idx in just_converged.nonzero(as_tuple=True)[0]:
++                    li = local_idx.item()
++                    slot = decode_slots[local_idx]
++                    # Stash only the real canvas positions (== CL unless this
++                    # canvas was truncated near max_model_len); padded tail
++                    # positions are never emitted.
++                    k_i = int(valid_canvas_len_np[li])
++                    start = li * CL
++                    self._pending_logprobs[slot.item()] = compute_topk_logprobs(
++                        flat_logits[start : start + k_i],
++                        max_num_logprobs,
++                        argmax_tokens[local_idx][:k_i],
++                    )
++
++            # Commit steps: is_committing was True at entry. Reassemble
++            # previously stashed logprobs and attach to SamplerOutput.
++            if is_committing.any() and self._pending_logprobs:
++                parts_ids, parts_lp, parts_ranks = [], [], []
++                cu_gen: list[int] = []
++                flat_offset = 0
++                for i in range(num_reqs):
++                    cu_gen.append(flat_offset)
++                    slot = int(slots_np[i])
++                    if is_decode_np[i] and slot in self._pending_logprobs:
++                        lp = self._pending_logprobs.pop(slot)
++                        parts_ids.append(lp.logprob_token_ids)
++                        parts_lp.append(lp.logprobs)
++                        parts_ranks.append(lp.selected_token_ranks)
++                        flat_offset += lp.logprobs.shape[0]
++                if parts_ids:
++                    logprobs_tensors = LogprobsTensors(
++                        logprob_token_ids=torch.cat(parts_ids),
++                        logprobs=torch.cat(parts_lp),
++                        selected_token_ranks=torch.cat(parts_ranks),
++                        cu_num_generated_tokens=cu_gen,
++                    )
++
++        return self._build_output(
++            input_batch,
++            sampled,
++            num_sampled,
++            per_req_nlogits_np,
++            device,
++            logprobs_tensors=logprobs_tensors,
++        )
+diff --git a/vllm/model_executor/models/gemma4.py b/vllm/model_executor/models/gemma4.py
+index 45e82c26d..57df7d760 100644
+--- a/vllm/model_executor/models/gemma4.py
++++ b/vllm/model_executor/models/gemma4.py
+@@ -631,6 +631,11 @@ class Gemma4DecoderLayer(nn.Module):
+         self.enable_moe_block = getattr(config, "enable_moe_block", False) or getattr(
+             config, "use_second_mlp_block", False
+         )
++        self.router_uses_prenormed_input = getattr(
++            config,
++            "router_uses_prenormed_input",
++            False,
++        )
+         if self.enable_moe_block:
+             self.router = Gemma4Router(
+                 config,
+@@ -725,10 +730,11 @@ class Gemma4DecoderLayer(nn.Module):
+         if self.enable_moe_block:
+             hidden_states_1 = self.post_feedforward_layernorm_1(hidden_states)
+
+-            # Router and MoE experts see the residual (pre-MLP state),
+-            # matching the HF transformers forward path
+-            router_logits = self.router(residual)
+             hidden_states_2 = self.pre_feedforward_layernorm_2(residual)
++            if self.router_uses_prenormed_input:
++                router_logits = self.router(hidden_states_2)
++            else:
++                router_logits = self.router(residual)
+             hidden_states_2 = self.moe(hidden_states_2, router_logits)
+             hidden_states_2 = self.post_feedforward_layernorm_2(hidden_states_2)
+
+diff --git a/vllm/model_executor/models/registry.py b/vllm/model_executor/models/registry.py
+index da7049eee..9359fbf5e 100644
+--- a/vllm/model_executor/models/registry.py
++++ b/vllm/model_executor/models/registry.py
+@@ -402,6 +402,10 @@ _MULTIMODAL_MODELS = {
+         "gemma3n_mm",
+         "Gemma3nForConditionalGeneration",
+     ),
++    "DiffusionGemmaForBlockDiffusion": (
++        "diffusion_gemma",
++        "DiffusionGemmaForConditionalGeneration",
++    ),
+     "Gemma4ForConditionalGeneration": ("gemma4_mm", "Gemma4ForConditionalGeneration"),
+     "Gemma4UnifiedForConditionalGeneration": (
+         "gemma4_unified",
+diff --git a/vllm/tool_parsers/gemma4_tool_parser.py b/vllm/tool_parsers/gemma4_tool_parser.py
+index 992528427..a92ab9bb6 100644
+--- a/vllm/tool_parsers/gemma4_tool_parser.py
++++ b/vllm/tool_parsers/gemma4_tool_parser.py
+@@ -20,9 +20,11 @@ import json
+ from collections.abc import Sequence
+
+ import regex as re
++from openai.types.responses import ToolChoiceFunction
+
+ from vllm.entrypoints.chat_utils import make_tool_call_id
+ from vllm.entrypoints.openai.chat_completion.protocol import (
++    ChatCompletionNamedToolChoiceParam,
+     ChatCompletionRequest,
+ )
+ from vllm.entrypoints.openai.engine.protocol import (
+@@ -343,6 +345,9 @@ class Gemma4ToolParser(ToolParser):
+     tool parsers.
+     """
+
++    # Gemma4 emits native special-token tool calls, not generic JSON calls.
++    supports_required_and_named = False
++
+     def __init__(self, tokenizer: TokenizerLike, tools: list[Tool] | None = None):
+         super().__init__(tokenizer, tools)
+
+@@ -390,6 +395,23 @@ class Gemma4ToolParser(ToolParser):
+     def adjust_request(
+         self, request: ChatCompletionRequest | ResponsesRequest
+     ) -> ChatCompletionRequest | ResponsesRequest:
++        if request.tools:
++            tc = request.tool_choice
++            if tc == "required" or isinstance(
++                tc,
++                (ChatCompletionNamedToolChoiceParam, ToolChoiceFunction),
++            ):
++                # Do NOT call super().adjust_request() for required/named tool
++                # choice. The base implementation injects a JSON-array
++                # `structured_outputs` schema and forces xgrammar guided
++                # decoding, which conflicts with Gemma4's native
++                # `<|tool_call>call:...` (non-JSON) tool syntax and crashes
++                # EngineCore under MTP spec decode. The streaming/extraction
++                # parser already handles the native output, so guided decoding
++                # is skipped here (mirrors the GLM4 precedent).
++                if request.tool_choice != "none":
++                    request.skip_special_tokens = False
++                return request
+         request = super().adjust_request(request)
+         if request.tools and request.tool_choice != "none":
+             # Don't skip special tokens — <|tool_call> etc. are needed for
+@@ -549,22 +571,40 @@ class Gemma4ToolParser(ToolParser):
+                 return DeltaMessage(content=delta_text)
+             return None
+
+-        # Case 2: Starting a new tool call
+-        if start_count > prev_start_count and start_count > end_count:
+-            self.current_tool_id += 1
++        # Case 2: One or more new tool calls started in this delta.
++        # A single delta can batch several complete calls, so advance the
++        # tool id once per newly-seen start token and allocate a tracking
++        # slot for each.
++        if start_count > prev_start_count:
++            num_new = start_count - prev_start_count
++            for _ in range(num_new):
++                self.current_tool_id += 1
++                self.streamed_args_for_tool.append("")
++                self.prev_tool_call_arr.append({})
+             self.current_tool_name_sent = False
+-            self.streamed_args_for_tool.append("")
+-            self.prev_tool_call_arr.append({})
+-            logger.debug("Starting new tool call %d", self.current_tool_id)
+-            # Don't return yet — fall through to try parsing if there's
+-            # content after <|tool_call> in this same delta
+-            # (but usually it's just the token itself, so return None)
+-            if len(delta_text) <= len(self.tool_call_start_token):
++            logger.debug(
++                "Started %d new tool call(s); current_tool_id=%d",
++                num_new,
++                self.current_tool_id,
++            )
++            # Don't return yet if this delta also contains call payload or
++            # the end marker; backends can batch one or more complete tool
++            # calls into a single streaming chunk. Only wait for more text
++            # when the delta is just the start token itself.
++            if start_count > end_count and len(delta_text) <= len(
++                self.tool_call_start_token
++            ):
+                 return None
+
+-        # Case 3: Tool call just ended
++        # Case 3: One or more tool calls just ended (possibly several in a
++        # single batched delta) — drain every newly-completed call.
+         if end_count > prev_end_count:
+-            return self._handle_tool_call_end(current_text)
++            return self._handle_tool_call_end(
++                current_text,
++                prev_end_count=prev_end_count,
++                end_count=end_count,
++                start_count=start_count,
++            )
+
+         # Case 4: In the middle of a tool call — parse partial content
+         if start_count > end_count:
+@@ -652,45 +692,111 @@ class Gemma4ToolParser(ToolParser):
+
+         return None
+
+-    def _handle_tool_call_end(self, current_text: str) -> DeltaMessage | None:
+-        """Handle streaming when a tool call has just completed.
+-
+-        Performs a final parse of the complete tool call and flushes
+-        any remaining un-streamed argument fragments.
++    def _handle_tool_call_end(
++        self,
++        current_text: str,
++        prev_end_count: int,
++        end_count: int,
++        start_count: int,
++    ) -> DeltaMessage | None:
++        """Handle streaming when one or more tool calls have just completed.
++
++        A single streaming delta can batch several complete tool calls
++        (``<|tool_call>...<tool_call|><|tool_call>...<tool_call|>``). Every
++        call whose ``<tool_call|>`` end marker arrived in this delta — i.e.
++        those with index in ``[prev_end_count, end_count)`` — is drained and
++        emitted, with one ``DeltaToolCall`` per call in a single
++        ``DeltaMessage`` (this matches the OpenAI streaming wire format, and
++        the serving layer iterates over ``delta.tool_calls``).
++
++        Per call:
++
++        * If the function name was already streamed incrementally (the
++          token-by-token path), only the remaining argument fragment is
++          flushed as a diff.
++        * If the call is seen complete for the first time in this delta (the
++          batched-complete path), the id + name + full arguments JSON are
++          emitted exactly once.
+         """
+-        if self.current_tool_id < 0 or self.current_tool_id >= len(
+-            self.prev_tool_call_arr
+-        ):
+-            logger.debug(
+-                "Tool call end detected but no active tool call (current_tool_id=%d)",
+-                self.current_tool_id,
+-            )
++        # Parse the complete tool calls using regex for accuracy.
++        all_matches = self.tool_call_regex.findall(current_text)
++        if not all_matches:
++            logger.debug("Tool call end detected but no complete tool call parsed yet.")
+             return None
+
+-        # Parse the complete tool call using regex for accuracy
+-        all_matches = self.tool_call_regex.findall(current_text)
+-        if self.current_tool_id < len(all_matches):
+-            _, args_str = all_matches[self.current_tool_id]
++        deltas: list[DeltaToolCall] = []
++        for idx in range(prev_end_count, end_count):
++            if idx >= len(all_matches):
++                break
++            # Ensure the tracking arrays have a slot for this index (defensive;
++            # Case 2 normally allocates these when the start token arrives).
++            while len(self.prev_tool_call_arr) <= idx:
++                self.prev_tool_call_arr.append({})
++                self.streamed_args_for_tool.append("")
++
++            func_name, args_str = all_matches[idx]
+             final_args = _parse_gemma4_args(args_str)
+             final_args_json = json.dumps(final_args, ensure_ascii=False)
+
+-            prev_streamed = self.streamed_args_for_tool[self.current_tool_id]
+-            if len(final_args_json) > len(prev_streamed):
+-                diff = final_args_json[len(prev_streamed) :]
+-                self.streamed_args_for_tool[self.current_tool_id] = final_args_json
+-                self.prev_tool_call_arr[self.current_tool_id]["arguments"] = final_args
+-
+-                return DeltaMessage(
+-                    tool_calls=[
++            # The name is sent exactly once per call. We track that via the
++            # per-call entry in prev_tool_call_arr (set either by the middle
++            # path or by the batched-complete branch below), which is robust
++            # even when several calls are drained in one delta.
++            name_already_sent = bool(self.prev_tool_call_arr[idx].get("name"))
++
++            if not name_already_sent:
++                # Batched-complete call: emit id + name + full arguments once.
++                self.streamed_args_for_tool[idx] = final_args_json
++                self.prev_tool_call_arr[idx] = {
++                    "name": func_name,
++                    "arguments": final_args,
++                }
++                deltas.append(
++                    DeltaToolCall(
++                        index=idx,
++                        type="function",
++                        id=make_tool_call_id(),
++                        function=DeltaFunctionCall(
++                            name=func_name, arguments=final_args_json
++                        ).model_dump(exclude_none=True),
++                    )
++                )
++            else:
++                # Incrementally-streamed call: flush the remaining argument
++                # tail that was withheld during the middle phase.
++                prev_streamed = self.streamed_args_for_tool[idx]
++                if len(final_args_json) > len(prev_streamed):
++                    diff = final_args_json[len(prev_streamed) :]
++                    self.streamed_args_for_tool[idx] = final_args_json
++                    self.prev_tool_call_arr[idx]["arguments"] = final_args
++                    deltas.append(
+                         DeltaToolCall(
+-                            index=self.current_tool_id,
++                            index=idx,
+                             function=DeltaFunctionCall(arguments=diff).model_dump(
+                                 exclude_none=True
+                             ),
+                         )
+-                    ]
+-                )
++                    )
++
++        # Advance streaming state past the calls completed in this delta. If a
++        # further tool call is still being accumulated (start without a
++        # matching end), point current_tool_id at it so the middle path can
++        # stream its arguments next; otherwise settle on the last completed
++        # call.
++        if start_count > end_count:
++            self.current_tool_id = end_count
++            while len(self.prev_tool_call_arr) <= self.current_tool_id:
++                self.prev_tool_call_arr.append({})
++                self.streamed_args_for_tool.append("")
++            self.current_tool_name_sent = bool(
++                self.prev_tool_call_arr[self.current_tool_id].get("name")
++            )
++        else:
++            self.current_tool_id = end_count - 1
++            self.current_tool_name_sent = True
+
++        if deltas:
++            return DeltaMessage(tool_calls=deltas)
+         return None
+
+     def _emit_argument_diff(self, raw_args_str: str) -> DeltaMessage | None:
+diff --git a/vllm/transformers_utils/config.py b/vllm/transformers_utils/config.py
+index a5878ca02..d67354e35 100644
+--- a/vllm/transformers_utils/config.py
++++ b/vllm/transformers_utils/config.py
+@@ -96,6 +96,9 @@ _CONFIG_REGISTRY: dict[str, type[PretrainedConfig]] = LazyConfigDict(
+     ops_colqwen3="OpsColQwen3Config",
+     qwen3_vl_nemotron_embed="Qwen3VLNemotronEmbedConfig",
+     cosmos3_omni="Cosmos3Config",
++    diffusion_gemma="DiffusionGemmaConfig",
++    # TODO(diffusion): remove once checkpoints finalize to RC0.1 "diffusion_gemma".
++    diffusion_gemma4="DiffusionGemma4Config",
+     deepseek_vl_v2="DeepseekVLV2Config",
+     deepseek_v32="DeepseekV3Config",
+     deepseek_v4="DeepseekV4Config",
+diff --git a/vllm/transformers_utils/configs/__init__.py b/vllm/transformers_utils/configs/__init__.py
+index 71f7723e4..0c5264a32 100644
+--- a/vllm/transformers_utils/configs/__init__.py
++++ b/vllm/transformers_utils/configs/__init__.py
+@@ -26,6 +26,11 @@ _CLASS_TO_MODULE: dict[str, str] = {
+     "OpsColQwen3Config": "vllm.transformers_utils.configs.colqwen3",
+     "Qwen3VLNemotronEmbedConfig": "vllm.transformers_utils.configs.colqwen3",
+     "Cosmos3Config": "vllm.transformers_utils.configs.cosmos3",
++    "DiffusionGemmaConfig": "vllm.transformers_utils.configs.diffusion_gemma",
++    "DiffusionGemmaTextConfig": "vllm.transformers_utils.configs.diffusion_gemma",
++    # TODO(diffusion): remove "...4" aliases once checkpoints finalize to RC0.1.
++    "DiffusionGemma4Config": "vllm.transformers_utils.configs.diffusion_gemma",
++    "DiffusionGemma4TextConfig": "vllm.transformers_utils.configs.diffusion_gemma",
+     "DeepseekVLV2Config": "vllm.transformers_utils.configs.deepseek_vl2",
+     "DeepseekV4Config": "vllm.transformers_utils.configs.deepseek_v4",
+     "DotsOCRConfig": "vllm.transformers_utils.configs.dotsocr",
+@@ -97,6 +102,10 @@ __all__ = [
+     "OpsColQwen3Config",
+     "Qwen3VLNemotronEmbedConfig",
+     "Cosmos3Config",
++    "DiffusionGemmaConfig",
++    "DiffusionGemmaTextConfig",
++    "DiffusionGemma4Config",
++    "DiffusionGemma4TextConfig",
+     "DeepseekVLV2Config",
+     "DeepseekV3Config",
+     "DeepseekV4Config",
+diff --git a/vllm/transformers_utils/configs/diffusion_gemma.py b/vllm/transformers_utils/configs/diffusion_gemma.py
+new file mode 100644
+index 000000000..bb37293af
+--- /dev/null
++++ b/vllm/transformers_utils/configs/diffusion_gemma.py
+@@ -0,0 +1,106 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""HF config for DiffusionGemma (not yet upstream in transformers).
++
++RC0.1 is the final form and uses the ``diffusion_gemma`` model_type (no "4").
++The ``diffusion_gemma4`` classes below are kept only to load earlier RC0/test
++checkpoints (including the NVFP4/FP8 quantized test checkpoints).
++"""
++
++from typing import Any
++
++from transformers import PretrainedConfig
++from transformers.models.gemma4.configuration_gemma4 import Gemma4VisionConfig
++
++
++def _init_text_config(self: PretrainedConfig, **kwargs: Any) -> None:
++    PretrainedConfig.__init__(self, **kwargs)
++    # DiffusionGemma always uses MoE and K=V sharing for full_attention
++    # layers. The HF reference removed these config fields entirely.
++    if getattr(self, "num_experts", None):
++        self.enable_moe_block = True
++    self.attention_k_eq_v = True
++
++
++def _init_config(
++    self: PretrainedConfig,
++    text_config_class: type[PretrainedConfig],
++    text_config: dict[str, Any] | None,
++    canvas_length: int,
++    self_conditioning_size: int | None,
++    **kwargs: Any,
++) -> None:
++    self.text_config = text_config_class(**(text_config or {}))
++    self.canvas_length = canvas_length
++    self.self_conditioning_size = self_conditioning_size
++    # Convert vision_config dict to a proper config object so that
++    # downstream code (AutoModel.from_config, ProcessingInfo, etc.)
++    # can access attributes normally.
++    vision_config = kwargs.pop("vision_config", None)
++    if isinstance(vision_config, dict):
++        # Use Gemma4VisionConfig (not bare PretrainedConfig) so that
++        # AutoModel.from_config() can resolve the vision tower model class.
++        # DiffusionGemma's vision tower is architecturally identical to Gemma4's.
++        self.vision_config = Gemma4VisionConfig(**vision_config)
++    else:
++        self.vision_config = vision_config
++    self.audio_config = None  # DiffusionGemma does not support audio
++    PretrainedConfig.__init__(self, **kwargs)
++
++
++class DiffusionGemmaTextConfig(PretrainedConfig):
++    model_type = "diffusion_gemma_text"
++
++    def __init__(self, **kwargs: Any):
++        _init_text_config(self, **kwargs)
++
++
++class DiffusionGemmaConfig(PretrainedConfig):
++    model_type = "diffusion_gemma"
++
++    def __init__(
++        self,
++        text_config: dict[str, Any] | None = None,
++        canvas_length: int = 256,
++        self_conditioning_size: int | None = None,
++        **kwargs: Any,
++    ):
++        _init_config(
++            self,
++            DiffusionGemmaTextConfig,
++            text_config,
++            canvas_length,
++            self_conditioning_size,
++            **kwargs,
++        )
++
++
++# TODO(diffusion): backward-compat for the pre-RC0.1 "diffusion_gemma4" naming
++# (used by RC0 / v2 / the NVFP4+FP8 test checkpoints). Remove these "...4"
++# classes once all checkpoints are finalized to the RC0.1 "diffusion_gemma"
++# naming.
++class DiffusionGemma4TextConfig(PretrainedConfig):
++    model_type = "diffusion_gemma4_text"
++
++    def __init__(self, **kwargs: Any):
++        _init_text_config(self, **kwargs)
++
++
++class DiffusionGemma4Config(PretrainedConfig):
++    model_type = "diffusion_gemma4"
++
++    def __init__(
++        self,
++        text_config: dict[str, Any] | None = None,
++        canvas_length: int = 256,
++        self_conditioning_size: int | None = None,
++        **kwargs: Any,
++    ):
++        _init_config(
++            self,
++            DiffusionGemma4TextConfig,
++            text_config,
++            canvas_length,
++            self_conditioning_size,
++            **kwargs,
++        )
+diff --git a/vllm/transformers_utils/model_arch_config_convertor.py b/vllm/transformers_utils/model_arch_config_convertor.py
+index 250aee503..350509632 100644
+--- a/vllm/transformers_utils/model_arch_config_convertor.py
++++ b/vllm/transformers_utils/model_arch_config_convertor.py
+@@ -582,6 +582,9 @@ MODEL_ARCH_CONFIG_CONVERTORS = {
+     "cohere_asr": CohereAsrModelArchConfigConvertor,
+     "dbrx": DbrxModelArchConfigConvertor,
+     "deepseek_mtp": DeepSeekMTPModelArchConfigConvertor,
++    "diffusion_gemma_text": Gemma4ModelArchConfigConvertor,
++    # TODO(diffusion): remove once checkpoints finalize to RC0.1 naming.
++    "diffusion_gemma4_text": Gemma4ModelArchConfigConvertor,
+     "ernie_mtp": ErnieMTPModelArchConfigConvertor,
+     "falcon": FalconModelArchConfigConvertor,
+     "falcon_mamba": MambaModelArchConfigConvertor,
+diff --git a/vllm/v1/attention/backend.py b/vllm/v1/attention/backend.py
+index 32b4b8ab9..152178ec2 100644
+--- a/vllm/v1/attention/backend.py
++++ b/vllm/v1/attention/backend.py
+@@ -387,7 +387,7 @@ class CommonAttentionMetadata:
+     block_table_tensor: torch.Tensor
+     slot_mapping: torch.Tensor
+
+-    causal: bool = True
++    causal: bool | torch.Tensor = True
+
+     # Needed by FastPrefillAttentionBuilder
+     logits_indices_padded: torch.Tensor | None = None
+@@ -497,7 +497,9 @@ class CommonAttentionMetadata:
+             max_seq_len=self.max_seq_len,
+             block_table_tensor=self.block_table_tensor[:num_actual_reqs],
+             slot_mapping=self.slot_mapping[:num_actual_tokens],
+-            causal=self.causal,
++            causal=self.causal[:num_actual_reqs]
++            if isinstance(self.causal, torch.Tensor)
++            else self.causal,
+             logits_indices_padded=self.logits_indices_padded,
+             num_logits_indices=self.num_logits_indices,
+             encoder_seq_lens=maybe_slice_reqs(self.encoder_seq_lens),
+diff --git a/vllm/v1/attention/backends/fa_utils.py b/vllm/v1/attention/backends/fa_utils.py
+index 0d6a3d298..474523780 100644
+--- a/vllm/v1/attention/backends/fa_utils.py
++++ b/vllm/v1/attention/backends/fa_utils.py
+@@ -131,6 +131,12 @@ def get_flash_attn_version(
+                 and head_size != head_size_v
+             ):
+                 upgrade_reason = "Diff-KV with sinks"
++            elif (
++                vllm_config is not None
++                and vllm_config.model_config is not None
++                and vllm_config.model_config.is_diffusion
++            ):
++                upgrade_reason = "Per-sequence causal (dynamic_causal) requires FA4"
+             if upgrade_reason:
+                 logger.info_once(
+                     "%s: upgrading FlashAttention 3 -> 4",
+diff --git a/vllm/v1/attention/backends/triton_attn.py b/vllm/v1/attention/backends/triton_attn.py
+index 92ff08cc0..377e9e7ab 100644
+--- a/vllm/v1/attention/backends/triton_attn.py
++++ b/vllm/v1/attention/backends/triton_attn.py
+@@ -79,6 +79,8 @@ class TritonAttentionMetadata:
+     softmax_segm_max: torch.Tensor
+     softmax_segm_expsum: torch.Tensor
+
++    causal: bool | torch.Tensor
++
+     # For cascade attention.
+     use_cascade: bool
+     common_prefix_len: int
+@@ -219,6 +221,7 @@ class TritonAttentionMetadataBuilder(AttentionMetadataBuilder[TritonAttentionMet
+             seq_lens=seq_lens,
+             block_table=block_table_tensor,
+             slot_mapping=slot_mapping,
++            causal=common_attn_metadata.causal,
+             use_cascade=use_cascade,
+             common_prefix_len=common_prefix_len,
+             cu_prefix_query_lens=cu_prefix_query_lens,
+@@ -271,6 +274,10 @@ class TritonAttentionBackend(AttentionBackend):
+
+     forward_includes_kv_cache_update: bool = False
+
++    @classmethod
++    def supports_non_causal(cls) -> bool:
++        return True
++
+     @staticmethod
+     def get_name() -> str:
+         return "TRITON_ATTN"
+@@ -619,7 +626,7 @@ class TritonAttentionImpl(AttentionImpl):
+             seqused_k=seqused_k,
+             max_seqlen_k=max_seqlen_k,
+             softmax_scale=self.scale,
+-            causal=True,
++            causal=attn_metadata.causal,
+             alibi_slopes=self.alibi_slopes,
+             use_alibi_sqrt=self.use_alibi_sqrt,
+             window_size=self.sliding_window,
+diff --git a/vllm/v1/attention/ops/triton_attention_helpers.py b/vllm/v1/attention/ops/triton_attention_helpers.py
+index 6ed50f6a2..ed9a38ad6 100644
+--- a/vllm/v1/attention/ops/triton_attention_helpers.py
++++ b/vllm/v1/attention/ops/triton_attention_helpers.py
+@@ -153,6 +153,8 @@ def compute_tile_loop_bounds(
+     SLIDING_WINDOW: tl.constexpr,
+     USE_MM_PREFIX: tl.constexpr,
+     IS_3D: tl.constexpr,
++    USE_CAUSAL: tl.constexpr = True,
++    USE_PER_SEQ_CAUSAL: tl.constexpr = False,
+     CHUNK_LOOKBACK: tl.constexpr = -1,
+     CHUNK_SIZE: tl.constexpr = -1,
+ ):
+@@ -163,10 +165,11 @@ def compute_tile_loop_bounds(
+
+     1. Longest prefix spanned by any query token in this q-block.
+        Clamped to ``seq_len`` (causal) or extended to it when
+-       mm_prefix is active (bidirectional ranges can reach past the
+-       causal prefix).
++       mm_prefix is active or non-causal sequences need the full
++       sequence.
+     2. Sliding-window pruning: narrows ``[tile_start, tile_end)`` to
+        only tiles that can contain an allowed key under SWA.
++       For non-causal sequences, the window extends in both directions.
+     3. 3D scoping: when ``IS_3D`` is True, further narrows to the
+        segment's slice via ``(segm_idx * tiles_per_segment,
+        (segm_idx + 1) * tiles_per_segment)``.
+@@ -179,9 +182,10 @@ def compute_tile_loop_bounds(
+         + (BLOCK_M - 1) // num_queries_per_kv
+         + 1
+     )
+-    if USE_MM_PREFIX:
+-        # image bidirectional attention ranges require a full range
+-        # including q_block padding to make sure doc mask is correct
++    if USE_MM_PREFIX or USE_PER_SEQ_CAUSAL or (not USE_CAUSAL):
++        # Non-causal or mixed batches need the full sequence range.
++        # Per-element masking in compute_kv_seq_mask handles the
++        # actual causal/non-causal boundary per sequence.
+         max_seq_prefix_len = tl.maximum(max_seq_prefix_len, seq_len)
+     else:
+         max_seq_prefix_len = tl.minimum(max_seq_prefix_len, seq_len)
+@@ -207,12 +211,17 @@ def compute_tile_loop_bounds(
+         # [context_len + qpos_lo - SLIDING_WINDOW + 1, context_len + qpos_hi]
+         q_abs = context_len + qpos_lo
+         if CHUNK_LOOKBACK > -1:
+-            # Chunked attention: align lower bound to the start of the
+-            # lookback'th previous chunk.
+             first_allowed_key = ((q_abs // CHUNK_SIZE) - CHUNK_LOOKBACK) * CHUNK_SIZE
+         else:
+             first_allowed_key = q_abs - SLIDING_WINDOW + 1
+-        last_allowed_key = context_len + qpos_hi
++        if USE_PER_SEQ_CAUSAL or (not USE_CAUSAL):
++            # Non-causal: keys can be AHEAD of query within the window
++            last_allowed_key = tl.minimum(
++                context_len + qpos_hi + SLIDING_WINDOW - 1,
++                seq_len - 1,
++            )
++        else:
++            last_allowed_key = context_len + qpos_hi
+         # Convert to tile indices and clamp
+         tile_start = tl.maximum(0, first_allowed_key // TILE_SIZE)
+         tile_end = tl.minimum((last_allowed_key // TILE_SIZE) + 1, num_tiles)
+@@ -262,10 +271,14 @@ def compute_kv_seq_mask(
+     query_abs_pos,
+     seq_offset,
+     seq_idx,
++    seq_len,
+     mm_prefix_range_ptr,
+     SLIDING_WINDOW: tl.constexpr,
+     USE_MM_PREFIX: tl.constexpr,
+     MAX_MM_RANGES: tl.constexpr,
++    USE_CAUSAL: tl.constexpr = True,
++    USE_PER_SEQ_CAUSAL: tl.constexpr = False,
++    per_seq_causal_ptr=None,
+     CHUNK_LOOKBACK: tl.constexpr = -1,
+     CHUNK_SIZE: tl.constexpr = -1,
+ ):
+@@ -279,9 +292,23 @@ def compute_kv_seq_mask(
+     Chunked attention takes precedence over sliding window when both
+     are non-default — the launcher zeros ``CHUNK_LOOKBACK`` whenever
+     sliding window is disabled.
++
++    When ``USE_PER_SEQ_CAUSAL`` is set, each sequence carries its own
++    causal flag via ``per_seq_causal_ptr``; non-causal sequences use a
++    simple ``key < seq_len`` bound instead.  ``USE_CAUSAL=False``
++    disables causal masking entirely.
+     """
+-    # Compute attention mask: causal by default (key <= query)
+-    seq_mask = seq_offset[None, :] <= query_abs_pos
++    if USE_PER_SEQ_CAUSAL:
++        is_causal = tl.load(per_seq_causal_ptr + seq_idx)
++        seq_mask = tl.where(
++            is_causal,
++            seq_offset[None, :] <= query_abs_pos,
++            seq_offset[None, :] < seq_len,
++        )
++    elif USE_CAUSAL:
++        seq_mask = seq_offset[None, :] <= query_abs_pos
++    else:
++        seq_mask = seq_offset[None, :] < seq_len
+
+     # Apply sliding window / chunked attention to base mask
+     # BEFORE mm_prefix OR.
+@@ -293,7 +320,15 @@ def compute_kv_seq_mask(
+             <= CHUNK_LOOKBACK
+         )
+     elif SLIDING_WINDOW > 0:
+-        seq_mask = seq_mask & ((query_abs_pos - seq_offset) < SLIDING_WINDOW)
++        sw_left = (query_abs_pos - seq_offset) < SLIDING_WINDOW
++        if USE_PER_SEQ_CAUSAL:
++            sw_right = (seq_offset[None, :] - query_abs_pos) < SLIDING_WINDOW
++            seq_mask = seq_mask & tl.where(is_causal, sw_left, sw_left & sw_right)
++        elif not USE_CAUSAL:
++            sw_right = (seq_offset[None, :] - query_abs_pos) < SLIDING_WINDOW
++            seq_mask = seq_mask & sw_left & sw_right
++        else:
++            seq_mask = seq_mask & sw_left
+
+     # PrefixLM: extend mask with bidirectional ranges for multimodal tokens.
+     # Applied AFTER sliding window so mm_prefix ranges override SW restriction.
+diff --git a/vllm/v1/attention/ops/triton_unified_attention.py b/vllm/v1/attention/ops/triton_unified_attention.py
+index 56f1d1c1d..e3b49f9d1 100644
+--- a/vllm/v1/attention/ops/triton_unified_attention.py
++++ b/vllm/v1/attention/ops/triton_unified_attention.py
+@@ -215,6 +215,9 @@ def kernel_unified_attention(
+     USE_SOFTCAP: tl.constexpr,  # bool
+     USE_SINKS: tl.constexpr,  # bool
+     SLIDING_WINDOW: tl.constexpr,  # int
++    USE_CAUSAL: tl.constexpr,  # bool
++    USE_PER_SEQ_CAUSAL: tl.constexpr,  # bool
++    per_seq_causal_ptr,  # [num_seqs] bool, or None
+     USE_MM_PREFIX: tl.constexpr,  # bool
+     MAX_MM_RANGES: tl.constexpr,  # int
+     mm_prefix_range_ptr,
+@@ -389,6 +392,8 @@ def kernel_unified_attention(
+         SLIDING_WINDOW,
+         USE_MM_PREFIX,
+         IS_3D,
++        USE_CAUSAL,
++        USE_PER_SEQ_CAUSAL,
+         CHUNK_LOOKBACK,
+         CHUNK_SIZE,
+     )
+@@ -493,10 +498,14 @@ def kernel_unified_attention(
+             query_abs_pos,
+             seq_offset,
+             seq_idx,
++            seq_len,
+             mm_prefix_range_ptr,
+             SLIDING_WINDOW,
+             USE_MM_PREFIX,
+             MAX_MM_RANGES,
++            USE_CAUSAL,
++            USE_PER_SEQ_CAUSAL,
++            per_seq_causal_ptr,
+             CHUNK_LOOKBACK,
+             CHUNK_SIZE,
+         )
+@@ -532,11 +541,19 @@ def kernel_unified_attention(
+
+         if SLIDING_WINDOW:
+             qpos_lo = q_block_local_idx * BLOCK_Q
+-            V = tl.where(
+-                (context_len + qpos_lo - seq_offset[:, None]) < SLIDING_WINDOW,
+-                V,
+-                0.0,
+-            )
++            dist = context_len + qpos_lo - seq_offset[:, None]
++            if USE_PER_SEQ_CAUSAL:
++                is_causal_seq = tl.load(per_seq_causal_ptr + seq_idx)
++                sw_mask_v = tl.where(
++                    is_causal_seq,
++                    dist < SLIDING_WINDOW,
++                    (dist < SLIDING_WINDOW) & (dist > -SLIDING_WINDOW),
++                )
++            elif USE_CAUSAL:
++                sw_mask_v = dist < SLIDING_WINDOW
++            else:
++                sw_mask_v = (dist < SLIDING_WINDOW) & (dist > -SLIDING_WINDOW)
++            V = tl.where(sw_mask_v, V, 0.0)
+         if USE_PER_TOKEN_HEAD_SCALES:
+             # Per-token-head quant: apply v_scale to P instead of V.
+             P_v = (P * v_token_head_scales[None, :]).to(V.dtype)
+@@ -802,7 +819,11 @@ def unified_attention(
+     # disabling this flag costs nothing.
+     use_td: bool = False,
+ ):
+-    assert causal, "Only causal attention is supported"
++    # Resolve causal: bool or per-seq tensor.
++    use_per_seq_causal = isinstance(causal, torch.Tensor)
++    use_causal = bool(causal) if not use_per_seq_causal else True
++    per_seq_causal_ptr = causal if use_per_seq_causal else None
++
+     if sinks is not None:
+         assert sinks.shape[0] == q.shape[1], "Sinks must be num_query_heads size"
+
+@@ -1002,10 +1023,13 @@ def unified_attention(
+         USE_QQ_BIAS=use_qq_bias,
+         USE_SOFTCAP=(softcap > 0),
+         USE_SINKS=(sinks is not None),
++        SLIDING_WINDOW=(1 + window_size[0]),
++        USE_CAUSAL=use_causal,
++        USE_PER_SEQ_CAUSAL=use_per_seq_causal,
++        per_seq_causal_ptr=per_seq_causal_ptr,
+         USE_MM_PREFIX=use_mm_prefix,
+         MAX_MM_RANGES=max_mm_ranges,
+         mm_prefix_range_ptr=mm_prefix_range,
+-        SLIDING_WINDOW=(1 + window_size[0]),
+         stride_k_cache_0=k.stride(0),
+         stride_k_cache_1=k.stride(1),
+         stride_k_cache_2=k.stride(2),
+diff --git a/vllm/v1/core/sched/async_scheduler.py b/vllm/v1/core/sched/async_scheduler.py
+index 2fd22f4c0..a79e84289 100644
+--- a/vllm/v1/core/sched/async_scheduler.py
++++ b/vllm/v1/core/sched/async_scheduler.py
+@@ -27,10 +27,14 @@ class AsyncScheduler(Scheduler):
+             scheduler_output.pending_structured_output_tokens |= (
+                 request.use_structured_output and request.num_output_placeholders > 0
+             )
+-            # The request will generate a new token plus num_spec_tokens
+-            # in this scheduling step.
++            # The request will generate num_sampled_tokens_per_step new tokens
++            # plus num_spec_tokens in this scheduling step. Diffusion has no AR
++            # bonus token (num_sampled_tokens_per_step == 0) — only the canvas
++            # (spec) tokens.
+             cur_num_spec_tokens = len(spec_decode_tokens.get(req_id, ()))
+-            request.num_output_placeholders += 1 + cur_num_spec_tokens
++            request.num_output_placeholders += (
++                self.num_sampled_tokens_per_step + cur_num_spec_tokens
++            )
+             # Add placeholders for the new draft/spec tokens.
+             # We will update the actual spec token ids in the worker process.
+             request.spec_token_ids = self._spec_token_placeholders
+diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
+index 889232c3e..df6e6fabc 100644
+--- a/vllm/v1/core/sched/scheduler.py
++++ b/vllm/v1/core/sched/scheduler.py
+@@ -112,6 +112,10 @@ class Scheduler(SchedulerInterface):
+             self.kv_events_config is not None
+             and self.kv_events_config.enable_kv_cache_events
+         )
++        # Diffusion models may not sample any tokens for a denoising step.
++        self.num_sampled_tokens_per_step = (
++            1 if not vllm_config.model_config.is_diffusion else 0
++        )
+
+         # Create KVConnector for the Scheduler. Note that each Worker
+         # will have a corresponding KVConnector with Role=WORKER.
+@@ -211,9 +215,9 @@ class Scheduler(SchedulerInterface):
+
+         speculative_config = vllm_config.speculative_config
+         self.use_eagle = False
+-        self.num_spec_tokens = self.num_lookahead_tokens = 0
+-        if speculative_config:
+-            self.num_spec_tokens = speculative_config.num_speculative_tokens
++        self.num_spec_tokens = vllm_config.num_speculative_tokens
++        self.num_lookahead_tokens = 0
++        if speculative_config is not None:
+             if speculative_config.use_eagle():
+                 self.use_eagle = True
+                 self.num_lookahead_tokens = self.num_spec_tokens
+@@ -412,7 +416,10 @@ class Scheduler(SchedulerInterface):
+             # Make sure the input position does not exceed the max model len.
+             # This is necessary when using spec decoding.
+             num_new_tokens = min(
+-                num_new_tokens, self.max_model_len - 1 - request.num_computed_tokens
++                num_new_tokens,
++                self.max_model_len
++                - request.num_computed_tokens
++                - self.num_sampled_tokens_per_step,
+             )
+
+             # Schedule encoder inputs.
+@@ -1414,9 +1421,10 @@ class Scheduler(SchedulerInterface):
+             scheduled_spec_token_ids = (
+                 scheduler_output.scheduled_spec_decode_tokens.get(req_id)
+             )
+-            if scheduled_spec_token_ids and generated_token_ids:
++            if scheduled_spec_token_ids:
+                 num_draft_tokens = len(scheduled_spec_token_ids)
+-                num_accepted = len(generated_token_ids) - 1
++                num_sampled = self.num_sampled_tokens_per_step
++                num_accepted = max(len(generated_token_ids) - num_sampled, 0)
+                 num_rejected = num_draft_tokens - num_accepted
+                 # num_computed_tokens represents the number of tokens
+                 # processed in the current step, considering scheduled
+diff --git a/vllm/v1/cudagraph_dispatcher.py b/vllm/v1/cudagraph_dispatcher.py
+index cf0c1d417..6a48b6282 100644
+--- a/vllm/v1/cudagraph_dispatcher.py
++++ b/vllm/v1/cudagraph_dispatcher.py
+@@ -34,11 +34,7 @@ class CudagraphDispatcher:
+     def __init__(self, vllm_config: VllmConfig):
+         self.vllm_config = vllm_config
+         self.compilation_config = vllm_config.compilation_config
+-        self.uniform_decode_query_len = (
+-            1
+-            if not self.vllm_config.speculative_config
+-            else 1 + self.vllm_config.speculative_config.num_speculative_tokens
+-        )
++        self.uniform_decode_query_len = 1 + self.vllm_config.num_speculative_tokens
+
+         # Dict to store valid cudagraph dispatching keys.
+         self.cudagraph_keys: dict[CUDAGraphMode, set[BatchDescriptor]] = {
+diff --git a/vllm/v1/engine/core.py b/vllm/v1/engine/core.py
+index 08c814ab3..6258c8199 100644
+--- a/vllm/v1/engine/core.py
++++ b/vllm/v1/engine/core.py
+@@ -155,7 +155,10 @@ class EngineCore:
+             block_size=scheduler_block_size,
+             hash_block_size=hash_block_size,
+         )
+-        self.use_spec_decode = vllm_config.speculative_config is not None
++        self.check_for_draft_tokens = (
++            vllm_config.speculative_config is not None
++            or vllm_config.model_config.is_diffusion
++        )
+         if self.scheduler.connector is not None:  # type: ignore
+             self.model_executor.init_kv_output_aggregator(self.scheduler.connector)  # type: ignore
+
+@@ -475,8 +478,7 @@ class EngineCore:
+         # When using async scheduling we can't get draft token ids in advance,
+         # so we update draft token ids in the worker process and don't
+         # need to update draft token ids here.
+-        if not self.async_scheduling and self.use_spec_decode and model_executed:
+-            # Take the draft token ids.
++        if self.check_for_draft_tokens and not self.async_scheduling and model_executed:
+             draft_token_ids = self.model_executor.take_draft_token_ids()
+             if draft_token_ids is not None:
+                 self.scheduler.update_draft_token_ids(draft_token_ids)
+@@ -574,13 +576,12 @@ class EngineCore:
+         # NOTE(nick): We can either handle the deferred tasks here or save
+         # in a field and do it immediately once step_with_batch_queue is
+         # re-called. The latter slightly favors TTFT over TPOT/throughput.
+-        if deferred_scheduler_output:
++        if self.check_for_draft_tokens and deferred_scheduler_output:
+             # If we are doing speculative decoding with structured output,
+             # we need to get the draft token ids from the prior step before
+             # we can compute the grammar bitmask for the deferred request.
+-            if self.use_spec_decode:
+-                draft_token_ids = self.model_executor.take_draft_token_ids()
+-                assert draft_token_ids is not None
++            draft_token_ids = self.model_executor.take_draft_token_ids()
++            if draft_token_ids is not None:
+                 # Update the draft token ids in the scheduler output to
+                 # filter out the invalid spec tokens, which will be padded
+                 # with -1 and skipped by the grammar bitmask computation.
+diff --git a/vllm/v1/metrics/loggers.py b/vllm/v1/metrics/loggers.py
+index 0052a3536..021019dc1 100644
+--- a/vllm/v1/metrics/loggers.py
++++ b/vllm/v1/metrics/loggers.py
+@@ -110,7 +110,9 @@ class LoggingStatLogger(StatLoggerBase):
+         self.connector_prefix_caching_metrics = CachingMetrics()
+         self.mm_caching_metrics = CachingMetrics()
+
+-        self.spec_decoding_logging = SpecDecodingLogging()
++        model_config = self.vllm_config.model_config
++        is_diffusion = model_config is not None and model_config.is_diffusion
++        self.spec_decoding_logging = SpecDecodingLogging(is_diffusion=is_diffusion)
+         kv_transfer_config = self.vllm_config.kv_transfer_config
+         self.kv_connector_logging = KVConnectorLogging(kv_transfer_config)
+         self.cudagraph_logging = None
+@@ -436,7 +438,10 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
+         per_engine_labelvalues = self.per_engine_labelvalues
+
+         self.spec_decoding_prom = self._spec_decoding_cls(
+-            vllm_config.speculative_config, labelnames, per_engine_labelvalues
++            vllm_config.speculative_config,
++            labelnames,
++            per_engine_labelvalues,
++            is_diffusion=vllm_config.model_config.is_diffusion,
+         )
+         self.kv_connector_prom = self._kv_connector_cls(
+             vllm_config, labelnames, per_engine_labelvalues
+diff --git a/vllm/v1/spec_decode/metrics.py b/vllm/v1/spec_decode/metrics.py
+index 9a41ff5c8..5da41510b 100644
+--- a/vllm/v1/spec_decode/metrics.py
++++ b/vllm/v1/spec_decode/metrics.py
+@@ -53,7 +53,11 @@ class SpecDecodingLogging:
+     before resetting to zero.
+     """
+
+-    def __init__(self):
++    def __init__(self, is_diffusion: bool = False):
++        # Diffusion (dLLM) models reuse the spec-decode data path with
++        # overloaded semantics, so the raw spec-decode framing (drafts, bonus
++        # token, per-position vector) is logged with diffusion-native terms.
++        self.is_diffusion = is_diffusion
+         self.reset()
+
+     def reset(self):
+@@ -85,6 +89,17 @@ class SpecDecodingLogging:
+             draft_throughput = num_draft_tokens / elapsed_time
+             accepted_throughput = num_accepted_tokens / elapsed_time
+
++        if self.is_diffusion:
++            self._log_diffusion(
++                log_fn,
++                num_denoising_steps=num_drafts,
++                num_canvas_tokens=num_draft_tokens,
++                num_committed_tokens=num_accepted_tokens,
++                committed_throughput=accepted_throughput,
++            )
++            self.reset()
++            return
++
+         draft_acceptance_rate = (
+             num_accepted_tokens / num_draft_tokens * 100
+             if num_draft_tokens > 0
+@@ -117,6 +132,43 @@ class SpecDecodingLogging:
+         )
+         self.reset()
+
++    def _log_diffusion(
++        self,
++        log_fn,
++        num_denoising_steps: int,
++        num_canvas_tokens: int,
++        num_committed_tokens: int,
++        committed_throughput: float,
++    ):
++        # Each "draft" is one denoising step that re-evaluates the canvas block
++        # and finalizes some of its positions.
++        mean_committed_per_step = (
++            num_committed_tokens / num_denoising_steps
++            if num_denoising_steps > 0
++            else float("nan")
++        )
++        mean_steps_per_canvas = (
++            num_canvas_tokens / num_committed_tokens
++            if num_committed_tokens > 0
++            else float("nan")
++        )
++
++        log_fn(
++            "DiffusionDecoding metrics: "
++            "Committed token throughput: %.2f tokens/s, "
++            "Mean denoising steps per canvas: %.2f, "
++            "Mean tokens committed per denoising step: %.2f, "
++            "Committed: %d tokens, "
++            "Denoising steps: %d, "
++            "Canvas positions evaluated: %d",
++            committed_throughput,
++            mean_steps_per_canvas,
++            mean_committed_per_step,
++            num_committed_tokens,
++            num_denoising_steps,
++            num_canvas_tokens,
++        )
++
+
+ class SpecDecodingProm:
+     """Record spec decoding metrics in Prometheus.
+@@ -146,56 +198,66 @@ class SpecDecodingProm:
+         speculative_config: SpeculativeConfig | None,
+         labelnames: list[str],
+         per_engine_labelvalues: dict[int, list[object]],
++        is_diffusion: bool = False,
+     ):
+-        self.spec_decoding_enabled = speculative_config is not None
++        # Diffusion (dLLM) models reuse the spec-decode counters but expose them
++        # under diffusion-native names; the per-position acceptance vector does
++        # not apply, so it is omitted.
++        self.is_diffusion = is_diffusion
++        self.spec_decoding_enabled = speculative_config is not None or is_diffusion
+         if not self.spec_decoding_enabled:
+             return
+
+-        counter_drafts = self._counter_cls(
+-            name="vllm:spec_decode_num_drafts",
+-            documentation="Number of spec decoding drafts.",
+-            labelnames=labelnames,
+-        )
+-        self.counter_spec_decode_num_drafts = create_metric_per_engine(
+-            counter_drafts, per_engine_labelvalues
+-        )
+-
+-        counter_draft_tokens = self._counter_cls(
+-            name="vllm:spec_decode_num_draft_tokens",
+-            documentation="Number of draft tokens.",
+-            labelnames=labelnames,
+-        )
+-        self.counter_spec_decode_num_draft_tokens = create_metric_per_engine(
+-            counter_draft_tokens, per_engine_labelvalues
+-        )
++        if is_diffusion:
++            counter_specs = [
++                ("vllm:diffusion_num_denoising_steps", "Number of denoising steps."),
++                (
++                    "vllm:diffusion_num_canvas_positions",
++                    "Number of canvas positions evaluated.",
++                ),
++                (
++                    "vllm:diffusion_num_committed_tokens",
++                    "Number of committed (finalized) tokens.",
++                ),
++            ]
++        else:
++            counter_specs = [
++                ("vllm:spec_decode_num_drafts", "Number of spec decoding drafts."),
++                ("vllm:spec_decode_num_draft_tokens", "Number of draft tokens."),
++                ("vllm:spec_decode_num_accepted_tokens", "Number of accepted tokens."),
++            ]
++
++        counters = [
++            create_metric_per_engine(
++                self._counter_cls(name=name, documentation=doc, labelnames=labelnames),
++                per_engine_labelvalues,
++            )
++            for name, doc in counter_specs
++        ]
++        # num_drafts/num_draft_tokens/num_accepted_tokens map onto denoising
++        # steps/canvas positions/committed tokens in the diffusion path.
++        self.counter_spec_decode_num_drafts = counters[0]
++        self.counter_spec_decode_num_draft_tokens = counters[1]
++        self.counter_spec_decode_num_accepted_tokens = counters[2]
+
+-        counter_accepted_tokens = self._counter_cls(
+-            name="vllm:spec_decode_num_accepted_tokens",
+-            documentation="Number of accepted tokens.",
+-            labelnames=labelnames,
+-        )
+-        self.counter_spec_decode_num_accepted_tokens = create_metric_per_engine(
+-            counter_accepted_tokens, per_engine_labelvalues
+-        )
+-
+-        assert speculative_config is not None
+-        num_spec_tokens = (
+-            speculative_config.num_speculative_tokens
+-            if self.spec_decoding_enabled
+-            else 0
+-        )
+-        pos_labelnames = labelnames + ["position"]
+-        base_counter = self._counter_cls(
+-            name="vllm:spec_decode_num_accepted_tokens_per_pos",
+-            documentation="Accepted tokens per draft position.",
+-            labelnames=pos_labelnames,
+-        )
+         self.counter_spec_decode_num_accepted_tokens_per_pos: dict[
+             int, list[prometheus_client.Counter]
+-        ] = {
+-            idx: [base_counter.labels(*lv, str(pos)) for pos in range(num_spec_tokens)]
+-            for idx, lv in per_engine_labelvalues.items()
+-        }
++        ] = {}
++        if not is_diffusion:
++            assert speculative_config is not None
++            num_spec_tokens = speculative_config.num_speculative_tokens
++            pos_labelnames = labelnames + ["position"]
++            base_counter = self._counter_cls(
++                name="vllm:spec_decode_num_accepted_tokens_per_pos",
++                documentation="Accepted tokens per draft position.",
++                labelnames=pos_labelnames,
++            )
++            self.counter_spec_decode_num_accepted_tokens_per_pos = {
++                idx: [
++                    base_counter.labels(*lv, str(pos)) for pos in range(num_spec_tokens)
++                ]
++                for idx, lv in per_engine_labelvalues.items()
++            }
+
+     def observe(self, spec_decoding_stats: SpecDecodingStats, engine_idx: int = 0):
+         if not self.spec_decoding_enabled:
+@@ -210,6 +272,6 @@ class SpecDecodingProm:
+             spec_decoding_stats.num_accepted_tokens
+         )
+         for pos, counter in enumerate(
+-            self.counter_spec_decode_num_accepted_tokens_per_pos[engine_idx]
++            self.counter_spec_decode_num_accepted_tokens_per_pos.get(engine_idx, [])
+         ):
+             counter.inc(spec_decoding_stats.num_accepted_tokens_per_pos[pos])
+diff --git a/vllm/v1/structured_output/__init__.py b/vllm/v1/structured_output/__init__.py
+index 6a4fcbb62..53a0d66c0 100644
+--- a/vllm/v1/structured_output/__init__.py
++++ b/vllm/v1/structured_output/__init__.py
+@@ -211,11 +211,20 @@ class StructuredOutputManager:
+         if not structured_output_request_ids:
+             return None
+
+-        max_num_spec_tokens = 0
+-        if self.vllm_config.speculative_config is not None:
+-            max_num_spec_tokens = (
+-                self.vllm_config.speculative_config.num_speculative_tokens
+-            )
++        # Size the lookahead from VllmConfig.num_speculative_tokens, which accounts
++        # for BOTH speculative_config (e.g. MTP) AND the diffusion (dLLM) canvas.
++        # Reading speculative_config alone under-counts when the diffusion path
++        # schedules extra tokens, leaving max_num_spec_tokens=0 and a bitmask of
++        # only max_num_seqs rows — the serial fill loop below then indexes past the
++        # end (IndexError -> EngineCore crash).
++        max_num_spec_tokens = self.vllm_config.num_speculative_tokens
++
++        # Exact number of bitmask rows this batch needs: one per request plus one
++        # per scheduled speculative/diffusion token for that request.
++        required_rows = sum(
++            1 + len(scheduled_spec_decode_tokens.get(req_id, ()))
++            for req_id in structured_output_request_ids
++        )
+
+         if self._grammar_bitmask is None:
+             assert self.backend is not None
+@@ -224,9 +233,23 @@ class StructuredOutputManager:
+             # Allocate a bitmask for each token needing to be checked:
+             # one for each speculative position, and one more for the
+             # bonus token / non-speculative token.
+-            self._grammar_bitmask = self.backend.allocate_token_bitmask(
+-                max_batch_size * (1 + max_num_spec_tokens)
++            initial_rows = max(
++                max_batch_size * (1 + max_num_spec_tokens), required_rows
++            )
++            self._grammar_bitmask = self.backend.allocate_token_bitmask(initial_rows)
++        elif self._grammar_bitmask.shape[0] < required_rows:
++            # Defensive grow: if a batch ever needs more rows than the initial
++            # estimate (e.g. variable diffusion lookahead), reallocate instead of
++            # indexing out of bounds. Bounds the bitmask to what is actually
++            # required for this batch.
++            assert self.backend is not None
++            logger.warning_once(
++                "Growing structured-output bitmask from %d to %d rows to fit "
++                "scheduled speculative/diffusion tokens.",
++                self._grammar_bitmask.shape[0],
++                required_rows,
+             )
++            self._grammar_bitmask = self.backend.allocate_token_bitmask(required_rows)
+
+         # Generate a batched bitmask for all structured output requests.
+         # When speculative decoding is enabled, we need to include multiple
+@@ -279,10 +302,13 @@ class StructuredOutputManager:
+                 req_tokens = scheduled_spec_decode_tokens.get(req_id, ())
+                 for token in itertools.chain(req_tokens, (-1,)):
+                     self._fill_bitmasks(((grammar, cumulative_index, apply_bitmask),))
+-                    if token == -1:
+-                        # Stop advancing the grammar once we hit a padding token.
++                    if token < 0:
++                        # Honor the -1 padding contract — never advance the
++                        # grammar or assert acceptance on a negative/padding
++                        # token (doing so triggers a fatal AssertionError under
++                        # MTP spec decode).
+                         apply_bitmask = False
+-                    if apply_bitmask and not grammar.is_terminated():
++                    if apply_bitmask and token >= 0 and not grammar.is_terminated():
+                         accepted = grammar.accept_tokens(req_id, [token])
+                         assert accepted, (token, req_id, scheduled_spec_decode_tokens)
+                         state_advancements += 1
+diff --git a/vllm/v1/structured_output/request.py b/vllm/v1/structured_output/request.py
+index dfa8c7efc..1a2e5d7fe 100644
+--- a/vllm/v1/structured_output/request.py
++++ b/vllm/v1/structured_output/request.py
+@@ -7,6 +7,7 @@ from concurrent.futures import Future
+ from concurrent.futures._base import TimeoutError
+ from typing import TYPE_CHECKING, Any, cast
+
++from vllm.logger import init_logger
+ from vllm.sampling_params import SamplingParams, StructuredOutputsParams
+ from vllm.v1.structured_output.backend_types import (
+     StructuredOutputGrammar,
+@@ -17,6 +18,8 @@ from vllm.v1.structured_output.backend_types import (
+ if TYPE_CHECKING:
+     from vllm.reasoning import ReasoningParser
+
++logger = init_logger(__name__)
++
+
+ @dataclasses.dataclass
+ class StructuredOutputRequest:
+@@ -50,6 +53,17 @@ class StructuredOutputRequest:
+                 self.status = RequestStatus.WAITING
+             except TimeoutError:
+                 return False
++            except Exception as exc:
++                # A grammar-compilation failure (e.g. xgrammar rejecting an
++                # auto-generated tool_choice schema) must not be allowed to
++                # propagate from the scheduler loop and kill EngineCore.
++                # Surface it as a client-side ValueError so the request fails
++                # cleanly instead of taking down the engine.
++                self.status = RequestStatus.FINISHED_ERROR
++                logger.exception("Grammar compilation failed for structured output")
++                raise ValueError(
++                    f"Failed to compile grammar for structured output: {exc}"
++                ) from exc
+         return True
+
+     @property
+diff --git a/vllm/v1/worker/gpu/attn_utils.py b/vllm/v1/worker/gpu/attn_utils.py
+index 6fc55ee32..d7acc9496 100644
+--- a/vllm/v1/worker/gpu/attn_utils.py
++++ b/vllm/v1/worker/gpu/attn_utils.py
+@@ -392,9 +392,9 @@ def build_attn_metadata(
+     seq_lens_cpu_upper_bound: torch.Tensor | None = None,
+     dcp_local_seq_lens: torch.Tensor | None = None,
+     positions: torch.Tensor | None = None,
+     model_specific_attn_metadata: ModelSpecificAttnMetadata | None = None,
+     for_cudagraph_capture: bool = False,
+-    causal: bool = True,
++    causal: bool | torch.Tensor = True,
+ ) -> dict[str, Any]:
+     seq_lens = seq_lens[:num_reqs]
+     if dcp_local_seq_lens is not None:
+diff --git a/vllm/v1/worker/gpu/input_batch.py b/vllm/v1/worker/gpu/input_batch.py
+index f905d09e4..6b750fe7e 100644
+--- a/vllm/v1/worker/gpu/input_batch.py
++++ b/vllm/v1/worker/gpu/input_batch.py
+@@ -302,6 +302,7 @@ def _combine_sampled_and_draft_tokens_kernel(
+     cu_num_logits_ptr,
+     logits_indices_ptr,
+     BLOCK_SIZE: tl.constexpr,
++    NUM_NEW_SAMPLED_TOKENS: tl.constexpr = 1,
+ ):
+     batch_idx = tl.program_id(0)
+     req_state_idx = tl.load(idx_mapping_ptr + batch_idx)
+@@ -310,7 +311,7 @@ def _combine_sampled_and_draft_tokens_kernel(
+     cu_num_logits_start = tl.load(cu_num_logits_ptr + batch_idx)
+     cu_num_logits_end = tl.load(cu_num_logits_ptr + batch_idx + 1)
+     num_logits = cu_num_logits_end - cu_num_logits_start
+-    num_draft_tokens = num_logits - 1
++    num_draft_tokens = num_logits - NUM_NEW_SAMPLED_TOKENS
+
+     # Compute the logits indices.
+     block = tl.arange(0, BLOCK_SIZE)
+@@ -328,9 +329,10 @@ def _combine_sampled_and_draft_tokens_kernel(
+         # Handling prefill tokens. No sampled or draft tokens.
+         return
+
+-    # Write the last sampled token ID to input_ids.
+-    last_token_id = tl.load(last_sampled_tokens_ptr + req_state_idx)
+-    tl.store(input_ids_ptr + query_end - num_logits, last_token_id)
++    if NUM_NEW_SAMPLED_TOKENS > 0:
++        # Write the last sampled token ID to input_ids.
++        last_token_id = tl.load(last_sampled_tokens_ptr + req_state_idx)
++        tl.store(input_ids_ptr + query_end - num_logits, last_token_id)
+
+     # Write the draft tokens (if any) to input_ids.
+     if num_draft_tokens > 0:
+@@ -356,7 +358,11 @@ def combine_sampled_and_draft_tokens(
+     draft_tokens: torch.Tensor,
+     cu_num_logits: torch.Tensor,
+     num_logits: int,
++    num_new_sampled_tokens: int = 1,  # excl accepted draft tokens, a.k.a bonus tokens
+ ) -> torch.Tensor:
++    assert num_new_sampled_tokens in (0, 1), (
++        f"num_new_sampled_tokens must be 0 or 1, got {num_new_sampled_tokens}"
++    )
+     # use idx_mapping.shape[0] for actual request count
+     num_reqs = idx_mapping.shape[0]
+     num_speculative_steps = draft_tokens.shape[-1]
+@@ -377,9 +383,12 @@ def combine_sampled_and_draft_tokens(
+         draft_tokens.stride(0),
+         cu_num_logits,
+         logits_indices,
+-        # NOTE(woosuk): Add 1 to ensure the block can cover the last sampled token
+-        # in addition to all draft tokens.
+-        BLOCK_SIZE=triton.next_power_of_2(num_speculative_steps + 1),
++        NUM_NEW_SAMPLED_TOKENS=num_new_sampled_tokens,
++        # NOTE(woosuk): Add num_new_sampled_tokens to ensure the block covers the
++        # last sampled token in addition to all draft tokens.
++        BLOCK_SIZE=triton.next_power_of_2(
++            num_speculative_steps + num_new_sampled_tokens
++        ),
+     )
+     return logits_indices
+
+diff --git a/vllm/v1/worker/gpu/model_runner.py b/vllm/v1/worker/gpu/model_runner.py
+index 50b78474b..bd122c3fb 100644
+--- a/vllm/v1/worker/gpu/model_runner.py
++++ b/vllm/v1/worker/gpu/model_runner.py
+@@ -78,7 +78,6 @@ from vllm.v1.worker.gpu.input_batch import (
+     InputBuffers,
+     combine_sampled_and_draft_tokens,
+     expand_idx_mapping,
+-    get_num_sampled_and_rejected,
+     post_update,
+     post_update_num_computed_tokens,
+     prepare_pos_seq_lens,
+@@ -185,11 +184,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+
+         # Speculative decoding.
+         self.speculator = None
+-        self.num_speculative_steps = 0
+         self.use_aux_hidden_state_outputs = False
++        self.num_speculative_steps = vllm_config.num_speculative_tokens
+         if self.speculative_config is not None:
+-            self.num_speculative_steps = self.speculative_config.num_speculative_tokens
+-
+             if self.is_last_pp_rank:
+                 self.speculator = init_speculator(self.vllm_config, self.device)
+
+@@ -201,7 +198,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+
+         # Draft tokens propagation - for spec-dec + struct outputs.
+         self.draft_tokens_handler = DraftTokensHandler(self.device)
+-        self.uniform_decode_query_len = 1 + self.num_speculative_steps
+
+         # Pooling models.
+         self.is_pooling_model = self.model_config.runner_type == "pooling"
+@@ -229,38 +225,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+                 device=self.device,
+             )
+
++        # Samplers and decode_query_len created in load_model() after
++        # model_state exists (num_new_sampled_tokens_per_step from ModelState).
+         self.sampler: Sampler | None = None
+         self.rejection_sampler: RejectionSampler | None = None
+         self.prompt_logprobs_worker: PromptLogprobsWorker | None = None
+         self.structured_outputs_worker: StructuredOutputsWorker | None = None
+-        if self.is_last_pp_rank and not self.is_pooling_model:
+-            # Initialize sampling-related workers.
+-            # These components are only set up on the last PP rank and
+-            # for generative (non-pooling) models.
+-            self.sampler = Sampler(
+-                max_num_reqs=self.max_num_reqs,
+-                vocab_size=self.vocab_size,
+-                device=self.device,
+-                req_states=self.req_states,
+-                logprobs_mode=self.model_config.logprobs_mode,
+-                num_speculative_tokens=self.num_speculative_steps + 1,
+-                use_fp64_gumbel=self.model_config.use_fp64_gumbel,
+-            )
+-            if self.speculative_config is not None:
+-                self.rejection_sampler = RejectionSampler(
+-                    self.sampler,
+-                    self.speculative_config,
+-                    self.device,
+-                )
+-            self.prompt_logprobs_worker = PromptLogprobsWorker(self.max_num_reqs)
+-            self.structured_outputs_worker = StructuredOutputsWorker(
+-                max_num_logits=self.max_num_reqs * (self.num_speculative_steps + 1),
+-                vocab_size=self.vocab_size,
+-                device=self.device,
+-            )
+-
+-        # For CUDA graphs, and will init cudagraph_manager after init_attn_backend.
+-        self.decode_query_len = self.num_speculative_steps + 1
+         self.cudagraph_manager: ModelCudaGraphManager | None = None
+         # LoRA-related workers.
+         self.lora_state = LoraState(max_num_reqs=self.max_num_reqs)
+@@ -332,6 +302,40 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+         self.model_state = init_model_state(
+             self.vllm_config, self.model, self.encoder_cache, self.device
+         )
++
++        self.decode_query_len = (
++            self.num_speculative_steps
++            + self.model_state.num_new_sampled_tokens_per_step
++        )
++
++        # Initialize samplers. Model states may override via custom_sampler().
++        if self.is_last_pp_rank and not self.is_pooling_model:
++            self.sampler = Sampler(
++                max_num_reqs=self.max_num_reqs,
++                vocab_size=self.vocab_size,
++                device=self.device,
++                req_states=self.req_states,
++                logprobs_mode=self.model_config.logprobs_mode,
++                num_speculative_tokens=self.decode_query_len,
++                use_fp64_gumbel=self.model_config.use_fp64_gumbel,
++            )
++            custom = self.model_state.custom_sampler(self.sampler)
++
++            if custom:
++                self.sampler, self.rejection_sampler = custom
++            elif self.speculative_config is not None:
++                self.rejection_sampler = RejectionSampler(
++                    self.sampler,
++                    self.speculative_config,
++                    self.device,
++                )
++            self.prompt_logprobs_worker = PromptLogprobsWorker(self.max_num_reqs)
++            self.structured_outputs_worker = StructuredOutputsWorker(
++                max_num_logits=self.max_num_reqs * self.decode_query_len,
++                vocab_size=self.vocab_size,
++                device=self.device,
++            )
++
+         if self.is_pooling_model and self.is_last_pp_rank:
+             self.pooling_runner = PoolingRunner(self.model)
+         eplb_models_added |= self.eplb.maybe_register_model(
+@@ -444,7 +448,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+         cudagraph_mode = self.compilation_config.resolve_cudagraph_mode_and_sizes(
+             attn_cg_support.min_cg_support,
+             attn_cg_support.min_cg_attn_backend,
+-            self.uniform_decode_query_len,
++            self.decode_query_len,
+             self.parallel_config.tensor_parallel_size,
+             self.kv_cache_config,
+             self.max_num_reqs,
+@@ -707,6 +711,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+         return cuda_graph_size
+
+     def _remove_request(self, req_id: str) -> bool:
++        # Call model_state.remove_request *before* req_states.remove_request
++        # so the model_state can still look up the slot index.
++        self.model_state.remove_request(req_id)
+         req_idx = self.req_states.remove_request(req_id)
+         if req_idx is None:
+             return False
+@@ -854,16 +861,16 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+                 dtype=np.int32,
+                 count=num_reqs,
+             )
++            num_bonus_tokens = self.model_state.num_new_sampled_tokens_per_step
+             total_num_draft_tokens = int(num_draft_tokens_per_req.sum())
+-            total_num_logits = num_reqs + total_num_draft_tokens
+-
+-            num_logits = num_draft_tokens_per_req + 1
++            total_num_logits = num_reqs * num_bonus_tokens + total_num_draft_tokens
++            num_logits = num_draft_tokens_per_req + num_bonus_tokens
+             cu_num_logits_np = np.empty(num_reqs + 1, dtype=np.int32)
+             cu_num_logits_np[0] = 0
+             np.cumsum(num_logits, out=cu_num_logits_np[1:])
+             cu_num_logits = async_copy_to_gpu(cu_num_logits_np, device=self.device)
+
+-            max_expand_len = self.num_speculative_steps + 1
++            max_expand_len = self.decode_query_len
+             expanded_idx_mapping, expanded_local_pos = expand_idx_mapping(
+                 idx_mapping, total_num_logits, cu_num_logits, max_expand_len
+             )
+@@ -932,6 +939,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+             self.req_states.draft_tokens,
+             cu_num_logits,
+             total_num_logits,
++            self.model_state.num_new_sampled_tokens_per_step,
+         )
+
+         # CPU upper bound on seq_lens; padded entries left at zero.
+@@ -1024,8 +1032,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+                 grammar_output.grammar_bitmask,
+             )
+
+-        if input_batch.num_draft_tokens == 0:
+-            # No draft tokens (common case).
++        if input_batch.num_draft_tokens == 0 or self.rejection_sampler is None:
+             assert self.sampler is not None
+             sampler_output = self.sampler(logits, input_batch)
+         else:
+@@ -1039,16 +1046,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+                 self.speculator.draft_logits,
+             )
+
+-        # Get the number of sampled and rejected tokens.
+-        # For chunked prefills, num_sampled and num_rejected are both 0.
+-        num_sampled, num_rejected = get_num_sampled_and_rejected(
+-            sampler_output.num_sampled,
+-            input_batch.seq_lens,
+-            input_batch.cu_num_logits,
+-            input_batch.idx_mapping,
+-            self.req_states.prefill_len.gpu,
+-        )
+-        return sampler_output, num_sampled, num_rejected
++        return sampler_output, sampler_output.num_sampled, sampler_output.num_rejected
+
+     def postprocess_sampled(
+         self,
+@@ -1445,7 +1443,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+                 mm_inputs=mm_inputs,
+             )
+             self.req_states.draft_tokens[input_batch.idx_mapping] = draft_tokens
+-            self.draft_tokens_handler.set_draft_tokens(input_batch, draft_tokens)
++
++        if self.num_speculative_steps > 0:
++            # Spec-decode and diffusion LLMs both use draft tokens but the latter does
++            # not have a speculator (i.e. self.speculator is None)
++            self.draft_tokens_handler.set_draft_tokens(
++                input_batch,
++                self.req_states.draft_tokens[input_batch.idx_mapping],
++            )
+
+         # Post-step KV connector related operations.
+         kv_connector_output = self.kv_connector.post_forward(finished_req_ids)
+diff --git a/vllm/v1/worker/gpu/model_states/__init__.py b/vllm/v1/worker/gpu/model_states/__init__.py
+index 06b5a92c3..983be393e 100644
+--- a/vllm/v1/worker/gpu/model_states/__init__.py
++++ b/vllm/v1/worker/gpu/model_states/__init__.py
+@@ -13,10 +13,17 @@ def init_model_state(
+     encoder_cache: EncoderCache | None,
+     device: torch.device,
+ ):
++    # Let the model provide its own ModelState if it defines one.
++    if hasattr(model, "get_model_state_cls"):
++        cls = model.get_model_state_cls()
++        return cls(vllm_config, model, encoder_cache, device)
++
++    architectures = vllm_config.model_config.architectures
++
+     if (
+-        "WhisperForConditionalGeneration" in vllm_config.model_config.architectures
+-        or "CohereAsrForConditionalGeneration" in vllm_config.model_config.architectures
++        "WhisperForConditionalGeneration" in architectures
++        or "CohereAsrForConditionalGeneration" in architectures
+     ):
+         from vllm.v1.worker.gpu.model_states.whisper import WhisperModelState
+
+         return WhisperModelState(vllm_config, model, encoder_cache, device)
+diff --git a/vllm/v1/worker/gpu/model_states/interface.py b/vllm/v1/worker/gpu/model_states/interface.py
+index 55bf8d473..86f28e08e 100644
+--- a/vllm/v1/worker/gpu/model_states/interface.py
++++ b/vllm/v1/worker/gpu/model_states/interface.py
+@@ -53,6 +53,9 @@ class ModelState(ABC):
+     def add_request(self, req_index: int, new_req_data: NewRequestData) -> None:
+         return None
+
++    def remove_request(self, req_id: str) -> None:
++        return None
++
+     def apply_staged_writes(self) -> None:
+         return None
+
+@@ -89,3 +92,16 @@ class ModelState(ABC):
+         for_capture: bool = False,
+     ) -> dict[str, Any]:
+         raise NotImplementedError
++
++    def custom_sampler(self, sampler: Any) -> tuple[Any, Any] | None:
++        """Wrap or replace the default sampler.
++
++        Called after model loading with the already-constructed base
++        ``Sampler``.  Return ``None`` to keep the defaults, or
++        ``(sampler, rejection_sampler | None)`` to override.
++        """
++        return None
++
++    num_new_sampled_tokens_per_step: int = 1
++    """New tokens sampled on each decode step
++    (excluding accepted draft tokens, a.k.a num bonus tokens)."""
+diff --git a/vllm/v1/worker/gpu/sample/output.py b/vllm/v1/worker/gpu/sample/output.py
+index f38ac8aff..130f4ddbf 100644
+--- a/vllm/v1/worker/gpu/sample/output.py
++++ b/vllm/v1/worker/gpu/sample/output.py
+@@ -13,3 +13,4 @@ class SamplerOutput:
+     logprobs_tensors: LogprobsTensors | None
+     num_nans: torch.Tensor | None
+     num_sampled: torch.Tensor | None
++    num_rejected: torch.Tensor | None = None
+diff --git a/vllm/v1/worker/gpu/sample/sampler.py b/vllm/v1/worker/gpu/sample/sampler.py
+index 6b545aef3..b269de9ea 100644
+--- a/vllm/v1/worker/gpu/sample/sampler.py
++++ b/vllm/v1/worker/gpu/sample/sampler.py
+@@ -12,7 +12,7 @@ from vllm.v1.sample.ops.topk_topp_sampler import (
+     flashinfer_sample,
+     flashinfer_sampler_supported,
+ )
+-from vllm.v1.worker.gpu.input_batch import InputBatch
++from vllm.v1.worker.gpu.input_batch import InputBatch, get_num_sampled_and_rejected
+ from vllm.v1.worker.gpu.metrics.logits import get_num_nans
+ from vllm.v1.worker.gpu.sample.bad_words import BadWordsState
+ from vllm.v1.worker.gpu.sample.gumbel import gumbel_sample
+@@ -44,6 +44,7 @@ class Sampler:
+         self.compute_nans = envs.VLLM_COMPUTE_NANS_IN_LOGITS  # False by default.
+         self.use_fp64_gumbel = use_fp64_gumbel
+
++        self.req_states = req_states
+         self.sampling_states = SamplingStates(max_num_reqs, vocab_size)
+         self.penalties_state = PenaltiesState(req_states)
+         self.logit_bias_state = LogitBiasState(max_num_reqs, device)
+@@ -118,6 +119,17 @@ class Sampler:
+         else:
+             logprobs_tensors = None
+
++        # 1 sampled token per request, except chunked-prefill requests
++        # (seq_len < prefill_len) which aren't done prefilling and produce no
++        # output token. num_rejected is always 0 here (one logit per request).
++        num_sampled, num_rejected = get_num_sampled_and_rejected(
++            input_batch.seq_lens.new_ones(input_batch.num_reqs),
++            input_batch.seq_lens,
++            input_batch.cu_num_logits,
++            input_batch.idx_mapping,
++            self.req_states.prefill_len.gpu,
++        )
++
+         # These are GPU tensors.
+         sampler_output = SamplerOutput(
+             # The sampled tokens are expanded to 2D tensor with shape
+@@ -126,7 +138,8 @@ class Sampler:
+             sampled_token_ids=sampled.view(-1, 1),
+             logprobs_tensors=logprobs_tensors,
+             num_nans=num_nans,
+-            num_sampled=input_batch.seq_lens.new_ones(input_batch.num_reqs),
++            num_sampled=num_sampled,
++            num_rejected=num_rejected,
+         )
+         return sampler_output
+
+diff --git a/vllm/v1/worker/gpu/spec_decode/rejection_sampler.py b/vllm/v1/worker/gpu/spec_decode/rejection_sampler.py
+index 1fe079a43..3868604d3 100644
+--- a/vllm/v1/worker/gpu/spec_decode/rejection_sampler.py
++++ b/vllm/v1/worker/gpu/spec_decode/rejection_sampler.py
+@@ -6,7 +6,10 @@ from vllm.config import SpeculativeConfig
+ from vllm.triton_utils import tl, triton
+ from vllm.v1.outputs import LogprobsTensors
+ from vllm.v1.spec_decode.utils import unconditional_to_conditional_rates
+-from vllm.v1.worker.gpu.input_batch import InputBatch
++from vllm.v1.worker.gpu.input_batch import (
++    InputBatch,
++    get_num_sampled_and_rejected,
++)
+ from vllm.v1.worker.gpu.metrics.logits import get_num_nans
+ from vllm.v1.worker.gpu.sample.logprob import compute_topk_logprobs
+ from vllm.v1.worker.gpu.sample.output import SamplerOutput
+@@ -136,9 +139,18 @@ class RejectionSampler:
+             else logits,
+         )
+
++        num_sampled, num_rejected = get_num_sampled_and_rejected(
++            num_sampled,
++            input_batch.seq_lens,
++            input_batch.cu_num_logits,
++            input_batch.idx_mapping,
++            self.sampler.req_states.prefill_len.gpu,
++        )
++
+         return SamplerOutput(
+             sampled_token_ids=sampled,
+             logprobs_tensors=logprobs_tensors,
+             num_nans=num_nans,
+             num_sampled=num_sampled,
++            num_rejected=num_rejected,
+         )
+diff --git a/vllm/v1/worker/gpu/structured_outputs.py b/vllm/v1/worker/gpu/structured_outputs.py
+index 34f00086d..0908b05ed 100644
+--- a/vllm/v1/worker/gpu/structured_outputs.py
++++ b/vllm/v1/worker/gpu/structured_outputs.py
+@@ -17,9 +17,24 @@ class StructuredOutputsWorker:
+         self.grammar_bitmask = torch.zeros(
+             (max_num_logits, cdiv(vocab_size, 32)), dtype=torch.int32, device=device
+         )
++        self.vocab_size = vocab_size
+         self.device = device
+         self.copy_stream = torch.cuda.Stream()
+
++    def _ensure_capacity(self, num_masks: int) -> None:
++        if num_masks <= self.grammar_bitmask.shape[0]:
++            return
++
++        new_size = max(num_masks, self.grammar_bitmask.shape[0] * 2)
++        self.logits_indices = torch.zeros(
++            new_size, dtype=torch.int32, device=self.device
++        )
++        self.grammar_bitmask = torch.zeros(
++            (new_size, cdiv(self.vocab_size, 32)),
++            dtype=torch.int32,
++            device=self.device,
++        )
++
+     def apply_grammar_bitmask(
+         self,
+         logits: torch.Tensor,
+@@ -30,12 +45,6 @@ class StructuredOutputsWorker:
+         if not grammar_req_ids:
+             return
+
+-        # Asynchronously copy the bitmask to GPU.
+-        with torch.cuda.stream(self.copy_stream):
+-            bitmask = async_copy_to_gpu(
+-                grammar_bitmask, out=self.grammar_bitmask[: grammar_bitmask.shape[0]]
+-            )
+-
+         # Construct bitmask -> logits mapping
+         mapping: list[int] = []
+         req_ids = input_batch.req_ids
+@@ -47,6 +56,31 @@ class StructuredOutputsWorker:
+             logits_end_idx = cu_num_logits[req_idx + 1]
+             mapping.extend(range(logits_start_idx, logits_end_idx))
+
++        if not mapping:
++            return
++
++        num_masks = grammar_bitmask.shape[0]
++        if num_masks != len(mapping):
++            if num_masks < len(mapping):
++                raise AssertionError(
++                    f"grammar bitmask has {num_masks} rows for "
++                    f"{len(mapping)} logits rows"
++                )
++
++            # Async scheduling can pad scheduled speculative tokens with -1
++            # placeholders. The CPU bitmask builder needs scratch rows for
++            # those placeholders, but the GPU worker only applies masks to the
++            # logits rows actually present in this sample call.
++            grammar_bitmask = grammar_bitmask[: len(mapping)]
++
++        self._ensure_capacity(grammar_bitmask.shape[0])
++
++        # Asynchronously copy the bitmask to GPU.
++        with torch.cuda.stream(self.copy_stream):
++            bitmask = async_copy_to_gpu(
++                grammar_bitmask, out=self.grammar_bitmask[: grammar_bitmask.shape[0]]
++            )
++
+         # Asynchronously copy the mapping to GPU.
+         with torch.cuda.stream(self.copy_stream):
+             logits_indices = torch.tensor(
+@@ -61,7 +95,6 @@ class StructuredOutputsWorker:
+         current_stream.wait_stream(self.copy_stream)
+
+         num_masks = bitmask.shape[0]
+-        assert num_masks == len(mapping)
+         vocab_size = logits.shape[-1]
+         BLOCK_SIZE = 8192
+         grid = (num_masks, triton.cdiv(vocab_size, BLOCK_SIZE))
+diff --git a/vllm/v1/worker/gpu/warmup.py b/vllm/v1/worker/gpu/warmup.py
+index 83d87c74a..e3a39dbb6 100644
+--- a/vllm/v1/worker/gpu/warmup.py
++++ b/vllm/v1/worker/gpu/warmup.py
+@@ -30,17 +30,18 @@ def warmup_kernels(
+     pipeline parallel coordination.
+
+     The first iteration simulates a prefill with requests of
+-    2 + num_spec_steps prompt tokens each. The second iteration simulates
+-    a decode step with all requests generating 1 + num_spec_steps tokens.
++    decode_query_len + 1 prompt tokens each. The second iteration simulates
++    a decode step with all requests generating decode_query_len tokens.
+     """
+     num_spec_steps = model_runner.num_speculative_steps
+-    # Use 1 + num_spec_steps + 1 tokens so the prefill batch's per-request
+-    # query length exceeds decode_query_len (= 1 + num_spec_steps), preventing
+-    # it from being misclassified as a uniform decode batch.
+-    prompt_len = 2 + num_spec_steps
++    decode_query_len = model_runner.decode_query_len
++    # Use decode_query_len + 1 tokens so the prefill batch's per-request query
++    # length exceeds decode_query_len, preventing it from being misclassified as
++    # a uniform decode batch.
++    prompt_len = decode_query_len + model_runner.decode_query_len
+     prompt_token_ids = list(range(prompt_len))
+-    # After prefill, decode generates 1 verified + num_spec_steps draft tokens.
+-    decode_len = prompt_len + 1 + num_spec_steps
++    # After prefill, decode generates decode_query_len tokens.
++    decode_len = prompt_len + decode_query_len
+
+     kv_cache_groups = model_runner.kv_cache_config.kv_cache_groups
+     num_kv_cache_groups = len(kv_cache_groups)
+@@ -57,7 +58,7 @@ def warmup_kernels(
+     num_reqs = min(
+         model_runner.scheduler_config.max_num_seqs,
+         model_runner.scheduler_config.max_num_batched_tokens
+-        // max(prompt_len, 1 + num_spec_steps),
++        // max(prompt_len, decode_query_len),
+         # Reserve block 0 (null block) and ensure we have enough blocks.
+         max(1, (model_runner.kv_cache_config.num_blocks - 1) // max_blocks_per_req),
+     )
+@@ -79,7 +80,7 @@ def warmup_kernels(
+         nonlocal next_block_id
+         return list(range(next_block_id, next_block_id := next_block_id + num_blocks))
+
+-    # Step 1: Prefill all requests with 2 + num_spec_steps prompt tokens each.
++    # Step 1: Prefill all requests with 1 + decode_query_len prompt tokens each.
+     new_reqs = [
+         NewRequestData.from_request(
+             Request(req_ids[i], prompt_token_ids, sampling_params, pooling_params),
+@@ -117,7 +118,7 @@ def warmup_kernels(
+
+         worker_sample_tokens(grammar_output)
+
+-        # Step 2: Decode all requests with 1 + num_spec_steps tokens each.
++        # Step 2: Decode all requests with decode_query_len tokens each.
+         cached_req_data = CachedRequestData.make_empty()
+         cached_req_data.req_ids = list(req_ids)
+         cached_req_data.num_computed_tokens = [prompt_len] * num_reqs
+@@ -131,7 +132,7 @@ def warmup_kernels(
+         decode_output = SchedulerOutput.make_empty()
+         decode_output.scheduled_cached_reqs = cached_req_data
+         decode_output.num_scheduled_tokens = {
+-            req_id: 1 + num_spec_steps for req_id in req_ids
++            req_id: decode_query_len for req_id in req_ids
+         }
+         if num_spec_steps > 0:
+             decode_output.scheduled_spec_decode_tokens = {

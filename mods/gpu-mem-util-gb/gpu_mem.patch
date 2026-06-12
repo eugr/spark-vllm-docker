@@ -163,8 +163,8 @@ diff --git a/vllm/v1/utils.py b/vllm/v1/utils.py
 index ba1db3282..acdaee5ae 100644
 --- a/vllm/v1/utils.py
 +++ b/vllm/v1/utils.py
-@@ -537,6 +537,9 @@ def report_usage_stats(
-             "dtype": str(vllm_config.model_config.dtype),
+@@ -678,6 +678,9 @@ def report_usage_stats(
+             "dtype": str(model_config.dtype),
              "block_size": vllm_config.cache_config.block_size,
              "gpu_memory_utilization": vllm_config.cache_config.gpu_memory_utilization,
 +            "gpu_memory_utilization_gb": (
@@ -172,7 +172,7 @@ index ba1db3282..acdaee5ae 100644
 +            ),
              "kv_cache_memory_bytes": vllm_config.cache_config.kv_cache_memory_bytes,
              # Quantization
-             "quantization": vllm_config.model_config.quantization,
+             "quantization": model_config.quantization,
 diff --git a/vllm/v1/worker/gpu_model_runner.py b/vllm/v1/worker/gpu_model_runner.py
 index d51bf2284..27b55114d 100644
 --- a/vllm/v1/worker/gpu_model_runner.py
