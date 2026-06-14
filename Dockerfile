@@ -396,10 +396,13 @@ RUN --mount=type=cache,id=uv-cache,target=/root/.cache/uv \
 
 # Install wheels from host ./wheels/ (bind-mounted from build context — no layer bloat)
 # With --tf5: override vLLM's transformers<5 constraint to get transformers>=5
+# FastAPI 0.137.0 adds _IncludedRouter entries that currently break
+# prometheus-fastapi-instrumentator route name lookup.
 RUN --mount=type=bind,source=wheels,target=/workspace/wheels \
     --mount=type=cache,id=uv-cache,target=/root/.cache/uv \
     PINNED_TORCH=$(python3 -c "import torch; print(torch.__version__)") && \
     echo "torch==${PINNED_TORCH}" > /tmp/wheel-override.txt && \
+    echo "fastapi[standard]>=0.115.0,<0.137.0" >> /tmp/wheel-override.txt && \
     if [ "$PRE_TRANSFORMERS" = "1" ]; then \
         echo "transformers>=5.0.0" >> /tmp/wheel-override.txt; \
     fi && \
@@ -421,6 +424,7 @@ ENV PATH=$VLLM_BASE_DIR:$PATH
 RUN --mount=type=cache,id=uv-cache,target=/root/.cache/uv \
     PINNED_TORCH=$(python3 -c "import torch; print(torch.__version__)") && \
     echo "torch==${PINNED_TORCH}" > /tmp/torch-override.txt && \
+    echo "fastapi[standard]>=0.115.0,<0.137.0" >> /tmp/torch-override.txt && \
     uv pip install ray[default] fastsafetensors instanttensor \
         --override /tmp/torch-override.txt
 
