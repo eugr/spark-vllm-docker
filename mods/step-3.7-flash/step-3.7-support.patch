@@ -975,7 +975,7 @@ diff --git a/vllm/model_executor/models/step3p5_mtp.py b/vllm/model_executor/mod
 +            try:
 +                _qname = str(quant_config.get_name())
 +            except Exception:
-+                _qname = type(quant_config).__name__
++                _qname = ""
 +        _mtp_unquant = "fp4" in _qname.lower()
 +        _vc = _copy.copy(vllm_config)
 +        if _mtp_unquant:
