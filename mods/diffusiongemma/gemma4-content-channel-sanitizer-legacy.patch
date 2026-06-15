@@ -1,9 +1,9 @@
 diff --git a/vllm/entrypoints/openai/chat_completion/serving.py b/vllm/entrypoints/openai/chat_completion/serving.py
 --- a/vllm/entrypoints/openai/chat_completion/serving.py
 +++ b/vllm/entrypoints/openai/chat_completion/serving.py
-@@ -72,6 +72,38 @@ if TYPE_CHECKING:
- logger = init_logger(__name__)
+@@ -78,6 +78,37 @@ if TYPE_CHECKING:
  
+ logger = init_logger(__name__)
  
 +_GEMMA4_REASONING_START = "<|channel>"
 +_GEMMA4_REASONING_END = "<channel|>"
@@ -36,11 +36,10 @@ diff --git a/vllm/entrypoints/openai/chat_completion/serving.py b/vllm/entrypoin
 +
 +    return "".join(result) or None
 +
-+
- def _get_mm_token_counts(engine_input: EngineInput) -> dict[str, int]:
-     """Sum per-modality placeholder tokens from ``mm_placeholders``.
  
-@@ -759,6 +791,9 @@ class OpenAIServingChat(OpenAIServing):
+ class OpenAIServingChat(OpenAIServing):
+     def __init__(
+@@ -759,6 +788,9 @@ class OpenAIServingChat(OpenAIServing):
                              continue
                          delta_message = DeltaMessage()
  
