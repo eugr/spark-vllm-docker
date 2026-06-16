@@ -1,0 +1,94 @@
+# Recipe: DeepSeek-V4-Flash (FP8 dense + MXFP4 MoE) on 2x DGX Spark GB10, served via the
+# community aidendle94 image (native B12X MXFP4 MoE backend, up to ~1M ctx), driven by the
+# eugr launcher. Supports both Ray and no-Ray.
+#
+# Launch:
+#   no-ray:  ./run-recipe.sh deepseek-v4-flash-fp8-aiden --no-ray -d
+#   ray:     ./run-recipe.sh deepseek-v4-flash-fp8-aiden -d        (see RAY note)
+#
+# This recipe runs a THIRD-PARTY image (aidendle94/sparkrun-vllm-ds4-gb10), not this repo's
+# own vllm-node build. Two things make it work with launch-cluster.sh:
+#  1) The image ships a custom entrypoint (dsv4-vllm-entrypoint) that activates its /opt/env
+#     venv + JIT cache env and then execs vllm. Because launch-cluster.sh runs the command via
+#     `docker exec` (which bypasses the entrypoint) and clears the entrypoint on the idle
+#     container, we invoke that entrypoint binary EXPLICITLY inside the command below. Do NOT
+#     pass --keep-entrypoint: that would make the idle `sleep infinity` run as
+#     `vllm sleep infinity` and crash the container.
+#  2) The image has WORKDIR=/tmp and no /workspace dir. launch-cluster.sh now creates
+#     /workspace before copying the launch script, so this runs out of the box.
+#
+# RAY note: the aiden image may not ship Ray; no-ray (PyTorch distributed) is the tested path.
+#
+# Model snapshot note: if your HF cache `refs/main` points at a commit that only carries
+# metadata (no weight shards), HF_HUB_OFFLINE resolution fails at load time with
+# "Cannot find any model weights" (the peer node then shows a downstream gloo
+# "Connection closed by peer", which is a symptom, not the cause). If you hit that, pin the
+# snapshot that actually has weights by adding `--revision <commit>` to the serve command.
+
+recipe_version: "1"
+name: DeepSeek-V4-Flash-FP8-Aiden
+description: deepseek-ai/DeepSeek-V4-Flash (FP8 + MXFP4 MoE) on 2x DGX Spark GB10 via the aidendle94 B12X image (Ray/no-Ray, ~1M ctx)
+
+model: deepseek-ai/DeepSeek-V4-Flash
+
+cluster_only: true
+container: aidendle94/sparkrun-vllm-ds4-gb10:production-v2
+
+build_args: []
+mods: []
+
+defaults:
+  port: 8000
+  host: 0.0.0.0
+  tensor_parallel: 2
+  gpu_memory_utilization: 0.82
+  max_model_len: 1000000
+  max_num_seqs: 6
+  max_num_batched_tokens: 8192
+  block_size: 256
+  served_model_name: deepseek-v4-flash
+  speculative_mtp: '{"method":"mtp","num_speculative_tokens":2}'
+
+env:
+  # HF + caches pointed at the launcher's default mounts (/root/.cache/*)
+  HF_HOME: /root/.cache/huggingface
+  HF_HUB_OFFLINE: "1"
+  TRANSFORMERS_OFFLINE: "1"
+  VLLM_CACHE_ROOT: /root/.cache/vllm
+  FLASHINFER_WORKSPACE_BASE: /root/.cache/flashinfer
+  TRITON_CACHE_DIR: /root/.triton
+  # aiden native MXFP4 MoE backend (B12X)
+  VLLM_USE_B12X_MOE: "1"
+  VLLM_SPARSE_INDEXER_MAX_LOGITS_MB: "256"
+  VLLM_ALLOW_LONG_MAX_MODEL_LEN: "1"
+  TORCH_CUDA_ARCH_LIST: "12.1a"
+  FLASHINFER_CUDA_ARCH_LIST: "12.1a"
+  NCCL_IGNORE_CPU_AFFINITY: "1"
+  NCCL_DEBUG: WARN
+
+# The command starts by invoking the entrypoint binary (NOT "vllm serve" directly: the venv is
+# not on PATH under docker exec). The entrypoint then execs vllm with these args.
+# run-recipe.py / make_node_script strip --distributed-executor-backend in --no-ray and inject
+# --nnodes/--node-rank/--master-* automatically.
+command: |
+  exec /usr/local/bin/dsv4-vllm-entrypoint serve deepseek-ai/DeepSeek-V4-Flash \
+    --served-model-name {served_model_name} \
+    --host {host} \
+    --port {port} \
+    --trust-remote-code \
+    --tensor-parallel-size {tensor_parallel} \
+    --pipeline-parallel-size 1 \
+    --distributed-executor-backend ray \
+    --kv-cache-dtype fp8 \
+    --block-size {block_size} \
+    --max-model-len {max_model_len} \
+    --max-num-seqs {max_num_seqs} \
+    --max-num-batched-tokens {max_num_batched_tokens} \
+    --gpu-memory-utilization {gpu_memory_utilization} \
+    --enable-prefix-caching \
+    --speculative-config '{speculative_mtp}' \
+    --tokenizer-mode deepseek_v4 \
+    --tool-call-parser deepseek_v4 \
+    --enable-auto-tool-choice \
+    --reasoning-parser deepseek_v4 \
+    --enable-flashinfer-autotune

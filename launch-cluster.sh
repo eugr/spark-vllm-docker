@@ -798,6 +798,9 @@ make_node_script() {
 copy_script_to_container() {
     local container="$1"; local script_path="$2"; local label="${3:-node}"
     echo "Copying launch script to $label..."
+    # Ensure /workspace exists: the repo's own image has it, but third-party vLLM images
+    # (e.g. custom community builds) may not. mkdir -p is a no-op when it already exists.
+    docker exec "$container" mkdir -p /workspace || { echo "Error: could not create /workspace in $label"; exit 1; }
     docker cp "$script_path" "$container:/workspace/exec-script.sh" || { echo "Error: docker cp to $label failed"; exit 1; }
     docker exec "$container" chmod +x /workspace/exec-script.sh
 }
@@ -809,7 +812,8 @@ copy_script_to_worker() {
     local remote_tmp="/tmp/vllm_script_$(date +%s)_$RANDOM.sh"
     scp -o BatchMode=yes -o StrictHostKeyChecking=no "$script_path" "$worker_ip:$remote_tmp" || { echo "Error: scp to $worker_ip failed"; exit 1; }
     ssh -o BatchMode=yes -o StrictHostKeyChecking=no "$worker_ip" \
-        "docker cp $remote_tmp $container:/workspace/exec-script.sh && \
+        "docker exec $container mkdir -p /workspace && \
+         docker cp $remote_tmp $container:/workspace/exec-script.sh && \
          docker exec $container chmod +x /workspace/exec-script.sh && \
          rm -f $remote_tmp" || { echo "Error: docker cp to worker $worker_ip failed"; exit 1; }
 }
