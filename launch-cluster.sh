@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
 # Default Configuration
 IMAGE_NAME="vllm-node"

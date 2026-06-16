@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # PROFILE: MiniMax-M2-AWQ Example
 # DESCRIPTION: vLLM serving MiniMax-M2-AWQ with Ray distributed backend
 

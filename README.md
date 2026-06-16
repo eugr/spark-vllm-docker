@@ -1552,7 +1552,7 @@ Launch scripts provide a simple way to define reusable model configurations. Ins
 Launch scripts are simple bash files that run directly inside the container:
 
 ```bash
-#!/bin/bash
+#!/usr/bin/env bash
 # PROFILE: OpenAI GPT-OSS 120B
 # DESCRIPTION: vLLM serving openai/gpt-oss-120b with FlashInfer MOE optimization
 

@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # PROFILE: OpenAI GPT-OSS 120B
 # DESCRIPTION: vLLM serving openai/gpt-oss-120b with FlashInfer MOE optimization
 

@@ -37,7 +37,7 @@ When using `--launch-script`, the `exec` action is automatically implied if no a
 Launch scripts are simple bash scripts. The script is copied into the container at `/workspace/exec-script.sh` and executed.
 
 ```bash
-#!/bin/bash
+#!/usr/bin/env bash
 # PROFILE: Human-readable name
 # DESCRIPTION: What this script does
 
@@ -56,7 +56,7 @@ vllm serve org/model-name \
 The `# PROFILE:` and `# DESCRIPTION:` comments are optional but recommended for documentation:
 
 ```bash
-#!/bin/bash
+#!/usr/bin/env bash
 # PROFILE: MiniMax-M2-AWQ Example
 # DESCRIPTION: vLLM serving MiniMax-M2-AWQ with Ray distributed backend
 ```
@@ -66,7 +66,7 @@ The `# PROFILE:` and `# DESCRIPTION:` comments are optional but recommended for 
 ### Basic vLLM Serving
 
 ```bash
-#!/bin/bash
+#!/usr/bin/env bash
 # PROFILE: MiniMax-M2-AWQ
 # DESCRIPTION: vLLM serving MiniMax-M2-AWQ with Ray distributed backend
 
@@ -85,7 +85,7 @@ vllm serve QuantTrio/MiniMax-M2-AWQ \
 ### With Environment Variables
 
 ```bash
-#!/bin/bash
+#!/usr/bin/env bash
 # PROFILE: OpenAI GPT-OSS 120B
 # DESCRIPTION: vLLM serving openai/gpt-oss-120b with FlashInfer MOE optimization
 
@@ -104,7 +104,7 @@ vllm serve openai/gpt-oss-120b \
 ### With Conditional Logic
 
 ```bash
-#!/bin/bash
+#!/usr/bin/env bash
 # PROFILE: Adaptive Model Server
 # DESCRIPTION: Adjusts settings based on available GPUs
 
@@ -130,7 +130,7 @@ vllm serve meta-llama/Llama-3.1-70B-Instruct \
 ### SGLang
 
 ```bash
-#!/bin/bash
+#!/usr/bin/env bash
 # PROFILE: SGLang Llama 3.1
 # DESCRIPTION: SGLang runtime with Llama 3.1
 
@@ -146,7 +146,7 @@ If your model requires patches, use `--apply-mod` alongside `--launch-script`:
 
 ```bash
 # Script: vllm-glm-4.7-nvfp4.sh
-#!/bin/bash
+#!/usr/bin/env bash
 # PROFILE: Salyut1/GLM-4.7-NVFP4
 # DESCRIPTION: vLLM serving GLM-4.7-NVFP4
 # NOTE: Requires --apply-mod mods/fix-Salyut1-GLM-4.7-NVFP4

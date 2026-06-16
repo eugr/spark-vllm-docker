@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
 # This mod will drop the FS caches every minute - useful to unstuck Qwen3.5-397B or other similar models during loading
 
