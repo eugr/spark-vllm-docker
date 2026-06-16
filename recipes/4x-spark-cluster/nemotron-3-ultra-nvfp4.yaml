@@ -15,8 +15,7 @@ container: vllm-node
 # Can only be run in a cluster
 cluster_only: true
 
-mods:
-  - mods/nemotron-ultra
+mods: []
 
 env:
   VLLM_FLOAT32_MATMUL_PRECISION: high
