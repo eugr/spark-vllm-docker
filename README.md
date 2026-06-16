@@ -1361,6 +1361,8 @@ When `--non-privileged` is specified:
 - RDMA devices are exposed via `--device=/dev/infiniband`
 - Resource limits are applied: memory (110GB), memory+swap (120GB), pids (4096)
 
+All launch modes set Docker's open-file ulimit to `1048576`, which avoids loader failures when highly sharded models are opened in parallel by Ray workers. Override it with `VLLM_SPARK_NOFILE_LIMIT` if your host requires a different value.
+
 These resource limits can be customized:
 ```bash
 ./launch-cluster.sh --non-privileged \
@@ -1380,6 +1382,7 @@ docker run -it --rm \
   --net=host \
   --ipc=host \
   --privileged \
+  --ulimit nofile=1048576:1048576 \
   --name vllm_node \
   -v ~/.cache/huggingface:/root/.cache/huggingface \
   vllm-node bash
@@ -1395,6 +1398,7 @@ Inside the container, run `vllm serve ...` directly for solo inference.
   * `--net=host`: **Required for cluster commands.** Ray and NCCL need full access to host network interfaces.
   * `--ipc=host`: **Recommended.** Allows shared memory access for PyTorch/NCCL. As an alternative, you can set it via `--shm-size=16g`.
   * `--privileged`: **Recommended for InfiniBand.** Grants the container access to RDMA devices (`/dev/infiniband`). As an alternative, you can pass `--ulimit memlock=-1 --ulimit stack=67108864 --device=/dev/infiniband`.
+  * `--ulimit nofile=1048576:1048576`: **Recommended for large sharded models.** Prevents `Too many open files` errors during parallel safetensors metadata loading.
 
 -----
 
