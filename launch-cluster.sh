@@ -742,8 +742,11 @@ apply_mod_to_container() {
     # 3. Run run.sh
     echo "  Running patch script on $node_ip..."
 
-    local local_exec_cmd="export WORKSPACE_DIR=$CONTAINER_WORKSPACE_DIR && cd $container_dest && chmod +x run.sh && ./run.sh"
-    local remote_exec_cmd="export WORKSPACE_DIR=$CONTAINER_WORKSPACE_DIR && cd $container_dest && chmod +x run.sh && ./run.sh"
+    # Preserve the container's default cwd for mods that copy files next to
+    # the eventual vLLM launch. The /workspace creation above only makes that
+    # default cwd safe for images that declare it but do not create it.
+    local local_exec_cmd="export WORKSPACE_DIR=\$PWD && cd $container_dest && chmod +x run.sh && ./run.sh"
+    local remote_exec_cmd="export WORKSPACE_DIR=\\\$PWD && cd $container_dest && chmod +x run.sh && ./run.sh"
     local ret_code=0
 
     if [[ "$is_local" == "true" ]]; then
