@@ -1,0 +1,27 @@
+diff --git a/vllm/v1/worker/gpu_worker.py b/vllm/v1/worker/gpu_worker.py
+index 81bf13898..7c3a8862b 100644
+--- a/vllm/v1/worker/gpu_worker.py
++++ b/vllm/v1/worker/gpu_worker.py
+@@ -727,6 +727,22 @@ class Worker(WorkerBase):
+     @instrument(span_name="Allocate KV cache")
+     def initialize_from_config(self, kv_cache_config: KVCacheConfig) -> None:
+         """Allocate GPU KV cache with the specified kv_cache_config."""
++        if self.device_config.device_type == "cuda":
++            gc.collect()
++            torch.accelerator.synchronize()
++            cached_memory = max(
++                torch.accelerator.memory_reserved(self.device)
++                - torch.accelerator.memory_allocated(self.device),
++                0,
++            )
++            torch.accelerator.empty_cache()
++            if cached_memory > 0:
++                logger.info_once(
++                    "Cleared %s GiB of cached CUDA allocator memory before "
++                    "KV cache allocation.",
++                    format_gib(cached_memory),
++                )
++
+         # Update local config with adjusted num blocks after profiling,
+         # so that it's available to the warmup stage.
+         self.cache_config.num_gpu_blocks = kv_cache_config.num_blocks

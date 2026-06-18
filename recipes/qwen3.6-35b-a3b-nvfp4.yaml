@@ -1,0 +1,50 @@
+# Recipe: Qwen3.6-35B-A3B-NVFP4-Marlin
+# Qwen3.6-35B-A3B model in NVIDIA NVFP4 format with Marlin MoE backend.
+
+recipe_version: "1"
+name: Qwen3.6-35B-A3B-NVFP4-Marlin
+description: vLLM serving nvidia/Qwen3.6-35B-A3B-NVFP4 with Marlin MoE backend
+
+# HuggingFace model to download (optional, for --download-model)
+model: nvidia/Qwen3.6-35B-A3B-NVFP4
+
+# Container image to use
+container: vllm-node
+
+# Default settings (can be overridden via CLI)
+defaults:
+  port: 8000
+  host: 0.0.0.0
+  tensor_parallel: 2
+  gpu_memory_utilization: 0.4
+  max_model_len: 262144
+  max_num_seqs: 4
+  max_num_batched_tokens: 8192
+
+# Environment variables
+env:
+  VLLM_MARLIN_USE_ATOMIC_ADD: 1
+
+# The vLLM serve command template
+command: |
+  vllm serve nvidia/Qwen3.6-35B-A3B-NVFP4 \
+    --host {host} \
+    --port {port} \
+    --tensor-parallel-size {tensor_parallel} \
+    --trust-remote-code \
+    --kv-cache-dtype auto \
+    --attention-backend flashinfer \
+    --moe-backend marlin \
+    --gpu-memory-utilization {gpu_memory_utilization} \
+    --max-model-len {max_model_len} \
+    --max-num-seqs {max_num_seqs} \
+    --max-num-batched-tokens {max_num_batched_tokens} \
+    --enable-chunked-prefill \
+    --async-scheduling \
+    --enable-prefix-caching \
+    --speculative-config '{{"method":"mtp","num_speculative_tokens":3,"moe_backend":"triton"}}' \
+    --load-format fastsafetensors \
+    --reasoning-parser qwen3 \
+    --tool-call-parser qwen3_xml \
+    --enable-auto-tool-choice \
+    --distributed-executor-backend ray
