@@ -19,6 +19,10 @@ VLLM_REF="main"
 VLLM_REF_SET=false
 FLASHINFER_REF="main"
 FLASHINFER_REF_SET=false
+DEFAULT_VLLM_PRS="43477"
+DEEPGEMM_REPO="https://github.com/deepseek-ai/DeepGEMM.git"
+DEEPGEMM_PR="324"
+DEEPGEMM_REF="9ca30487a6d1a484757f2d87f532c5f6707b9f25"
 TMP_IMAGE=""
 PARALLEL_COPY=false
 EXP_MXFP4=false
@@ -56,6 +60,9 @@ generate_build_metadata() {
     local pre_transformers="$6"
     local exp_mxfp4="$7"
     local vllm_prs="$8"
+    local deepgemm_ref="$9"
+    local deepgemm_commit="${10}"
+    local deepgemm_pr="${11}"
 
     local base_image
     base_image=$(grep -m1 '^FROM .* AS runner' "$dockerfile" | awk '{print $2}')
@@ -66,6 +73,7 @@ build_script_commit: $(git rev-parse HEAD 2>/dev/null || echo "unknown")
 vllm_version: ${vllm_version:-unknown}
 vllm_commit: ${vllm_commit:-unknown}
 flashinfer_commit: ${flashinfer_commit:-unknown}
+deepgemm_commit: ${deepgemm_commit:-unknown}
 gpu_arch: ${GPU_ARCH_LIST}
 base_image: ${base_image:-unknown}
 build_args:
@@ -73,6 +81,8 @@ build_args:
   transformers_5: ${pre_transformers}
   exp_mxfp4: ${exp_mxfp4}
   vllm_prs: "${vllm_prs}"
+  deepgemm_ref: "${deepgemm_ref}"
+  deepgemm_pr: "${deepgemm_pr}"
   build_jobs: ${BUILD_JOBS}
 EOF
     echo "Generated build-metadata.yaml"
@@ -384,7 +394,7 @@ usage() {
     echo "  -u, --user <user>             : Username for ssh command (default: \$USER)"
     echo "  --tf5                         : Install transformers>=5 (aliases: --pre-tf, --pre-transformers)"
     echo "  --exp-mxfp4, --experimental-mxfp4 : Build with experimental native MXFP4 support"
-    echo "  --apply-vllm-pr <pr-num>      : Apply a specific PR patch to vLLM source. Can be specified multiple times."
+    echo "  --apply-vllm-pr <pr-num>      : Apply an additional PR patch to vLLM source. Can be specified multiple times."
     echo "  --apply-flashinfer-pr <pr-num>: Apply a specific PR patch to FlashInfer source. Can be specified multiple times."
     echo "  --full-log                    : Enable full build logging (--progress=plain)"
     echo "  --no-build                    : Skip building, only copy image (requires --copy-to)"
@@ -538,6 +548,15 @@ if [ "$EXP_MXFP4" = true ]; then
     if [ "$REBUILD_VLLM" = true ]; then echo "Error: --exp-mxfp4 is incompatible with --rebuild-vllm"; exit 1; fi
 fi
 
+if [ "$EXP_MXFP4" = false ] && [ -n "$DEFAULT_VLLM_PRS" ]; then
+    for default_pr in $DEFAULT_VLLM_PRS; do
+        case " $VLLM_PRS " in
+            *" $default_pr "*) ;;
+            *) VLLM_PRS="${default_pr}${VLLM_PRS:+ $VLLM_PRS}" ;;
+        esac
+    done
+fi
+
 # Validate --no-build usage
 if [ "$NO_BUILD" = true ] && [ "${#COPY_HOSTS[@]}" -eq 0 ]; then
     echo "Error: --no-build requires --copy-to to be specified"
@@ -598,7 +617,7 @@ if [ "$NO_BUILD" = false ]; then
         MXFP4_VLLM_SHA=$(grep -m1 '^ARG VLLM_SHA=' Dockerfile.mxfp4 | cut -d= -f2)
         MXFP4_FLASHINFER_SHA=$(grep -m1 '^ARG FLASHINFER_SHA=' Dockerfile.mxfp4 | cut -d= -f2)
         generate_build_metadata Dockerfile.mxfp4 "unknown" "$MXFP4_VLLM_SHA" "$MXFP4_FLASHINFER_SHA" \
-            "mxfp4-pinned" "false" "true" ""
+            "mxfp4-pinned" "false" "true" "" "" "" ""
 
         CMD=("docker" "build" "-t" "$IMAGE_TAG" "${COMMON_BUILD_FLAGS[@]}" "-f" "Dockerfile.mxfp4" ".")
         echo "Building image with command: ${CMD[*]}"
@@ -714,7 +733,10 @@ if [ "$NO_BUILD" = false ]; then
                 "--target" "vllm-export"
                 "--output" "type=local,dest=./wheels"
                 "${COMMON_BUILD_FLAGS[@]}"
-                "--build-arg" "VLLM_REF=$VLLM_REF")
+                "--build-arg" "VLLM_REF=$VLLM_REF"
+                "--build-arg" "DEEPGEMM_REPO=$DEEPGEMM_REPO"
+                "--build-arg" "DEEPGEMM_PR=$DEEPGEMM_PR"
+                "--build-arg" "DEEPGEMM_REF=$DEEPGEMM_REF")
 
             if [ "$REBUILD_VLLM" = true ]; then
                 VLLM_CMD+=("--build-arg" "CACHEBUST_VLLM=$(date +%s)")
@@ -755,8 +777,10 @@ if [ "$NO_BUILD" = false ]; then
         [ -f "./wheels/.vllm-commit" ] && VLLM_COMMIT=$(cat ./wheels/.vllm-commit)
         FLASHINFER_COMMIT=""
         [ -f "./wheels/.flashinfer-commit" ] && FLASHINFER_COMMIT=$(cat ./wheels/.flashinfer-commit)
+        DEEPGEMM_COMMIT=""
+        [ -f "./wheels/.deepgemm-commit" ] && DEEPGEMM_COMMIT=$(cat ./wheels/.deepgemm-commit)
         generate_build_metadata Dockerfile "$VLLM_VERSION" "$VLLM_COMMIT" "$FLASHINFER_COMMIT" \
-            "$VLLM_REF" "$PRE_TRANSFORMERS" "false" "$VLLM_PRS"
+            "$VLLM_REF" "$PRE_TRANSFORMERS" "false" "$VLLM_PRS" "$DEEPGEMM_REF" "$DEEPGEMM_COMMIT" "$DEEPGEMM_PR"
 
         RUNNER_CMD=("docker" "build"
             "-t" "$IMAGE_TAG"

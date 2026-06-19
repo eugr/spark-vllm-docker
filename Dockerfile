@@ -102,6 +102,7 @@ RUN --mount=type=cache,id=uv-cache,target=/root/.cache/uv \
 
 # Smart Git Clone (Fetch changes instead of full re-clone)
 RUN --mount=type=cache,id=repo-cache,target=/repo-cache \
+    echo "CACHEBUST_FLASHINFER=${CACHEBUST_FLASHINFER}" && \
     cd /repo-cache && \
     if [ ! -d "flashinfer" ]; then \
         echo "Cache miss: Cloning FlashInfer from scratch..." && \
@@ -134,7 +135,7 @@ RUN if [ -n "$FLASHINFER_PRS" ]; then \
         echo "Applying PRs: $FLASHINFER_PRS"; \
         for pr in $FLASHINFER_PRS; do \
             echo "Fetching and merging PR #$pr..."; \
-            git fetch origin pull/${pr}/head:pr-${pr}; \
+            git fetch origin +pull/${pr}/head:pr-${pr}; \
             git merge pr-${pr} --no-edit; \
         done; \
     fi
@@ -187,8 +188,15 @@ ARG CACHEBUST_VLLM=1
 # Git reference (branch, tag, or SHA) to checkout
 ARG VLLM_REF=main
 
+# DeepGEMM PR #324 is required by vLLM PR #43477 for SM120/SM121 MXFP4 paths.
+ARG DEEPGEMM_REPO=https://github.com/deepseek-ai/DeepGEMM.git
+ARG DEEPGEMM_PR=324
+ARG DEEPGEMM_REF=9ca30487a6d1a484757f2d87f532c5f6707b9f25
+ENV DEEPGEMM_SRC_DIR=/workspace/DeepGEMM
+
 # Smart Git Clone (Fetch changes instead of full re-clone)
 RUN --mount=type=cache,id=repo-cache,target=/repo-cache \
+    echo "CACHEBUST_VLLM=${CACHEBUST_VLLM}" && \
     cd /repo-cache && \
     if [ ! -d "vllm" ]; then \
         echo "Cache miss: Cloning vLLM from scratch..." && \
@@ -209,9 +217,33 @@ RUN --mount=type=cache,id=repo-cache,target=/repo-cache \
     fi && \
     cp -a /repo-cache/vllm $VLLM_BASE_DIR/
 
+RUN --mount=type=cache,id=repo-cache,target=/repo-cache \
+    set -eux; \
+    cd /repo-cache; \
+    if [ ! -d "deepgemm" ]; then \
+        echo "Cache miss: Cloning DeepGEMM from scratch..."; \
+        git clone --recursive "$DEEPGEMM_REPO" deepgemm; \
+    else \
+        echo "Cache hit: Fetching DeepGEMM updates..."; \
+        cd deepgemm; \
+        git fetch origin; \
+        git fetch origin --tags --force; \
+        cd ..; \
+    fi; \
+    cd deepgemm; \
+    if [ -n "$DEEPGEMM_PR" ]; then \
+        git fetch origin +pull/${DEEPGEMM_PR}/head:pr-${DEEPGEMM_PR}; \
+    fi; \
+    git checkout --detach "$DEEPGEMM_REF"; \
+    git reset --hard; \
+    git submodule update --init --recursive; \
+    git clean -fdx; \
+    rm -rf "$DEEPGEMM_SRC_DIR"; \
+    cp -a /repo-cache/deepgemm "$DEEPGEMM_SRC_DIR"
+
 WORKDIR $VLLM_BASE_DIR/vllm
 
-ARG VLLM_PRS=""
+ARG VLLM_PRS="43477"
 
 RUN if [ -n "$VLLM_PRS" ]; then \
         # Git requires a user identity to create merge commits
@@ -221,7 +253,7 @@ RUN if [ -n "$VLLM_PRS" ]; then \
         echo "Applying PRs: $VLLM_PRS"; \
         for pr in $VLLM_PRS; do \
             echo "Fetching and merging PR #$pr..."; \
-            git fetch origin pull/${pr}/head:pr-${pr}; \
+            git fetch origin +pull/${pr}/head:pr-${pr}; \
             git merge pr-${pr} --no-edit; \
         done; \
     fi
@@ -332,7 +364,8 @@ RUN --mount=type=cache,id=ccache,target=/root/.ccache \
     --mount=type=cache,id=uv-cache,target=/root/.cache/uv \
     uv build --no-build-isolation --wheel . --out-dir=/workspace/wheels -v && \
     # dump git ref in the wheels dir
-    git rev-parse HEAD > /workspace/wheels/.vllm-commit
+    git rev-parse HEAD > /workspace/wheels/.vllm-commit && \
+    git -C "$DEEPGEMM_SRC_DIR" rev-parse HEAD > /workspace/wheels/.deepgemm-commit
 
 # =========================================================
 # STAGE 5: vLLM Wheel Export
