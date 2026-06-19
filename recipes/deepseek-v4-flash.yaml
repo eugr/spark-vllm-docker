@@ -1,0 +1,71 @@
+# Recipe: DeepSeek-V4-Flash official FP8 on dual DGX Spark
+# Based on vLLM PR #41834 head 8f93ea34 (2026-06-19), including SM12x prefill and prefix-cache fixes.
+# Keep CUDA graphs enabled; do not add --enforce-eager.
+
+recipe_version: "1"
+name: DeepSeek-V4-Flash
+# Official DeepSeek V4 Flash FP8 model on dual DGX Spark TP=2.
+description: DeepSeek V4 Flash FP8 on dual DGX Spark TP=2 with PR 41834 SM12x support, MTP disabled for stable concurrent serving
+model: deepseek-ai/DeepSeek-V4-Flash
+container: vllm-node-dsv4
+cluster_only: true
+
+build_args:
+  - --vllm-repo
+  - https://github.com/jasl/vllm.git
+  - --vllm-ref
+  - 8f93ea34c0805c8162343a17072811ae256ffa57
+  - --rebuild-vllm
+
+mods: []
+
+defaults:
+  port: 8000
+  host: 0.0.0.0
+  tensor_parallel: 2
+  pipeline_parallel: 1
+  gpu_memory_utilization: 0.85
+  max_model_len: 200000
+  max_num_batched_tokens: 4096
+  max_num_seqs: 2
+  block_size: 256
+  served_model_name: deepseek-v4-flash
+
+env:
+  TORCH_CUDA_ARCH_LIST: 12.1a
+  VLLM_ALLOW_LONG_MAX_MODEL_LEN: 1
+  VLLM_TRITON_MLA_SPARSE: 1
+  VLLM_DEEPSEEK_V4_FLASHINFER_SM120_DECODE: 1
+  FLASHINFER_DISABLE_VERSION_CHECK: 1
+  TILELANG_CLEANUP_TEMP_FILES: 1
+  DG_JIT_USE_NVRTC: 0
+  DG_JIT_NVCC_COMPILER: /usr/local/cuda/bin/nvcc
+  DG_JIT_PRINT_COMPILER_COMMAND: 1
+  NCCL_IB_DISABLE: 0
+  NCCL_DEBUG: WARN
+
+command: |
+  vllm serve deepseek-ai/DeepSeek-V4-Flash \
+      --served-model-name {served_model_name} \
+      --host {host} \
+      --port {port} \
+      --trust-remote-code \
+      --tensor-parallel-size {tensor_parallel} \
+      --pipeline-parallel-size {pipeline_parallel} \
+      --kv-cache-dtype fp8 \
+      --block-size {block_size} \
+      --enable-prefix-caching \
+      --enable-flashinfer-autotune \
+      --max-model-len {max_model_len} \
+      --max-num-seqs {max_num_seqs} \
+      --max-num-batched-tokens {max_num_batched_tokens} \
+      --gpu-memory-utilization {gpu_memory_utilization} \
+      --distributed-executor-backend ray \
+      --compilation-config '{{"cudagraph_mode":"FULL_AND_PIECEWISE","custom_ops":["all"]}}' \
+      --tokenizer-mode deepseek_v4 \
+      --tool-call-parser deepseek_v4 \
+      --enable-auto-tool-choice \
+      --reasoning-parser deepseek_v4 \
+      --reasoning-config '{{"reasoning_parser":"deepseek_v4","reasoning_start_str":"<think>","reasoning_end_str":"</think>"}}' \
+      --default-chat-template-kwargs '{{"thinking":true}}' \
+      --load-format safetensors
