@@ -9,6 +9,7 @@ ATTENTION_LEGACY_PATCH_FILE="$MOD_DIR/diffusiongemma-attention-legacy.patch"
 ATTENTION_MAIN_PATCH_FILE="$MOD_DIR/diffusiongemma-attention-main.patch"
 STREAMING_REASONING_PATCH_FILE="$MOD_DIR/gemma4-streaming-reasoning.patch"
 CONTENT_CHANNEL_SANITIZER_PATCH_FILE="$MOD_DIR/gemma4-content-channel-sanitizer.patch"
+CONTENT_CHANNEL_SANITIZER_LEGACY_PATCH_FILE="$MOD_DIR/gemma4-content-channel-sanitizer-legacy.patch"
 CHAT_TEMPLATE_FILE="$MOD_DIR/chat_template_no_think.jinja"
 PATCH_EXCLUDES=(
   --exclude="benchmarks/*"
@@ -56,6 +57,14 @@ has_gemma4_content_channel_sanitizer_patch() {
     has_marker "vllm/reasoning/gemma4_reasoning_parser.py" "wait_for_end=True"
 }
 
+has_gemma4_engine_parser_patch() {
+  has_marker "vllm/parser/gemma4.py" "class Gemma4Parser(ParserEngine)" &&
+    has_marker "vllm/parser/gemma4.py" "def _preprocess_feed(" &&
+    has_marker "vllm/parser/engine/registered_adapters.py" "Gemma4ParserReasoningAdapter" &&
+    has_marker "vllm/reasoning/gemma4_engine_reasoning_parser.py" "Gemma4ParserReasoningAdapter" &&
+    has_marker "vllm/tool_parsers/gemma4_engine_tool_parser.py" "Gemma4EngineToolParser"
+}
+
 has_diffusiongemma_attention_patch() {
   has_marker "vllm/v1/attention/backends/flash_attn.py" "dynamic_causal=dynamic_causal" &&
     has_marker "vllm/vllm_flash_attn/flash_attn_interface.py" "dynamic_causal: \"torch.Tensor | None\" = None"
@@ -66,6 +75,14 @@ select_attention_patch() {
     echo "$ATTENTION_MAIN_PATCH_FILE"
   else
     echo "$ATTENTION_LEGACY_PATCH_FILE"
+  fi
+}
+
+select_content_channel_sanitizer_patch() {
+  if has_marker "vllm/entrypoints/openai/chat_completion/serving.py" "_get_mm_token_counts"; then
+    echo "$CONTENT_CHANNEL_SANITIZER_PATCH_FILE"
+  else
+    echo "$CONTENT_CHANNEL_SANITIZER_LEGACY_PATCH_FILE"
   fi
 }
 
@@ -112,7 +129,9 @@ else
   exit 1
 fi
 
-if [ ! -f "$STREAMING_REASONING_PATCH_FILE" ]; then
+if has_gemma4_engine_parser_patch; then
+  echo "[diffusiongemma] Installed vLLM already has Gemma4 engine parser support; skipping Gemma4 streaming reasoning patch."
+elif [ ! -f "$STREAMING_REASONING_PATCH_FILE" ]; then
   echo "[diffusiongemma] Gemma4 streaming reasoning patch not found: $STREAMING_REASONING_PATCH_FILE" >&2
   exit 1
 elif ! command -v git >/dev/null 2>&1; then
@@ -131,7 +150,11 @@ else
   exit 1
 fi
 
-if [ ! -f "$CONTENT_CHANNEL_SANITIZER_PATCH_FILE" ]; then
+CONTENT_CHANNEL_SANITIZER_PATCH_FILE="$(select_content_channel_sanitizer_patch)"
+
+if has_gemma4_engine_parser_patch; then
+  echo "[diffusiongemma] Installed vLLM already has Gemma4 engine parser support; skipping Gemma4 content channel sanitizer patch."
+elif [ ! -f "$CONTENT_CHANNEL_SANITIZER_PATCH_FILE" ]; then
   echo "[diffusiongemma] Gemma4 content channel sanitizer patch not found: $CONTENT_CHANNEL_SANITIZER_PATCH_FILE" >&2
   exit 1
 elif ! command -v git >/dev/null 2>&1; then

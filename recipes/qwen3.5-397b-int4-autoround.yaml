@@ -21,6 +21,7 @@ build_args:
 mods:
   - mods/fix-qwen3.5-chat-template
   - mods/gpu-mem-util-gb
+  - mods/kv-cache-prealloc-cleanup
   - mods/drop-caches
 
 # Default settings (can be overridden via CLI)
@@ -29,12 +30,14 @@ defaults:
   host: 0.0.0.0
   tensor_parallel: 2
   gpu_memory_utilization: 108
+  kv_cache_memory_bytes: 2415919104
   max_model_len: 262144
   max_num_batched_tokens: 4176
 
 # Environment variables
-env: 
+env:
   VLLM_MARLIN_USE_ATOMIC_ADD: 1
+  VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS: 0
 
 # The vLLM serve command template
 command: |
@@ -43,6 +46,7 @@ command: |
     --max-num-seqs 2 \
     --kv-cache-dtype fp8 \
     --gpu-memory-utilization-gb {gpu_memory_utilization} \
+    --kv-cache-memory-bytes {kv_cache_memory_bytes} \
     --port {port} \
     --host {host} \
     --enable-prefix-caching \
@@ -52,7 +56,7 @@ command: |
     --max-num-batched-tokens {max_num_batched_tokens} \
     --trust-remote-code \
     --chat-template unsloth.jinja \
+    --load-format instanttensor \
     -tp {tensor_parallel} \
     --distributed-executor-backend ray
 
-  

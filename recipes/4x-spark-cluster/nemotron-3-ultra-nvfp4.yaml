@@ -1,0 +1,62 @@
+# Recipe: Nemotron-3-Ultra-NVFP4
+# Nemotron-3-Ultra-550B-A55B NVFP4, TP=4 across 4 DGX Spark nodes
+# Intended for no-ray multi-node launch with the nemotron-ultra mod applied.
+
+recipe_version: "1"
+name: Nemotron-3-Ultra-NVFP4
+description: vLLM serving Nemotron-3-Ultra-550B-A55B-NVFP4 with TP=4 across 4 DGX Spark nodes
+
+# HuggingFace model to download (optional, for --download-model)
+model: nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-NVFP4
+
+# Container image to use
+container: vllm-node
+
+# Can only be run in a cluster
+cluster_only: true
+
+mods: []
+
+env:
+  VLLM_FLOAT32_MATMUL_PRECISION: high
+
+defaults:
+  port: 8000
+  host: 0.0.0.0
+  tensor_parallel: 4
+  gpu_memory_utilization: 0.85
+  max_model_len: 262144
+  max_num_seqs: 2
+  max_num_batched_tokens: 16384
+
+command: |
+  vllm serve nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-NVFP4 \
+    --tensor-parallel-size {tensor_parallel} \
+    --distributed-executor-backend ray \
+    --host {host} \
+    --port {port} \
+    --dtype auto \
+    --max-model-len {max_model_len} \
+    --gpu-memory-utilization {gpu_memory_utilization} \
+    --max-num-seqs {max_num_seqs} \
+    --load-format instanttensor \
+    --attention-backend TRITON_ATTN \
+    --max-num-batched-tokens {max_num_batched_tokens} \
+    --uvicorn-log-level warning \
+    --disable-uvicorn-access-log \
+    --kv-cache-dtype fp8 \
+    --moe-backend marlin \
+    --mamba-cache-mode align \
+    --mamba_ssm_cache_dtype float32 \
+    --generation-config vllm \
+    --no-scheduler-reserve-full-isl \
+    --max-parallel-loading-workers 1 \
+    -cc.mode 0 \
+    -cc.cudagraph_mode FULL_DECODE_ONLY \
+    --cudagraph-capture-sizes 5 10 15 20 \
+    --speculative-config '{{"method":"mtp","num_speculative_tokens":4,"moe_backend":"triton","attention_backend":"TRITON_ATTN"}}' \
+    --enable-prefix-caching \
+    --enable-flashinfer-autotune \
+    --reasoning-parser nemotron_v3 \
+    --enable-auto-tool-choice \
+    --tool-call-parser qwen3_xml

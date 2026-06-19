@@ -4,6 +4,8 @@
 IMAGE_NAME="vllm-node"
 DEFAULT_CONTAINER_NAME="vllm_node"
 HF_CACHE_DIR="${HF_HOME:-$HOME/.cache/huggingface}"
+CONTAINER_WORKSPACE_DIR="/workspace"
+CONTAINER_EXEC_SCRIPT="$CONTAINER_WORKSPACE_DIR/exec-script.sh"
 # Modify these if you want to pass additional docker args or set VLLM_SPARK_EXTRA_DOCKER_ARGS variable
 DOCKER_ARGS="-e NCCL_IGNORE_CPU_AFFINITY=1 -v $HF_CACHE_DIR:/root/.cache/huggingface"
 
@@ -44,6 +46,7 @@ MEM_LIMIT_GB="110"
 MEM_SWAP_LIMIT_GB=""
 PIDS_LIMIT="4096"
 SHM_SIZE_GB="64"
+NOFILE_LIMIT="${VLLM_SPARK_NOFILE_LIMIT:-1048576}"
 PORT_MAPPINGS=()
 
 # Function to print usage
@@ -76,6 +79,9 @@ usage() {
   --setup/--discover  Force autodiscovery and save configuration (even if .env exists)"
     echo "  action          start | stop | status | exec (Default: start). Not compatible with --launch-script."
     echo "  command         Command to run (only for 'exec' action). Not compatible with --launch-script."
+    echo ""
+    echo "Environment overrides:"
+    echo "  VLLM_SPARK_NOFILE_LIMIT  Docker nofile ulimit for containers (default: 1048576)"
     echo ""
     echo "Supported .env file variables:"
     echo "  CLUSTER_NODES       Comma-separated list of node IPs"
@@ -290,6 +296,11 @@ else
     done
 fi
 
+if ! [[ "$NOFILE_LIMIT" =~ ^[1-9][0-9]*$ ]]; then
+    echo "Error: VLLM_SPARK_NOFILE_LIMIT must be a positive integer, got: $NOFILE_LIMIT"
+    exit 1
+fi
+
 # Append NCCL_DEBUG if set, with validation
 if [[ -n "$NCCL_DEBUG_VAL" ]]; then
     case "$NCCL_DEBUG_VAL" in
@@ -371,7 +382,7 @@ if [[ -n "$LAUNCH_SCRIPT_PATH" ]]; then
     echo "Using launch script: $LAUNCH_SCRIPT_PATH"
     
     # Set command to run the copied script (use absolute path since docker exec may not be in /workspace)
-    COMMAND_TO_RUN="/workspace/exec-script.sh"
+    COMMAND_TO_RUN="$CONTAINER_EXEC_SCRIPT"
     LAUNCH_SCRIPT_MODE="true"
 
     # If launch script is specified, default action to exec unless explicitly set to stop/status
@@ -686,7 +697,7 @@ apply_mod_to_container() {
     fi
 
     # 2. Copy into container
-    local container_dest="/workspace/mods/$mod_name"
+    local container_dest="$CONTAINER_WORKSPACE_DIR/mods/$mod_name"
     
     # Command prefix for remote vs local
     local cmd_prefix=""
@@ -694,8 +705,12 @@ apply_mod_to_container() {
         cmd_prefix="ssh -o BatchMode=yes -o StrictHostKeyChecking=no $node_ip"
     fi
 
-    # Create workspace in container
-    $cmd_prefix docker exec "$container" mkdir -p "$container_dest"
+    # Create workspace in container. Run from / because some images configure
+    # /workspace as WORKDIR but do not create it, which breaks docker exec.
+    $cmd_prefix docker exec -w / "$container" mkdir -p "$container_dest" || {
+        echo "Error: Failed to create $container_dest in container on $node_ip"
+        exit 1
+    }
 
     if [[ "$mod_type" == "zip" ]]; then
         local zip_name=$(basename "$mod_path")
@@ -725,6 +740,9 @@ apply_mod_to_container() {
     # 3. Run run.sh
     echo "  Running patch script on $node_ip..."
 
+    # Preserve the container's default cwd for mods that copy files next to
+    # the eventual vLLM launch. The /workspace creation above only makes that
+    # default cwd safe for images that declare it but do not create it.
     local local_exec_cmd="export WORKSPACE_DIR=\$PWD && cd $container_dest && chmod +x run.sh && ./run.sh"
     local remote_exec_cmd="export WORKSPACE_DIR=\\\$PWD && cd $container_dest && chmod +x run.sh && ./run.sh"
     local ret_code=0
@@ -794,12 +812,30 @@ make_node_script() {
     echo "$tmp"
 }
 
-# Copy a script file into a local container as /workspace/exec-script.sh
+ensure_container_workspace() {
+    local node_ip="$1"; local container="$2"; local is_local="$3"
+
+    if [[ "$is_local" == "true" ]]; then
+        docker exec -w / "$container" mkdir -p "$CONTAINER_WORKSPACE_DIR" || {
+            echo "Error: Failed to create $CONTAINER_WORKSPACE_DIR in container on $node_ip"
+            exit 1
+        }
+    else
+        ssh -o BatchMode=yes -o StrictHostKeyChecking=no "$node_ip" \
+            "docker exec -w / $container mkdir -p $CONTAINER_WORKSPACE_DIR" || {
+            echo "Error: Failed to create $CONTAINER_WORKSPACE_DIR in container on $node_ip"
+            exit 1
+        }
+    fi
+}
+
+# Copy a script file into a local container as $CONTAINER_EXEC_SCRIPT
 copy_script_to_container() {
     local container="$1"; local script_path="$2"; local label="${3:-node}"
     echo "Copying launch script to $label..."
-    docker cp "$script_path" "$container:/workspace/exec-script.sh" || { echo "Error: docker cp to $label failed"; exit 1; }
-    docker exec "$container" chmod +x /workspace/exec-script.sh
+    ensure_container_workspace "$HEAD_IP" "$container" "true"
+    docker cp "$script_path" "$container:$CONTAINER_EXEC_SCRIPT" || { echo "Error: docker cp to $label failed"; exit 1; }
+    docker exec -w / "$container" chmod +x "$CONTAINER_EXEC_SCRIPT"
 }
 
 # Copy a script file to a remote container via scp + docker cp
@@ -807,10 +843,11 @@ copy_script_to_worker() {
     local worker_ip="$1"; local container="$2"; local script_path="$3"
     echo "Copying launch script to worker $worker_ip..."
     local remote_tmp="/tmp/vllm_script_$(date +%s)_$RANDOM.sh"
+    ensure_container_workspace "$worker_ip" "$container" "false"
     scp -o BatchMode=yes -o StrictHostKeyChecking=no "$script_path" "$worker_ip:$remote_tmp" || { echo "Error: scp to $worker_ip failed"; exit 1; }
     ssh -o BatchMode=yes -o StrictHostKeyChecking=no "$worker_ip" \
-        "docker cp $remote_tmp $container:/workspace/exec-script.sh && \
-         docker exec $container chmod +x /workspace/exec-script.sh && \
+        "docker cp $remote_tmp $container:$CONTAINER_EXEC_SCRIPT && \
+         docker exec -w / $container chmod +x $CONTAINER_EXEC_SCRIPT && \
          rm -f $remote_tmp" || { echo "Error: docker cp to worker $worker_ip failed"; exit 1; }
 }
 
@@ -883,10 +920,10 @@ start_cluster() {
     if [[ "$NON_PRIVILEGED_MODE" == "true" ]]; then
         echo "Running in non-privileged mode..."
         docker_caps_args="--cap-add=IPC_LOCK"
-        docker_resource_args="--shm-size=${SHM_SIZE_GB}g --device=/dev/infiniband --memory ${MEM_LIMIT_GB}g --memory-swap ${MEM_SWAP_LIMIT_GB}g --pids-limit ${PIDS_LIMIT}"
+        docker_resource_args="--ulimit nofile=${NOFILE_LIMIT}:${NOFILE_LIMIT} --shm-size=${SHM_SIZE_GB}g --device=/dev/infiniband --memory ${MEM_LIMIT_GB}g --memory-swap ${MEM_SWAP_LIMIT_GB}g --pids-limit ${PIDS_LIMIT}"
     else
         docker_caps_args="--privileged"
-        docker_resource_args="--ipc=host"
+        docker_resource_args="--ulimit nofile=${NOFILE_LIMIT}:${NOFILE_LIMIT} --ipc=host"
     fi
 
     # Start Head Node

@@ -257,10 +257,13 @@ RUN mkdir -p tiktoken_encodings && \
     wget -O tiktoken_encodings/cl100k_base.tiktoken "https://openaipublic.blob.core.windows.net/encodings/cl100k_base.tiktoken"
 
 # Copy artifacts from Builder Stage
+# FastAPI 0.137.0 adds _IncludedRouter entries that currently break
+# prometheus-fastapi-instrumentator route name lookup.
 RUN --mount=type=bind,from=builder,source=/workspace/wheels,target=/mount/wheels \
     --mount=type=cache,id=uv-cache,target=/root/.cache/uv \
     PINNED_TORCH=$(python3 -c "import torch; print(torch.__version__)") && \
     echo "torch==${PINNED_TORCH}" > /tmp/wheel-override.txt && \
+    echo "fastapi[standard]>=0.115.0,<0.137.0" >> /tmp/wheel-override.txt && \
     uv pip install /mount/wheels/*.whl --override /tmp/wheel-override.txt
 
 # Setup environment vars for runtime
@@ -278,6 +281,7 @@ ENV PATH=$VLLM_BASE_DIR:$PATH
 RUN --mount=type=cache,id=uv-cache,target=/root/.cache/uv \
     PINNED_TORCH=$(python3 -c "import torch; print(torch.__version__)") && \
     echo "torch==${PINNED_TORCH}" > /tmp/torch-override.txt && \
+    echo "fastapi[standard]>=0.115.0,<0.137.0" >> /tmp/torch-override.txt && \
     uv pip install ray[default] fastsafetensors "nvidia-nvshmem-cu13<3.6" \
         --override /tmp/torch-override.txt
 
