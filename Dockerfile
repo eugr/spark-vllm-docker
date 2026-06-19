@@ -211,25 +211,6 @@ RUN --mount=type=cache,id=repo-cache,target=/repo-cache \
 
 WORKDIR $VLLM_BASE_DIR/vllm
 
-# TEMPORARY PATCH: DeepSeek V4 Flash SM12x / DGX Spark enablement.
-ARG VLLM_DEEPSEEK_V4_PR=41834
-RUN set -eux; \
-    if [ -n "$VLLM_DEEPSEEK_V4_PR" ]; then \
-        git config --global user.email "builder@example.com"; \
-        git config --global user.name "Docker Builder"; \
-        if [ -f vllm/envs.py ] && grep -Fq "VLLM_DEEPSEEK_V4_FLASHINFER_SM120_DECODE" vllm/envs.py; then \
-            echo "DeepSeek V4 SM12x marker already present; skipping PR #${VLLM_DEEPSEEK_V4_PR}."; \
-        else \
-            echo "Applying DeepSeek V4 Flash SM12x PR #${VLLM_DEEPSEEK_V4_PR}..."; \
-            git fetch origin "+pull/${VLLM_DEEPSEEK_V4_PR}/head:refs/heads/pr-${VLLM_DEEPSEEK_V4_PR}"; \
-            if git merge-base --is-ancestor "pr-${VLLM_DEEPSEEK_V4_PR}" HEAD; then \
-                echo "PR #${VLLM_DEEPSEEK_V4_PR} is already included; skipping merge."; \
-            else \
-                git merge "pr-${VLLM_DEEPSEEK_V4_PR}" --no-edit; \
-            fi; \
-        fi; \
-    fi
-
 ARG VLLM_PRS=""
 
 RUN if [ -n "$VLLM_PRS" ]; then \
