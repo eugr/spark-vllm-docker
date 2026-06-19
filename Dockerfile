@@ -241,6 +241,39 @@ RUN --mount=type=cache,id=repo-cache,target=/repo-cache \
     rm -rf "$DEEPGEMM_SRC_DIR"; \
     cp -a /repo-cache/deepgemm "$DEEPGEMM_SRC_DIR"
 
+# TEMPORARY PATCH: DeepGEMM PR #324's NVRTC path only includes
+# CUDA_HOME/include. CUDA target headers, including cuda/std/* on DGX Spark,
+# can live under CUDA_HOME/targets/<platform>/include.
+RUN python3 - <<PY
+from pathlib import Path
+
+target = Path("/workspace/DeepGEMM/csrc/jit/compiler.hpp")
+needle = '''        include_dirs += fmt::format("-I{} ", library_include_path.string());
+        include_dirs += fmt::format("-I{} ", (cuda_home / "include").string());
+'''
+replacement = '''        include_dirs += fmt::format("-I{} ", library_include_path.string());
+        include_dirs += fmt::format("-I{} ", (cuda_home / "include").string());
+        const auto cuda_sbsa_include = cuda_home / "targets" / "sbsa-linux" / "include";
+        if (std::filesystem::exists(cuda_sbsa_include))
+            include_dirs += fmt::format("-I{} ", cuda_sbsa_include.string());
+        const auto cuda_aarch64_include = cuda_home / "targets" / "aarch64-linux" / "include";
+        if (std::filesystem::exists(cuda_aarch64_include))
+            include_dirs += fmt::format("-I{} ", cuda_aarch64_include.string());
+        const auto cuda_x86_64_include = cuda_home / "targets" / "x86_64-linux" / "include";
+        if (std::filesystem::exists(cuda_x86_64_include))
+            include_dirs += fmt::format("-I{} ", cuda_x86_64_include.string());
+'''
+
+text = target.read_text()
+if replacement in text:
+    print("DeepGEMM NVRTC CUDA target include patch already present; skipping")
+elif needle in text:
+    target.write_text(text.replace(needle, replacement, 1))
+    print("Applied DeepGEMM NVRTC CUDA target include patch")
+else:
+    raise SystemExit("DeepGEMM NVRTC include pattern not found")
+PY
+
 WORKDIR $VLLM_BASE_DIR/vllm
 
 ARG VLLM_PRS="43477"
