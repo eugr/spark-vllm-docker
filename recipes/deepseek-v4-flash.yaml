@@ -1,5 +1,5 @@
 # Recipe: DeepSeek-V4-Flash official FP8 on dual DGX Spark
-# Based on vLLM PR #41834 latest head f32247a5 (2026-06-11), including sparse MLA stats env fix.
+# Based on vLLM PR #41834 head 8f93ea34 (2026-06-19), including SM12x prefill and prefix-cache fixes.
 # Keep CUDA graphs enabled; do not add --enforce-eager.
 
 recipe_version: "1"
@@ -14,7 +14,7 @@ build_args:
   - --vllm-repo
   - https://github.com/jasl/vllm.git
   - --vllm-ref
-  - f32247a5a695fa8979d61837bf6b87da897dcb7d
+  - 8f93ea34c0805c8162343a17072811ae256ffa57
   - --rebuild-vllm
 
 mods: []
@@ -35,6 +35,7 @@ env:
   TORCH_CUDA_ARCH_LIST: 12.1a
   VLLM_ALLOW_LONG_MAX_MODEL_LEN: 1
   VLLM_TRITON_MLA_SPARSE: 1
+  VLLM_DEEPSEEK_V4_FLASHINFER_SM120_DECODE: 1
   FLASHINFER_DISABLE_VERSION_CHECK: 1
   TILELANG_CLEANUP_TEMP_FILES: 1
   DG_JIT_USE_NVRTC: 0

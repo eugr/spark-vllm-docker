@@ -52,7 +52,7 @@ RUN apt update && \
 # Additional deps
 RUN --mount=type=cache,id=uv-cache,target=/root/.cache/uv \
      uv pip install torch==2.11.0 torchvision torchaudio triton --index-url https://download.pytorch.org/whl/cu130 && \
-     uv pip install nvidia-nccl-cu13==2.30.4 && \
+     uv pip install nvidia-nccl-cu13==2.30.7 && \
      uv pip install nvidia-nvshmem-cu13 "apache-tvm-ffi<0.2" filelock pynvml requests tqdm
 
 # Configure Ccache for CUDA/C++
@@ -86,8 +86,8 @@ RUN git clone -b v2.30u1 https://github.com/NVIDIA/nccl.git && \
 # Pin runtime NCCL to the version used by the current SM12x validation.
 RUN apt update && \
     apt install -y --no-install-recommends --allow-downgrades --allow-change-held-packages \
-    libnccl2=2.30.4-1+cuda13.2 \
-    libnccl-dev=2.30.4-1+cuda13.2 && \
+    libnccl2=2.30.7-1+cuda13.3 \
+    libnccl-dev=2.30.7-1+cuda13.3 && \
     rm -rf /var/lib/apt/lists/*
 
 # =========================================================
@@ -398,8 +398,8 @@ RUN --mount=type=bind,from=base,source=/workspace/vllm/nccl/build/pkg/deb,target
     libxcb1 \
     && cd /workspace/nccl-pkg && apt install -y --no-install-recommends --allow-downgrades --allow-change-held-packages ./*.deb \
     && apt install -y --no-install-recommends --allow-downgrades --allow-change-held-packages \
-        libnccl2=2.30.4-1+cuda13.2 \
-        libnccl-dev=2.30.4-1+cuda13.2 \
+        libnccl2=2.30.7-1+cuda13.3 \
+        libnccl-dev=2.30.7-1+cuda13.3 \
     && rm -rf /var/lib/apt/lists/* \
     && pip install uv
 
@@ -416,7 +416,7 @@ ARG PRE_TRANSFORMERS=0
 # Install deps
 RUN --mount=type=cache,id=uv-cache,target=/root/.cache/uv \
      uv pip install torch==2.11.0 torchvision torchaudio triton --index-url https://download.pytorch.org/whl/cu130 && \
-     uv pip install nvidia-nccl-cu13==2.30.4 && \
+     uv pip install nvidia-nccl-cu13==2.30.7 && \
      uv pip install nvidia-nvshmem-cu13 "apache-tvm-ffi<0.2"
 
 # Install wheels from host ./wheels/ (bind-mounted from build context — no layer bloat)
@@ -452,7 +452,7 @@ RUN --mount=type=cache,id=uv-cache,target=/root/.cache/uv \
     echo "fastapi[standard]>=0.115.0,<0.137.0" >> /tmp/torch-override.txt && \
     uv pip install ray[default] fastsafetensors instanttensor \
         --override /tmp/torch-override.txt && \
-    uv pip install nvidia-nccl-cu13==2.30.4 && \
+    uv pip install nvidia-nccl-cu13==2.30.7 && \
     uv pip install --reinstall --no-deps torch==2.11.0 --index-url https://download.pytorch.org/whl/cu130
 
 # Fix NCCL
