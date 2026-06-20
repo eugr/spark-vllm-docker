@@ -1,0 +1,61 @@
+# Recipe: DeepSeek V4 Flash
+# DeepSeek V4 Flash with sparse MLA/DeepGEMM experimental SM120 support
+
+recipe_version: "1"
+name: DeepSeek-V4-Flash
+description: vLLM serving deepseek-ai/DeepSeek-V4-Flash on a DGX Spark cluster
+
+# HuggingFace model to download (optional, for --download-model)
+model: deepseek-ai/DeepSeek-V4-Flash
+
+# Container image to use
+container: vllm-node
+
+# Can only be run in a cluster
+cluster_only: true
+
+# No mods required
+mods: []
+
+# Default settings (can be overridden via CLI where supported)
+defaults:
+  port: 8000
+  host: 0.0.0.0
+  tensor_parallel: 2
+  gpu_memory_utilization: 0.8
+  max_model_len: 500000
+  block_size: 256
+  max_num_seqs: 4
+  max_num_batched_tokens: 8192
+  num_speculative_tokens: 2
+
+# Environment variables
+env:
+  DG_JIT_USE_NVRTC: "0"
+  VLLM_ALLOW_LONG_MAX_MODEL_LEN: "1"
+  VLLM_USE_BREAKABLE_CUDAGRAPH: "0"
+
+# The vLLM serve command template
+command: |
+  vllm serve deepseek-ai/DeepSeek-V4-Flash \
+      --host {host} \
+      --port {port} \
+      --trust-remote-code \
+      --tensor-parallel-size {tensor_parallel} \
+      --kv-cache-dtype fp8 \
+      --block-size {block_size} \
+      --max-model-len {max_model_len} \
+      --max-num-seqs {max_num_seqs} \
+      --max-num-batched-tokens {max_num_batched_tokens} \
+      --gpu-memory-utilization {gpu_memory_utilization} \
+      --enable-prefix-caching \
+      --speculative-config '{{"method":"mtp","num_speculative_tokens":{num_speculative_tokens}}}' \
+      --tokenizer-mode deepseek_v4 \
+      --distributed-executor-backend ray \
+      --tool-call-parser deepseek_v4 \
+      --enable-auto-tool-choice \
+      --reasoning-parser deepseek_v4 \
+      --reasoning-config '{{"reasoning_parser":"deepseek_v4","reasoning_start_str":"","reasoning_end_str":""}}' \
+      --default-chat-template-kwargs.thinking=true \
+      --default-chat-template-kwargs.reasoning_effort=high \
+      --load-format instanttensor
