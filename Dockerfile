@@ -127,7 +127,8 @@ WORKDIR /workspace/flashinfer
 
 ARG FLASHINFER_PRS=""
 
-RUN if [ -n "$FLASHINFER_PRS" ]; then \
+RUN set -eux; \
+    if [ -n "$FLASHINFER_PRS" ]; then \
         # Git requires a user identity to create merge commits
         git config --global user.email "builder@example.com"; \
         git config --global user.name "Docker Builder"; \
@@ -136,7 +137,19 @@ RUN if [ -n "$FLASHINFER_PRS" ]; then \
         for pr in $FLASHINFER_PRS; do \
             echo "Fetching and merging PR #$pr..."; \
             git fetch origin +pull/${pr}/head:pr-${pr}; \
-            git merge pr-${pr} --no-edit; \
+            if git merge-base --is-ancestor pr-${pr} HEAD; then \
+                echo "PR #$pr is already contained in HEAD; skipping."; \
+            else \
+                cherry_file="/tmp/pr-${pr}.cherry"; \
+                git cherry HEAD pr-${pr} > "$cherry_file"; \
+                if ! grep -q '^+' "$cherry_file"; then \
+                    echo "PR #$pr is already patch-equivalent to HEAD; skipping."; \
+                    rm -f "$cherry_file"; \
+                    continue; \
+                fi; \
+                rm -f "$cherry_file"; \
+                git merge pr-${pr} --no-edit; \
+            fi; \
         done; \
     fi
 
@@ -263,7 +276,19 @@ RUN set -eux; \
         for pr in $VLLM_ALL_PRS; do \
             echo "Fetching and merging PR #$pr..."; \
             git fetch origin +pull/${pr}/head:pr-${pr}; \
-            git merge pr-${pr} --no-edit; \
+            if git merge-base --is-ancestor pr-${pr} HEAD; then \
+                echo "PR #$pr is already contained in HEAD; skipping."; \
+            else \
+                cherry_file="/tmp/pr-${pr}.cherry"; \
+                git cherry HEAD pr-${pr} > "$cherry_file"; \
+                if ! grep -q '^+' "$cherry_file"; then \
+                    echo "PR #$pr is already patch-equivalent to HEAD; skipping."; \
+                    rm -f "$cherry_file"; \
+                    continue; \
+                fi; \
+                rm -f "$cherry_file"; \
+                git merge pr-${pr} --no-edit; \
+            fi; \
         done; \
     fi
 
