@@ -243,15 +243,24 @@ RUN --mount=type=cache,id=repo-cache,target=/repo-cache \
 
 WORKDIR $VLLM_BASE_DIR/vllm
 
-ARG VLLM_PRS="43477"
+ARG VLLM_PRESET_PRS="43477"
+ARG VLLM_PRS=""
 
-RUN if [ -n "$VLLM_PRS" ]; then \
+RUN set -eux; \
+    VLLM_ALL_PRS=""; \
+    for pr in $VLLM_PRESET_PRS $VLLM_PRS; do \
+        case " $VLLM_ALL_PRS " in \
+            *" $pr "*) ;; \
+            *) VLLM_ALL_PRS="${VLLM_ALL_PRS:+$VLLM_ALL_PRS }$pr";; \
+        esac; \
+    done; \
+    if [ -n "$VLLM_ALL_PRS" ]; then \
         # Git requires a user identity to create merge commits
         git config --global user.email "builder@example.com"; \
         git config --global user.name "Docker Builder"; \
         \
-        echo "Applying PRs: $VLLM_PRS"; \
-        for pr in $VLLM_PRS; do \
+        echo "Applying PRs: $VLLM_ALL_PRS"; \
+        for pr in $VLLM_ALL_PRS; do \
             echo "Fetching and merging PR #$pr..."; \
             git fetch origin +pull/${pr}/head:pr-${pr}; \
             git merge pr-${pr} --no-edit; \
