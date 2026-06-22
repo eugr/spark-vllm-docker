@@ -23,6 +23,7 @@ TMP_IMAGE=""
 PARALLEL_COPY=false
 EXP_MXFP4=false
 VLLM_PRS=""
+APPLY_PRESET_VLLM_PRS=false
 FLASHINFER_PRS=""
 PRE_TRANSFORMERS=false
 FULL_LOG=false
@@ -385,6 +386,7 @@ usage() {
     echo "  --tf5                         : Install transformers>=5 (aliases: --pre-tf, --pre-transformers)"
     echo "  --exp-mxfp4, --experimental-mxfp4 : Build with experimental native MXFP4 support"
     echo "  --apply-vllm-pr <pr-num>      : Apply a specific PR patch to vLLM source. Can be specified multiple times."
+    echo "  --apply-preset-vllm-prs       : Also apply Dockerfile preset vLLM PRs when --apply-vllm-pr is specified."
     echo "  --apply-flashinfer-pr <pr-num>: Apply a specific PR patch to FlashInfer source. Can be specified multiple times."
     echo "  --full-log                    : Enable full build logging (--progress=plain)"
     echo "  --no-build                    : Skip building, only copy image (requires --copy-to)"
@@ -439,6 +441,7 @@ while [[ "$#" -gt 0 ]]; do
                exit 1
             fi
             ;;
+        --apply-preset-vllm-prs) APPLY_PRESET_VLLM_PRS=true ;;
         --apply-flashinfer-pr)
             if [ -n "$2" ] && [[ "$2" != -* ]]; then
                if [ -n "$FLASHINFER_PRS" ]; then
@@ -723,6 +726,13 @@ if [ "$NO_BUILD" = false ]; then
             if [ -n "$VLLM_PRS" ]; then
                 echo "Applying vLLM PRs: $VLLM_PRS"
                 VLLM_CMD+=("--build-arg" "VLLM_PRS=$VLLM_PRS")
+                if [ "$APPLY_PRESET_VLLM_PRS" = true ]; then
+                    echo "Also applying preset vLLM PRs from the Dockerfile."
+                    VLLM_CMD+=("--build-arg" "VLLM_APPLY_PRESET_PRS=1")
+                else
+                    echo "Skipping preset vLLM PRs because --apply-vllm-pr was specified."
+                    VLLM_CMD+=("--build-arg" "VLLM_APPLY_PRESET_PRS=0")
+                fi
             fi
 
             VLLM_CMD+=(".")

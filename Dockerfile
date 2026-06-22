@@ -257,11 +257,22 @@ RUN --mount=type=cache,id=repo-cache,target=/repo-cache \
 WORKDIR $VLLM_BASE_DIR/vllm
 
 ARG VLLM_PRESET_PRS="43477"
+ARG VLLM_APPLY_PRESET_PRS=""
 ARG VLLM_PRS=""
 
 RUN set -eux; \
     VLLM_ALL_PRS=""; \
-    for pr in $VLLM_PRESET_PRS $VLLM_PRS; do \
+    VLLM_SELECTED_PRESET_PRS=""; \
+    case "$VLLM_APPLY_PRESET_PRS" in \
+        1|true|TRUE|yes|YES) VLLM_SELECTED_PRESET_PRS="$VLLM_PRESET_PRS";; \
+        0|false|FALSE|no|NO) VLLM_SELECTED_PRESET_PRS="";; \
+        ""|auto|AUTO) \
+            if [ -z "$VLLM_PRS" ]; then \
+                VLLM_SELECTED_PRESET_PRS="$VLLM_PRESET_PRS"; \
+            fi;; \
+        *) echo "Invalid VLLM_APPLY_PRESET_PRS value: $VLLM_APPLY_PRESET_PRS"; exit 1;; \
+    esac; \
+    for pr in $VLLM_SELECTED_PRESET_PRS $VLLM_PRS; do \
         case " $VLLM_ALL_PRS " in \
             *" $pr "*) ;; \
             *) VLLM_ALL_PRS="${VLLM_ALL_PRS:+$VLLM_ALL_PRS }$pr";; \

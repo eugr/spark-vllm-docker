@@ -841,7 +841,7 @@ Thanks @raphaelamorim for the contribution!
 
 `./build-and-copy.sh` now supports ability to apply vLLM PRs to builds. PR is applied to the most recent vLLM commit (or specific vllm-ref if set). This does NOT apply to wheels build and MXFP4 special build!
 
-To use, just specify `--apply-vllm-pr <pr_num>` in the arguments. Please note that it may fail depending on whether the PR needs a rebase for the specified vLLM reference/main branch. Use with caution!
+To use, just specify `--apply-vllm-pr <pr_num>` in the arguments. When custom vLLM PRs are specified, Dockerfile preset vLLM PRs are skipped unless `--apply-preset-vllm-prs` is also specified. Please note that it may fail depending on whether the PR needs a rebase for the specified vLLM reference/main branch. Use with caution!
 
 Example:
 
@@ -1232,6 +1232,7 @@ Using a different username:
 | `--vllm-ref <ref>` | vLLM commit SHA, branch or tag (default: `main`) |
 | `--flashinfer-ref <ref>` | FlashInfer commit SHA, branch or tag (default: `main`) |
 | `--apply-vllm-pr <pr-num>` | Apply a vLLM PR patch during build. Can be specified multiple times. |
+| `--apply-preset-vllm-prs` | Also apply Dockerfile preset vLLM PRs when `--apply-vllm-pr` is specified. |
 | `--apply-flashinfer-pr <pr-num>` | Apply a FlashInfer PR patch during build. Can be specified multiple times. |
 | `--tf5` | Install transformers v5 (5.0.0 or higher). Aliases: `--pre-tf, --pre-transformers`. |
 | `--exp-mxfp4` | Build with experimental native MXFP4 support. Alias: `--experimental-mxfp4`. |
