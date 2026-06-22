@@ -15,7 +15,8 @@ ENV MAX_JOBS=${BUILD_JOBS}
 ENV CMAKE_BUILD_PARALLEL_LEVEL=${BUILD_JOBS}
 ENV NINJAFLAGS="-j${BUILD_JOBS}"
 ENV MAKEFLAGS="-j${BUILD_JOBS}"
-ENV DG_JIT_USE_NVRTC=0 # disable for conflicts with DeepGEMM
+# disable for conflicts with DeepGEMM
+ENV DG_JIT_USE_NVRTC=0
 ENV USE_CUDNN=1
 
 # Set non-interactive frontend to prevent apt prompts
