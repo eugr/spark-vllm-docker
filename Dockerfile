@@ -195,6 +195,7 @@ ARG CACHEBUST_VLLM=1
 # Git reference (branch, tag, or SHA) to checkout
 ARG VLLM_REF=main
 ARG VLLM_REPO=https://github.com/vllm-project/vllm.git
+ARG DEEPGEMM_REF=""
 
 # Checkout VLLM_REF whether it is passed as a branch name, tag, SHA,
 # refs/heads/<branch>, or refs/pull/<id>/head.
@@ -245,6 +246,33 @@ RUN if [ -n "$VLLM_PRS" ]; then \
             git fetch origin pull/${pr}/head:pr-${pr}; \
             git merge pr-${pr} --no-edit; \
         done; \
+    fi
+
+# EXPERIMENTAL: DeepGEMM SM120 support landed in deepseek-ai/DeepGEMM#324
+# after vLLM PR #41834 disabled SM120 DeepGEMM for the stock-deps path.
+# Re-enable the platform gate only when an explicit DeepGEMM ref is provided.
+RUN if [ -n "$DEEPGEMM_REF" ]; then \
+        python3 - <<'PY'
+from pathlib import Path
+
+target = Path("vllm/platforms/cuda.py")
+text = target.read_text()
+old = "return cls.is_device_capability(90) or cls.is_device_capability_family(100)"
+new = (
+    "return (cls.is_device_capability(90) "
+    "or cls.is_device_capability_family(100) "
+    "or cls.is_device_capability_family(120))"
+)
+if new in text:
+    print("SM120 DeepGEMM support gate already enabled")
+elif old in text:
+    target.write_text(text.replace(old, new, 1))
+    print("Enabled SM120 DeepGEMM support gate for experimental DeepGEMM build")
+else:
+    raise SystemExit("Could not find vLLM DeepGEMM support gate to patch")
+PY
+    else \
+        echo "DEEPGEMM_REF not set; leaving stock SM120 DeepGEMM fallback path"; \
     fi
 
 # TEMPORARY PATCH: vLLM PR #43409 started passing AutoGPTQ MoE qzeros
@@ -412,12 +440,29 @@ RUN mkdir -p tiktoken_encodings && \
     wget -O tiktoken_encodings/cl100k_base.tiktoken "https://openaipublic.blob.core.windows.net/encodings/cl100k_base.tiktoken"
 
 ARG PRE_TRANSFORMERS=0
+ARG DEEPGEMM_REPO=https://github.com/deepseek-ai/DeepGEMM.git
+ARG DEEPGEMM_REF=""
 
 # Install deps
 RUN --mount=type=cache,id=uv-cache,target=/root/.cache/uv \
      uv pip install torch==2.11.0 torchvision torchaudio triton --index-url https://download.pytorch.org/whl/cu130 && \
      uv pip install nvidia-nccl-cu13==2.30.7 && \
      uv pip install nvidia-nvshmem-cu13 "apache-tvm-ffi<0.2"
+
+# EXPERIMENTAL: install external DeepGEMM with SM120/SM121 support.
+RUN --mount=type=cache,id=uv-cache,target=/root/.cache/uv \
+    --mount=type=cache,id=ccache,target=/root/.ccache \
+    if [ -n "$DEEPGEMM_REF" ]; then \
+        rm -rf /workspace/DeepGEMM && \
+        git clone --recursive "$DEEPGEMM_REPO" /workspace/DeepGEMM && \
+        cd /workspace/DeepGEMM && \
+        git checkout "$DEEPGEMM_REF" && \
+        git submodule update --init --recursive && \
+        DG_FORCE_BUILD=1 uv pip install --no-build-isolation . && \
+        git rev-parse HEAD > /workspace/.deepgemm-commit; \
+    else \
+        echo "DEEPGEMM_REF not set; not installing external DeepGEMM"; \
+    fi
 
 # Install wheels from host ./wheels/ (bind-mounted from build context — no layer bloat)
 # With --tf5: override vLLM's transformers<5 constraint to get transformers>=5
@@ -454,6 +499,20 @@ RUN --mount=type=cache,id=uv-cache,target=/root/.cache/uv \
         --override /tmp/torch-override.txt && \
     uv pip install nvidia-nccl-cu13==2.30.7 && \
     uv pip install --reinstall --no-deps torch==2.11.0 --index-url https://download.pytorch.org/whl/cu130
+
+RUN --mount=type=cache,id=uv-cache,target=/root/.cache/uv \
+    --mount=type=cache,id=ccache,target=/root/.ccache \
+    if [ -n "$DEEPGEMM_REF" ]; then \
+        rm -rf /workspace/DeepGEMM && \
+        git clone --recursive "$DEEPGEMM_REPO" /workspace/DeepGEMM && \
+        cd /workspace/DeepGEMM && \
+        git checkout "$DEEPGEMM_REF" && \
+        git submodule update --init --recursive && \
+        DG_FORCE_BUILD=1 uv pip install --no-build-isolation . && \
+        git rev-parse HEAD > /workspace/.deepgemm-commit; \
+    else \
+        echo "DEEPGEMM_REF not set; not installing external DeepGEMM"; \
+    fi
 
 # Fix NCCL
 RUN rm /usr/local/lib/python3.12/dist-packages/nvidia/nccl/lib/libnccl.so.2 && \

@@ -21,6 +21,9 @@ VLLM_REPO="https://github.com/vllm-project/vllm.git"
 VLLM_REPO_SET=false
 FLASHINFER_REF="main"
 FLASHINFER_REF_SET=false
+DEEPGEMM_REPO="https://github.com/deepseek-ai/DeepGEMM.git"
+DEEPGEMM_REF=""
+DEEPGEMM_REF_SET=false
 TMP_IMAGE=""
 PARALLEL_COPY=false
 EXP_MXFP4=false
@@ -59,6 +62,7 @@ generate_build_metadata() {
     local exp_mxfp4="$7"
     local vllm_prs="$8"
     local vllm_repo="${9:-https://github.com/vllm-project/vllm.git}"
+    local deepgemm_ref="${10:-}"
 
     local base_image
     base_image=$(grep -m1 '^FROM .* AS runner' "$dockerfile" | awk '{print $2}')
@@ -77,6 +81,7 @@ build_args:
   transformers_5: ${pre_transformers}
   exp_mxfp4: ${exp_mxfp4}
   vllm_prs: "${vllm_prs}"
+  deepgemm_ref: ${deepgemm_ref:-none}
   build_jobs: ${BUILD_JOBS}
 EOF
     echo "Generated build-metadata.yaml"
@@ -382,6 +387,7 @@ usage() {
     echo "  --force-download              : Force download of all prebuilt wheels (skip cached wheel checks)"
     echo "  --vllm-ref <ref>              : vLLM commit SHA, branch or tag (default: 'main')"
     echo "  --flashinfer-ref <ref>        : FlashInfer commit SHA, branch or tag (default: 'main')"
+    echo "  --deepgemm-ref <ref>          : Install DeepGEMM from deepseek-ai/DeepGEMM at ref and enable SM120 DeepGEMM"
     echo "  -c, --copy-to <hosts>         : Host(s) to copy the image to. Accepts comma or space-delimited lists."
     echo "      --copy-to-host            : Alias for --copy-to (backwards compatibility)."
     echo "      --copy-parallel           : Copy to all hosts in parallel instead of serially."
@@ -418,6 +424,7 @@ while [[ "$#" -gt 0 ]]; do
             ;;
         --vllm-ref) VLLM_REF="$2"; VLLM_REF_SET=true; shift ;;
         --flashinfer-ref) FLASHINFER_REF="$2"; FLASHINFER_REF_SET=true; shift ;;
+        --deepgemm-ref) DEEPGEMM_REF="$2"; DEEPGEMM_REF_SET=true; shift ;;
         -c|--copy-to|--copy-to-host|--copy-to-hosts)
             COPY_TO_FLAG=true
             shift
@@ -589,6 +596,10 @@ fi
 COMMON_BUILD_FLAGS+=("--build-arg" "BUILD_JOBS=$BUILD_JOBS")
 COMMON_BUILD_FLAGS+=("--build-arg" "TORCH_CUDA_ARCH_LIST=$GPU_ARCH_LIST")
 COMMON_BUILD_FLAGS+=("--build-arg" "FLASHINFER_CUDA_ARCH_LIST=$GPU_ARCH_LIST")
+if [ "$DEEPGEMM_REF_SET" = true ]; then
+    COMMON_BUILD_FLAGS+=("--build-arg" "DEEPGEMM_REPO=$DEEPGEMM_REPO")
+    COMMON_BUILD_FLAGS+=("--build-arg" "DEEPGEMM_REF=$DEEPGEMM_REF")
+fi
 if [ -n "$NETWORK_ARG" ]; then
     COMMON_BUILD_FLAGS+=("--network" "$NETWORK_ARG")
 fi
@@ -767,7 +778,7 @@ if [ "$NO_BUILD" = false ]; then
         FLASHINFER_COMMIT=""
         [ -f "./wheels/.flashinfer-commit" ] && FLASHINFER_COMMIT=$(cat ./wheels/.flashinfer-commit)
         generate_build_metadata Dockerfile "$VLLM_VERSION" "$VLLM_COMMIT" "$FLASHINFER_COMMIT" \
-            "$VLLM_REF" "$PRE_TRANSFORMERS" "false" "$VLLM_PRS" "$VLLM_REPO"
+            "$VLLM_REF" "$PRE_TRANSFORMERS" "false" "$VLLM_PRS" "$VLLM_REPO" "$DEEPGEMM_REF"
 
         RUNNER_CMD=("docker" "build"
             "-t" "$IMAGE_TAG"
