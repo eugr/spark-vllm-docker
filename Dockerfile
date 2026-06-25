@@ -450,7 +450,7 @@ ARG DEEPGEMM_REF=""
 RUN --mount=type=cache,id=uv-cache,target=/root/.cache/uv \
      uv pip install torch==2.11.0 torchvision torchaudio triton --index-url https://download.pytorch.org/whl/cu130 && \
      uv pip install nvidia-nccl-cu13==2.30.7 && \
-     uv pip install nvidia-nvshmem-cu13 "apache-tvm-ffi<0.2"
+     uv pip install nvidia-nvshmem-cu13 "apache-tvm-ffi<0.2" packaging
 
 # EXPERIMENTAL: install external DeepGEMM with SM120/SM121 support.
 RUN --mount=type=cache,id=uv-cache,target=/root/.cache/uv \
