@@ -32,7 +32,7 @@ command: |
     --port {port} \
     --tensor-parallel-size {tensor_parallel} \
     --trust-remote-code \
-    --kv-cache-dtype auto \
+    --kv-cache-dtype fp8 \
     --attention-backend flashinfer \
     --moe-backend marlin \
     --gpu-memory-utilization {gpu_memory_utilization} \
