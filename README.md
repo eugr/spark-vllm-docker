@@ -146,7 +146,7 @@ For periodic maintenance, I recommend using a filter: `docker builder prune --fi
 
 #### Deepseek V4 Flash support
 
-Support and a recipe for Deepseek V4 Flash has been added based on a newly merged vLLM PR. Please note that this PR requires a fork of DeepGEMM that is not present in default vLLM builds, but included in this community build.
+Support and a recipe for Deepseek V4 Flash has been added based on a newly merged vLLM PR. Please note that this PR requires the DeepGEMM `nv_dev` branch, which is not present in default vLLM builds, but included in this community build.
 
 To run DSV4F you will need a Spark cluster (2 or more nodes).
 

@@ -202,10 +202,9 @@ ARG CACHEBUST_VLLM=1
 # Git reference (branch, tag, or SHA) to checkout
 ARG VLLM_REF=main
 
-# DeepGEMM PR #324 is required by vLLM PR #43477 for SM120/SM121 MXFP4 paths.
+# DeepGEMM nv_dev includes SM120/SM121 MXFP4 support from PR #324.
 ARG DEEPGEMM_REPO=https://github.com/deepseek-ai/DeepGEMM.git
-ARG DEEPGEMM_PR=324
-ARG DEEPGEMM_REF=9ca30487a6d1a484757f2d87f532c5f6707b9f25
+ARG DEEPGEMM_REF=nv_dev
 ENV DEEPGEMM_SRC_DIR=/workspace/DeepGEMM
 
 # Smart Git Clone (Fetch changes instead of full re-clone)
@@ -245,10 +244,7 @@ RUN --mount=type=cache,id=repo-cache,target=/repo-cache \
         cd ..; \
     fi; \
     cd deepgemm; \
-    if [ -n "$DEEPGEMM_PR" ]; then \
-        git fetch origin +pull/${DEEPGEMM_PR}/head:pr-${DEEPGEMM_PR}; \
-    fi; \
-    git checkout --detach "$DEEPGEMM_REF"; \
+    git checkout --detach "$DEEPGEMM_REF" 2>/dev/null || git checkout --detach "origin/$DEEPGEMM_REF"; \
     git reset --hard; \
     git submodule update --init --recursive; \
     git clean -fdx; \
