@@ -5,7 +5,7 @@
 recipe_version: "1"
 name: DeepSeek-V4-Flash
 # Official DeepSeek V4 Flash FP8 model on dual DGX Spark TP=2.
-description: DeepSeek V4 Flash FP8 on dual DGX Spark TP=2 with PR 41834 SM12x support, FlashInfer prefill/decode, and experimental DeepGEMM SM120
+description: DeepSeek V4 Flash FP8 on dual DGX Spark TP=2 with PR 41834 SM12x support, FlashInfer prefill/decode, and experimental DeepGEMM MoE
 model: deepseek-ai/DeepSeek-V4-Flash
 container: vllm-node-dsv4
 cluster_only: true
@@ -40,9 +40,10 @@ env:
   VLLM_TRITON_MLA_SPARSE: 1
   VLLM_DEEPSEEK_V4_FLASHINFER_SM120_DECODE: 1
   VLLM_DEEPSEEK_V4_FLASHINFER_SM120_PREFILL: 1
-  VLLM_USE_DEEP_GEMM: 1
+  # FP8 linear DeepGEMM scale-layout JIT currently fails on GB10 with CUDA_ERROR_INVALID_IMAGE.
+  VLLM_USE_DEEP_GEMM: 0
   VLLM_MOE_USE_DEEP_GEMM: 1
-  VLLM_USE_DEEP_GEMM_E8M0: 1
+  VLLM_USE_DEEP_GEMM_E8M0: 0
   FLASHINFER_DISABLE_VERSION_CHECK: 1
   TILELANG_CLEANUP_TEMP_FILES: 1
   DG_JIT_USE_NVRTC: 0
