@@ -300,6 +300,44 @@ RUN set -eux; \
         done; \
     fi
 
+# TEMPORARY PATCH (source build only): vLLM PR #43008 selects cooperative_topk
+# for all SM90+ devices. On DGX Spark / SM12.x this fails at launch with
+# "cooperative_topk launch failed: invalid argument". Keep the cooperative
+# path on SM90 and let newer architectures use the existing persistent_topk fallback.
+RUN python3 - <<'PY'
+from pathlib import Path
+
+target = Path("vllm/model_executor/layers/sparse_attn_indexer.py")
+old = '''        use_cooperative_topk = (
+            current_platform.is_cuda()
+            and topk_tokens in (512, 1024, 2048)
+            and num_rows <= 32
+            and logits.stride(0) % 4 == 0  # TMA 16-byte alignment
+            and current_platform.has_device_capability(90)
+        )'''
+new = '''        device_capability = current_platform.get_device_capability()
+        use_cooperative_topk = (
+            current_platform.is_cuda()
+            and topk_tokens in (512, 1024, 2048)
+            and num_rows <= 32
+            and logits.stride(0) % 4 == 0  # TMA 16-byte alignment
+            and device_capability is not None
+            and device_capability.to_int() == 90
+        )'''
+
+if not target.exists():
+    print(f"{target} not found; skipping SM120 cooperative_topk workaround")
+else:
+    text = target.read_text()
+    if "device_capability.to_int() == 90" in text:
+        print("SM120 cooperative_topk workaround already present; skipping")
+    elif old in text:
+        target.write_text(text.replace(old, new, 1))
+        print("Applied SM120 cooperative_topk workaround")
+    else:
+        print("Known cooperative_topk selector pattern not found; skipping")
+PY
+
 # TEMPORARY PATCH: vLLM PR #43409 started passing AutoGPTQ MoE qzeros
 # through even for symmetric GPTQ. On CUDA Marlin MoE this can select the
 # wrong zero-point kernel path and crash Qwen3-Coder-Next AutoRound during
