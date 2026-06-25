@@ -40,8 +40,8 @@ env:
   VLLM_TRITON_MLA_SPARSE: 1
   VLLM_DEEPSEEK_V4_FLASHINFER_SM120_DECODE: 1
   VLLM_DEEPSEEK_V4_FLASHINFER_SM120_PREFILL: 1
-  # FP8 linear DeepGEMM scale-layout JIT currently fails on GB10 with CUDA_ERROR_INVALID_IMAGE.
-  VLLM_USE_DEEP_GEMM: 0
+  # Keep FP8 linear on Triton below; DeepGEMM is only forced for MXFP4 MoE.
+  VLLM_USE_DEEP_GEMM: 1
   VLLM_MOE_USE_DEEP_GEMM: 1
   VLLM_USE_DEEP_GEMM_E8M0: 0
   FLASHINFER_DISABLE_VERSION_CHECK: 1
@@ -68,6 +68,8 @@ command: |
       --max-num-seqs {max_num_seqs} \
       --max-num-batched-tokens {max_num_batched_tokens} \
       --gpu-memory-utilization {gpu_memory_utilization} \
+      --linear-backend triton \
+      --moe-backend deep_gemm \
       --distributed-executor-backend ray \
       --compilation-config '{{"cudagraph_mode":"FULL_AND_PIECEWISE","custom_ops":["all"]}}' \
       --tokenizer-mode deepseek_v4 \
