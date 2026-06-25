@@ -251,8 +251,10 @@ RUN if [ -n "$VLLM_PRS" ]; then \
 # EXPERIMENTAL: DeepGEMM SM120 support landed in deepseek-ai/DeepGEMM#324
 # after vLLM PR #41834 disabled SM120 DeepGEMM for the stock-deps path.
 # Re-enable the platform gate only when an explicit DeepGEMM ref is provided.
-RUN if [ -n "$DEEPGEMM_REF" ]; then \
-        python3 - <<'PY'
+RUN <<'BASH'
+set -e
+if [ -n "$DEEPGEMM_REF" ]; then
+    python3 - <<'PY'
 from pathlib import Path
 
 target = Path("vllm/platforms/cuda.py")
@@ -271,9 +273,10 @@ elif old in text:
 else:
     raise SystemExit("Could not find vLLM DeepGEMM support gate to patch")
 PY
-    else \
-        echo "DEEPGEMM_REF not set; leaving stock SM120 DeepGEMM fallback path"; \
-    fi
+else
+    echo "DEEPGEMM_REF not set; leaving stock SM120 DeepGEMM fallback path"
+fi
+BASH
 
 # TEMPORARY PATCH: vLLM PR #43409 started passing AutoGPTQ MoE qzeros
 # through even for symmetric GPTQ. On CUDA Marlin MoE this can select the
