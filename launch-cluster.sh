@@ -23,6 +23,7 @@ MASTER_PORT="29501"
 # Initialize variables
 NODES_ARG=""
 CONTAINER_NAME="$DEFAULT_CONTAINER_NAME"
+NETWORK="host"
 COMMAND_TO_RUN=""
 DAEMON_MODE="false"
 CHECK_CONFIG="false"
@@ -51,7 +52,7 @@ PORT_MAPPINGS=()
 
 # Function to print usage
 usage() {
-    echo "Usage: $0 [-n <node_ips>] [-t <image_name>] [--name <container_name>] [--eth-if <if_name>] [--ib-if <if_name>] [--nccl-debug <level>] [--check-config] [--solo] [-p <host:container>] [-d] [action] [command]"
+    echo "Usage: $0 [-n <node_ips>] [-t <image_name>] [--name <container_name>] [--eth-if <if_name>] [--ib-if <if_name>] [--nccl-debug <level>] [--check-config] [--solo] [-p <host:container>] [--network <name>] [-d] [action] [command]"
     echo "  -n, --nodes     Comma-separated list of node IPs (Optional, auto-detected if omitted)"
     echo "  -t              Docker image name (Optional, default: $IMAGE_NAME)"
     echo "  --name          Container name (Optional, default: $DEFAULT_CONTAINER_NAME)"
@@ -66,6 +67,7 @@ usage() {
     echo "  --solo          Solo mode: skip autodetection, launch only on current node, do not launch Ray cluster"
     echo "  --master-port   Port for cluster coordination: Ray head port or PyTorch distributed master port (default: 29501)"
     echo "  -p, --publish   Publish a container port in Docker format (e.g. -p 8000:8000). Solo mode only; can be specified multiple times."
+    echo "  --network       Container network (default: host). Useful with -p to use a custom network instead of bridge."
     echo "  --no-ray        No-Ray mode: run multi-node vLLM without Ray (uses PyTorch distributed backend)"
     echo "  --no-cache-dirs Do not mount default cache directories (~/.cache/vllm, ~/.cache/flashinfer, ~/.triton, ~/.tilelang)"
     echo "  --keep-entrypoint Keep the Docker image entrypoint instead of clearing it by default"
@@ -90,6 +92,7 @@ usage() {
     echo "  MASTER_PORT         Port for cluster coordination (default: 29501)"
     echo "  CONTAINER_NAME      Container name (default: vllm_node)"
     echo "  LOCAL_IP            Local IP address (for solo mode or override auto-detection)"
+    echo "  NETWORK             Container network (default: host)"
     echo "  CONTAINER_*         Any variable starting with CONTAINER_ (except CONTAINER_NAME)"
     echo "                      becomes -e flag. Example: CONTAINER_NCCL_DEBUG=INFO -> -e NCCL_DEBUG=INFO"
     echo ""
@@ -100,6 +103,7 @@ usage() {
     echo "  MASTER_PORT=29501"
     echo "  CONTAINER_NAME=vllm_node"
     echo "  LOCAL_IP=192.168.1.1"
+    echo "  NETWORK=ai-network"
     echo "  CONTAINER_NCCL_DEBUG=INFO"
     echo "  CONTAINER_HF_TOKEN=abc123"
     echo ""
@@ -146,6 +150,7 @@ while [[ "$#" -gt 0 ]]; do
         -h|--help) usage ;;
         --config) CONFIG_FILE="$2"; shift ;;
         --setup|--discover) FORCE_DISCOVER=true; export FORCE_DISCOVER ;;
+        --network) NETWORK="$2"; shift ;;
         start|stop|status) 
             if [[ -n "$LAUNCH_SCRIPT_PATH" ]]; then
                 echo "Error: Action '$1' is not compatible with --launch-script. Please omit the action or not use --launch-script."
@@ -278,6 +283,11 @@ fi
 
 if [[ -n "$DOTENV_LOCAL_IP" ]]; then
     export LOCAL_IP="$DOTENV_LOCAL_IP"
+fi
+
+# Apply NETWORK from .env (CLI --network takes precedence)
+if [[ "$NETWORK" == "host" ]] && [[ -n "$DOTENV_NETWORK" ]]; then
+    NETWORK="$DOTENV_NETWORK"
 fi
 
 # Validate non-privileged mode flags
@@ -550,10 +560,12 @@ if [[ "$CHECK_CONFIG" == "true" ]]; then
     echo "  ETH Interface: $ETH_IF"
     echo "  IB Interface: $IB_IF"
     echo "  Docker Args: $DOCKER_ARGS"
-    if [[ ${#PORT_MAPPINGS[@]} -gt 0 ]]; then
-        echo "  Docker Network: default bridge with published ports: ${PORT_MAPPINGS[*]}"
+    if [[ ${#PORT_MAPPINGS[@]} -eq 0 ]]; then
+        echo "  Docker Network: $NETWORK"
+    elif [[ "$NETWORK" == "host" ]]; then
+        echo "  Docker Network: default bridge with published ports: ${PORT_MAPPINGS[*]} (--network host overridden)"
     else
-        echo "  Docker Network: host"
+        echo "  Docker Network: $NETWORK with published ports: ${PORT_MAPPINGS[*]}"
     fi
     if [[ "$MOUNT_CACHE_DIRS" == "true" ]]; then
          echo "  Mounting Cache Dirs: ${CACHE_DIRS_TO_CREATE[*]}"
@@ -909,9 +921,11 @@ start_cluster() {
         docker_entrypoint_args="--entrypoint="
     fi
 
-    local docker_network_args="--network host"
+    local docker_network_args="--network $NETWORK"
     if [[ ${#PORT_MAPPINGS[@]} -gt 0 ]]; then
-        docker_network_args=""
+        if [[ "$NETWORK" == "host" ]]; then
+            docker_network_args=""
+        fi
         for mapping in "${PORT_MAPPINGS[@]}"; do
             docker_network_args="$docker_network_args -p $mapping"
         done
