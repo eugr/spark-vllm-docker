@@ -92,6 +92,7 @@ ARG FLASHINFER_CUDA_ARCH_LIST="12.1a"
 ENV FLASHINFER_CUDA_ARCH_LIST=${FLASHINFER_CUDA_ARCH_LIST}
 WORKDIR $VLLM_BASE_DIR
 ARG FLASHINFER_REF=main
+ARG FLASHINFER_REPO=https://github.com/flashinfer-ai/flashinfer.git
 
 # --- CACHE BUSTER ---
 # Change this argument to force a re-download of FlashInfer
@@ -107,7 +108,7 @@ RUN --mount=type=cache,id=repo-cache,target=/repo-cache \
     cd /repo-cache && \
     if [ ! -d "flashinfer" ]; then \
         echo "Cache miss: Cloning FlashInfer from scratch..." && \
-        git clone --recursive https://github.com/flashinfer-ai/flashinfer.git; \
+        git clone --recursive ${FLASHINFER_REPO}; \
         if [ "$FLASHINFER_REF" != "main" ]; then \
             cd flashinfer && \
             git checkout ${FLASHINFER_REF}; \
@@ -115,6 +116,7 @@ RUN --mount=type=cache,id=repo-cache,target=/repo-cache \
     else \
         echo "Cache hit: Fetching flashinfer updates..." && \
         cd flashinfer && \
+        git remote set-url origin ${FLASHINFER_REPO} 2>/dev/null || true; \
         git fetch origin && \
         git fetch origin --tags --force && \
         (git checkout --detach origin/${FLASHINFER_REF} 2>/dev/null || git checkout ${FLASHINFER_REF}) && \
@@ -201,6 +203,7 @@ ARG CACHEBUST_VLLM=1
 
 # Git reference (branch, tag, or SHA) to checkout
 ARG VLLM_REF=main
+ARG VLLM_REPO=https://github.com/vllm-project/vllm.git
 
 # DeepGEMM nv_dev includes SM120/SM121 MXFP4 support from PR #324.
 ARG DEEPGEMM_REPO=https://github.com/deepseek-ai/DeepGEMM.git
@@ -213,7 +216,7 @@ RUN --mount=type=cache,id=repo-cache,target=/repo-cache \
     cd /repo-cache && \
     if [ ! -d "vllm" ]; then \
         echo "Cache miss: Cloning vLLM from scratch..." && \
-        git clone --recursive https://github.com/vllm-project/vllm.git; \
+        git clone --recursive ${VLLM_REPO}; \
         if [ "$VLLM_REF" != "main" ]; then \
             cd vllm && \
             git checkout ${VLLM_REF}; \
@@ -221,6 +224,7 @@ RUN --mount=type=cache,id=repo-cache,target=/repo-cache \
     else \
         echo "Cache hit: Fetching updates..." && \
         cd vllm && \
+        git remote set-url origin ${VLLM_REPO} 2>/dev/null || true; \
         git fetch origin && \
         git fetch origin --tags --force && \
         (git checkout --detach origin/${VLLM_REF} 2>/dev/null || git checkout ${VLLM_REF}) && \

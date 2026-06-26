@@ -19,6 +19,8 @@ VLLM_REF="main"
 VLLM_REF_SET=false
 FLASHINFER_REF="main"
 FLASHINFER_REF_SET=false
+VLLM_REPO="https://github.com/vllm-project/vllm.git"
+FLASHINFER_REPO="https://github.com/flashinfer-ai/flashinfer.git"
 TMP_IMAGE=""
 PARALLEL_COPY=false
 EXP_MXFP4=false
@@ -378,6 +380,8 @@ usage() {
     echo "  --force-download              : Force download of all prebuilt wheels (skip cached wheel checks)"
     echo "  --vllm-ref <ref>              : vLLM commit SHA, branch or tag (default: 'main')"
     echo "  --flashinfer-ref <ref>        : FlashInfer commit SHA, branch or tag (default: 'main')"
+    echo "  --vllm-repo <url>             : vLLM repository URL (default: 'https://github.com/vllm-project/vllm.git')"
+    echo "  --flashinfer-repo <url>       : FlashInfer repository URL (default: 'https://github.com/flashinfer-ai/flashinfer.git')"
     echo "  -c, --copy-to <hosts>         : Host(s) to copy the image to. Accepts comma or space-delimited lists."
     echo "      --copy-to-host            : Alias for --copy-to (backwards compatibility)."
     echo "      --copy-parallel           : Copy to all hosts in parallel instead of serially."
@@ -414,6 +418,8 @@ while [[ "$#" -gt 0 ]]; do
             ;;
         --vllm-ref) VLLM_REF="$2"; VLLM_REF_SET=true; shift ;;
         --flashinfer-ref) FLASHINFER_REF="$2"; FLASHINFER_REF_SET=true; shift ;;
+        --vllm-repo) VLLM_REPO="$2"; shift ;;
+        --flashinfer-repo) FLASHINFER_REPO="$2"; shift ;;
         -c|--copy-to|--copy-to-host|--copy-to-hosts)
             COPY_TO_FLAG=true
             shift
@@ -603,7 +609,7 @@ if [ "$NO_BUILD" = false ]; then
         generate_build_metadata Dockerfile.mxfp4 "unknown" "$MXFP4_VLLM_SHA" "$MXFP4_FLASHINFER_SHA" \
             "mxfp4-pinned" "false" "true" ""
 
-        CMD=("docker" "build" "-t" "$IMAGE_TAG" "${COMMON_BUILD_FLAGS[@]}" "-f" "Dockerfile.mxfp4" ".")
+        CMD=("docker" "build" "-t" "$IMAGE_TAG" "${COMMON_BUILD_FLAGS[@]}" "--build-arg" "VLLM_REPO=$VLLM_REPO" "--build-arg" "FLASHINFER_REPO=$FLASHINFER_REPO" "-f" "Dockerfile.mxfp4" ".")
         echo "Building image with command: ${CMD[*]}"
         BUILD_START=$(date +%s)
         "${CMD[@]}"
@@ -650,7 +656,8 @@ if [ "$NO_BUILD" = false ]; then
                 "--target" "flashinfer-export"
                 "--output" "type=local,dest=./wheels"
                 "${COMMON_BUILD_FLAGS[@]}"
-                "--build-arg" "FLASHINFER_REF=$FLASHINFER_REF")
+                "--build-arg" "FLASHINFER_REF=$FLASHINFER_REF"
+                "--build-arg" "FLASHINFER_REPO=$FLASHINFER_REPO")
 
             if [ "$REBUILD_FLASHINFER" = true ]; then
                 FI_CMD+=("--build-arg" "CACHEBUST_FLASHINFER=$(date +%s)")
@@ -717,7 +724,8 @@ if [ "$NO_BUILD" = false ]; then
                 "--target" "vllm-export"
                 "--output" "type=local,dest=./wheels"
                 "${COMMON_BUILD_FLAGS[@]}"
-                "--build-arg" "VLLM_REF=$VLLM_REF")
+                "--build-arg" "VLLM_REF=$VLLM_REF"
+                "--build-arg" "VLLM_REPO=$VLLM_REPO")
 
             if [ "$REBUILD_VLLM" = true ]; then
                 VLLM_CMD+=("--build-arg" "CACHEBUST_VLLM=$(date +%s)")
