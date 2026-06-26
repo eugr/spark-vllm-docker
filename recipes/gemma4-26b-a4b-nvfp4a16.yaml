@@ -1,0 +1,42 @@
+# Recipe: Gemma4-26B-A4B NVFP4A16
+# Pre-quantized NVFP4 (W4A16) variant - weight-only quantization for better quality
+# Model: bg-digitalservices/Gemma-4-26B-A4B-it-NVFP4A16
+# Ref: https://huggingface.co/bg-digitalservices/Gemma-4-26B-A4B-it-NVFP4A16
+
+recipe_version: "1"
+name: Gemma4-26B-A4B-NVFP4A16
+description: vLLM serving Gemma4-26B-A4B with NVFP4 weight-only quantization (W4A16)
+
+model: bg-digitalservices/Gemma-4-26B-A4B-it-NVFP4A16
+container: vllm-node-tf5
+cluster_only: false
+solo_only: true
+
+mods:
+  - fix-gemma4-nvfp4-moe
+
+env:
+  VLLM_NVFP4_GEMM_BACKEND: marlin
+
+defaults:
+  port: 8000
+  host: 0.0.0.0
+  gpu_memory_utilization: 0.40
+  max_model_len: 262144
+  max_num_seqs: 4
+
+command: |
+  vllm serve bg-digitalservices/Gemma-4-26B-A4B-it-NVFP4A16 \
+    --served-model-name gemma-4 \
+    --host {host} --port {port} \
+    --quantization modelopt \
+    --dtype auto \
+    --kv-cache-dtype fp8 \
+    --gpu-memory-utilization {gpu_memory_utilization} \
+    --max-model-len {max_model_len} \
+    --max-num-seqs {max_num_seqs} \
+    --moe-backend marlin \
+    --enable-auto-tool-choice \
+    --tool-call-parser gemma4 \
+    --reasoning-parser gemma4 \
+    --trust-remote-code

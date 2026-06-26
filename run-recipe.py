@@ -1304,7 +1304,7 @@ Examples:
 
         # Add mods
         for mod in recipe.get("mods", []):
-            mod_path = SCRIPT_DIR / mod
+            mod_path = SCRIPT_DIR / "mods" / mod
             if not mod_path.exists():
                 print(f"Warning: Mod path not found: {mod_path}")
             cmd.extend(["--apply-mod", str(mod_path)])
