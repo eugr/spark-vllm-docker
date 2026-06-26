@@ -32,7 +32,7 @@ GLM_FLASH_AWQ_ARGS=(
 # README Reference: Lines 244-257 (solo) and 264-280 (cluster)
 # ==============================================================================
 GPT_OSS_MODEL="openai/gpt-oss-120b"
-GPT_OSS_CONTAINER="vllm-node-mxfp4"
+GPT_OSS_CONTAINER="sparkarena/spark-vllm-docker:mxfp4"
 GPT_OSS_ARGS=(
     "--port 8000"
     "--host 0.0.0.0"
@@ -64,7 +64,7 @@ MINIMAX_ARGS=(
     "--load-format fastsafetensors"
     "--enable-auto-tool-choice"
     "--tool-call-parser minimax_m2"
-    "--reasoning-parser minimax_m2_append_think"
+    "--reasoning-parser minimax_m2"
 )
 
 # ==============================================================================

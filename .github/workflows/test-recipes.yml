@@ -55,5 +55,9 @@ jobs:
         for recipe in recipes/*.yaml; do
           name=$(basename "$recipe" .yaml)
           echo "Testing recipe: $name"
-          ./run-recipe.py "$name" --dry-run --solo || exit 1
+          if grep -Eq '^cluster_only:[[:space:]]*true' "$recipe"; then
+            ./run-recipe.py "$name" --dry-run -n 10.0.0.1,10.0.0.2 || exit 1
+          else
+            ./run-recipe.py "$name" --dry-run --solo || exit 1
+          fi
         done

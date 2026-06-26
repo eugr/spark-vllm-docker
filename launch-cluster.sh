@@ -855,6 +855,56 @@ copy_script_to_worker() {
          rm -f $remote_tmp" || { echo "Error: docker cp to worker $worker_ip failed"; exit 1; }
 }
 
+# Ensure cache directories exist inside a local container.
+ensure_cache_dirs_in_container() {
+    local container="$1"
+    if [[ "$MOUNT_CACHE_DIRS" != "true" ]]; then
+        return
+    fi
+    docker exec "$container" mkdir -p /root/.cache/vllm /root/.cache/flashinfer /root/.triton || {
+        echo "Warning: Failed to ensure cache directories inside container '$container'."
+    }
+}
+
+# Ensure cache directories exist inside a remote worker container.
+ensure_cache_dirs_in_worker() {
+    local worker_ip="$1"; local container="$2"
+    if [[ "$MOUNT_CACHE_DIRS" != "true" ]]; then
+        return
+    fi
+    ssh -o BatchMode=yes -o StrictHostKeyChecking=no "$worker_ip" \
+        "docker exec $container mkdir -p /root/.cache/vllm /root/.cache/flashinfer /root/.triton" || {
+        echo "Warning: Failed to ensure cache directories in worker container '$container' on $worker_ip."
+    }
+}
+
+# Copy (and patch for no-ray) launch script to all nodes.
+sync_launch_script_to_nodes() {
+    if [[ -z "$LAUNCH_SCRIPT_PATH" ]]; then
+        return
+    fi
+
+    local total_nodes=$(( 1 + ${#PEER_NODES[@]} ))
+    if [[ "$NO_RAY_MODE" == "true" ]]; then
+        # Build per-node patched scripts on the host, then copy.
+        local head_script
+        head_script=$(make_node_script "$LAUNCH_SCRIPT_PATH" "$total_nodes" "0" "$HEAD_IP")
+        copy_script_to_container "$CONTAINER_NAME" "$head_script" "head node ($HEAD_IP)"
+        rm -f "$head_script"
+
+        local rank=1
+        for worker in "${PEER_NODES[@]}"; do
+            local worker_script
+            worker_script=$(make_node_script "$LAUNCH_SCRIPT_PATH" "$total_nodes" "$rank" "$HEAD_IP")
+            copy_script_to_worker "$worker" "$CONTAINER_NAME" "$worker_script"
+            rm -f "$worker_script"
+            (( rank++ ))
+        done
+    else
+        copy_script_to_container "$CONTAINER_NAME" "$LAUNCH_SCRIPT_PATH" "head node"
+    fi
+}
+
 # Build -e KEY=VALUE flags for a given node IP (used in docker run and docker exec)
 get_env_flags() {
     local node_ip="$1"
@@ -900,6 +950,13 @@ start_cluster() {
     check_cluster_running
 
     if [[ "$CLUSTER_WAS_RUNNING" == "true" ]]; then
+        # Reusing an already running container is valid, but we still need to
+        # refresh the launch script so each run executes the current recipe.
+        sync_launch_script_to_nodes
+        ensure_cache_dirs_in_container "$CONTAINER_NAME"
+        for worker in "${PEER_NODES[@]}"; do
+            ensure_cache_dirs_in_worker "$worker" "$CONTAINER_NAME"
+        done
         return
     fi
 
@@ -963,26 +1020,11 @@ start_cluster() {
         done
     fi
 
-    # Copy (and patch for no-ray) launch script
-    if [[ -n "$LAUNCH_SCRIPT_PATH" ]]; then
-        local total_nodes=$(( 1 + ${#PEER_NODES[@]} ))
-        if [[ "$NO_RAY_MODE" == "true" ]]; then
-            # Build per-node patched scripts on the host, then copy
-            local head_script; head_script=$(make_node_script "$LAUNCH_SCRIPT_PATH" "$total_nodes" "0" "$HEAD_IP")
-            copy_script_to_container "$CONTAINER_NAME" "$head_script" "head node ($HEAD_IP)"
-            rm -f "$head_script"
-
-            local rank=1
-            for worker in "${PEER_NODES[@]}"; do
-                local worker_script; worker_script=$(make_node_script "$LAUNCH_SCRIPT_PATH" "$total_nodes" "$rank" "$HEAD_IP")
-                copy_script_to_worker "$worker" "$CONTAINER_NAME" "$worker_script"
-                rm -f "$worker_script"
-                (( rank++ ))
-            done
-        else
-            copy_script_to_container "$CONTAINER_NAME" "$LAUNCH_SCRIPT_PATH" "head node"
-        fi
-    fi
+    sync_launch_script_to_nodes
+    ensure_cache_dirs_in_container "$CONTAINER_NAME"
+    for worker in "${PEER_NODES[@]}"; do
+        ensure_cache_dirs_in_worker "$worker" "$CONTAINER_NAME"
+    done
 
     # Start Ray cluster (unless solo or no-ray)
     if [[ "$SOLO_MODE" == "false" && "$NO_RAY_MODE" == "false" ]]; then

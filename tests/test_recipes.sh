@@ -289,11 +289,11 @@ test_solo_mode_tp1() {
     
     output=$(run_recipe_dry_run "$recipe_name" "solo")
     
-    # Check that -tp 1 is in the output (solo mode should set tp=1)
-    if echo "$output" | grep -q "\-tp 1"; then
-        log_pass "Solo mode correctly sets -tp 1"
+    # Check that tp=1 is in the output (accept either short or long flag form)
+    if echo "$output" | grep -q "\-tp 1" || echo "$output" | grep -q "\-\-tensor-parallel-size 1"; then
+        log_pass "Solo mode correctly sets tensor parallel to 1"
     else
-        log_fail "Solo mode did not set -tp 1"
+        log_fail "Solo mode did not set tensor parallel to 1"
         log_verbose "$output"
     fi
 }
@@ -604,19 +604,22 @@ test_launch_cmd_container_image() {
     log_test "Launch command includes correct container image (-t)"
     
     # Use openai-gpt-oss-120b which has a specific container name
-    if [[ ! -f "$PROJECT_DIR/recipes/openai-gpt-oss-120b.yaml" ]]; then
+    local recipe_file="$PROJECT_DIR/recipes/openai-gpt-oss-120b.yaml"
+    if [[ ! -f "$recipe_file" ]]; then
         log_skip "openai-gpt-oss-120b.yaml not found"
         return
     fi
     
     output=$("$PROJECT_DIR/run-recipe.py" openai-gpt-oss-120b --dry-run --solo 2>&1)
     launch_cmd=$(extract_launch_cmd "$output")
+    expected_container=$(get_recipe_flag "container" "$recipe_file")
     
-    # Check the container is vllm-node-mxfp4 (from the recipe)
-    if echo "$launch_cmd" | grep -q "\-t vllm-node-mxfp4"; then
+    # Check the container matches the recipe.
+    if echo "$launch_cmd" | grep -q "\-t $expected_container"; then
         log_pass "Launch command includes correct container image"
     else
         log_fail "Launch command has wrong container image"
+        log_verbose "Expected:  -t $expected_container"
         log_verbose "Launch cmd: $launch_cmd"
     fi
 }
