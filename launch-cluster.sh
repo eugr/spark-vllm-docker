@@ -7,7 +7,8 @@ HF_CACHE_DIR="${HF_HOME:-$HOME/.cache/huggingface}"
 CONTAINER_WORKSPACE_DIR="/workspace"
 CONTAINER_EXEC_SCRIPT="$CONTAINER_WORKSPACE_DIR/exec-script.sh"
 # Modify these if you want to pass additional docker args or set VLLM_SPARK_EXTRA_DOCKER_ARGS variable
-DOCKER_ARGS="-e NCCL_IGNORE_CPU_AFFINITY=1 -v $HF_CACHE_DIR:/root/.cache/huggingface"
+DOCKER_ARGS="-e NVIDIA_DRIVER_CAPABILITIES=all -e NCCL_IGNORE_CPU_AFFINITY=1 -v /run/udev:/run/udev:ro -v $HF_CACHE_DIR:/root/.cache/huggingface"
+DOCKER_ARGS="$DOCKER_ARGS -e VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR=/root/.config/vllm/flashinfer_tuning"
 
 # Append additional arguments from environment variable
 if [[ -n "$VLLM_SPARK_EXTRA_DOCKER_ARGS" ]]; then
@@ -350,9 +351,16 @@ if [[ "$MOUNT_CACHE_DIRS" == "true" ]]; then
     DOCKER_ARGS="$DOCKER_ARGS -v $HOME/.cache/vllm:/root/.cache/vllm"
     CACHE_DIRS_TO_CREATE+=("$HOME/.cache/vllm")
     
+    # vLLM Config (for FlashInfer Autotune cache)
+    DOCKER_ARGS="$DOCKER_ARGS -v $HOME/.config/vllm:/root/.config/vllm"
+    CACHE_DIRS_TO_CREATE+=("$HOME/.config/vllm")
+
     # FlashInfer Cache
     DOCKER_ARGS="$DOCKER_ARGS -v $HOME/.cache/flashinfer:/root/.cache/flashinfer"
     CACHE_DIRS_TO_CREATE+=("$HOME/.cache/flashinfer")
+
+    # FlashInfer CUBINs (Docker named volume to preserve pre-built ones and persist new ones)
+    DOCKER_ARGS="$DOCKER_ARGS -v flashinfer_cubins:/usr/local/lib/python3.12/dist-packages/flashinfer_cubin/cubins"
 
     # Triton Cache
     DOCKER_ARGS="$DOCKER_ARGS -v $HOME/.triton:/root/.triton"

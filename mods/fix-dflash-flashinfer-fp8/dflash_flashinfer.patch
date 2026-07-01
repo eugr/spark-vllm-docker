@@ -1,0 +1,1447 @@
+diff --git a/vllm/config/speculative.py b/vllm/config/speculative.py
+index e388987d..282bbe40 100644
+--- a/vllm/config/speculative.py
++++ b/vllm/config/speculative.py
+@@ -290,6 +290,14 @@ class SpeculativeConfig:
+                 "eagle_aux_hidden_state_layer_ids",
+                 None,
+             )
++            if not layer_ids:
++                dflash_config = getattr(
++                    self.draft_model_config.hf_config, "dflash_config", None
++                )
++                if dflash_config and isinstance(dflash_config, dict):
++                    layer_ids = [
++                        i + 1 for i in dflash_config.get("target_layer_ids", [])
++                    ]
+             if layer_ids is not None:
+                 # Convert to tuple to make it hashable
+                 factors.append(tuple(layer_ids))
+@@ -1070,6 +1078,10 @@ class SpeculativeConfig:
+     def use_eagle(self) -> bool:
+         return self.method in ("eagle", "eagle3", "mtp", "dflash")
+ 
++    def requires_eagle_cache_drop(self) -> bool:
++        """Whether prefix cache hits must drop one block for hidden states."""
++        return self.use_eagle() and not self.use_dflash()
++
+     def use_dflash(self) -> bool:
+         return self.method == "dflash"
+ 
+diff --git a/vllm/model_executor/models/qwen3_dflash.py b/vllm/model_executor/models/qwen3_dflash.py
+index 25f139f2..7da26aa4 100644
+--- a/vllm/model_executor/models/qwen3_dflash.py
++++ b/vllm/model_executor/models/qwen3_dflash.py
+@@ -1,7 +1,7 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ 
+-from collections.abc import Iterable
++from collections.abc import Iterable, Mapping
+ 
+ import torch
+ import torch.nn.functional as F
+@@ -34,6 +34,11 @@ from vllm.model_executor.model_loader.weight_utils import (
+ from vllm.multimodal.inputs import NestedTensors
+ from vllm.transformers_utils.config import set_default_rope_theta
+ from vllm.v1.attention.backend import AttentionType
++from vllm.v1.kv_cache_interface import (
++    FullAttentionSpec,
++    KVCacheSpec,
++    SlidingWindowSpec,
++)
+ 
+ from .qwen2 import Qwen2MLP as Qwen3MLP
+ from .qwen3 import Qwen3ForCausalLM
+@@ -47,6 +52,53 @@ from .utils import (
+ logger = init_logger(__name__)
+ 
+ 
++_DFLASH_VALID_LAYER_TYPES = frozenset({"full_attention", "sliding_attention"})
++
++
++def _get_dflash_layer_types(config: Qwen3Config) -> tuple[str, ...]:
++    layer_types = getattr(config, "layer_types", None)
++    if layer_types is None:
++        return ("full_attention",) * config.num_hidden_layers
++    if len(layer_types) != config.num_hidden_layers:
++        raise ValueError(
++            f"DFlash layer_types length {len(layer_types)} does not match "
++            f"num_hidden_layers {config.num_hidden_layers}."
++        )
++    invalid = set(layer_types) - _DFLASH_VALID_LAYER_TYPES
++    if invalid:
++        raise ValueError(f"Invalid DFlash layer_type(s): {sorted(invalid)}.")
++    if "sliding_attention" in layer_types and not getattr(
++        config, "sliding_window", None
++    ):
++        raise ValueError(
++            "DFlash sliding_attention layers require `sliding_window` in config."
++        )
++    return tuple(layer_types)
++
++
++class DFlashAttention(Attention):
++    """Attention with DFlash-specific KV allocation semantics.
++
++    The compute path keeps the layer's configured sliding window. The KV cache
++    spec is widened to full attention because DFlash writes every context KV
++    before drafting and cannot evict old context blocks from draft layers.
++    """
++
++    def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec | None:
++        spec = super().get_kv_cache_spec(vllm_config)
++        if isinstance(spec, SlidingWindowSpec):
++            return FullAttentionSpec(
++                block_size=spec.block_size,
++                num_kv_heads=spec.num_kv_heads,
++                head_size=spec.head_size,
++                head_size_v=getattr(spec, "head_size_v", spec.head_size),
++                dtype=spec.dtype,
++                kv_quant_mode=spec.kv_quant_mode,
++                page_size_padded=spec.page_size_padded,
++            )
++        return spec
++
++
+ class DFlashQwen3Attention(nn.Module):
+     """Attention for DFlash speculative decoding.
+ 
+@@ -66,6 +118,7 @@ class DFlashQwen3Attention(nn.Module):
+         attention_bias: bool = False,
+         cache_config: CacheConfig | None = None,
+         quant_config: QuantizationConfig | None = None,
++        sliding_window: int | None = None,
+         prefix: str = "",
+         attn_type: str = AttentionType.DECODER,
+     ) -> None:
+@@ -109,13 +162,14 @@ class DFlashQwen3Attention(nn.Module):
+             max_position=max_position,
+             rope_parameters=rope_parameters,
+         )
+-        self.attn = Attention(
++        self.attn = DFlashAttention(
+             self.num_heads,
+             self.head_dim,
+             self.scaling,
+             num_kv_heads=self.num_kv_heads,
+             cache_config=cache_config,
+             quant_config=quant_config,
++            per_layer_sliding_window=sliding_window,
+             prefix=f"{prefix}.attn",
+             attn_type=attn_type,
+         )
+@@ -158,12 +212,17 @@ class DFlashQwen3DecoderLayer(nn.Module):
+         config: Qwen3Config,
+         cache_config: CacheConfig | None = None,
+         quant_config: QuantizationConfig | None = None,
++        layer_type: str = "full_attention",
+         prefix: str = "",
+     ) -> None:
+         super().__init__()
+         self.hidden_size = config.hidden_size
++        self.layer_type = layer_type
+         set_default_rope_theta(config, default_theta=1000000)
+         attn_type = AttentionType.DECODER
++        sliding_window = (
++            config.sliding_window if layer_type == "sliding_attention" else None
++        )
+ 
+         self.self_attn = DFlashQwen3Attention(
+             hidden_size=self.hidden_size,
+@@ -175,6 +234,7 @@ class DFlashQwen3DecoderLayer(nn.Module):
+             head_dim=getattr(config, "head_dim", None),
+             cache_config=cache_config,
+             quant_config=quant_config,
++            sliding_window=sliding_window,
+             rope_parameters=config.rope_parameters,
+             prefix=f"{prefix}.self_attn",
+             attn_type=attn_type,
+@@ -243,6 +303,7 @@ class DFlashQwen3Model(nn.Module):
+             prefix=maybe_prefix(prefix, "embed_tokens"),
+         )
+ 
++        self.layer_types = _get_dflash_layer_types(self.config)
+         self.layers = nn.ModuleList(
+             [
+                 DFlashQwen3DecoderLayer(
+@@ -250,11 +311,17 @@ class DFlashQwen3Model(nn.Module):
+                     config=self.config,
+                     cache_config=current_vllm_config.cache_config,
+                     quant_config=self.quant_config,
++                    layer_type=self.layer_types[layer_idx],
+                     prefix=maybe_prefix(prefix, f"layers.{layer_idx + start_layer_id}"),
+                 )
+                 for layer_idx in range(self.config.num_hidden_layers)
+             ]
+         )
++        self.sliding_attention_layer_names = {
++            layer.self_attn.attn.layer_name
++            for layer in self.layers
++            if layer.layer_type == "sliding_attention"
++        }
+         if self.use_aux_hidden_state:
+             num_features_to_use = self.config.num_hidden_layers
+             if "target_layer_ids" in drafter_config:
+@@ -345,7 +412,7 @@ class DFlashQwen3Model(nn.Module):
+         self,
+         context_states: torch.Tensor,
+         context_positions: torch.Tensor,
+-        context_slot_mapping: torch.Tensor | None = None,
++        context_slot_mapping: torch.Tensor | Mapping[str, torch.Tensor] | None = None,
+     ) -> None:
+         """Precompute K/V for context states write them into each layer's KV cache.
+ 
+@@ -426,13 +493,18 @@ class DFlashQwen3Model(nn.Module):
+         all_k_final = all_k_flat.view(L, num_ctx, nkv, hd)
+         for i in range(L):
+             attn = self._attn_layers[i]
++            layer_slot_mapping = (
++                context_slot_mapping[attn.layer_name]
++                if isinstance(context_slot_mapping, Mapping)
++                else context_slot_mapping
++            )
+             kv_cache = attn.kv_cache
+             attn.impl.do_kv_cache_update(
+                 attn,
+                 all_k_final[i],
+                 all_v[i],
+                 kv_cache,
+-                context_slot_mapping,
++                layer_slot_mapping,
+             )
+ 
+     def forward(
+@@ -522,7 +594,8 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
+             prefix=maybe_prefix(prefix, "lm_head"),
+         )
+         self.logits_processor = LogitsProcessor(
+-            self.config.draft_vocab_size, scale=logit_scale
++            self.config.draft_vocab_size,
++            scale=logit_scale,
+         )
+         target_vocab_size = vllm_config.model_config.get_vocab_size()
+         if self.config.draft_vocab_size != target_vocab_size:
+@@ -570,13 +643,17 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
+         self,
+         context_states: torch.Tensor,
+         context_positions: torch.Tensor,
+-        context_slot_mapping: torch.Tensor | None = None,
++        context_slot_mapping: torch.Tensor | Mapping[str, torch.Tensor] | None = None,
+     ) -> None:
+         """Precompute projected + RoPE'd K/V and write to cache."""
+         self.model.precompute_and_store_context_kv(
+             context_states, context_positions, context_slot_mapping
+         )
+ 
++    @property
++    def sliding_attention_layer_names(self) -> set[str]:
++        return self.model.sliding_attention_layer_names
++
+     def combine_hidden_states(
+         self,
+         hidden_states: torch.Tensor,
+diff --git a/vllm/transformers_utils/configs/speculators/algos.py b/vllm/transformers_utils/configs/speculators/algos.py
+index 650f09c3..6695d299 100644
+--- a/vllm/transformers_utils/configs/speculators/algos.py
++++ b/vllm/transformers_utils/configs/speculators/algos.py
+@@ -85,19 +85,29 @@ def update_dflash(config_dict: dict, pre_trained_config: dict) -> None:
+     - target_hidden_size: Hidden size of the target model
+     - mask_token_id (required): Token ID used for parallel drafting mask
+         placeholders
+-    - aux_hidden_state_layer_ids (required): Layer indices from the target
+-        model whose intermediate hidden states are used as context for the
+-        DFlash drafter. Mapped to both eagle_aux_hidden_state_layer_ids
+-        (for gpu_model_runner) and dflash_config.target_layer_ids (for the
+-        DFlash model).
++    - aux_hidden_state_layer_ids (required): DFlash target layer indices whose
++        intermediate hidden states are used as context for the DFlash drafter.
++        Mapped to dflash_config.target_layer_ids for the DFlash model. The
++        runner-facing eagle_aux_hidden_state_layer_ids are shifted by one to
++        match vLLM's hidden-state extraction semantics.
+     """
+     pre_trained_config["architectures"] = ["DFlashDraftModel"]
+     pre_trained_config["draft_vocab_size"] = config_dict.get("draft_vocab_size")
+     if config_dict.get("target_hidden_size") is not None:
+         pre_trained_config["target_hidden_size"] = config_dict["target_hidden_size"]
++    for key in (
++        "layer_types",
++        "use_sliding_window",
++        "sliding_window",
++        "max_window_layers",
++    ):
++        if key in config_dict:
++            pre_trained_config[key] = config_dict[key]
+ 
+     aux_layer_ids = config_dict["aux_hidden_state_layer_ids"]
+-    pre_trained_config["eagle_aux_hidden_state_layer_ids"] = aux_layer_ids
++    pre_trained_config["eagle_aux_hidden_state_layer_ids"] = [
++        i + 1 for i in aux_layer_ids
++    ]
+ 
+     # DFlash configs use different indexing for the target layers, see #40727
+     pre_trained_config["dflash_config"] = {
+diff --git a/vllm/v1/attention/backend.py b/vllm/v1/attention/backend.py
+index af58bfd3..ff053fed 100644
+--- a/vllm/v1/attention/backend.py
++++ b/vllm/v1/attention/backend.py
+@@ -150,6 +150,11 @@ class AttentionBackend(ABC):
+     def full_cls_name(cls) -> tuple[str, str]:
+         return (cls.__module__, cls.__qualname__)
+ 
++    @classmethod
++    def get_metadata_group_key(cls, attn_layer: Any) -> tuple[Any, ...]:
++        """Return extra layer attributes that require separate metadata builders."""
++        return ()
++
+     @classmethod
+     def get_supported_head_sizes(cls) -> list[int]:
+         return []
+diff --git a/vllm/v1/attention/backends/flashinfer.py b/vllm/v1/attention/backends/flashinfer.py
+index a81c5742..1516fd64 100755
+--- a/vllm/v1/attention/backends/flashinfer.py
++++ b/vllm/v1/attention/backends/flashinfer.py
+@@ -4,7 +4,7 @@
+ 
+ from dataclasses import dataclass
+ from functools import partial
+-from typing import ClassVar
++from typing import Any, ClassVar
+ 
+ import numpy as np
+ import torch
+@@ -345,6 +345,21 @@ class FlashInferBackend(AttentionBackend):
+     def get_name() -> str:
+         return "FLASHINFER"
+ 
++    @classmethod
++    def supports_non_causal(cls) -> bool:
++        return True
++
++    @classmethod
++    def get_metadata_group_key(cls, attn_layer: Any) -> tuple[Any, ...]:
++        impl = attn_layer.impl
++        scale = getattr(impl, "scale", None)
++        return (
++            getattr(impl, "window_left", None),
++            getattr(impl, "logits_soft_cap", None),
++            float(scale) if scale is not None else None,
++            getattr(impl, "sinks", None) is not None,
++        )
++
+     @staticmethod
+     def get_impl_cls() -> type["FlashInferImpl"]:
+         return FlashInferImpl
+@@ -512,6 +527,7 @@ class FlashInferMetadata:
+     num_decode_tokens: int
+     num_prefills: int
+     num_prefill_tokens: int
++    causal: bool
+ 
+     prefill: FIPrefill | TRTLLMPrefill | None
+     """
+@@ -554,6 +570,9 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
+         self._prefill_wrapper: (
+             BatchPrefillWithPagedKVCacheWrapper | BatchDCPPrefillWrapper | None
+         ) = None  # Wrapper for prefill/append
++        self._noncausal_prefill_wrapper: (
++            BatchPrefillWithPagedKVCacheWrapper | None
++        ) = None  # Wrapper for non-causal prefill (DFlash)
+         self._decode_wrapper = None  # Wrapper for decode (general shape)
+ 
+         if envs.VLLM_BATCH_INVARIANT:
+@@ -760,7 +779,28 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
+ 
+     def _get_prefill_wrapper(
+         self,
++        causal: bool = True,
+     ) -> BatchPrefillWithPagedKVCacheWrapper | BatchDCPPrefillWrapper:
++        if not causal:
++            if self.use_dcp:
++                raise NotImplementedError(
++                    "FlashInfer non-causal prefill is not supported with DCP yet."
++                )
++            if self.is_kvcache_nvfp4:
++                raise NotImplementedError(
++                    "FlashInfer non-causal attention is not supported with "
++                    "NVFP4 KV cache."
++                )
++            if self._noncausal_prefill_wrapper is None:
++                self._noncausal_prefill_wrapper = (
++                    BatchPrefillWithPagedKVCacheWrapper(
++                        self._get_workspace_buffer(),
++                        get_kv_cache_layout(),
++                        backend="auto",
++                    )
++                )
++            return self._noncausal_prefill_wrapper
++
+         if self._prefill_wrapper is None:
+             if self.use_dcp:
+                 self._prefill_wrapper = BatchDCPPrefillWrapper(
+@@ -891,13 +931,22 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
+     ) -> FlashInferMetadata:
+         num_reqs = common_attn_metadata.num_reqs
+         num_actual_tokens = common_attn_metadata.num_actual_tokens
+-        num_decodes, num_prefills, num_decode_tokens, num_prefill_tokens = (
+-            split_decodes_and_prefills(
+-                common_attn_metadata,
+-                decode_threshold=self.reorder_batch_threshold,
+-                require_uniform=True,
++        causal = common_attn_metadata.causal
++        if causal:
++            num_decodes, num_prefills, num_decode_tokens, num_prefill_tokens = (
++                split_decodes_and_prefills(
++                    common_attn_metadata,
++                    decode_threshold=self.reorder_batch_threshold,
++                    require_uniform=True,
++                )
+             )
+-        )
++        else:
++            # FlashInfer decode/TRTLLM paths cannot express non-causal
++            # query-query attention, so DFlash runs as native prefill.
++            num_decodes = 0
++            num_prefills = num_reqs
++            num_decode_tokens = 0
++            num_prefill_tokens = num_actual_tokens
+ 
+         page_size = self.page_size
+         max_seq_len = common_attn_metadata.max_seq_len
+@@ -912,23 +961,41 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
+         # - Decode (FI native or TRTLLM)
+         use_cascade = common_prefix_len > 0
+         uses_spec_reorder = self.reorder_batch_threshold > 1
+-        prefill_use_trtllm = use_trtllm_attention(
+-            self.num_qo_heads,
+-            self.num_kv_heads,
+-            num_prefill_tokens,
+-            max_seq_len,
+-            self.dcp_world_size,
+-            self.cache_dtype,
+-            self.q_data_type,
+-            is_prefill=True,
+-            force_use_trtllm=self.attention_config.use_trtllm_attention,
+-            has_sinks=self.has_sinks,
+-            has_spec=uses_spec_reorder,
++        prefill_use_trtllm = (
++            causal
++            and use_trtllm_attention(
++                self.num_qo_heads,
++                self.num_kv_heads,
++                num_prefill_tokens,
++                max_seq_len,
++                self.dcp_world_size,
++                self.cache_dtype,
++                self.q_data_type,
++                is_prefill=True,
++                force_use_trtllm=self.attention_config.use_trtllm_attention,
++                has_sinks=self.has_sinks,
++                has_spec=uses_spec_reorder,
++            )
+         )
+         decode_use_trtllm = (
+-            self.use_trtllm_decode_attention and self.dcp_world_size <= 1
++            causal
++            and self.use_trtllm_decode_attention
++            and self.dcp_world_size <= 1
+         )
+ 
++        if not causal and self.use_dcp:
++            raise NotImplementedError(
++                "FlashInfer non-causal prefill is not supported with DCP yet."
++            )
++        uses_trtllm = (num_prefills > 0 and prefill_use_trtllm) or (
++            num_decodes > 0 and decode_use_trtllm
++        )
++        if not causal and uses_trtllm:
++            raise NotImplementedError(
++                "FlashInfer non-causal attention is not supported with TRTLLM "
++                "kernels yet."
++            )
++
+         all_uses_trtllm = (num_prefills == 0 or prefill_use_trtllm) and (
+             num_decodes == 0 or decode_use_trtllm
+         )
+@@ -969,6 +1036,7 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
+             num_decode_tokens=num_decode_tokens,
+             num_prefills=num_prefills,
+             num_prefill_tokens=num_prefill_tokens,
++            causal=causal,
+             use_cascade=use_cascade,
+             prefill=None,
+             decode=None,
+@@ -1126,7 +1194,7 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
+                     max_seq_len=max_seq_len,
+                 )
+             else:
+-                prefill_wrapper = self._get_prefill_wrapper()
++                prefill_wrapper = self._get_prefill_wrapper(causal=attn_metadata.causal)
+                 # Slicing CPU buffers that are only needed for FI native prefills
+                 paged_kv_last_page_len_prefill_cpu = self.paged_kv_last_page_len.cpu[
+                     prefill_start:num_reqs
+@@ -1176,7 +1244,7 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
+                         num_kv_heads=self.num_kv_heads,
+                         head_dim_qk=self.head_dim,
+                         page_size=self.page_size,
+-                        causal=True,
++                        causal=attn_metadata.causal,
+                         sm_scale=self.sm_scale,
+                         window_left=self.window_left,
+                         logits_soft_cap=self.logits_soft_cap,
+@@ -1551,7 +1619,7 @@ class FlashInferImpl(AttentionImpl):
+                         self.logits_soft_cap or 0.0
+                     )
+                     assert prefill_wrapper._sm_scale == self.scale
+-                    assert prefill_wrapper._causal
++                    assert prefill_wrapper._causal == attn_metadata.causal
+ 
+                     if self.is_kvcache_nvfp4:
+                         kv_cache_permute = nvfp4_kv_data
+diff --git a/vllm/v1/core/kv_cache_utils.py b/vllm/v1/core/kv_cache_utils.py
+index 7f3a5e4f..06cf815b 100644
+--- a/vllm/v1/core/kv_cache_utils.py
++++ b/vllm/v1/core/kv_cache_utils.py
+@@ -1307,9 +1307,9 @@ def get_kv_cache_config_from_groups(
+         kv_cache_tensors = []
+         for i in range(group_size):
+             shared_by = []
+-            for j in range(len(kv_cache_groups)):
+-                if i < len(kv_cache_groups[j].layer_names):
+-                    shared_by.append(kv_cache_groups[j].layer_names[i])
++            for group in kv_cache_groups:
++                if i < len(group.layer_names):
++                    shared_by.append(group.layer_names[i])
+             kv_cache_tensors.append(
+                 KVCacheTensor(size=page_size * num_blocks, shared_by=shared_by)
+             )
+diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
+index 73d3dcb4..267ec6c9 100644
+--- a/vllm/v1/core/sched/scheduler.py
++++ b/vllm/v1/core/sched/scheduler.py
+@@ -210,11 +210,15 @@ class Scheduler(SchedulerInterface):
+ 
+         speculative_config = vllm_config.speculative_config
+         self.use_eagle = False
++        self.requires_eagle_cache_drop = False
+         self.num_spec_tokens = self.num_lookahead_tokens = 0
+         if speculative_config:
+             self.num_spec_tokens = speculative_config.num_speculative_tokens
+             if speculative_config.use_eagle():
+                 self.use_eagle = True
++                self.requires_eagle_cache_drop = (
++                    speculative_config.requires_eagle_cache_drop()
++                )
+                 self.num_lookahead_tokens = self.num_spec_tokens
+             if speculative_config.uses_draft_model():
+                 self.num_lookahead_tokens = self.num_spec_tokens
+@@ -232,7 +236,7 @@ class Scheduler(SchedulerInterface):
+             max_model_len=self.max_model_len,
+             max_num_batched_tokens=self.scheduler_config.max_num_batched_tokens,
+             enable_caching=self.cache_config.enable_prefix_caching,
+-            use_eagle=self.use_eagle,
++            use_eagle=self.requires_eagle_cache_drop,
+             log_stats=self.log_stats,
+             enable_kv_cache_events=self.enable_kv_cache_events,
+             dcp_world_size=self.dcp_world_size,
+@@ -307,13 +311,13 @@ class Scheduler(SchedulerInterface):
+             # must be a multiple of `block_size`.
+             # As an exception, if `num_new_tokens` is less than `block_size`, the
+             # state is simply not cached, requiring no special handling.
+-            # Additionally, when Eagle mode is enabled, FullAttn prunes the last
+-            # matching block. To prevent this from causing a Mamba cache miss, the
+-            # last chunk must be not smaller than `block_size`.
++            # Additionally, when Eagle-style cache drop is enabled, FullAttn
++            # prunes the last matching block. To prevent this from causing a
++            # Mamba cache miss, the last chunk must be not smaller than
++            # `block_size`.
+             block_size = self.cache_config.block_size
+             last_cache_position = request.num_tokens - request.num_tokens % block_size
+-            # eagle prune
+-            if self.use_eagle:
++            if self.requires_eagle_cache_drop:
+                 last_cache_position = max(last_cache_position - block_size, 0)
+             num_computed_tokens_after_sched = num_computed_tokens + num_new_tokens
+             if num_computed_tokens_after_sched < last_cache_position:
+@@ -417,7 +421,7 @@ class Scheduler(SchedulerInterface):
+                     request.num_computed_tokens,
+                     num_new_tokens,
+                     encoder_compute_budget,
+-                    shift_computed_tokens=1 if self.use_eagle else 0,
++                    shift_computed_tokens=1 if self.requires_eagle_cache_drop else 0,
+                 )
+ 
+             if self.need_mamba_block_aligned_split:
+@@ -686,7 +690,9 @@ class Scheduler(SchedulerInterface):
+                             num_computed_tokens,
+                             num_new_tokens,
+                             encoder_compute_budget,
+-                            shift_computed_tokens=1 if self.use_eagle else 0,
++                            shift_computed_tokens=1
++                            if self.requires_eagle_cache_drop
++                            else 0,
+                         )
+                         if num_new_tokens == 0:
+                             # The request cannot be scheduled.
+diff --git a/vllm/v1/spec_decode/dflash.py b/vllm/v1/spec_decode/dflash.py
+index 72d0f99d..7689c783 100644
+--- a/vllm/v1/spec_decode/dflash.py
++++ b/vllm/v1/spec_decode/dflash.py
+@@ -1,17 +1,17 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ 
+-from dataclasses import replace
+ from typing import Any
+ 
+ import torch
+ from typing_extensions import override
+ 
+-from vllm.config import VllmConfig
++from vllm.config import VllmConfig, replace
+ from vllm.forward_context import set_forward_context
+ from vllm.logger import init_logger
+ from vllm.triton_utils import triton
+ from vllm.v1.attention.backend import CommonAttentionMetadata
++from vllm.v1.kv_cache_interface import KVCacheConfig
+ from vllm.v1.spec_decode.llm_base_proposer import SpecDecodeBaseProposer
+ from vllm.v1.spec_decode.utils import copy_and_expand_dflash_inputs_kernel
+ 
+@@ -30,6 +30,7 @@ class DFlashProposer(SpecDecodeBaseProposer):
+         super().__init__(
+             vllm_config=vllm_config,
+             device=device,
++            # Request aux hidden states; DFlash turns them into context K/V.
+             pass_hidden_states_to_model=True,
+             runner=runner,
+         )
+@@ -50,6 +51,11 @@ class DFlashProposer(SpecDecodeBaseProposer):
+             dtype=torch.int64,
+             device=device,
+         )
++        self._slot_mapping_buffers_by_gid: dict[
++            int, tuple[torch.Tensor, torch.Tensor]
++        ] = {}
++        self._draft_block_size_by_gid: dict[int, int] = {}
++        self._draft_block_tables: dict[int, torch.Tensor] = {}
+         self._context_positions_buffer = torch.zeros(
+             self.max_num_tokens,
+             dtype=torch.int64,
+@@ -65,11 +71,43 @@ class DFlashProposer(SpecDecodeBaseProposer):
+             self.max_positions + 1, device=device, dtype=torch.int32
+         )
+ 
+-        # For DFlash we use the input embeddings to embed the mask token
++        # DFlash embeds mask tokens directly.
+         self.parallel_drafting_hidden_state_tensor = None
+ 
+         self.dflash_causal = self.dflash_config.get("causal", False)
+ 
++    @override
++    def allow_multiple_draft_kv_cache_groups(self) -> bool:
++        return True
++
++    @override
++    def initialize_attn_backend(
++        self,
++        kv_cache_config: KVCacheConfig,
++        kernel_block_sizes: list[int] | None = None,
++    ) -> None:
++        super().initialize_attn_backend(kv_cache_config, kernel_block_sizes)
++        self._draft_block_size_by_gid.clear()
++        for attn_group in self.draft_attn_groups:
++            gid = attn_group.kv_cache_group_id
++            self._draft_block_size_by_gid[gid] = (
++                kernel_block_sizes[gid]
++                if kernel_block_sizes is not None and gid < len(kernel_block_sizes)
++                else attn_group.get_metadata_builder().kv_cache_spec.block_size
++            )
++        self._ensure_slot_mapping_buffers()
++
++    def clear_draft_block_tables(self) -> None:
++        self._draft_block_tables.clear()
++
++    def set_draft_block_table(
++        self,
++        kv_cache_gid: int,
++        block_table: torch.Tensor,
++    ) -> None:
++        if kv_cache_gid in self._draft_kv_cache_group_ids:
++            self._draft_block_tables[kv_cache_gid] = block_table
++
+     @override
+     def _create_draft_vllm_config(self) -> VllmConfig:
+         base = super()._create_draft_vllm_config()
+@@ -84,8 +122,85 @@ class DFlashProposer(SpecDecodeBaseProposer):
+     @override
+     def _warn_if_multimodal(self):
+         # Override to allow multimodal inputs since DFlash supports Qwen3.5 models
++        # Support for multimodal inputs has not been tested.
+         pass
+ 
++    def _ensure_slot_mapping_buffers(self) -> None:
++        gids = self._draft_kv_gids()
++
++        first_gid = gids[0]
++        for gid in gids:
++            if gid in self._slot_mapping_buffers_by_gid:
++                continue
++            if gid == first_gid:
++                self._slot_mapping_buffers_by_gid[gid] = (
++                    self._context_slot_mapping_buffer,
++                    self._slot_mapping_buffer,
++                )
++            else:
++                self._slot_mapping_buffers_by_gid[gid] = (
++                    torch.zeros(
++                        self.max_num_tokens,
++                        dtype=torch.int64,
++                        device=self.device,
++                    ),
++                    torch.zeros(
++                        self.max_query_tokens,
++                        dtype=torch.int64,
++                        device=self.device,
++                    ),
++                )
++
++    def _draft_kv_gids(self) -> list[int]:
++        return self._draft_kv_cache_group_ids or [
++            self.kv_cache_gid if self.kv_cache_gid >= 0 else 0
++        ]
++
++    def _get_dflash_block_table(
++        self,
++        kv_cache_gid: int,
++        cad: CommonAttentionMetadata,
++    ) -> torch.Tensor:
++        block_table = self._draft_block_tables.get(kv_cache_gid)
++        if block_table is not None:
++            return block_table
++        if kv_cache_gid == self.kv_cache_gid or self.kv_cache_gid < 0:
++            return cad.block_table_tensor
++        raise RuntimeError(
++            "Missing DFlash KV metadata for draft KV cache group "
++            f"{kv_cache_gid}. This is required when DFlash draft layers span "
++            "multiple KV cache groups."
++        )
++
++    def _get_dflash_context_slot_mapping(
++        self,
++        num_context: int,
++    ) -> torch.Tensor | dict[str, torch.Tensor]:
++        if not self._draft_layer_to_kv_cache_gid:
++            return self._context_slot_mapping_buffer[:num_context]
++        return {
++            layer_name: self._slot_mapping_buffers_by_gid[
++                self._draft_layer_to_kv_cache_gid[layer_name]
++            ][0][:num_context]
++            for layer_name in self._draft_attn_layer_names
++        }
++
++    @override
++    def _get_slot_mapping(
++        self,
++        num_tokens: int,
++        slot_mapping: torch.Tensor | None = None,
++    ) -> dict[str, torch.Tensor]:
++        self._ensure_slot_mapping_buffers()
++        if self._draft_layer_to_kv_cache_gid:
++            return {
++                layer_name: self._slot_mapping_buffers_by_gid[
++                    self._draft_layer_to_kv_cache_gid[layer_name]
++                ][1][:num_tokens]
++                for layer_name in self._draft_attn_layer_names
++            }
++        return super()._get_slot_mapping(num_tokens, slot_mapping)
++
+     @override
+     def set_inputs_first_pass(
+         self,
+@@ -104,11 +219,9 @@ class DFlashProposer(SpecDecodeBaseProposer):
+         num_query_per_req = 1 + self.num_speculative_tokens
+         num_query_total = batch_size * num_query_per_req
+ 
+-        # Store for build_model_inputs_first_pass to use
+         self._dflash_num_context = num_context
+ 
+-        # We don't need to copy into a buffer here since the context preprocessing
+-        # does not run in a CUDA graph
++        # Context preprocessing does not run in a CUDA graph.
+         self._dflash_hidden_states = target_hidden_states
+ 
+         token_indices_to_sample = torch.empty(
+@@ -117,8 +230,7 @@ class DFlashProposer(SpecDecodeBaseProposer):
+             device=self.device,
+         )
+ 
+-        # Launch fused triton kernel for input_ids, positions, slot_mapping,
+-        # and token_indices_to_sample
++        # Fill query inputs and per-KV-group slot mappings.
+         max_ctx_per_req = cad.max_query_len
+         max_tokens_per_req = max_ctx_per_req + num_query_per_req
+         BLOCK_SIZE = min(256, triton.next_power_of_2(max_tokens_per_req))
+@@ -126,36 +238,48 @@ class DFlashProposer(SpecDecodeBaseProposer):
+         grid = (batch_size, num_blocks)
+ 
+         has_num_rejected = num_rejected_tokens_gpu is not None
+-        copy_and_expand_dflash_inputs_kernel[grid](
+-            # Inputs
+-            next_token_ids_ptr=next_token_ids,
+-            target_positions_ptr=target_positions,
+-            # Outputs
+-            out_input_ids_ptr=self.input_ids,
+-            out_context_positions_ptr=self._context_positions_buffer,
+-            out_query_positions_ptr=self.positions,
+-            out_context_slot_mapping_ptr=self._context_slot_mapping_buffer,
+-            out_query_slot_mapping_ptr=self._slot_mapping_buffer,
+-            out_token_indices_ptr=token_indices_to_sample,
+-            # Block table
+-            block_table_ptr=cad.block_table_tensor,
+-            block_table_stride=cad.block_table_tensor.stride(0),
+-            # Metadata
+-            query_start_loc_ptr=cad.query_start_loc,
+-            num_rejected_tokens_ptr=(
+-                num_rejected_tokens_gpu if has_num_rejected else 0
+-            ),
+-            # Scalars
+-            parallel_drafting_token_id=self.parallel_drafting_token_id,
+-            block_size=self.block_size,
+-            num_query_per_req=num_query_per_req,
+-            num_speculative_tokens=self.num_speculative_tokens,
+-            total_input_tokens=num_context,
+-            BLOCK_SIZE=BLOCK_SIZE,
+-            HAS_NUM_REJECTED=has_num_rejected,
+-        )
++        self._ensure_slot_mapping_buffers()
++        draft_kv_group_ids = self._draft_kv_gids()
++        for kv_cache_gid in draft_kv_group_ids:
++            context_slot_mapping_buffer, query_slot_mapping_buffer = (
++                self._slot_mapping_buffers_by_gid[kv_cache_gid]
++            )
++            block_table = self._get_dflash_block_table(kv_cache_gid, cad)
++            copy_and_expand_dflash_inputs_kernel[grid](
++                # Inputs
++                next_token_ids_ptr=next_token_ids,
++                target_positions_ptr=target_positions,
++                # Outputs
++                out_input_ids_ptr=self.input_ids,
++                out_context_positions_ptr=self._context_positions_buffer,
++                out_query_positions_ptr=self.positions,
++                out_context_slot_mapping_ptr=context_slot_mapping_buffer,
++                out_query_slot_mapping_ptr=query_slot_mapping_buffer,
++                out_token_indices_ptr=token_indices_to_sample,
++                # Block table
++                block_table_ptr=block_table,
++                block_table_stride=block_table.stride(0),
++                # Metadata
++                query_start_loc_ptr=cad.query_start_loc,
++                num_rejected_tokens_ptr=(
++                    num_rejected_tokens_gpu if has_num_rejected else 0
++                ),
++                # Scalars
++                parallel_drafting_token_id=self.parallel_drafting_token_id,
++                block_size=self._draft_block_size_by_gid.get(
++                    kv_cache_gid, self.block_size
++                ),
++                num_query_per_req=num_query_per_req,
++                num_speculative_tokens=self.num_speculative_tokens,
++                total_input_tokens=num_context,
++                BLOCK_SIZE=BLOCK_SIZE,
++                HAS_NUM_REJECTED=has_num_rejected,
++            )
+ 
+-        query_slot_mapping = self._slot_mapping_buffer[:num_query_total]
++        primary_kv_cache_gid = draft_kv_group_ids[0]
++        query_slot_mapping = self._slot_mapping_buffers_by_gid[primary_kv_cache_gid][1][
++            :num_query_total
++        ]
+         new_query_start_loc = self.arange[: batch_size + 1] * num_query_per_req
+ 
+         # In padded mode, cad.seq_lens includes rejected tokens. Subtract
+@@ -164,12 +288,6 @@ class DFlashProposer(SpecDecodeBaseProposer):
+         if has_num_rejected:
+             effective_seq_lens = effective_seq_lens - num_rejected_tokens_gpu
+ 
+-        # Skip num_rejected_tokens (GPU-only); overestimating is fine here.
+-        new_seq_lens_cpu_upper_bound = (
+-            cad.seq_lens_cpu_upper_bound + num_query_per_req
+-            if cad.seq_lens_cpu_upper_bound is not None
+-            else None
+-        )
+         new_cad = CommonAttentionMetadata(
+             query_start_loc=new_query_start_loc,
+             seq_lens=effective_seq_lens + num_query_per_req,
+@@ -179,12 +297,11 @@ class DFlashProposer(SpecDecodeBaseProposer):
+             ),
+             _seq_lens_cpu=None,
+             _num_computed_tokens_cpu=None,
+-            seq_lens_cpu_upper_bound=new_seq_lens_cpu_upper_bound,
+             num_reqs=cad.num_reqs,
+             num_actual_tokens=num_query_total,
+             max_query_len=num_query_per_req,
+             max_seq_len=cad.max_seq_len + num_query_per_req,
+-            block_table_tensor=cad.block_table_tensor,
++            block_table_tensor=self._get_dflash_block_table(primary_kv_cache_gid, cad),
+             slot_mapping=query_slot_mapping,
+             causal=self.dflash_causal,
+         )
+@@ -257,15 +374,13 @@ class DFlashProposer(SpecDecodeBaseProposer):
+         num_input_tokens: int,
+         mm_embed_inputs: tuple[list[torch.Tensor], torch.Tensor] | None,
+     ) -> tuple[dict[str, Any], int]:
+-        # Context and query positions/slots were written to separate
+-        # buffers by the kernel — no copy needed.
++        # Context and query positions/slots were written by the kernel.
+         num_context = self._dflash_num_context
+ 
+-        # Pre-insert context KVs directly into cache
+         self.model.precompute_and_store_context_kv(
+             self._dflash_hidden_states,  # Shape is already [num_context, hidden_size]
+             self._context_positions_buffer[:num_context],
+-            self._context_slot_mapping_buffer[:num_context],
++            self._get_dflash_context_slot_mapping(num_context),
+         )
+         return (
+             dict(
+@@ -280,17 +395,58 @@ class DFlashProposer(SpecDecodeBaseProposer):
+     def build_per_group_and_layer_attn_metadata(
+         self, cad: CommonAttentionMetadata, draft_index: int = 0
+     ) -> tuple[list[object], dict[str, object]]:
+-        per_group, per_layer = super().build_per_group_and_layer_attn_metadata(
+-            cad, draft_index
++        self._ensure_slot_mapping_buffers()
++        sliding_layer_names: set[str] = getattr(
++            self.model, "sliding_attention_layer_names", set()
+         )
+-        if not self.dflash_causal:
+-            # Require all layers to support non-causal attention when required by DFlash
+-            for layer_name, attn_metadata in per_layer.items():
++        per_group: list[object] = []
++        per_layer: dict[str, object] = {}
++        for attn_group in self.draft_attn_groups:
++            kv_cache_gid = attn_group.kv_cache_group_id
++            group_cad = cad.replace(
++                block_table_tensor=self._get_dflash_block_table(kv_cache_gid, cad),
++                slot_mapping=self._slot_mapping_buffers_by_gid[kv_cache_gid][1][
++                    : cad.num_actual_tokens
++                ],
++                causal=False,
++            )
++            attn_metadata = attn_group.get_metadata_builder().build_for_drafting(
++                common_attn_metadata=group_cad,
++                draft_index=draft_index,
++            )
++            per_group.append(attn_metadata)
++            for layer_name in attn_group.layer_names:
++                per_layer[layer_name] = attn_metadata
++
++            # DFlash layers consume attention metadata through the per-layer
++            # forward context. Keep the non-causal group metadata for
++            # group-level spec decode checks, and specialize only the SWA
++            # layers that need a causal sliding-window mask.
++            causal_layers = sliding_layer_names & set(attn_group.layer_names)
++            if causal_layers:
++                causal_attn_metadata = (
++                    attn_group.get_metadata_builder().build_for_drafting(
++                        common_attn_metadata=group_cad.replace(causal=True),
++                        draft_index=draft_index,
++                    )
++                )
++                for layer_name in causal_layers:
++                    per_layer[layer_name] = causal_attn_metadata
++
++        for layer_name, attn_metadata in per_layer.items():
++            if layer_name in sliding_layer_names:
++                assert getattr(attn_metadata, "causal", None) is True, (
++                    f"Attention metadata for sliding layer {layer_name} does not have"
++                    " causal support, which is required for DFlash SWA."
++                )
++                continue
++            if not self.dflash_causal:
+                 assert getattr(attn_metadata, "causal", None) is False, (
+                     f"Attention metadata for layer {layer_name} does not have"
+                     " non-causal support, which is required for DFlash."
+-                    " Consider using a different attention backend, e.g FlashAttention."
++                    " Consider using a different attention backend, such as FlashAttention."
+                 )
++
+         return per_group, per_layer
+ 
+     @override
+diff --git a/vllm/v1/spec_decode/llm_base_proposer.py b/vllm/v1/spec_decode/llm_base_proposer.py
+index 9a0b5371..1ddf8310 100644
+--- a/vllm/v1/spec_decode/llm_base_proposer.py
++++ b/vllm/v1/spec_decode/llm_base_proposer.py
+@@ -30,7 +30,11 @@ from vllm.v1.attention.backend import CommonAttentionMetadata
+ from vllm.v1.attention.backends.registry import AttentionBackendEnum
+ from vllm.v1.attention.backends.triton_attn import TritonAttentionMetadata
+ from vllm.v1.cudagraph_dispatcher import CudagraphDispatcher
+-from vllm.v1.kv_cache_interface import KVCacheConfig, UniformTypeKVCacheSpecs
++from vllm.v1.kv_cache_interface import (
++    KVCacheConfig,
++    KVCacheSpec,
++    UniformTypeKVCacheSpecs,
++)
+ from vllm.v1.sample.metadata import SamplingMetadata
+ from vllm.v1.sample.sampler import _SAMPLING_EPS
+ from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
+@@ -130,6 +134,8 @@ class SpecDecodeBaseProposer:
+ 
+         self.draft_attn_groups: list[AttentionGroup] = []
+         self.kv_cache_gid: int = -1
++        self._draft_layer_to_kv_cache_gid: dict[str, int] = {}
++        self._draft_kv_cache_group_ids: list[int] = []
+         self.eagle3_use_aux_hidden_state: bool = (
+             self._get_eagle3_use_aux_hidden_state_from_config()
+         )
+@@ -1539,6 +1545,9 @@ class SpecDecodeBaseProposer:
+             == 1
+         ), "All drafting layers should belong to the same kv cache group"
+ 
++    def allow_multiple_draft_kv_cache_groups(self) -> bool:
++        return False
++
+     def initialize_attn_backend(
+         self,
+         kv_cache_config: KVCacheConfig,
+@@ -1553,47 +1562,63 @@ class SpecDecodeBaseProposer:
+             AttentionLayerBase,  # type: ignore[type-abstract]
+         )
+ 
+-        # Find which kv_cache_group the draft layers belong to
+-        self.validate_same_kv_cache_group(kv_cache_config)
+-        kv_cache_spec = None
+-        for gid, group in enumerate(kv_cache_config.kv_cache_groups):
+-            if self._draft_attn_layer_names & set(group.layer_names):
+-                self.kv_cache_gid = gid
+-                kv_cache_spec = group.kv_cache_spec
+-                break
+-
+-        attention_groups: dict[tuple[str, str], AttentionGroup] = {}
+-        if kv_cache_spec is not None:
+-            for layer_name in self._draft_attn_layer_names:
+-                attn_backend = all_attn_layers[layer_name].get_attn_backend()
+-                backend_key = attn_backend.full_cls_name()
+-                if backend_key not in attention_groups:
+-                    layer_kv_cache_spec = kv_cache_spec
+-                    if isinstance(layer_kv_cache_spec, UniformTypeKVCacheSpecs):
+-                        layer_kv_cache_spec = layer_kv_cache_spec.kv_cache_specs[
+-                            layer_name
+-                        ]
+-
+-                    kernel_block_size = (
+-                        kernel_block_sizes[self.kv_cache_gid]
+-                        if kernel_block_sizes is not None
+-                        and self.kv_cache_gid < len(kernel_block_sizes)
+-                        else None
+-                    )
+-                    attn_group = AttentionGroup(
+-                        backend=attn_backend,
+-                        layer_names=[layer_name],
+-                        kv_cache_spec=layer_kv_cache_spec,
+-                        kv_cache_group_id=self.kv_cache_gid,
+-                    )
+-                    attn_group.create_metadata_builders(
+-                        self.vllm_config,
+-                        self.device,
+-                        kernel_block_size=kernel_block_size,
+-                    )
+-                    attention_groups[backend_key] = attn_group
+-                else:
+-                    attention_groups[backend_key].layer_names.append(layer_name)
++        self._draft_layer_to_kv_cache_gid = {
++            layer_name: gid
++            for gid, group in enumerate(kv_cache_config.kv_cache_groups)
++            for layer_name in group.layer_names
++            if layer_name in self._draft_attn_layer_names
++        }
++        missing_layers = self._draft_attn_layer_names - set(
++            self._draft_layer_to_kv_cache_gid
++        )
++        assert not missing_layers, (
++            "Draft attention layers are missing from KV cache groups: "
++            f"{sorted(missing_layers)}"
++        )
++        self._draft_kv_cache_group_ids = sorted(
++            set(self._draft_layer_to_kv_cache_gid.values())
++        )
++        if not self.allow_multiple_draft_kv_cache_groups():
++            assert len(self._draft_kv_cache_group_ids) == 1, (
++                "All drafting layers should belong to the same kv cache group"
++            )
++        self.kv_cache_gid = self._draft_kv_cache_group_ids[0]
++
++        attention_groups: dict[
++            tuple[int, tuple[str, str], KVCacheSpec, tuple[Any, ...]], AttentionGroup
++        ] = {}
++        for layer_name in self._draft_attn_layer_names:
++            gid = self._draft_layer_to_kv_cache_gid[layer_name]
++            kv_cache_spec = kv_cache_config.kv_cache_groups[gid].kv_cache_spec
++            layer_kv_cache_spec = kv_cache_spec
++            if isinstance(layer_kv_cache_spec, UniformTypeKVCacheSpecs):
++                layer_kv_cache_spec = layer_kv_cache_spec.kv_cache_specs[layer_name]
++
++            attn_layer = all_attn_layers[layer_name]
++            attn_backend = attn_layer.get_attn_backend()
++            backend_key = attn_backend.full_cls_name()
++            metadata_group_key = attn_backend.get_metadata_group_key(attn_layer)
++            group_key = (gid, backend_key, layer_kv_cache_spec, metadata_group_key)
++            if group_key not in attention_groups:
++                kernel_block_size = (
++                    kernel_block_sizes[gid]
++                    if kernel_block_sizes is not None and gid < len(kernel_block_sizes)
++                    else None
++                )
++                attn_group = AttentionGroup(
++                    backend=attn_backend,
++                    layer_names=[layer_name],
++                    kv_cache_spec=layer_kv_cache_spec,
++                    kv_cache_group_id=gid,
++                )
++                attn_group.create_metadata_builders(
++                    self.vllm_config,
++                    self.device,
++                    kernel_block_size=kernel_block_size,
++                )
++                attention_groups[group_key] = attn_group
++            else:
++                attention_groups[group_key].layer_names.append(layer_name)
+ 
+         self.draft_attn_groups = list(attention_groups.values())
+         self.block_size = (
+diff --git a/vllm/v1/worker/gpu/attn_utils.py b/vllm/v1/worker/gpu/attn_utils.py
+index 6fc55ee3..4ca7749b 100644
+--- a/vllm/v1/worker/gpu/attn_utils.py
++++ b/vllm/v1/worker/gpu/attn_utils.py
+@@ -85,8 +85,10 @@ def init_attn_backend(
+         layer_type = cast(type[Any], AttentionLayerBase)
+         attn_layers = get_layers_from_vllm_config(vllm_config, layer_type, layer_names)
+ 
+-        group_map: dict[tuple[tuple[str, str], KVCacheSpec], AttentionGroup] = {}
+-        group_order: list[tuple[tuple[str, str], KVCacheSpec]] = []
++        group_map: dict[
++            tuple[tuple[str, str], KVCacheSpec, tuple[Any, ...]], AttentionGroup
++        ] = {}
++        group_order: list[tuple[tuple[str, str], KVCacheSpec, tuple[Any, ...]]] = []
+ 
+         for layer_name in layer_names:
+             attn_backend = attn_layers[layer_name].get_attn_backend()
+@@ -95,7 +97,14 @@ def init_attn_backend(
+             if isinstance(layer_kv_cache_spec, UniformTypeKVCacheSpecs):
+                 layer_kv_cache_spec = layer_kv_cache_spec.kv_cache_specs[layer_name]
+ 
+-            key = (attn_backend.full_cls_name(), layer_kv_cache_spec)
++            metadata_group_key = attn_backend.get_metadata_group_key(
++                attn_layers[layer_name]
++            )
++            key = (
++                attn_backend.full_cls_name(),
++                layer_kv_cache_spec,
++                metadata_group_key,
++            )
+             if key not in group_map:
+                 group_map[key] = AttentionGroup(
+                     attn_backend, [layer_name], layer_kv_cache_spec, kv_cache_group_id
+diff --git a/vllm/v1/worker/gpu_model_runner.py b/vllm/v1/worker/gpu_model_runner.py
+index f82d2224..004a8751 100644
+--- a/vllm/v1/worker/gpu_model_runner.py
++++ b/vllm/v1/worker/gpu_model_runner.py
+@@ -2402,6 +2402,14 @@ class GPUModelRunner(
+         # Prepare the attention metadata for each KV cache group and make layers
+         # in the same group share the same metadata.
+         spec_decode_common_attn_metadata = None
++        dflash_drafter = (
++            self.drafter
++            if self.speculative_config and isinstance(self.drafter, DFlashProposer)
++            else None
++        )
++        if dflash_drafter is not None:
++            dflash_drafter.clear_draft_block_tables()
++
+         for kv_cache_gid, kv_cache_group in enumerate(kv_cache_groups):
+             cm = copy(cm_base)  # shallow copy
+ 
+@@ -2417,6 +2425,11 @@ class GPUModelRunner(
+                 cm.block_table_tensor = _get_block_table(kv_cache_gid)
+                 cm.slot_mapping = slot_mappings[kv_cache_gid]
+ 
++            if dflash_drafter is not None:
++                dflash_drafter.set_draft_block_table(
++                    kv_cache_gid, cm.block_table_tensor
++                )
++
+             if self.speculative_config and spec_decode_common_attn_metadata is None:
+                 if isinstance(
+                     self.drafter,
+@@ -5247,15 +5260,14 @@ class GPUModelRunner(
+             dflash_config = getattr(hf_config, "dflash_config", None)
+             eagle_config = getattr(hf_config, "eagle_config", None)
+ 
+-            if dflash_config and isinstance(dflash_config, dict):
+-                # Add 1 to convert DFlash's aux layer id semantics
+-                layer_ids = [
+-                    i + 1 for i in (dflash_config.get("target_layer_ids") or [])
+-                ]
++            if dflash_config and isinstance(dflash_config, dict):
++                # Add 1 to convert DFlash's aux layer id semantics.
++                layer_ids = [i + 1 for i in dflash_config.get("target_layer_ids", [])]
+ 
+             if eagle_config and isinstance(eagle_config, dict):
+                 layer_ids = eagle_config.get("eagle_aux_hidden_state_layer_ids")
+ 
++
+         if layer_ids and isinstance(layer_ids, (list, tuple)):
+             return tuple(layer_ids)
+ 
+@@ -6575,6 +6586,7 @@ class GPUModelRunner(
+             attn_backend: type[AttentionBackend]
+             kv_cache_spec: KVCacheSpec
+             num_heads_q: int
++            metadata_group_key: tuple[Any, ...]
+ 
+         def get_attn_backends_for_group(
+             kv_cache_group_spec: KVCacheGroupSpec,
+@@ -6610,9 +6622,12 @@ class GPUModelRunner(
+                 # fallback can never spuriously merge them with attention
+                 # layers.
+                 num_heads_q = getattr(layers[layer_name], "num_heads", 0)
+-                key = (full_cls_name, layer_kv_cache_spec, num_heads_q)
++                metadata_group_key = attn_backend.get_metadata_group_key(
++                    layers[layer_name]
++                )
++                key = (full_cls_name, layer_kv_cache_spec, num_heads_q, metadata_group_key)
+                 attn_backends[key] = AttentionGroupKey(
+-                    attn_backend, layer_kv_cache_spec, num_heads_q
++                    attn_backend, layer_kv_cache_spec, num_heads_q, metadata_group_key
+                 )
+                 attn_backend_layers[key].append(layer_name)
+             return (
+@@ -6625,11 +6640,11 @@ class GPUModelRunner(
+             kv_cache_group_id: int,
+         ) -> list[AttentionGroup]:
+             attn_groups: list[AttentionGroup] = []
+-            for key, layer_names in attn_backends_map.items():
++            for group_key, layer_names in attn_backends_map.items():
+                 attn_group = AttentionGroup(
+-                    key.attn_backend,
++                    group_key.attn_backend,
+                     layer_names,
+-                    key.kv_cache_spec,
++                    group_key.kv_cache_spec,
+                     kv_cache_group_id,
+                 )
+ 
+@@ -6912,6 +6927,118 @@ class GPUModelRunner(
+         for attn_groups in self.attn_groups:
+             yield from attn_groups
+ 
++    @staticmethod
++    def _get_kv_cache_stride_order(
++        attn_backend: type[AttentionBackend],
++        kv_cache_shape: tuple[int, ...],
++    ) -> tuple[int, ...]:
++        try:
++            kv_cache_stride_order = attn_backend.get_kv_cache_stride_order()
++            assert len(kv_cache_stride_order) == len(kv_cache_shape)
++            return kv_cache_stride_order
++        except (AttributeError, NotImplementedError):
++            return tuple(range(len(kv_cache_shape)))
++
++    @classmethod
++    def _get_standard_kv_cache_orders(
++        cls,
++        attn_backend: type[AttentionBackend],
++        kv_cache_shape: tuple[int, ...],
++        num_blocks: int,
++    ) -> tuple[tuple[int, ...], tuple[str, ...] | None, tuple[str, ...] | None]:
++        stride_order = cls._get_kv_cache_stride_order(attn_backend, kv_cache_shape)
++        if len(kv_cache_shape) != 5:
++            return stride_order, None, None
++        if kv_cache_shape[:2] == (2, num_blocks):
++            public_order = ("kv", "block", "token", "head", "dim")
++        elif kv_cache_shape[:2] == (num_blocks, 2):
++            public_order = ("block", "kv", "token", "head", "dim")
++        else:
++            return stride_order, None, None
++        return stride_order, public_order, tuple(public_order[i] for i in stride_order)
++
++    @staticmethod
++    def _view_kv_cache_with_physical_order(
++        raw_tensor: torch.Tensor,
++        kv_cache_shape: tuple[int, ...],
++        public_order: tuple[str, ...],
++        physical_order: tuple[str, ...],
++    ) -> torch.Tensor:
++        # Backends can expose the same standard KV cache with different public
++        # shapes or physical orders. When they share one raw tensor, keep each
++        # backend's public shape but map it to the shared physical layout.
++        dim_sizes = dict(zip(public_order, kv_cache_shape))
++        physical_strides: dict[str, int] = {}
++        stride = 1
++        for dim in reversed(physical_order):
++            physical_strides[dim] = stride
++            stride *= dim_sizes[dim]
++        public_strides = tuple(physical_strides[dim] for dim in public_order)
++        return torch.as_strided(
++            raw_tensor,
++            size=kv_cache_shape,
++            stride=public_strides,
++        )
++
++    @staticmethod
++    def _get_attention_kv_cache_shape(
++        attn_backend: type[AttentionBackend],
++        kv_cache_spec: AttentionSpec,
++        num_blocks: int,
++        kernel_block_size: int,
++        cache_dtype_str: str,
++    ) -> tuple[int, ...]:
++        # For MLA with compression, storage_block_size != block_size.
++        if kv_cache_spec.storage_block_size != kv_cache_spec.block_size:
++            shape_block_size = kv_cache_spec.storage_block_size
++        else:
++            shape_block_size = kernel_block_size
++        return attn_backend.get_kv_cache_shape(
++            num_blocks,
++            shape_block_size,
++            kv_cache_spec.num_kv_heads,
++            kv_cache_spec.head_size,
++            cache_dtype_str=cache_dtype_str,
++        )
++
++    def _get_raw_tensor_physical_orders(
++        self,
++        kv_cache_raw_tensors: dict[str, torch.Tensor],
++        kernel_block_sizes: list[int],
++    ) -> dict[int, set[tuple[str, ...]]]:
++        raw_tensor_physical_orders: dict[int, set[tuple[str, ...]]] = defaultdict(set)
++        for group in self._kv_cache_spec_attn_group_iterator():
++            kv_cache_spec = group.kv_cache_spec
++            if group.kv_cache_group_id == len(kernel_block_sizes) or not isinstance(
++                kv_cache_spec, AttentionSpec
++            ):
++                continue
++            kernel_block_size = kernel_block_sizes[group.kv_cache_group_id]
++            for layer_name in group.layer_names:
++                if (
++                    layer_name in self.runner_only_attn_layers
++                    or layer_name not in kv_cache_raw_tensors
++                ):
++                    continue
++                raw_tensor = kv_cache_raw_tensors[layer_name]
++                num_blocks = raw_tensor.numel() // kv_cache_spec.page_size_bytes
++                num_blocks *= kv_cache_spec.block_size // kernel_block_size
++                kv_cache_shape = self._get_attention_kv_cache_shape(
++                    group.backend,
++                    kv_cache_spec,
++                    num_blocks,
++                    kernel_block_size,
++                    self.cache_config.cache_dtype,
++                )
++                _, _, physical_order = self._get_standard_kv_cache_orders(
++                    group.backend,
++                    kv_cache_shape,
++                    num_blocks,
++                )
++                if physical_order is not None:
++                    raw_tensor_physical_orders[id(raw_tensor)].add(physical_order)
++        return raw_tensor_physical_orders
++
+     def _reshape_kv_cache_tensors(
+         self,
+         kv_cache_raw_tensors: dict[str, torch.Tensor],
+@@ -6930,6 +7057,10 @@ class GPUModelRunner(
+         """
+         kv_caches: dict[str, torch.Tensor] = {}
+         has_attn, has_mamba = False, False
++        raw_tensor_physical_orders = self._get_raw_tensor_physical_orders(
++            kv_cache_raw_tensors, kernel_block_sizes
++        )
++
+         for group in self._kv_cache_spec_attn_group_iterator():
+             kv_cache_spec = group.kv_cache_spec
+             attn_backend = group.backend
+@@ -6950,25 +7081,45 @@ class GPUModelRunner(
+                     )
+                     kernel_num_blocks = num_blocks * num_blocks_per_kv_block
+ 
+-                    # For MLA with compression, storage_block_size != block_size
+-                    if kv_cache_spec.storage_block_size != kv_cache_spec.block_size:
+-                        shape_block_size = kv_cache_spec.storage_block_size
+-                    else:
+-                        shape_block_size = kernel_block_size
+-
+-                    kv_cache_shape = attn_backend.get_kv_cache_shape(
++                    kv_cache_shape = self._get_attention_kv_cache_shape(
++                        attn_backend,
++                        kv_cache_spec,
++                        kernel_num_blocks,
++                        kernel_block_size,
++                        self.cache_config.cache_dtype,
++                    )
++                    (
++                        kv_cache_stride_order,
++                        public_order,
++                        physical_order,
++                    ) = self._get_standard_kv_cache_orders(
++                        attn_backend,
++                        kv_cache_shape,
+                         kernel_num_blocks,
+-                        shape_block_size,
+-                        kv_cache_spec.num_kv_heads,
+-                        kv_cache_spec.head_size,
+-                        cache_dtype_str=self.cache_config.cache_dtype,
+                     )
+                     dtype = kv_cache_spec.dtype
+-                    try:
+-                        kv_cache_stride_order = attn_backend.get_kv_cache_stride_order()
+-                        assert len(kv_cache_stride_order) == len(kv_cache_shape)
+-                    except (AttributeError, NotImplementedError):
+-                        kv_cache_stride_order = tuple(range(len(kv_cache_shape)))
++                    shared_orders = raw_tensor_physical_orders[id(raw_tensor)]
++                    block_major_orders = (
++                        order for order in shared_orders if order[:2] == ("block", "kv")
++                    )
++                    shared_physical_order = next(
++                        iter(sorted(block_major_orders)), None
++                    ) or next(iter(sorted(shared_orders)), None)
++                    raw_tensor = raw_tensor.view(dtype)
++                    if (
++                        public_order is not None
++                        and physical_order != shared_physical_order
++                        and shared_physical_order is not None
++                        and kv_cache_spec.page_size_padded is None
++                    ):
++                        kv_caches[layer_name] = self._view_kv_cache_with_physical_order(
++                            raw_tensor,
++                            kv_cache_shape,
++                            public_order,
++                            shared_physical_order,
++                        )
++                        continue
++
+                     # The allocation respects the backend-defined stride order
+                     # to ensure the semantic remains consistent for each
+                     # backend. We first obtain the generic kv cache shape and
+@@ -6983,16 +7134,15 @@ class GPUModelRunner(
+                         for i in range(len(kv_cache_stride_order))
+                     ]
+ 
+-                    raw_tensor = kv_cache_raw_tensors[layer_name].view(dtype)
+                     if kv_cache_spec.page_size_padded is not None:
+                         # Use strided view to handle page_size_bytes that
+-                        # include padding. This follows
+-                        # the same pattern as MambaSpec handling below.
++                        # include padding. This follows the same pattern as
++                        # MambaSpec handling below.
+                         # NOTE: This assumes kv_cache_shape[0] == num_blocks
+                         # (i.e. the first physical dimension is the block
+                         # index), which holds for MLA backends but NOT for
+-                        # standard attention backends whose shape starts with
+-                        # a K/V dimension of size 2.
++                        # standard attention backends whose shape starts
++                        # with a K/V dimension of size 2.
+                         dtype_size = get_dtype_size(dtype)
+                         page_stride = kv_cache_spec.page_size_bytes // dtype_size
+                         strides = list(torch.empty(kv_cache_shape).stride())
