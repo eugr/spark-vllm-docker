@@ -26,6 +26,7 @@ VLLM_PRS=""
 APPLY_PRESET_VLLM_PRS=false
 FLASHINFER_PRS=""
 PRE_TRANSFORMERS=false
+INSTALL_INSTANTTENSOR=false
 FULL_LOG=false
 BUILD_JOBS="16"
 GPU_ARCH_LIST="12.1a"
@@ -384,6 +385,7 @@ usage() {
     echo "  -j, --build-jobs <jobs>       : Number of concurrent build jobs (default: ${BUILD_JOBS})"
     echo "  -u, --user <user>             : Username for ssh command (default: \$USER)"
     echo "  --tf5                         : Install transformers>=5 (aliases: --pre-tf, --pre-transformers)"
+    echo "  --instanttensor               : Install InstantTensor runtime support"
     echo "  --exp-mxfp4, --experimental-mxfp4 : Build with experimental native MXFP4 support"
     echo "  --apply-vllm-pr <pr-num>      : Apply a specific PR patch to vLLM source. Can be specified multiple times."
     echo "  --apply-preset-vllm-prs       : Also apply Dockerfile preset vLLM PRs when --apply-vllm-pr is specified."
@@ -427,6 +429,7 @@ while [[ "$#" -gt 0 ]]; do
         -u|--user) SSH_USER="$2"; shift ;;
         --copy-parallel) PARALLEL_COPY=true ;;
         --tf5|--pre-tf|--pre-transformers) PRE_TRANSFORMERS=true ;;
+        --instanttensor) INSTALL_INSTANTTENSOR=true ;;
         --exp-mxfp4|--experimental-mxfp4) EXP_MXFP4=true ;;
         --apply-vllm-pr)
             if [ -n "$2" ] && [[ "$2" != -* ]]; then
@@ -775,6 +778,10 @@ if [ "$NO_BUILD" = false ]; then
         if [ "$PRE_TRANSFORMERS" = true ]; then
             echo "Using transformers>=5.0.0..."
             RUNNER_CMD+=("--build-arg" "PRE_TRANSFORMERS=1")
+        fi
+        if [ "$INSTALL_INSTANTTENSOR" = true ]; then
+            echo "Installing InstantTensor runtime support..."
+            RUNNER_CMD+=("--build-arg" "INSTALL_INSTANTTENSOR=1")
         fi
 
         RUNNER_CMD+=(".")

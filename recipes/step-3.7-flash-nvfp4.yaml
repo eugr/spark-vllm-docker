@@ -11,6 +11,9 @@ model: stepfun-ai/Step-3.7-Flash-NVFP4
 # Container image to use
 container: vllm-node
 
+build_args:
+  - --instanttensor
+
 # Can only be run in a cluster
 cluster_only: true
 

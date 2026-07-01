@@ -546,6 +546,7 @@ RUN mkdir -p tiktoken_encodings && \
     wget -O tiktoken_encodings/cl100k_base.tiktoken "https://openaipublic.blob.core.windows.net/encodings/cl100k_base.tiktoken"
 
 ARG PRE_TRANSFORMERS=0
+ARG INSTALL_INSTANTTENSOR=0
 
 # Install deps
 RUN --mount=type=cache,id=uv-cache,target=/root/.cache/uv \
@@ -583,7 +584,11 @@ RUN --mount=type=cache,id=uv-cache,target=/root/.cache/uv \
     PINNED_TORCH=$(python3 -c "import torch; print(torch.__version__)") && \
     echo "torch==${PINNED_TORCH}" > /tmp/torch-override.txt && \
     echo "fastapi[standard]>=0.115.0,<0.137.0" >> /tmp/torch-override.txt && \
-    uv pip install ray[default] fastsafetensors instanttensor \
+    EXTRA_DEPS="" && \
+    if [ "$INSTALL_INSTANTTENSOR" = "1" ]; then \
+        EXTRA_DEPS="instanttensor"; \
+    fi && \
+    uv pip install ray fastsafetensors ${EXTRA_DEPS} \
         --override /tmp/torch-override.txt
 
 # Fix NCCL

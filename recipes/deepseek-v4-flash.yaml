@@ -11,6 +11,9 @@ model: deepseek-ai/DeepSeek-V4-Flash
 # Container image to use
 container: vllm-node
 
+build_args:
+  - --instanttensor
+
 # Can only be run in a cluster
 cluster_only: true
 

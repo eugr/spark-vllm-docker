@@ -17,6 +17,7 @@ container: vllm-node-tf5
 
 build_args:
   - --tf5
+  - --instanttensor
 
 mods:
   - mods/fix-qwen3.5-chat-template

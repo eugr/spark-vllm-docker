@@ -12,6 +12,9 @@ model: nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-NVFP4
 # Container image to use
 container: vllm-node
 
+build_args:
+  - --instanttensor
+
 # Can only be run in a cluster
 cluster_only: true
 
