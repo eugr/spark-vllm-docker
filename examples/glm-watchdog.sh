@@ -48,6 +48,16 @@ while true; do
     FAILS=0; continue
   fi
 
+  # Startup grace: a container younger than 30 min may still be loading
+  # weights or compiling — don't count probes against it.
+  STARTED=$(docker inspect -f '{{.State.StartedAt}}' vllm_node 2>/dev/null)
+  if [ -n "$STARTED" ]; then
+    AGE=$(( $(date +%s) - $(date -d "$STARTED" +%s 2>/dev/null || echo 0) ))
+    if [ "$AGE" -lt 1800 ]; then
+      FAILS=0; continue
+    fi
+  fi
+
   if probe; then
     [ "$FAILS" -gt 0 ] && log "recovered after $FAILS failed probe(s)"
     FAILS=0
