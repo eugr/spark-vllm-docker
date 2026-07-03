@@ -1,0 +1,161 @@
+# Recipe: GLM-5.2-NVFP4
+# Full (unpruned) nvidia/GLM-5.2-NVFP4: ~753B/40B-active MoE with DeepSeek
+# Sparse Attention (GlmMoeDsaForCausalLM), NVFP4 experts + BF16 attention/
+# shared experts, fp8 KV cache. ~465GB of weights -> ~58GB/node on 8 Sparks
+# with TP=8 (num_attention_heads=64 and 78 layers divide cleanly).
+#
+# Requires mods/glm-5.2: sm_121 shared-memory fix for the Triton MLA decode
+# kernel (GLM-5.2's Lk=576 head layout overflows the 101376-byte limit).
+#
+# DSA stays ENABLED (unlike the REAP-pruned community variant, which ships
+# broken indexer weights and disables it). index_topk_pattern is passed
+# explicitly via --hf-overrides because the checkpoint sets it to null;
+# current vLLM main derives the same F/S pattern from index_topk_freq=4 /
+# index_skip_topk_offset=3, but the override makes it explicit and guards
+# older builds that defaulted null to all-full indexers (garbage at long
+# context). The pattern matches the config's indexer_types: 21 "full" +
+# 57 "shared" over 78 layers.
+#
+# Model supports 1M context. 393216 (384K) is the validated ceiling:
+# vLLM's persistent_topk kernel (DSA indexer) fails to launch during
+# startup profiling at max_model_len 500000 and 524288 (topk.cu:136) on
+# sm_121, but 393216 passes. Validated in anger: a 319K-token prompt with
+# a needle at 94% depth retrieves exactly. A full 320K prefill takes
+# ~8 minutes (~630 tok/s at that depth); prefix caching makes it a
+# once-per-conversation cost.
+#
+# ROOT CAUSE of the silent all-rank wedge this recipe works around:
+# FlashInfer's SM120 sparse-MLA attention (used for DSA via the
+# FLASHINFER_MLA_SPARSE_SM120 backend, flashinfer 0.6.14) dispatches
+# attention calls with <=64 query tokens to a working autotuned kernel
+# (decode-dsv3_2) and everything larger to a generic fallback kernel that
+# hangs on GB10/sm_121 (data-dependently; reliably for 2048-token chunks).
+# One rank hangs there, the other 7 orphan in the next NCCL all-reduce,
+# all GPUs spin at ~96% forever with no errors. Verified with
+# CUDA_LAUNCH_BLOCKING=1 stack captures on all 8 ranks; raw 8-node NCCL
+# all-reduce sweeps up to 128MB are clean, exonerating the fabric.
+#
+# The workaround: max_num_batched_tokens=64 + block_size=64 keep every
+# sparse attention call inside the working kernel's dispatch envelope
+# (num_tokens<=64, page_block_size==64, heads/TP=8, topk=2048). Prefill
+# is slow (~64 tokens/step, ~180 tok/s) but stable through 20K+ contexts.
+# Revisit when flashinfer ships a fallback-kernel fix (their SM120 sparse
+# MLA kernels landed 2026-06; see flashinfer PR #3374/#3395, issues
+# #3618/#3625 for the related top-k races).
+#
+# Performance results (2026-07-03, all with mods/sparse-mla-chunked):
+# - decode 24.0 tok/s single-stream (MTP2 speculative decoding, 2.53 mean
+#   acceptance length), 45-58 tok/s aggregate at 4-way concurrency.
+# - prefill ~880 tok/s (fresh short/mid contexts), ~630 tok/s at 320K.
+# - GSM8K 93.1% strict (full 1319, no MTP), 96.8% on a 250-problem subset
+#   with MTP — speculative decoding is lossless under greedy, as expected.
+# - MoE backend: auto (FLASHINFER_CUTLASS main + triton for the BF16 MTP
+#   draft layer). Do NOT set --moe-backend marlin with MTP: the draft MoE
+#   is unquantized and marlin rejects it. Note upstream vLLM #46834 (MTP
+#   garbage) reproduces only with expert parallelism (EP16); plain TP=8
+#   is unaffected — validated by needle/canary probes and the subset run.
+# - cudagraph mode: default (FULL_AND_PIECEWISE) is stable here; a 60-req
+#   soak + two GSM8K runs saw zero hangs.
+# - flashinfer_b12x MoE (mods/b12x-min): works but no win (12.6 tok/s);
+#   decode is all-reduce-latency-bound so MoE kernels barely matter.
+# Operational notes:
+# - Never run two launcher invocations concurrently: a still-running
+#   launch-cluster.sh execs a second vllm serve into new containers
+#   (EADDRINUSE on the master port, phantom crashes).
+# - If launches hang silently in distributed init right after "Model
+#   loading took", clear ~/.cache/vllm/torch_compile_cache and
+#   flashinfer_autotune_cache on ALL nodes (a hard-crashed launch can
+#   poison them).
+# - Config changes that alter the compiled graph (MoE backend, cudagraph
+#   mode, spec config) trigger a ~10-20 min cold torch.compile: silent
+#   logs with idle GPU and ~70% worker CPU is normal during it.
+
+recipe_version: "1"
+name: GLM-5.2-NVFP4
+description: vLLM serving nvidia/GLM-5.2-NVFP4 on an 8x DGX Spark cluster (TP=8, DSA enabled)
+
+# HuggingFace model to download (optional, for --download-model)
+model: nvidia/GLM-5.2-NVFP4
+
+# Container image to use
+container: vllm-node
+
+# Can only be run in a cluster
+cluster_only: true
+
+# sm_121 Triton MLA decode kernel fix
+mods:
+  - mods/glm-5.2
+  - mods/sparse-mla-chunked
+
+# Default settings (can be overridden via CLI where supported)
+defaults:
+  port: 8000
+  host: 0.0.0.0
+  tensor_parallel: 8
+  gpu_memory_utilization: 0.85
+  max_model_len: 393216
+  block_size: 64
+  max_num_seqs: 4
+  # 2048 requires mods/sparse-mla-chunked (chunks attention calls into
+  # <=64-token slices through the working dsv3_2 kernel; the generic
+  # fallback kernel for >64-token calls hangs on sm_121). Without that
+  # mod this MUST be <=64. block_size must stay 64 (dsv3_2 page size).
+  max_num_batched_tokens: 2048
+
+# Environment variables
+env:
+  # ROOT-CAUSE FIX for the silent all-rank wedge (GPU ~96%, low power, no
+  # errors) that hit any request beyond trivial size: FlashInfer's
+  # RadixTopKMaskLogitsMultiCTA sampling kernel has a multi-CTA barrier
+  # reset race that bites SM120/121 first (fixed upstream in
+  # flashinfer-ai/flashinfer#3615; vLLM #44405 default-disables the
+  # sampler on these chips). Until those land in our build, use the
+  # torch-native sampler.
+  VLLM_USE_FLASHINFER_SAMPLER: "0"
+  VLLM_ALLOW_LONG_MAX_MODEL_LEN: "1"
+  # 465GB of weights: don't let the engine time out during load/warmup
+  VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS: "1200"
+  PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
+  MALLOC_ARENA_MAX: "2"
+  # No NCCL_IB_GID_INDEX / NCCL_IB_TC overrides: the second RoCE rail
+  # (roceP2p1s0f0) only exposes link-local GIDs 0-1, so a global GID index
+  # of 3 fails NCCL init. NCCL auto-selects the right GID per HCA.
+  NCCL_NVLS_ENABLE: "0"
+  # Conservative NCCL transport pins, adopted from the working 8x-Spark
+  # TP=8 Kimi-K2.6 deployment (eugr issue #260). Not implicated in the
+  # sparse-MLA wedge (raw NCCL swept clean without them) but kept as
+  # known-good; candidates to drop when tuning.
+  NCCL_PROTO: Simple
+  NCCL_ALGO: Ring
+  NCCL_NCHANNELS: "1"
+  NCCL_CROSS_NIC: "0"
+  NCCL_IB_QPS_PER_CONNECTION: "1"
+  NCCL_IB_TIMEOUT: "25"
+  NCCL_IB_RETRY_CNT: "7"
+  NCCL_IB_ROCE_VERSION_NUM: "2"
+  NCCL_IB_ADDR_FAMILY: AF_INET
+
+# The vLLM serve command template
+command: |
+  vllm serve nvidia/GLM-5.2-NVFP4 \
+  --served-model-name GLM-5.2-NVFP4 \
+  --host {host} \
+  --port {port} \
+  --trust-remote-code \
+  --tensor-parallel-size {tensor_parallel} \
+  --kv-cache-dtype fp8 \
+  --block-size {block_size} \
+  --max-model-len {max_model_len} \
+  --max-num-seqs {max_num_seqs} \
+  --max-num-batched-tokens {max_num_batched_tokens} \
+  --gpu-memory-utilization {gpu_memory_utilization} \
+  --speculative-config '{{"method":"mtp","num_speculative_tokens":2}}' \
+
+  --hf-overrides '{{"index_topk_pattern": "FFFSSSFSSSFSSSFSSSFSSSFSSSFSSSFSSSFSSSFSSSFSSSFSSSFSSSFSSSFSSSFSSSFSSSFSSSFSSS"}}' \
+  --enable-prefix-caching \
+  --distributed-executor-backend ray \
+  --enable-auto-tool-choice \
+  --tool-call-parser glm47 \
+  --reasoning-parser glm45 \
+  --load-format instanttensor
