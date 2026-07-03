@@ -47,8 +47,11 @@
 # - decode 24.0 tok/s single-stream (MTP2 speculative decoding, 2.53 mean
 #   acceptance length), 45-58 tok/s aggregate at 4-way concurrency.
 # - prefill ~880 tok/s (fresh short/mid contexts), ~630 tok/s at 320K.
-# - GSM8K 93.1% strict (full 1319, no MTP), 96.8% on a 250-problem subset
-#   with MTP — speculative decoding is lossless under greedy, as expected.
+# - GSM8K on this exact config (MTP2): 92.7% strict, full 1319 problems.
+#   Baseline without MTP measured 93.1% — within run-to-run noise (+/-0.7%),
+#   confirming speculative decoding is lossless under greedy.
+# - At 332K context: decode 20.4 tok/s, 5-fact synthesis across 10-90%
+#   depth exact, prefill ~635 tok/s.
 # - MoE backend: auto (FLASHINFER_CUTLASS main + triton for the BF16 MTP
 #   draft layer). Do NOT set --moe-backend marlin with MTP: the draft MoE
 #   is unquantized and marlin rejects it. Note upstream vLLM #46834 (MTP
