@@ -507,11 +507,11 @@ else
 fi
 
 # Determine model directory path
-# uvx hf download stores models in ~/.cache/huggingface/hub with the pattern: models--<org>--<model>-<suffix>
+# uvx hf download stores models in the hub cache ($HUB_PATH) with the pattern: models--<org>--<model>-<suffix>
 MODEL_DIR=""
 
 # Try to find the model directory
-# The pattern for model directories is: ~/.cache/huggingface/hub/models--ORG--MODEL-VARIATION (or similar)
+# The pattern for model directories is: $HUB_PATH/models--ORG--MODEL-VARIATION (or similar)
 # Model names like "QuantTrio/MiniMax-M2-AWQ" become "models--QuantTrio--MiniMax-M2-AQW" or similar
 
 # Parse org and model name from MODEL_NAME
