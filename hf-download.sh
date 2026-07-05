@@ -1,7 +1,9 @@
 #!/bin/bash
 set -e
 
-HUB_PATH="${HF_HOME:-$HOME/.cache/huggingface}/hub"
+# Resolve the HuggingFace hub cache the same way huggingface_hub (and thus
+# `uvx hf download`) does: HF_HUB_CACHE wins, else it lives under HF_HOME.
+HUB_PATH="${HF_HUB_CACHE:-${HF_HOME:-${XDG_CACHE_HOME:-$HOME/.cache}/huggingface}/hub}"
 
 # Default values
 COPY_HOSTS=()
@@ -155,11 +157,11 @@ else
 fi
 
 # Determine model directory path
-# uvx hf download stores models in ~/.cache/huggingface/hub with the pattern: models--<org>--<model>-<suffix>
+# uvx hf download stores models in the hub cache ($HUB_PATH) with the pattern: models--<org>--<model>-<suffix>
 MODEL_DIR=""
 
 # Try to find the model directory
-# The pattern for model directories is: ~/.cache/huggingface/hub/models--ORG--MODEL-VARIATION (or similar)
+# The pattern for model directories is: $HUB_PATH/models--ORG--MODEL-VARIATION (or similar)
 # Model names like "QuantTrio/MiniMax-M2-AWQ" become "models--QuantTrio--MiniMax-M2-AQW" or similar
 
 # Parse org and model name from MODEL_NAME
@@ -188,7 +190,7 @@ fi
 
 if [ -z "$MODEL_DIR" ]; then
     echo "Error: Could not find downloaded model directory in $HUB_PATH"
-    echo "Please check the ~/.cache/huggingface/hub directory manually."
+    echo "Please check the $HUB_PATH directory manually."
     exit 1
 fi
 

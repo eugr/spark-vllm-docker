@@ -3,13 +3,31 @@
 # Default Configuration
 IMAGE_NAME="vllm-node"
 DEFAULT_CONTAINER_NAME="vllm_node"
-HF_CACHE_DIR="${HF_HOME:-$HOME/.cache/huggingface}"
+HF_HOME_DIR="${HF_HOME:-${XDG_CACHE_HOME:-$HOME/.cache}/huggingface}"
 CONTAINER_WORKSPACE_DIR="/workspace"
 CONTAINER_EXEC_SCRIPT="$CONTAINER_WORKSPACE_DIR/exec-script.sh"
 # Modify these if you want to pass additional docker args or set VLLM_SPARK_EXTRA_DOCKER_ARGS variable
 DOCKER_ARGS="-e NCCL_IGNORE_CPU_AFFINITY=1"
 DOCKER_ARGS="$DOCKER_ARGS -e PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True"
-DOCKER_ARGS="$DOCKER_ARGS -v $HF_CACHE_DIR:/root/.cache/huggingface"
+DOCKER_ARGS="$DOCKER_ARGS -v $HF_HOME_DIR:/root/.cache/huggingface"
+
+# HF_HOME and HF_HUB_CACHE are independent: HF_HOME (mounted above) holds tokens
+# etc., while HF_HUB_CACHE is specifically the model cache and may live elsewhere
+# (e.g. an NFS mount). When it's set, mount it over the container's default hub
+# location so models are found there, and point the container at it explicitly.
+if [[ -n "$HF_HUB_CACHE" ]]; then
+    # Pre-create both the cache dir and its mount point inside HF_HOME, otherwise
+    # docker creates them owned by root and later downloads as the user fail.
+    mkdir -p "$HF_HUB_CACHE" "$HF_HOME_DIR/hub"
+    DOCKER_ARGS="$DOCKER_ARGS -v $HF_HUB_CACHE:/root/.cache/huggingface/hub -e HF_HUB_CACHE=/root/.cache/huggingface/hub"
+fi
+
+# Propagate HF_HUB_OFFLINE from the host. The HF cache is a host mount, so if the
+# host is set to run offline the container must honor the same intent (otherwise
+# it would try to reach HF Hub for files that are already present in the mount).
+if [[ -n "$HF_HUB_OFFLINE" ]]; then
+    DOCKER_ARGS="$DOCKER_ARGS -e HF_HUB_OFFLINE=$HF_HUB_OFFLINE"
+fi
 
 # Append additional arguments from environment variable
 if [[ -n "$VLLM_SPARK_EXTRA_DOCKER_ARGS" ]]; then
