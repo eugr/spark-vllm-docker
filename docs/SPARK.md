@@ -16,7 +16,7 @@ There are two roles:
 - **Control machine** — where you run `./spark`. It orchestrates everything over SSH.
   Can be your laptop, a management server, or one of the fleet nodes itself.
 - **Master** — the host that actually runs `run-recipe.sh` and `docker run` commands.
-  By default this is the first node listed in `fleet.yaml`. Override with `--master`.
+  By default this is the first node listed in `spark.yaml`. Override with `--master`.
 
 The control machine never loads models itself. It pushes configurations and launches
 containers by SSHing into the master, which in turn SSHs into fleet nodes to manage Docker.
@@ -41,7 +41,7 @@ containers by SSHing into the master, which in turn SSHs into fleet nodes to man
 
 ## Usage Scenarios
 
-`spark` has no hardcoded fleet size limit — it manages however many nodes you list in `fleet.yaml`.
+`spark` has no hardcoded fleet size limit — it manages however many nodes you list in `spark.yaml`.
 
 | Scenario | Models | Nodes | How |
 |----------|--------|-------|-----|
@@ -74,11 +74,11 @@ deployments:
     port: 8002
 ```
 
-Then `./spark apply -f fleet.yaml --execute`. Both run in separate containers, co-tenanted on the same GPU. Memory budgets can be tightened later with `kv_cache_gb` and `kv_dtype` (see Phase 2 in `docs/SPARK-ROADMAP.md`).
+Then `./spark apply -f spark.yaml --execute`. Both run in separate containers, co-tenanted on the same GPU. Memory budgets can be tightened later with `kv_cache_gb` and `kv_dtype` (see Phase 2 in `docs/SPARK-ROADMAP.md`).
 
 ### Multi-node cluster example
 
-The same `fleet.yaml` pattern scales to any size. A 10-node fleet looks identical — just add nodes and assign deployments:
+The same `spark.yaml` pattern scales to any size. A 10-node fleet looks identical — just add nodes and assign deployments:
 
 ```yaml
 fleet:
@@ -157,25 +157,25 @@ Table output includes:
 
 ### apply
 
-Start deployments defined in a fleet YAML file (`fleet.yaml` by default).
+Start deployments defined in a fleet YAML file (`spark.yaml` by default).
 
 **Dry-run (default):** prints the launch plan without executing.
 
 ```bash
-./spark apply -f fleet.yaml
+./spark apply -f spark.yaml
 ```
 
 **Execute:** actually launches the containers.
 
 ```bash
-./spark apply -f fleet.yaml --execute
+./spark apply -f spark.yaml --execute
 ```
 
 Options:
 
 | Flag | Description |
 |------|-------------|
-| `-f, --file` | Path to fleet YAML (default: `fleet.yaml`) |
+| `-f, --file` | Path to fleet YAML (default: `spark.yaml`) |
 | `--master` | Control host that runs `run-recipe.sh` (default: first fleet node) |
 | `--remote-dir` | Project directory on the master (default: `~/projects/spark-vllm-docker`) |
 | `--execute` | Execute the plan (default: dry-run) |
@@ -188,17 +188,17 @@ Stop fleet YAML deployments.
 
 ```bash
 # Dry-run
-./spark down -f fleet.yaml
+./spark down -f spark.yaml
 
 # Execute
-./spark down -f fleet.yaml --execute
+./spark down -f spark.yaml --execute
 ```
 
 Options:
 
 | Flag | Description |
 |------|-------------|
-| `-f, --file` | Path to fleet YAML (default: `fleet.yaml`) |
+| `-f, --file` | Path to fleet YAML (default: `spark.yaml`) |
 | `--execute` | Execute (default: dry-run) |
 
 ### restart
@@ -206,20 +206,20 @@ Options:
 Restart a single deployment by name.
 
 ```bash
-./spark restart -f fleet.yaml my-model-name
+./spark restart -f spark.yaml my-model-name
 ```
 
 Options:
 
 | Flag | Description |
 |------|-------------|
-| `-f, --file` | Path to fleet YAML (default: `fleet.yaml`) |
+| `-f, --file` | Path to fleet YAML (default: `spark.yaml`) |
 | `--master` | Control host (default: first fleet node) |
 | `--remote-dir` | Project directory on the master |
 
 The deployment is stopped and relaunched on the same node and port. Waits for the model to become ready before returning.
 
-## fleet.yaml format
+## spark.yaml format
 
 ```yaml
 fleet:
@@ -253,7 +253,7 @@ deployments:
 
 ## Recipes
 
-Every deployment in `fleet.yaml` references a recipe by the `recipe:` field. Recipes are YAML files in `recipes/` that define a model, container image, vLLM flags, and memory settings. The same fleet can mix Spark recipes and x86/discrete-GPU recipes — `spark` has no architecture assumptions.
+Every deployment in `spark.yaml` references a recipe by the `recipe:` field. Recipes are YAML files in `recipes/` that define a model, container image, vLLM flags, and memory settings. The same fleet can mix Spark recipes and x86/discrete-GPU recipes — `spark` has no architecture assumptions.
 
 ### Spark recipe (unified memory, ~120 GB)
 
@@ -340,14 +340,14 @@ command: |
 
 ### Placeholder variables
 
-The `command` template can use `{placeholders}` that are resolved from `defaults` or `fleet.yaml` overrides:
+The `command` template can use `{placeholders}` that are resolved from `defaults` or `spark.yaml` overrides:
 
-- `{port}`, `{host}`, `{gpu_memory_utilization}`, `{max_model_len}`, `{tensor_parallel}` — from recipe `defaults` or `fleet.yaml`
+- `{port}`, `{host}`, `{gpu_memory_utilization}`, `{max_model_len}`, `{tensor_parallel}` — from recipe `defaults` or `spark.yaml`
 - `{max_num_batched_tokens}`, `{max_num_seqs}` — any key in `defaults`
 
-### fleet.yaml overrides
+### spark.yaml overrides
 
-Values in `fleet.yaml` override recipe defaults per deployment:
+Values in `spark.yaml` override recipe defaults per deployment:
 
 ```yaml
 deployments:
@@ -365,7 +365,7 @@ deployments:
 2. Set `name`, `model`, and `container`.
 3. Pick memory budget: absolute GB (`mods/gpu-mem-util-gb`) for Spark, fractional (`--gpu-memory-utilization`) for discrete GPUs.
 4. Write `command` with `{placeholder}` variables pulled from `defaults`.
-5. Test with `./spark apply -f fleet.yaml` (dry-run) before `--execute`.
+5. Test with `./spark apply -f spark.yaml` (dry-run) before `--execute`.
 
 ## Requirements
 
@@ -383,7 +383,7 @@ hand-started containers or the legacy `vllm_node`.
 
 ## Placement
 
-Placement is explicit in `fleet.yaml`:
+Placement is explicit in `spark.yaml`:
 
 - **Solo** (`node:`) — one container on one node. The `--node <ip>` flag supports both
   local and remote solo containers. When the target is remote, the master orchestrates

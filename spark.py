@@ -256,7 +256,7 @@ def cmd_scan(args: argparse.Namespace) -> int:
 
 
 # ---------------------------------------------------------------------------
-# Fleet apply (Phase 1) — reconcile fleet.yaml -> running containers
+# Fleet apply (Phase 1) — reconcile spark.yaml -> running containers
 # ---------------------------------------------------------------------------
 
 DEFAULT_REMOTE_DIR = "~/projects/spark-vllm-docker"
@@ -531,20 +531,20 @@ def main(argv: list[str] | None = None) -> int:
     s.add_argument("--json", action="store_true", help="emit JSON instead of a table")
     s.set_defaults(func=cmd_scan)
 
-    a = sub.add_parser("apply", help="start fleet.yaml deployments (dry-run unless --execute)")
-    a.add_argument("-f", "--file", default="fleet.yaml")
+    a = sub.add_parser("apply", help="start spark.yaml deployments (dry-run unless --execute)")
+    a.add_argument("-f", "--file", default="spark.yaml")
     a.add_argument("--master", help="control host that runs run-recipe.sh (default: first fleet node)")
     a.add_argument("--remote-dir", default=DEFAULT_REMOTE_DIR, help="project dir on the master")
     a.add_argument("--execute", action="store_true", help="actually run (default: print plan)")
     a.set_defaults(func=cmd_apply)
 
-    d = sub.add_parser("down", help="stop fleet.yaml deployments (dry-run unless --execute)")
-    d.add_argument("-f", "--file", default="fleet.yaml")
+    d = sub.add_parser("down", help="stop spark.yaml deployments (dry-run unless --execute)")
+    d.add_argument("-f", "--file", default="spark.yaml")
     d.add_argument("--execute", action="store_true")
     d.set_defaults(func=cmd_down)
 
     r = sub.add_parser("restart", help="restart a specific model by name (always executes)")
-    r.add_argument("-f", "--file", default="fleet.yaml")
+    r.add_argument("-f", "--file", default="spark.yaml")
     r.add_argument("--master", help="control host (default: first fleet node)")
     r.add_argument("--remote-dir", default=DEFAULT_REMOTE_DIR)
     r.add_argument("name", help="deployment name to restart")
