@@ -251,6 +251,122 @@ deployments:
     max_model_len: 128000
 ```
 
+## Recipes
+
+Every deployment in `fleet.yaml` references a recipe by the `recipe:` field. Recipes are YAML files in `recipes/` that define a model, container image, vLLM flags, and memory settings. The same fleet can mix Spark recipes and x86/discrete-GPU recipes — `spark` has no architecture assumptions.
+
+### Spark recipe (unified memory, ~120 GB)
+
+```yaml
+recipe_version: "1"
+name: Ornith-1.0-35B-NVFP4
+model: sakamakismile/Ornith-1.0-35B-NVFP4
+
+container: vllm-node-tf5
+build_args:
+  - --tf5
+
+mods:
+  - mods/gpu-mem-util-gb        # Spark-only: hard GB cap
+
+defaults:
+  gpu_memory_utilization: 45    # ABSOLUTE GB (NOT a fraction)
+  max_model_len: 262144
+
+command: |
+  vllm serve sakamakismile/Ornith-1.0-35B-NVFP4 \
+    --gpu-memory-utilization-gb {gpu_memory_utilization} \
+    --kv-cache-dtype fp8 \
+    ...
+```
+
+**Key details:**
+- `container:` — your custom-built image (`vllm-node`, `vllm-node-tf5`, etc.).
+- `mods:` — `mods/gpu-mem-util-gb` patches vLLM to accept `--gpu-memory-utilization-gb` (absolute GB). This is critical for GB10's unified memory where fractional allocation (`--gpu-memory-utilization`) can starve the OS.
+- `defaults.gpu_memory_utilization` — an integer (GB), not a 0–1 fraction.
+
+### x86 / discrete-GPU recipe
+
+```yaml
+recipe_version: "1"
+name: Qwen3-Embedding-8B-x86
+model: Qwen/Qwen3-Embedding-8B
+
+container: vllm/vllm-openai:latest   # stock upstream image, no build needed
+
+defaults:
+  gpu_memory_utilization: 0.37       # FRACTION (0.0–1.0) of VRAM
+  max_model_len: 4096
+
+env:
+  NCCL_IB_DISABLE: "1"
+  NCCL_SOCKET_IFNAME: enp9s0f0np0
+
+command: |
+  vllm serve Qwen/Qwen3-Embedding-8B \
+    --quantization fp8 \
+    --kv-cache-dtype fp8 \
+    --gpu-memory-utilization {gpu_memory_utilization} \
+    ...
+```
+
+**Key differences from a Spark recipe:**
+
+| Setting | Spark (GB10) | x86 / discrete GPU |
+|---------|-------------|---------------------|
+| `container:` | Custom-built (`vllm-node-tf5`) | Stock upstream (`vllm/vllm-openai:latest`) |
+| `mods:` | `mods/gpu-mem-util-gb` | None |
+| `gpu_memory_utilization` | Integer (absolute GB) | Fraction (0.0–1.0) |
+| Quantization | Pre-quantized checkpoint | `--quantization fp8` (on-the-fly) |
+| Context length | Full context (262 144) | Short (OOM-prone on limited VRAM) |
+| InfiniBand | Default NCCL | Disable (`NCCL_IB_DISABLE: "1"`) |
+| NIC pinning | Not needed | Required (`NCCL_SOCKET_IFNAME`) |
+
+### Recipe template reference
+
+| Field | Type | Required | Notes |
+|-------|------|----------|-------|
+| `name` | string | yes | Display name |
+| `description` | string | no | Human-readable |
+| `model` | string | yes | HF repo ID |
+| `container` | string | yes | Docker image name — pulled or built per node |
+| `build_args` | list | no | Flags to pass to `build-and-copy.sh` when building |
+| `mods` | list | no | Spark-only mods to apply |
+| `defaults` | map | yes | Values injected into `{placeholders}` in `command` |
+| `env` | map | no | Environment variables exported to the container |
+| `command` | string | yes | vLLM command template — must contain `{port}` and `{host}` |
+| `solo_only` | bool | no | Enforce single-node placement |
+| `cluster_only` | bool | no | Enforce multi-node placement |
+
+### Placeholder variables
+
+The `command` template can use `{placeholders}` that are resolved from `defaults` or `fleet.yaml` overrides:
+
+- `{port}`, `{host}`, `{gpu_memory_utilization}`, `{max_model_len}`, `{tensor_parallel}` — from recipe `defaults` or `fleet.yaml`
+- `{max_num_batched_tokens}`, `{max_num_seqs}` — any key in `defaults`
+
+### fleet.yaml overrides
+
+Values in `fleet.yaml` override recipe defaults per deployment:
+
+```yaml
+deployments:
+  - name: ocr
+    recipe: glm-ocr-x86
+    node: 10.0.0.12
+    port: 8003
+    # Recipe default is 32768; override to 8192 to fit on the card
+    max_model_len: 8192
+```
+
+### Writing a new recipe
+
+1. Copy an existing recipe as a template (or use `recipes/templates/`).
+2. Set `name`, `model`, and `container`.
+3. Pick memory budget: absolute GB (`mods/gpu-mem-util-gb`) for Spark, fractional (`--gpu-memory-utilization`) for discrete GPUs.
+4. Write `command` with `{placeholder}` variables pulled from `defaults`.
+5. Test with `./spark apply -f fleet.yaml` (dry-run) before `--execute`.
+
 ## Requirements
 
 - **PyYAML** — auto-installed by the `spark` launcher script on first use.
