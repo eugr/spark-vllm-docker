@@ -99,6 +99,30 @@ deployments:
 
 `spark apply` launches deployments **in parallel across nodes** and **sequentially within each node**. The tool doesn't care if you have 1 or 50 Sparks — it just SSHes into the master and orchestrates from there.
 
+### Heterogeneous fleets
+
+Not all nodes need to be DGX Sparks. Any machine with Docker and an SSH server can be a fleet
+member — x86 workstations, discrete-GPU servers, ARM nodes, whatever you want. Your recipes just
+need to target the container image for that hardware.
+
+```yaml
+fleet:
+  - { ip: 10.0.0.10, mem_gb: 120 }   # DGX Spark (GB10)
+  - { ip: 10.0.0.11, mem_gb: 120 }   # DGX Spark (GB10)
+  - { ip: 10.0.0.12, mem_gb: 24 }    # x86 w/ RTX 4090 (24GB VRAM)
+
+deployments:
+  # Big models stay on the Sparks
+  - { name: qwen35, recipe: qwen3.5-122b-a10b-nvfp4, node: 10.0.0.10, port: 8001 }
+
+  # Smaller models, embedding, reranking — no problem on x86
+  - { name: embed,  recipe: qwen3-embedding-8b-x86,       node: 10.0.0.12, port: 8005 }
+  - { name: rerank, recipe: qwen3-reranker-8b-x86,        node: 10.0.0.12, port: 8002 }
+```
+
+`spark` treats every node the same regardless of architecture — it SSHes in and runs Docker.
+The only requirement is that the recipe and container image match the target hardware.
+
 ## Commands
 
 ### scan
