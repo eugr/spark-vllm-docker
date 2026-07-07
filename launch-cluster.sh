@@ -40,6 +40,8 @@ NO_RAY_MODE="true"
 NO_RAY_EXPLICIT="false"
 RAY_MODE_EXPLICIT="false"
 LAUNCH_SCRIPT_MODE="false"
+NODE_TARGET=""        # --node <ip>: place a single solo container on this node (local or remote)
+REMOTE_SOLO="false"   # set when --node points at a remote node (master orchestrates over SSH)
 MOUNT_CACHE_DIRS="true"
 BUILD_JOBS=""
 NON_PRIVILEGED_MODE="false"
@@ -116,6 +118,7 @@ usage() {
 while [[ "$#" -gt 0 ]]; do
     case $1 in
         -n|--nodes) NODES_ARG="$2"; shift ;;
+        --node) NODE_TARGET="$2"; shift ;;
         -t) IMAGE_NAME="$2"; shift ;;
         --name) CONTAINER_NAME="$2"; shift ;;
         --eth-if) ETH_IF="$2"; shift ;;
@@ -471,6 +474,23 @@ if [[ "${FORCE_DISCOVER:-false}" == "true" ]]; then
     # If no action was specified, setup was the only intent — exit cleanly
     if [[ -z "$ACTION" && "$LAUNCH_SCRIPT_MODE" != "true" ]]; then
         exit 0
+    fi
+fi
+
+# --node <ip>: single-container placement on a chosen node.
+#  - local target  -> behave exactly like --solo (local docker run).
+#  - remote target -> validate as a "solo" with LOCAL_IP forced to the target (so the
+#    head-in-nodes check passes), then redirect the final dispatch to run_remote_solo,
+#    which orchestrates the container on that node over SSH.
+if [[ -n "$NODE_TARGET" ]]; then
+    _myips=" $(hostname -I 2>/dev/null) 127.0.0.1 localhost "
+    SOLO_MODE="true"
+    if [[ "$_myips" == *" $NODE_TARGET "* ]]; then
+        echo "--node $NODE_TARGET is local; running solo here."
+    else
+        REMOTE_SOLO="true"
+        LOCAL_IP="$NODE_TARGET"
+        echo "--node $NODE_TARGET is remote; master will orchestrate it over SSH."
     fi
 fi
 
@@ -919,6 +939,8 @@ copy_script_to_worker() {
     ssh -o BatchMode=yes -o StrictHostKeyChecking=no "$worker_ip" \
         "docker cp $remote_tmp $container:$CONTAINER_EXEC_SCRIPT && \
          docker exec -w / $container chmod +x $CONTAINER_EXEC_SCRIPT && \
+        "docker cp $remote_tmp $container:/tmp/exec-script.sh && \
+         docker exec $container chmod +x /tmp/exec-script.sh && \
          rm -f $remote_tmp" || { echo "Error: docker cp to worker $worker_ip failed"; exit 1; }
 }
 
@@ -1072,6 +1094,59 @@ start_cluster() {
     fi
 }
 
+# Remote-solo: run ONE model container on a single REMOTE node (no Ray, no local head).
+# Driven by --node <remote_ip>. The master orchestrates entirely over SSH, reusing the
+# worker primitives (docker run, apply_mod_to_container, copy_script_to_worker, docker exec).
+run_remote_solo() {
+    local node="$1"
+
+    local docker_entrypoint_args=""
+    [[ "$KEEP_ENTRYPOINT" != "true" ]] && docker_entrypoint_args="--entrypoint="
+
+    local docker_network_args="--network host"
+    if [[ ${#PORT_MAPPINGS[@]} -gt 0 ]]; then
+        docker_network_args=""
+        for mapping in "${PORT_MAPPINGS[@]}"; do
+            docker_network_args="$docker_network_args -p $mapping"
+        done
+    fi
+
+    local docker_args_common="--gpus all -d --rm $docker_network_args --name $CONTAINER_NAME $docker_entrypoint_args $DOCKER_ARGS $IMAGE_NAME"
+    local docker_caps_args docker_resource_args
+    if [[ "$NON_PRIVILEGED_MODE" == "true" ]]; then
+        docker_caps_args="--cap-add=IPC_LOCK"
+        docker_resource_args="--shm-size=${SHM_SIZE_GB}g --device=/dev/infiniband --memory ${MEM_LIMIT_GB}g --memory-swap ${MEM_SWAP_LIMIT_GB}g --pids-limit ${PIDS_LIMIT}"
+    else
+        docker_caps_args="--privileged"
+        docker_resource_args="--ipc=host"
+    fi
+
+    echo "Remote-solo: starting container '$CONTAINER_NAME' on $node..."
+    [[ "$MOUNT_CACHE_DIRS" == "true" ]] && ssh -o BatchMode=yes -o StrictHostKeyChecking=no "$node" "mkdir -p ${CACHE_DIRS_TO_CREATE[*]}" 2>/dev/null
+    ssh -o BatchMode=yes -o StrictHostKeyChecking=no "$node" \
+        "docker rm -f $CONTAINER_NAME >/dev/null 2>&1; docker run $docker_caps_args $docker_resource_args $(get_env_flags "$node") $docker_args_common sleep infinity" \
+        || { echo "Error: remote docker run on $node failed"; exit 1; }
+
+    if [[ ${#MOD_PATHS[@]} -gt 0 ]]; then
+        echo "Applying mods on $node..."
+        for i in "${!MOD_PATHS[@]}"; do
+            apply_mod_to_container "$node" "$CONTAINER_NAME" "false" "${MOD_PATHS[$i]}" "${MOD_TYPES[$i]}"
+        done
+    fi
+
+    if [[ -n "$LAUNCH_SCRIPT_PATH" ]]; then
+        copy_script_to_worker "$node" "$CONTAINER_NAME" "$LAUNCH_SCRIPT_PATH"
+    fi
+
+    # Exec the model in the background; output -> container PID 1 so `docker logs` works.
+    local payload="/tmp/exec-script.sh >> /proc/1/fd/1 2>&1"
+    local remote_cmd
+    printf -v remote_cmd 'docker exec -d %q bash -c %q' "$CONTAINER_NAME" "$payload"
+    ssh -o BatchMode=yes -o StrictHostKeyChecking=no "$node" "$remote_cmd" \
+        || { echo "Error: remote docker exec on $node failed"; exit 1; }
+    echo "Remote-solo model dispatched on $node (container $CONTAINER_NAME)."
+}
+
 # Wait for Cluster Readiness
 wait_for_cluster() {
     echo "Waiting for cluster to be ready..."
@@ -1177,6 +1252,12 @@ if [[ "$ACTION" == "exec" ]]; then
                 PEER_NODES=("${PEER_NODES[@]:0:$(( required_nodes - 1 ))}")
             fi
         fi
+    fi
+
+    # Remote-solo: master orchestrates the single container on the target node over SSH.
+    if [[ "$REMOTE_SOLO" == "true" ]]; then
+        run_remote_solo "$LOCAL_IP"
+        exit 0
     fi
 
     start_cluster
