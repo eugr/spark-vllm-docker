@@ -670,6 +670,36 @@ if [ "$NO_BUILD" = false ]; then
         RUNNER_BUILD_TIME=$((BUILD_END - BUILD_START))
     else
         # ----------------------------------------------------------
+        # Phase 0: NCCL wheel
+        # ----------------------------------------------------------
+        echo "Building/exporting NCCL wheel..."
+
+        # Avoid accidentally keeping an older NCCL wheel around.
+        rm -f ./wheels/nvidia_nccl_cu13-*.whl
+
+        NCCL_CMD=(
+            docker build
+            --target nccl-export
+            --output type=local,dest=./wheels
+            "${COMMON_BUILD_FLAGS[@]}"
+            .
+        )
+
+        echo "NCCL export command: ${NCCL_CMD[*]}"
+        "${NCCL_CMD[@]}"
+
+        shopt -s nullglob
+        NCCL_WHEELS=(./wheels/nvidia_nccl_cu13-*.whl)
+        shopt -u nullglob
+
+        if [ "${#NCCL_WHEELS[@]}" -eq 0 ]; then
+            echo "Error: NCCL wheel was not exported into ./wheels"
+            exit 1
+        fi
+
+        echo "NCCL wheel exported: ${NCCL_WHEELS[0]}"
+
+        # ----------------------------------------------------------
         # Phase 1: FlashInfer wheels
         # ----------------------------------------------------------
         if [ "$FLASHINFER_REF_SET" = true ] || [ -n "$FLASHINFER_PRS" ]; then
