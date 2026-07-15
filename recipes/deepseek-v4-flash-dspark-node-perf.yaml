@@ -13,7 +13,9 @@ container: vllm-node
 cluster_only: true
 mods:
   - mods/fix-dspark-dsv4-d2t   # guards speculator.py:86 against DeepSeek-V4 (no draft_id_to_target_id)
-  - mods/add-dsv4-topk256      # sparse-MLA sm120 topk=256 decode instantiation (flashinfer#3817); REMOVE once merged + released
+  # SM12x DSpark needs both TOPK=256 halves. Remove this pair only after the FlashInfer version pinned by the image contains #3817 + #3834; #3896 was superseded by #3834.
+  - mods/add-dsv4-topk256          # FlashInfer #3817: sparse-MLA SM120 TOPK=256 decode instantiations
+  - mods/add-dsv4-topk256-prefill  # FlashInfer #3834: sparse-MLA SM120 TOPK=256 BF16 prefill instantiation
 defaults:
   port: 8000
   host: 0.0.0.0
