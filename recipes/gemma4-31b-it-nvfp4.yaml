@@ -1,0 +1,58 @@
+# Recipe: Gemma4-31B-IT-NVFP4
+# Gemma-4-31B-IT (dense, not MoE) in NVIDIA NVFP4 quantization.
+#
+# Locally authored (not from upstream eugr/spark-vllm-docker). NVIDIA's own
+# model card example targets an 8x H100 node (--tensor-parallel-size 8);
+# adapted here for a single GB10 GPU the same way qwen3.6-27b-nvfp4.yaml
+# adapts its MoE sibling recipe for dense models: tensor_parallel: 1, no
+# --moe-backend (dense model, no expert layers). Tool/reasoning parser
+# flags carry over from gemma4-26b-a4b-nvfp4.yaml since they're
+# Gemma4-architecture-family flags, not specific to that checkpoint's MoE
+# variant.
+#
+# MTP speculative decoding: Google ships a dedicated ~0.5B drafter,
+# google/gemma-4-31B-it-assistant, for this checkpoint (same pattern as the
+# 26B-A4B recipe's assistant model, just no "moe_backend" key since there's
+# no MoE draft/verify path here). Requires vLLM built after the Gemma4 MTP
+# PR (vllm-project/vllm#41745, merged 2026-05-06) — confirmed present in
+# the eugr/spark-vllm:latest nightly pulled 2026-07-19.
+#
+# Load-tested on this box (2026-07-19), without MTP: pp ~2060 tok/s,
+# tg ~6.8 tok/s on a single GB10 GPU. MTP itself not yet benchmarked here.
+
+recipe_version: "1"
+name: Gemma4-31B-IT-NVFP4
+description: vLLM serving nvidia/Gemma-4-31B-IT-NVFP4 (dense)
+
+model: nvidia/Gemma-4-31B-IT-NVFP4
+
+cluster_only: false
+solo_only: true
+
+container: vllm-node
+
+defaults:
+  port: 8000
+  host: 0.0.0.0
+  tensor_parallel: 1
+  gpu_memory_utilization: 0.7
+  max_model_len: 262144
+  max_num_batched_tokens: 8192
+
+env: {}
+
+command: |
+  vllm serve nvidia/Gemma-4-31B-IT-NVFP4 \
+    --host {host} \
+    --port {port} \
+    --tensor-parallel-size {tensor_parallel} \
+    --max-model-len {max_model_len} \
+    --gpu-memory-utilization {gpu_memory_utilization} \
+    --max-num-batched-tokens {max_num_batched_tokens} \
+    --load-format instanttensor \
+    --enable-prefix-caching \
+    --enable-auto-tool-choice \
+    --tool-call-parser gemma4 \
+    --reasoning-parser gemma4 \
+    --kv-cache-dtype fp8 \
+    --speculative-config '{{"method":"mtp","model":"google/gemma-4-31B-it-assistant","num_speculative_tokens":4}}'
