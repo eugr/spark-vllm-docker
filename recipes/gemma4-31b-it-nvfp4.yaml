@@ -17,8 +17,16 @@
 # PR (vllm-project/vllm#41745, merged 2026-05-06) — confirmed present in
 # the eugr/spark-vllm:latest nightly pulled 2026-07-19.
 #
-# Load-tested on this box (2026-07-19), without MTP: pp ~2060 tok/s,
-# tg ~6.8 tok/s on a single GB10 GPU. MTP itself not yet benchmarked here.
+# Load-tested on this box (2026-07-19): pp ~2060 tok/s / tg ~6.8 tok/s
+# without MTP; pp ~1900 tok/s / tg ~16 tok/s with MTP (~2.3x tg speedup).
+#
+# --enable-force-include-usage: without this, vLLM only emits the final
+# usage/metrics SSE chunk if the client explicitly sets
+# stream_options.include_usage=true. Most real streaming clients don't, so
+# llama-swap logged "no valid JSON data found in stream, recording minimal
+# metrics" and showed 0 t/s in its Activity view even with
+# --enable-per-request-metrics on. This forces that chunk on every request
+# regardless of client.
 
 recipe_version: "1"
 name: Gemma4-31B-IT-NVFP4
@@ -55,4 +63,6 @@ command: |
     --tool-call-parser gemma4 \
     --reasoning-parser gemma4 \
     --kv-cache-dtype fp8 \
+    --enable-per-request-metrics \
+    --enable-force-include-usage \
     --speculative-config '{{"method":"mtp","model":"google/gemma-4-31B-it-assistant","num_speculative_tokens":4}}'

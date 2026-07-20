@@ -46,6 +46,8 @@ command: |
     --reasoning-parser gemma4 \
     --kv-cache-dtype fp8 \
     --max-num-batched-tokens {max_num_batched_tokens} \
+    --enable-per-request-metrics \
+    --enable-force-include-usage \
     --speculative-config '{{"method":"mtp","model":"google/gemma-4-26B-A4B-it-assistant","num_speculative_tokens":4, "moe_backend": "triton"}}' \
     -tp {tensor_parallel} --distributed-executor-backend ray
     
