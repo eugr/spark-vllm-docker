@@ -24,6 +24,10 @@ defaults:
   host: 0.0.0.0
   gpu_memory_utilization: 0.8
   max_model_len: 262144
+  # JSON-valued args live here whole: the renderer can't substitute inside JSON braces
+  diffusion_config: '{"canvas_length":256}'
+  override_generation_config: '{"max_new_tokens": null}'
+  default_chat_template_kwargs: '{"enable_thinking": true}'
 
 # Environment variables
 env: {}
@@ -41,7 +45,7 @@ command: |
     --load-format fastsafetensors \
     --attention-backend TRITON_ATTN \
     --enable-prefix-caching \
-    --diffusion-config '{{"canvas_length":256}}' \
-    --override-generation-config '{{"max_new_tokens": null}}' \
+    --diffusion-config '{diffusion_config}' \
+    --override-generation-config '{override_generation_config}' \
     --reasoning-parser gemma4 \
-    --default-chat-template-kwargs '{{"enable_thinking": true}}'
+    --default-chat-template-kwargs '{default_chat_template_kwargs}'
