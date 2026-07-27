@@ -20,7 +20,7 @@ fi
 ETH_IF=""
 IB_IF=""
 NCCL_DEBUG_VAL=""
-MASTER_PORT="29501"
+MASTER_PORT=""  # resolved after .env load: CLI > .env > 29501 default
 
 # Initialize variables
 NODES_ARG=""
@@ -53,6 +53,7 @@ SHM_SIZE_GB="64"
 NOFILE_LIMIT="${VLLM_SPARK_NOFILE_LIMIT:-1048576}"
 PORT_MAPPINGS=()
 VOLUME_MAPPINGS=()
+PLACEMENT_NODE=""
 ENABLE_EARLYOOM="false"
 EARLYOOM_ARGS="${VLLM_SPARK_EARLYOOM_ARGS:--M 524288,102400 -s 100 -r 60}"
 
@@ -71,6 +72,7 @@ usage() {
     echo "  --launch-script Path to bash script to execute in the container (from examples/ directory or absolute path). If launch script is specified, action should be omitted."
     echo "  --check-config  Check configuration and auto-detection without launching"
     echo "  --solo          Solo mode: skip autodetection, launch only on current node, do not launch Ray cluster"
+    echo "  --placement-node <IP>  Run the standalone container on the given node (local, or remote via SSH). Implies solo mode."
     echo "  --master-port   Port for cluster coordination: Ray head port or PyTorch distributed master port (default: 29501)"
     echo "  -p, --publish   Publish a container port in Docker format (e.g. -p 8000:8000). Solo mode only; can be specified multiple times."
     echo "  -v, --volume    Map a volume in Docker format (e.g. -v /local/path:/container/path). Can be specified multiple times."
@@ -147,6 +149,7 @@ while [[ "$#" -gt 0 ]]; do
         -v=*|--volume=*) VOLUME_MAPPINGS+=("${1#*=}") ;;
         --check-config) CHECK_CONFIG="true" ;;
         --solo) SOLO_MODE="true" ;;
+        --placement-node) PLACEMENT_NODE="$2"; shift ;;
         --ray)
             if [[ "$NO_RAY_EXPLICIT" == "true" ]]; then
                 echo "Error: --ray and --no-ray are mutually exclusive."
@@ -201,6 +204,28 @@ while [[ "$#" -gt 0 ]]; do
     esac
     shift
 done
+
+# --placement-node: run the standalone container's full lifecycle on the given
+# node (local, or remote via SSH). Implies solo mode: no Ray, no worker fan-out,
+# no master port.
+if [[ -n "$PLACEMENT_NODE" ]]; then
+    SOLO_MODE="true"
+    NODES_ARG="$PLACEMENT_NODE"
+fi
+
+# Placement-target routing: every container operation on the placement target
+# goes through run_on_target so a remote node is reached over SSH (with a
+# connect timeout so an unreachable node fails fast) and a local one runs
+# directly. Without --placement-node this always takes the local branch.
+SSH_OPTS="-o BatchMode=yes -o StrictHostKeyChecking=no -o ConnectTimeout=5"
+target_is_remote() { [[ -n "$PLACEMENT_NODE" && "$PLACEMENT_NODE" != "$LOCAL_IP" ]]; }
+run_on_target() {
+    if target_is_remote; then
+        ssh $SSH_OPTS "$PLACEMENT_NODE" "$1"
+    else
+        bash -c "$1"
+    fi
+}
 
 # Set .env file path (use default if not specified)
 if [[ -z "$CONFIG_FILE" ]]; then
@@ -299,9 +324,10 @@ if [[ -z "$IB_IF" && -n "$DOTENV_IB_IF" ]]; then
     IB_IF="$DOTENV_IB_IF"
 fi
 
-if [[ -z "$MASTER_PORT" || "$MASTER_PORT" == "29501" ]] && [[ -n "$DOTENV_MASTER_PORT" ]]; then
+if [[ -z "$MASTER_PORT" && -n "$DOTENV_MASTER_PORT" ]]; then
     MASTER_PORT="$DOTENV_MASTER_PORT"
 fi
+MASTER_PORT="${MASTER_PORT:-29501}"
 
 if [[ -z "$CONTAINER_NAME" || "$CONTAINER_NAME" == "vllm_node" ]] && [[ -n "$DOTENV_CONTAINER_NAME" ]]; then
     CONTAINER_NAME="$DOTENV_CONTAINER_NAME"
@@ -505,7 +531,12 @@ if [[ "$SOLO_MODE" == "true" ]]; then
     if [[ -z "$LOCAL_IP" ]]; then
         LOCAL_IP="127.0.0.1"
     fi
-    NODES_ARG="$LOCAL_IP"
+    if [[ -n "$PLACEMENT_NODE" ]]; then
+        NODES_ARG="$PLACEMENT_NODE"
+        echo "Placement mode enabled. Target node: $PLACEMENT_NODE"
+    else
+        NODES_ARG="$LOCAL_IP"
+    fi
     PEER_NODES=()
     echo "Solo mode enabled. Skipping node detection."
 else
@@ -527,21 +558,27 @@ if [[ "$SOLO_MODE" != "true" ]]; then
     detect_local_ip || exit 1
 fi
 
-HEAD_IP="$LOCAL_IP"
+if [[ -n "$PLACEMENT_NODE" ]]; then
+    # Placement launch: the head container runs on the placement target, which
+    # need not be the local machine. Skip the local-IP-in-nodes check.
+    HEAD_IP="$PLACEMENT_NODE"
+else
+    HEAD_IP="$LOCAL_IP"
 
-# Verify HEAD_IP is in ALL_NODES
-FOUND_HEAD=false
-for ip in "${ALL_NODES[@]}"; do
-    ip=$(echo "$ip" | xargs)
-    if [[ "$ip" == "$HEAD_IP" ]]; then
-        FOUND_HEAD=true
-        break
+    # Verify HEAD_IP is in ALL_NODES
+    FOUND_HEAD=false
+    for ip in "${ALL_NODES[@]}"; do
+        ip=$(echo "$ip" | xargs)
+        if [[ "$ip" == "$HEAD_IP" ]]; then
+            FOUND_HEAD=true
+            break
+        fi
+    done
+
+    if [ "$FOUND_HEAD" = false ]; then
+        echo "Error: Local IP ($HEAD_IP) is not in the list of nodes ($NODES_ARG)."
+        exit 1
     fi
-done
-
-if [ "$FOUND_HEAD" = false ]; then
-    echo "Error: Local IP ($HEAD_IP) is not in the list of nodes ($NODES_ARG)."
-    exit 1
 fi
 
 # Implicit Solo Mode Detection
@@ -576,17 +613,25 @@ echo "Container Name: $CONTAINER_NAME"
 echo "Image Name: $IMAGE_NAME"
 echo "Action: $ACTION"
 
-# Check SSH connectivity to worker nodes
+# Check SSH connectivity to remote nodes (placement target and/or workers)
+check_ssh_reachable() {
+    if ! ssh $SSH_OPTS "$1" true 2>/dev/null; then
+        echo "Error: Passwordless SSH to $1 failed."
+        echo "  Please ensure SSH keys are configured and the host is reachable."
+        exit 1
+    fi
+    echo "  SSH to $1: OK"
+}
+
 if [[ "$ACTION" == "start" || "$ACTION" == "exec" || "$CHECK_CONFIG" == "true" ]]; then
+    if target_is_remote; then
+        echo "Checking SSH connectivity to placement node..."
+        check_ssh_reachable "$PLACEMENT_NODE"
+    fi
     if [ ${#PEER_NODES[@]} -gt 0 ]; then
         echo "Checking SSH connectivity to worker nodes..."
         for worker in "${PEER_NODES[@]}"; do
-            if ! ssh -o BatchMode=yes -o ConnectTimeout=5 -o StrictHostKeyChecking=no "$worker" true 2>/dev/null; then
-                echo "Error: Passwordless SSH to $worker failed."
-                echo "  Please ensure SSH keys are configured and the host is reachable."
-                exit 1
-            fi
-            echo "  SSH to $worker: OK"
+            check_ssh_reachable "$worker"
         done
     fi
 fi
@@ -629,9 +674,9 @@ cleanup() {
     echo ""
     echo "Stopping cluster..."
     
-    # Stop Head
+    # Stop Head (on the placement target when one is set)
     echo "Stopping head node ($HEAD_IP)..."
-    docker stop "$CONTAINER_NAME" >/dev/null 2>&1 || true
+    run_on_target "docker stop $CONTAINER_NAME >/dev/null 2>&1" || true
     
     # Stop Workers
     for worker in "${PEER_NODES[@]}"; do
@@ -652,12 +697,12 @@ fi
 if [[ "$ACTION" == "status" ]]; then
     echo "Checking status..."
     
-    # Check Head
-    if docker ps | grep -q "$CONTAINER_NAME"; then
+    # Check Head (on the placement target when one is set)
+    if run_on_target "docker ps | grep -q '$CONTAINER_NAME'"; then
         echo "[HEAD] $HEAD_IP: Container '$CONTAINER_NAME' is RUNNING."
         if [[ "$NO_RAY_MODE" == "false" ]]; then
             echo "--- Ray Status ---"
-            docker exec "$CONTAINER_NAME" ray status || echo "Failed to get ray status."
+            run_on_target "docker exec $CONTAINER_NAME ray status" || echo "Failed to get ray status."
             echo "------------------"
         fi
     else
@@ -685,8 +730,8 @@ fi
 check_cluster_running() {
     local running=false
     
-    # Check Head
-    if docker ps --format '{{.Names}}' | grep -q "^${CONTAINER_NAME}$"; then
+    # Check Head (on the placement target when one is set)
+    if run_on_target "docker ps --format '{{.Names}}' | grep -q '^${CONTAINER_NAME}$'"; then
         echo "Warning: Container '$CONTAINER_NAME' is already running on head node ($HEAD_IP)."
         running=true
     fi
@@ -1081,15 +1126,13 @@ start_cluster() {
     local keepalive_cmd
     keepalive_cmd="$(container_keepalive_command)"
 
-    # Start Head Node
+    # Start Head Node (run_on_target reaches the placement target when one is
+    # set, and runs locally otherwise)
     echo "Starting Head Node on $HEAD_IP..."
     if [[ "$MOUNT_CACHE_DIRS" == "true" ]]; then
-        for dir in "${CACHE_DIRS_TO_CREATE[@]}"; do
-            mkdir -p "$dir"
-        done
+        run_on_target "mkdir -p ${CACHE_DIRS_TO_CREATE[*]}"
     fi
-    docker run $docker_caps_args $docker_resource_args \
-        $(get_env_flags "$HEAD_IP") $docker_args_common $keepalive_cmd
+    run_on_target "docker run $docker_caps_args $docker_resource_args $(get_env_flags "$HEAD_IP") $docker_args_common $keepalive_cmd"
 
     # Start Worker Nodes
     for worker in "${PEER_NODES[@]}"; do
@@ -1101,11 +1144,14 @@ start_cluster() {
         ssh "$worker" "$docker_run_cmd $keepalive_cmd"
     done
 
-    # Apply mods (containers are idle — no mod_done sync needed)
+    # Apply mods (containers are idle — no mod_done sync needed). HEAD_IP is
+    # the placement target when one is set, so only the is-local flag varies.
     if [[ ${#MOD_PATHS[@]} -gt 0 ]]; then
         echo "Applying modifications to cluster nodes..."
+        local head_is_local="true"
+        if target_is_remote; then head_is_local="false"; fi
         for i in "${!MOD_PATHS[@]}"; do
-            apply_mod_to_container "$HEAD_IP" "$CONTAINER_NAME" "true" "${MOD_PATHS[$i]}" "${MOD_TYPES[$i]}"
+            apply_mod_to_container "$HEAD_IP" "$CONTAINER_NAME" "$head_is_local" "${MOD_PATHS[$i]}" "${MOD_TYPES[$i]}"
         done
         for worker in "${PEER_NODES[@]}"; do
             for i in "${!MOD_PATHS[@]}"; do
@@ -1139,7 +1185,11 @@ start_cluster() {
                     temp_ray_script="$ray_script"
                 fi
             fi
-            copy_script_to_container "$CONTAINER_NAME" "$ray_script" "head node"
+            if target_is_remote; then
+                copy_script_to_worker "$PLACEMENT_NODE" "$CONTAINER_NAME" "$ray_script"
+            else
+                copy_script_to_container "$CONTAINER_NAME" "$ray_script" "head node"
+            fi
             [[ -n "$temp_ray_script" ]] && rm -f "$temp_ray_script"
         fi
     fi
@@ -1179,16 +1229,36 @@ wait_for_cluster() {
     exit 1
 }
 
-# Execute command on head node (daemon or interactive)
+# Execute command on head node (daemon or interactive).
+# When a remote placement target is set, the docker exec runs there over SSH.
 _exec_on_head() {
-    local cmd="$1"
+    local cmd="$1" exec_flags ssh_flags="" payload
     if [[ "$DAEMON_MODE" == "true" ]]; then
-        docker exec -d "$CONTAINER_NAME" bash -c "$cmd >> /proc/1/fd/1 2>&1"
-        echo "Command dispatched in background (Daemon mode). Container: $CONTAINER_NAME"
+        exec_flags="-d"
+        payload="$cmd >> /proc/1/fd/1 2>&1"
+    elif [ -t 0 ]; then
+        exec_flags="-it"
+        ssh_flags="-t"
+        payload="$cmd"
     else
-        if [ -t 0 ]; then DOCKER_EXEC_FLAGS="-it"; else DOCKER_EXEC_FLAGS="-i"; fi
-        docker exec $DOCKER_EXEC_FLAGS "$CONTAINER_NAME" bash -c "$cmd"
+        exec_flags="-i"
+        payload="$cmd"
     fi
+    local rc on_where=""
+    if target_is_remote; then
+        local remote_cmd
+        printf -v remote_cmd 'docker exec %s %q bash -c %q' "$exec_flags" "$CONTAINER_NAME" "$payload"
+        ssh $ssh_flags $SSH_OPTS "$PLACEMENT_NODE" "$remote_cmd"
+        rc=$?
+        on_where=" on $PLACEMENT_NODE"
+    else
+        docker exec $exec_flags "$CONTAINER_NAME" bash -c "$payload"
+        rc=$?
+    fi
+    if [[ "$DAEMON_MODE" == "true" ]]; then
+        echo "Command dispatched in background (Daemon mode). Container: $CONTAINER_NAME$on_where"
+    fi
+    return $rc
 }
 
 # Execute a no-ray multi-node command: workers (background) then head
@@ -1282,7 +1352,7 @@ elif [[ "$ACTION" == "start" ]]; then
     else
         echo "Cluster started. Tailing logs from head node..."
         echo "Press Ctrl+C to stop the cluster."
-        docker logs -f "$CONTAINER_NAME" &
+        run_on_target "docker logs -f $CONTAINER_NAME" &
         wait $!
     fi
 fi

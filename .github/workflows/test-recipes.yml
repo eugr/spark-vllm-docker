@@ -6,16 +6,22 @@ on:
     paths:
       - 'run-recipe.py'
       - 'run-recipe.sh'
+      - 'run-stack.py'
+      - 'run-stack.sh'
       - 'launch-cluster.sh'
       - 'recipes/**'
+      - 'stacks/**'
       - 'tests/**'
       - '.github/workflows/test-recipes.yml'
   pull_request:
     paths:
       - 'run-recipe.py'
       - 'run-recipe.sh'
+      - 'run-stack.py'
+      - 'run-stack.sh'
       - 'launch-cluster.sh'
       - 'recipes/**'
+      - 'stacks/**'
       - 'tests/**'
       - '.github/workflows/test-recipes.yml'
   workflow_dispatch:
@@ -43,14 +49,18 @@ jobs:
     
     - name: Make scripts executable
       run: |
-        chmod +x run-recipe.py run-recipe.sh launch-cluster.sh
-        chmod +x tests/test_recipes.sh tests/test_launch_cluster_image_sync.sh
-    
+        chmod +x run-recipe.py run-recipe.sh run-stack.py run-stack.sh launch-cluster.sh
+        chmod +x tests/test_recipes.sh tests/test_stack.sh tests/test_launch_cluster_image_sync.sh
+
     - name: Run recipe integration tests
       run: |
         ./tests/test_recipes.sh -v
         ./tests/test_launch_cluster_image_sync.sh
-    
+
+    - name: Run stack integration tests
+      run: |
+        ./tests/test_stack.sh -v
+
     - name: Verify all recipes with dry-run
       run: |
         for recipe in recipes/*.yaml; do
@@ -60,5 +70,40 @@ jobs:
             ./run-recipe.py "$name" --dry-run -n "10.0.0.1,10.0.0.2" || exit 1
           else
             ./run-recipe.py "$name" --dry-run --solo || exit 1
+          fi
+        done
+
+    - name: Verify all stacks with dry-run
+      run: |
+        # Every stack must dry-run clean. Default: verify against a synthetic
+        # 2-node cluster (so 'placement: all' resolves distributed and pinned
+        # 'placement: <IP>' resolves to its node). run-stack.py exits 3 when
+        # the ONLY problem is a recipe's own solo_only/cluster_only flag
+        # forbidding the resolved mode -- such a stack is legitimately
+        # single-host, so re-verify it with no cluster configured. Any OTHER
+        # failure (bad recipe, duplicate master_port, unknown placement IP,
+        # per-node port clash) is a real error and fails CI even though a
+        # no-cluster run might have passed.
+        # The synthetic node IPs must cover every 'placement: <IP>' pinned by a
+        # stack in stacks/, or that stack fails load-time placement validation.
+        # Keep these in sync with the IPs used by the shipped example stacks.
+        printf 'CLUSTER_NODES="10.0.1.1,10.0.1.2"\nLOCAL_IP="10.0.1.1"\n' > /tmp/ci-cluster.env
+        : > /tmp/ci-nocluster.env
+        for stack in stacks/*.yaml stacks/*.yml; do
+          [ -e "$stack" ] || continue
+          echo "Testing stack: $(basename "$stack")"
+          out="$(./run-stack.py "$stack" --dry-run --config /tmp/ci-cluster.env 2>&1)"; rc=$?
+          if [ "$rc" -eq 0 ]; then
+            echo "  ok (2-node cluster)"
+            continue
+          fi
+          echo "$out" | sed 's/^/    /'
+          if [ "$rc" -eq 3 ]; then
+            echo "  single-host (a recipe mode flag forbids distribution); retrying with no cluster"
+            ./run-stack.py "$stack" --dry-run --config /tmp/ci-nocluster.env || { echo "  FAILED (no cluster)"; exit 1; }
+            echo "  ok (single-host, no cluster)"
+          else
+            echo "  FAILED (2-node cluster)"
+            exit 1
           fi
         done

@@ -1,0 +1,65 @@
+stack_version: "1"
+name: example-cluster-stack
+# Three models, three different placements, one manifest -- which is the whole
+# point of a per-recipe 'placement:' key:
+#
+#   qwen3.6-35b-a3b-fp8    sharded across every node in CLUSTER_NODES
+#   nemotron-3-nano-nvfp4  pinned alone to 10.0.1.1
+#   gemma4-26b-a4b-nvfp4   pinned alone to 10.0.1.2
+#
+# The two pinned recipes are marked solo_only, so they CANNOT be sharded --
+# 'placement: all' would be refused outright (exit 3). Pinning is what lets
+# them run on a cluster at all, and putting one on each node keeps them from
+# competing for the same node's memory.
+#
+# Sized for the two-node cluster in .env's CLUSTER_NODES. Illustrative only:
+# tune gpu_mem to your own models and hardware.
+health_timeout: 1800
+
+recipes:
+  # Largest first: vLLM profiles free memory at startup, so the biggest model
+  # must claim its slice against a clean pool.
+  - recipe: qwen3.6-35b-a3b-fp8
+    container_name: qwen_fp8
+    port: 8000                     # served on the head node
+    placement: all                 # shard across every node in CLUSTER_NODES
+    gpu_mem: 0.40                  # recipe default is 0.8; halved so each node's shard leaves room for the model pinned beside it
+    # master_port auto-assigns base + 0 (base = .env MASTER_PORT, else 29501).
+    # Only distributed entries use one -- it is where the shards coordinate --
+    # and each gets a distinct port so co-located distributed recipes can't collide.
+    # extra_args go to vLLM (after run-recipe's `--`). --load-format instanttensor
+    # cuts the peak memory spike during weight load — the transient that most
+    # often decides whether co-located models fit on each node.
+    extra_args: ["--load-format", "instanttensor"]
+
+  # ---- The other form: pin a model to ONE node instead of sharding it ----
+  # 'placement: <IP>' runs the recipe alone on that node. The IP must be either
+  # this machine (LOCAL_IP) or a node listed in CLUSTER_NODES; anything else is
+  # rejected at load time, before a single container starts.
+  #
+  # You do not declare which node is local. Whichever IP matches .env's
+  # LOCAL_IP runs here; the other is driven over ssh. So the same manifest
+  # works unchanged from either node -- only which of the two entries is the
+  # remote one changes. The comments below assume you launch from 10.0.1.1.
+  - recipe: nemotron-3-nano-nvfp4
+    container_name: nano-nvfp4
+    port: 8001                     # served on http://10.0.1.1:8001
+    placement: 10.0.1.1            # matches LOCAL_IP here, so it runs locally
+    gpu_mem: 0.38                  # recipe default is 0.7 — must be lowered to fit beside the qwen shard
+    extra_args: ["--load-format", "instanttensor"]
+
+  - recipe: gemma4-26b-a4b-nvfp4
+    container_name: gemma4-nvfp4
+    port: 8001                     # the same port as above is fine: different node
+    placement: 10.0.1.2            # the other node: run-stack drives it over ssh
+    gpu_mem: 0.38                  # recipe default is 0.7
+    extra_args: ["--load-format", "instanttensor"]
+
+# gpu_mem is a PER-NODE budget, not a cluster-wide one. Under tensor-parallel
+# sharding every node holds a shard of the distributed model, and that shard
+# shares the node with whatever is pinned there:
+#   10.0.1.1: 0.40 (qwen shard) + 0.38 (nemotron, pinned) = 0.78
+#   10.0.1.2: 0.40 (qwen shard) + 0.38 (gemma4, pinned)   = 0.78
+# Both nodes stay under 1.0, leaving headroom for CUDA context and non-torch
+# allocations. Run --dry-run first: it prints the resolved placement for every
+# entry, so you can confirm what lands where before anything allocates memory.

@@ -86,6 +86,7 @@ RELATED FILES:
 import argparse
 import os
 import re
+import socket
 import subprocess
 import shlex
 import sys
@@ -130,6 +131,29 @@ def ensure_ray_backend(command: str) -> str:
 
 
 
+def resolve_recipe_path(recipe_path: Path) -> Path | None:
+    """Resolve a recipe reference to an existing file, or None if not found.
+
+    Search order: exact path -> path with .yaml/.yml appended -> recipes/
+    directory (bare name, name with .yaml/.yml, then stem with .yaml).
+    Shared with run-stack.py so both drivers accept the same references.
+    """
+    if recipe_path.exists():
+        return recipe_path
+    candidates = [
+        Path(str(recipe_path) + ".yaml"),
+        Path(str(recipe_path) + ".yml"),
+        RECIPES_DIR / recipe_path.name,
+        RECIPES_DIR / f"{recipe_path.name}.yaml",
+        RECIPES_DIR / f"{recipe_path.name}.yml",
+        RECIPES_DIR / f"{recipe_path.stem}.yaml",
+    ]
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return None
+
+
 def load_recipe(recipe_path: Path) -> dict[str, Any]:
     """
     Load and validate a recipe YAML file.
@@ -167,25 +191,12 @@ def load_recipe(recipe_path: Path) -> dict[str, Any]:
     Raises:
         SystemExit: If recipe not found or validation fails
     """
-    if not recipe_path.exists():
-        # Try candidates in order: add extension to original path first,
-        # then fall back to flat recipes/ directory (for bare recipe names)
-        candidates = [
-            Path(str(recipe_path) + ".yaml"),
-            Path(str(recipe_path) + ".yml"),
-            RECIPES_DIR / recipe_path.name,
-            RECIPES_DIR / f"{recipe_path.name}.yaml",
-            RECIPES_DIR / f"{recipe_path.name}.yml",
-            RECIPES_DIR / f"{recipe_path.stem}.yaml",
-        ]
-        for candidate in candidates:
-            if candidate.exists():
-                recipe_path = candidate
-                break
-        else:
-            print(f"Error: Recipe not found: {recipe_path}")
-            print(f"Searched in: {recipe_path}, {RECIPES_DIR}")
-            sys.exit(1)
+    resolved = resolve_recipe_path(recipe_path)
+    if resolved is None:
+        print(f"Error: Recipe not found: {recipe_path}")
+        print(f"Searched in: {recipe_path}, {RECIPES_DIR}")
+        sys.exit(1)
+    recipe_path = resolved
 
     with open(recipe_path) as f:
         recipe = yaml.safe_load(f)
@@ -564,15 +575,13 @@ def get_worker_nodes(nodes: list[str]) -> list[str]:
     return nodes[1:]
 
 
-def load_env_file() -> dict[str, str]:
+def load_env_file(path: Path | None = None) -> dict[str, str]:
     """
-    Load environment variables from .env file.
+    Load environment variables from a .env file.
 
-    Reads the .env file created by --discover for persistent cluster configuration.
-
-    EXTENSIBILITY:
-    - To support multiple .env files: Add a --env-file CLI argument
-    - To add validation: Check for required keys after loading
+    Reads the .env file created by --discover for persistent cluster
+    configuration. Defaults to this run's ENV_FILE; run-stack.py passes an
+    explicit path so both drivers share one parser.
 
     SUPPORTED KEYS (set by --discover):
         CLUSTER_NODES: Comma-separated list of node IPs
@@ -581,11 +590,13 @@ def load_env_file() -> dict[str, str]:
         IB_IF: InfiniBand interface name (if available)
 
     Returns:
-        Dictionary of key=value pairs from .env file
+        Dictionary of key=value pairs from the .env file
     """
+    if path is None:
+        path = ENV_FILE
     env = {}
-    if ENV_FILE.exists():
-        with open(ENV_FILE) as f:
+    if path is not None and path.exists():
+        with open(path) as f:
             for line in f:
                 line = line.strip()
                 if line and not line.startswith("#") and "=" in line:
@@ -594,6 +605,34 @@ def load_env_file() -> dict[str, str]:
                     value = value.strip().strip('"').strip("'")
                     env[key.strip()] = value
     return env
+
+
+def is_local_address(ip):
+    """True if `ip` names this machine — via .env LOCAL_IP or the host's own
+    network addresses. Used to skip a needless self-copy for a local placement
+    when .env has no LOCAL_IP (the fresh-node case --placement-node serves)."""
+    if not ip:
+        return False
+    if load_env_file().get("LOCAL_IP") == ip:
+        return True
+    if ip in ("127.0.0.1", "localhost", "::1"):
+        return True
+    try:
+        for info in socket.getaddrinfo(socket.gethostname(), None):
+            if info[4][0] == ip:
+                return True
+    except OSError:
+        pass
+    # getaddrinfo(hostname) commonly resolves to just 127.0.1.1 on
+    # Debian-family hosts, missing the LAN address. A UDP "connect" (no packet
+    # is sent) asks the kernel which source address routes to `ip`; it equals
+    # `ip` only when the address is one of this machine's own.
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.connect((ip, 9))
+            return s.getsockname()[0] == ip
+    except OSError:
+        return False
 
 
 def run_autodiscover() -> dict[str, str] | None:
@@ -686,6 +725,11 @@ Examples:
   # Cluster deployment (auto-discover)
   %(prog)s --discover              # Detect nodes and save to .env
   %(prog)s glm-4.7-nvfp4 --setup   # Uses nodes from .env
+
+  # Pin as a standalone server on one node (local or remote), no Ray/cluster
+  # coordination -- implies solo. Used by run-stack.py for per-recipe
+  # 'placement: <IP>' entries; useful directly too.
+  %(prog)s glm-4.7-nvfp4 --placement-node 192.168.1.1 --setup
 
   # Just build/download without running
   %(prog)s glm-4.7-nvfp4 --build-only
@@ -858,6 +902,10 @@ Examples:
         help="Port for cluster coordination (Ray head port or PyTorch distributed master port, default: 29501)",
     )
     launch_group.add_argument(
+        "--placement-node", dest="placement_node", metavar="IP",
+        help="Run this recipe as a standalone server on one node (local or remote). Implies solo.",
+    )
+    launch_group.add_argument(
         "--name",
         dest="container_name",
         help="Override container name (default: vllm_node)",
@@ -1020,13 +1068,16 @@ Examples:
     model = recipe.get("model")
     build_args = recipe.get("build_args", [])
 
+    # A pinned placement node forces a solo run: no node list, no autodiscover.
+    placement_solo = args.solo or bool(args.placement_node)
+
     # Parse nodes - check command line first, then .env file, then autodiscover
-    nodes = parse_nodes(args.nodes) if not args.solo else []
+    nodes = parse_nodes(args.nodes) if not placement_solo else []
     nodes_from_env = False
     eth_if = None
     ib_if = None
 
-    if not args.solo:
+    if not placement_solo:
         # Try to load from .env file
         env = load_env_file()
         if not nodes:
@@ -1062,7 +1113,7 @@ Examples:
     # Check if recipe requires cluster mode
     cluster_only = recipe.get("cluster_only", False)
     solo_only = recipe.get("solo_only", False)
-    is_solo = args.solo or not is_cluster
+    is_solo = placement_solo or not is_cluster
 
     use_ray = getattr(args, "ray", False) and not is_solo
 
@@ -1119,6 +1170,12 @@ Examples:
             copy_targets = [h.strip() for h in copy_hosts_str.split(",") if h.strip()]
         else:
             copy_targets = worker_nodes
+    elif args.placement_node:
+        # A placement run targets a single (possibly remote) node. Direct the
+        # --setup image/weight copy there instead of the (empty) cluster list.
+        # A placement run copies image/weights to the target only if it is NOT
+        # this machine. Robust to a missing .env LOCAL_IP (see is_local_address).
+        copy_targets = None if is_local_address(args.placement_node) else [args.placement_node]
     else:
         copy_targets = None
 
@@ -1322,6 +1379,8 @@ Examples:
             cmd_parts.append("--no-ray")
         if nodes:
             cmd_parts.extend(["-n", ",".join(nodes)])
+        if args.placement_node:
+            cmd_parts.extend(["--placement-node", args.placement_node])
         if args.nccl_debug:
             cmd_parts.extend(["--nccl-debug", args.nccl_debug])
         for env_var in args.env_vars:
@@ -1409,6 +1468,9 @@ Examples:
         # Pass nodes to launch-cluster.sh (from command line, .env, or autodiscover)
         if nodes:
             cmd.extend(["-n", ",".join(nodes)])
+
+        if args.placement_node:
+            cmd.extend(["--placement-node", args.placement_node])
 
         if args.nccl_debug:
             cmd.extend(["--nccl-debug", args.nccl_debug])

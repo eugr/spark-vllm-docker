@@ -20,42 +20,8 @@ VERBOSE="${1:-}"
 # Load expected commands for README verification
 source "$SCRIPT_DIR/expected_commands.sh"
 
-# Colors for output
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-NC='\033[0m' # No Color
-
-# Test counters
-TESTS_PASSED=0
-TESTS_FAILED=0
-TESTS_SKIPPED=0
-
-# Helper functions
-log_test() {
-    echo -e "${YELLOW}[TEST]${NC} $1"
-}
-
-log_pass() {
-    echo -e "${GREEN}[PASS]${NC} $1"
-    TESTS_PASSED=$((TESTS_PASSED + 1))
-}
-
-log_fail() {
-    echo -e "${RED}[FAIL]${NC} $1"
-    TESTS_FAILED=$((TESTS_FAILED + 1))
-}
-
-log_skip() {
-    echo -e "${YELLOW}[SKIP]${NC} $1"
-    TESTS_SKIPPED=$((TESTS_SKIPPED + 1))
-}
-
-log_verbose() {
-    if [[ "$VERBOSE" == "-v" ]]; then
-        echo "       $1"
-    fi
-}
+# Shared harness: colors, counters, log_*/assert_contains helpers
+source "$SCRIPT_DIR/lib.sh"
 
 get_recipe_flag() {
     local flag_name="$1"
@@ -1069,6 +1035,64 @@ test_launch_cmd_earlyoom_rejects_keep_entrypoint() {
     fi
 }
 
+# Test: --placement-node forwards to launch-cluster.sh as a solo run (no -n)
+test_launch_cmd_placement_node() {
+    log_test "--placement-node forwards to launch-cluster as solo with no -n"
+
+    OUT="$("$PROJECT_DIR/run-recipe.py" qwen3.6-35b-a3b-nvfp4 --placement-node 10.0.0.2 --name a -d --port 8000 --dry-run 2>&1)"; RC=$?
+    LC_LINE="$(echo "$OUT" | grep -E 'launch-cluster\.sh')"
+    if [[ $RC -eq 0 && "$LC_LINE" == *"--placement-node 10.0.0.2"* && "$LC_LINE" != *"-n "* \
+          && ( "$OUT" == *"--tensor-parallel-size 1"* || "$OUT" == *"-tp 1"* ) ]]; then
+        log_pass "placement-node forwarded, solo (TP=1), no -n"
+    else
+        log_fail "placement-node forwarded, solo (TP=1), no -n (rc=$RC)"
+        log_verbose "$OUT"
+    fi
+}
+
+# Test: A --placement-node targeting THIS machine must not trigger a
+# self-copy in --setup, even when .env has no LOCAL_IP (the fresh-node case
+# --placement-node is meant to serve). A genuinely remote IP still copies.
+test_placement_node_no_self_copy_without_local_ip() {
+    log_test "--placement-node to this host + --setup skips self-copy when .env lacks LOCAL_IP"
+
+    local this_ip
+    this_ip="$(python3 -c 'import socket; print(socket.gethostbyname(socket.gethostname()))')"
+
+    local no_local_ip_env
+    no_local_ip_env="$(mktemp)"
+    echo "CLUSTER_NODES=" > "$no_local_ip_env"
+
+    OUT="$("$PROJECT_DIR/run-recipe.py" qwen3.6-35b-a3b-nvfp4 --placement-node "$this_ip" --name x -d --port 8000 --setup --config "$no_local_ip_env" --dry-run 2>&1)"; RC=$?
+    rm -f "$no_local_ip_env"
+
+    if [[ $RC -eq 0 && "$OUT" != *"Would copy to: $this_ip"* && "$OUT" != *"copy to workers: $this_ip"* ]]; then
+        log_pass "local placement (no LOCAL_IP in .env) does not self-copy"
+    else
+        log_fail "local placement (no LOCAL_IP in .env) wrongly shows a copy target (rc=$RC)"
+        log_verbose "$OUT"
+    fi
+
+    log_test "--placement-node to a genuinely remote host + --setup still copies"
+
+    local remote_env
+    remote_env="$(mktemp)"
+    echo "CLUSTER_NODES=" > "$remote_env"
+
+    OUT="$("$PROJECT_DIR/run-recipe.py" qwen3.6-35b-a3b-nvfp4 --placement-node 10.99.99.99 --name x -d --port 8000 --setup --config "$remote_env" --dry-run 2>&1)"; RC=$?
+    rm -f "$remote_env"
+
+    # Accept either wording: the download phase prints "Would copy to:" while the
+    # build phase prints "...copy to workers:" — which one fires depends on
+    # whether the model/image already exist in this box's caches (unrelated state).
+    if [[ $RC -eq 0 && ( "$OUT" == *"Would copy to: 10.99.99.99"* || "$OUT" == *"copy to workers: 10.99.99.99"* ) ]]; then
+        log_pass "remote placement still yields a copy target"
+    else
+        log_fail "remote placement did not yield a copy target (rc=$RC)"
+        log_verbose "$OUT"
+    fi
+}
+
 # ==============================================================================
 # README Documentation Verification Tests
 # ==============================================================================
@@ -1575,6 +1599,8 @@ main() {
     test_launch_cmd_keep_entrypoint_passthrough
     test_launch_cmd_earlyoom_passthrough
     test_launch_cmd_earlyoom_rejects_keep_entrypoint
+    test_launch_cmd_placement_node
+    test_placement_node_no_self_copy_without_local_ip
     echo ""
     
     # README documentation verification tests
