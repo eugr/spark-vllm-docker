@@ -1,0 +1,94 @@
+diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
+index d6f3c3ad0..d28f16c82 100644
+--- a/vllm/v1/core/sched/scheduler.py
++++ b/vllm/v1/core/sched/scheduler.py
+@@ -393,6 +393,11 @@ class Scheduler(SchedulerInterface):
+             if self.mamba_partial_cache_hit
+             else 0
+         )
++        if self.use_eagle and tail_boundary > 0:
++            # Cache the predecessor FullAttention hash so changed prompt
++            # suffixes do not invalidate the only partial entry. EAGLE rewinds
++            # that match once more, so materialize Mamba at the replay point.
++            tail_boundary = max(tail_boundary - 2 * self.hash_block_size, 0)
+         stops = (
+             # Resumed mid-block (fine-grained partial hash hit): re-align to
+             # the block grid before running on, so the crossed boundary's
+diff --git a/vllm/v1/core/single_type_kv_cache_manager.py b/vllm/v1/core/single_type_kv_cache_manager.py
+index 244048390..720a1327e 100644
+--- a/vllm/v1/core/single_type_kv_cache_manager.py
++++ b/vllm/v1/core/single_type_kv_cache_manager.py
+@@ -774,23 +774,29 @@ class FullAttentionManager(SingleTypeKVCacheManager):
+         block are intentionally skipped.
+         """
+         hash_block_size = self.block_pool.hash_block_size
+-        boundary_tokens = request.num_prompt_tokens // hash_block_size * hash_block_size
+-        if boundary_tokens == 0 or boundary_tokens > num_tokens:
+-            return
+-        if boundary_tokens % self.block_size == 0:
+-            return
+-
++        tail_boundary = request.num_prompt_tokens // hash_block_size * hash_block_size
++        boundaries = [tail_boundary]
++        if self.use_eagle and tail_boundary > hash_block_size:
++            # The final hash may include a short context-load probe that differs
++            # from the follow-up. Retain its predecessor; EAGLE rewinds a hit on
++            # this entry to the Mamba replay state cached one hash unit earlier.
++            boundaries.append(tail_boundary - hash_block_size)
+         blocks = self.req_to_blocks[request.request_id]
+-        block_idx = boundary_tokens // self.block_size
+-        if block_idx >= len(blocks):
+-            return
+-        self.block_pool.cache_partial_block(
+-            request=request,
+-            block=blocks[block_idx],
+-            num_tokens=boundary_tokens,
+-            kv_cache_group_id=self.kv_cache_group_id,
+-            block_size=self.block_size,
+-        )
++        for boundary_tokens in boundaries:
++            if boundary_tokens == 0 or boundary_tokens > num_tokens:
++                continue
++            if boundary_tokens % self.block_size == 0:
++                continue
++            block_idx = boundary_tokens // self.block_size
++            if block_idx >= len(blocks):
++                continue
++            self.block_pool.cache_partial_block(
++                request=request,
++                block=blocks[block_idx],
++                num_tokens=boundary_tokens,
++                kv_cache_group_id=self.kv_cache_group_id,
++                block_size=self.block_size,
++            )
+ 
+     def get_num_common_prefix_blocks(self, running_request_id: str) -> int:
+         blocks = self.req_to_blocks[running_request_id]
+@@ -1660,10 +1666,16 @@ class MambaManager(SingleTypeKVCacheManager):
+         latest_prompt_hash_boundary = (
+             request.num_prompt_tokens // hash_block_size
+         ) * hash_block_size
+-        if num_tokens != latest_prompt_hash_boundary:
++        cache_boundary = latest_prompt_hash_boundary
++        if self.use_eagle and cache_boundary > 0:
++            # FullAttention retains the predecessor prompt hash, then EAGLE
++            # rewinds that match by one more hash unit. Mamba cannot rewind a
++            # newer recurrent state, so cache the exact replay boundary.
++            cache_boundary = max(cache_boundary - 2 * hash_block_size, 0)
++        if num_tokens != cache_boundary:
+             return None
+ 
+-        block_idx = num_tokens // self.block_size
++        block_idx = cache_boundary // self.block_size
+         blocks = self.req_to_blocks[request.request_id]
+         if block_idx >= len(blocks):
+             return None
+@@ -1674,7 +1686,7 @@ class MambaManager(SingleTypeKVCacheManager):
+         partial_hash = self.block_pool.cache_partial_block(
+             request=request,
+             block=source_block,
+-            num_tokens=num_tokens,
++            num_tokens=cache_boundary,
+             kv_cache_group_id=self.kv_cache_group_id,
+             block_size=self.block_size,
+         )

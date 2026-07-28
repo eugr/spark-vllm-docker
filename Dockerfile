@@ -192,61 +192,7 @@ RUN set -eux; \
         echo "Final FlashInfer source after PR application: requested $FLASHINFER_REF ($FLASHINFER_REQUESTED_HEAD), final $(git describe --tags --always --dirty)."; \
     fi
 
-# TEMPORARY PATCH: FlashInfer PR #3738 narrowed native FP4 profiler workspace
-# allocation to the FP8-activation family. Native SM100+ NVFP4 MoE uses FP4
-# activations and FP4 weights, so autotune allocates null quant workspaces and
-# fails in prepareQuantParams(). Remove after the upstream FlashInfer fix lands.
-RUN python3 - <<'PY'
-from pathlib import Path
 
-target = Path("csrc/fused_moe/cutlass_backend/cutlass_fused_moe_kernels.cuh")
-old_predicate = (
-    "  bool const is_native_wfp4afp8_family = isNativeWfp4Afp8Family();\n"
-)
-fixed_predicates = """  bool const is_native_wfp4afp8_family = isNativeWfp4Afp8Family();
-  // Native Blackwell NVFP4 uses FP4 activations and FP4 weights.
-  bool const is_native_wfp4afp4_family =
-      mSM >= 100 &&
-      (mDType == nvinfer1::DataType::kFP4 || mDType == nvinfer1::DataType::kINT64) &&
-      (mWType == nvinfer1::DataType::kFP4 || mWType == nvinfer1::DataType::kINT64);
-"""
-old_branch = "  if (is_native_wfp4afp8_family) {"
-fixed_branch = (
-    "  if (is_native_wfp4afp8_family || is_native_wfp4afp4_family) {"
-)
-
-if not target.exists():
-    raise SystemExit(f"{target} not found; cannot apply NVFP4 profiler patch")
-
-text = target.read_text()
-already_fixed = fixed_predicates in text and fixed_branch in text
-if already_fixed:
-    print("FlashInfer native NVFP4 profiler workaround already present; skipping")
-else:
-    if text.count(old_predicate) != 1 or text.count(old_branch) != 1:
-        raise SystemExit(
-            "Known FlashInfer PR #3738 profiler pattern not found exactly once; "
-            "refusing to apply an unverified patch"
-        )
-    text = text.replace(old_predicate, fixed_predicates, 1)
-    text = text.replace(old_branch, fixed_branch, 1)
-    target.write_text(text)
-    print("Applied FlashInfer native NVFP4 profiler workspace workaround")
-
-patched = target.read_text()
-if fixed_predicates not in patched or fixed_branch not in patched:
-    raise SystemExit("FlashInfer native NVFP4 profiler patch verification failed")
-PY
-
-# TEMPORARY patch for flashinfer autotune and other improvements (PR 2927) - MERGED 4/3
-# RUN curl -fsL https://github.com/flashinfer-ai/flashinfer/pull/2927.diff -o pr2927.diff \
-#     && if git apply --reverse --check pr2927.diff 2>/dev/null; then \
-#          echo "PR #2927 already applied, skipping."; \
-#        else \
-#          echo "Applying FI PR #2927..."; \
-#          git apply -v pr2927.diff; \
-#        fi \
-#     && rm pr2927.diff
 
 # Apply patch to avoid re-downloading existing cubins
 COPY flashinfer_cache.patch .
@@ -299,9 +245,10 @@ ARG CACHEBUST_VLLM=1
 # Git reference (branch, tag, or SHA) to checkout
 ARG VLLM_REF=main
 
-# DeepGEMM nv_dev includes SM120/SM121 MXFP4 support from PR #324.
+# Pinned while investigating an SM121 DeepSeek-V4 MXFP4 grouped scale-factor
+# regression first observed at nv_dev f8e8fb5 (PR #384); last known good.
 ARG DEEPGEMM_REPO=https://github.com/deepseek-ai/DeepGEMM.git
-ARG DEEPGEMM_REF=nv_dev
+ARG DEEPGEMM_REF=a6b593d2826719dcf4892609af7b84ee23aaf32a
 ENV DEEPGEMM_SRC_DIR=/workspace/DeepGEMM
 
 # Smart Git Clone (Fetch changes instead of full re-clone)
@@ -353,8 +300,7 @@ WORKDIR $VLLM_BASE_DIR/vllm
 
 # Temporary upstream fixes carried until they are present in the pinned vLLM ref.
 # See https://github.com/vllm-project/vllm/pull/47392
-# See https://github.com/vllm-project/vllm/pull/47618
-ARG VLLM_PRESET_PRS="47392 47618"
+ARG VLLM_PRESET_PRS="47392"
 ARG VLLM_APPLY_PRESET_PRS=""
 ARG VLLM_PRS=""
 
@@ -462,6 +408,55 @@ RUN set -eux; \
         fi; \
         echo "Final vLLM source after PR application: requested $VLLM_REF ($VLLM_REQUESTED_HEAD), final $(git describe --tags --always --dirty)."; \
     fi
+
+# TEMPORARY PATCH: vLLM PR #49408 / commit d6dbdb9 misplaced the XPU-only
+# return in topk_hash_softplus_sqrt, making the CUDA/ROCm kernel call dead code.
+# Remove after upstream fix PR #49452 is merged and present in the oldest
+# supported VLLM_REF. Inspect source shape rather than commit ancestry so this
+# also handles rebases, cherry-picks, and builds that already include the fix.
+RUN python3 - <<'PY'
+from pathlib import Path
+
+target = Path("vllm/_custom_ops.py")
+function_marker = "def topk_hash_softplus_sqrt("
+direct_call = "\n    torch.ops._moe_C.topk_softplus_sqrt("
+misplaced_return = "\n\n    return" + direct_call
+fixed_return = "\n        return\n" + direct_call
+
+if not target.exists():
+    raise SystemExit(f"{target} not found; cannot inspect vLLM PR #49408 regression")
+
+text = target.read_text()
+start = text.find(function_marker)
+if start == -1:
+    print("topk_hash_softplus_sqrt is absent; vLLM PR #49408 is not applicable")
+else:
+    end = text.find("\ndef ", start + len(function_marker))
+    end = len(text) if end == -1 else end
+    function = text[start:end]
+
+    if "is_padding" not in function:
+        print("topk_hash_softplus_sqrt predates vLLM PR #49408; skipping workaround")
+    elif fixed_return in function:
+        print("vLLM topk_softplus_sqrt non-XPU path already fixed; skipping")
+    elif (
+        direct_call in function
+        and "current_platform.is_xpu()" not in function
+        and "\n    return" not in function
+    ):
+        print("topk_hash_softplus_sqrt has no XPU workaround; patch is not applicable")
+    elif function.count(misplaced_return) == 1:
+        function = function.replace(misplaced_return, fixed_return, 1)
+        updated = text[:start] + function + text[end:]
+        compile(updated, str(target), "exec")
+        target.write_text(updated)
+        print("Applied vLLM PR #49452 topk_softplus_sqrt control-flow fix")
+    else:
+        raise SystemExit(
+            "Unknown is_padding-aware topk_hash_softplus_sqrt layout; "
+            "refusing to guess whether vLLM PR #49408 is fixed"
+        )
+PY
 
 # TEMPORARY PATCH: vLLM PR #47914 added per-KV-group causal metadata by
 # treating non-bool causal as Mapping[int, bool]. DiffusionGemma passes a
