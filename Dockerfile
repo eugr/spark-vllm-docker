@@ -53,7 +53,7 @@ RUN apt update && \
 
 # Additional deps
 RUN --mount=type=cache,id=uv-cache,target=/root/.cache/uv \
-     uv pip install torch==2.11.0 torchvision torchaudio triton --index-url https://download.pytorch.org/whl/cu130 && \
+     uv pip install torch==2.11.0 torchvision torchaudio triton && \
      uv pip install nvidia-nvshmem-cu13 "apache-tvm-ffi<0.2" filelock pynvml requests tqdm
 
 # Configure Ccache for CUDA/C++
@@ -949,7 +949,7 @@ ARG PRE_TRANSFORMERS=0
 
 # Install deps
 RUN --mount=type=cache,id=uv-cache,target=/root/.cache/uv \
-     uv pip install torch==2.11.0 torchvision torchaudio triton --index-url https://download.pytorch.org/whl/cu130 && \
+     uv pip install torch==2.11.0 torchvision torchaudio triton && \
      uv pip install nvidia-nvshmem-cu13 "apache-tvm-ffi<0.2"
 
 # Install wheels from host ./wheels/ (bind-mounted from build context — no layer bloat)
@@ -958,8 +958,14 @@ RUN --mount=type=cache,id=uv-cache,target=/root/.cache/uv \
 # prometheus-fastapi-instrumentator route name lookup.
 RUN --mount=type=bind,source=wheels,target=/workspace/wheels \
     --mount=type=cache,id=uv-cache,target=/root/.cache/uv \
-    PINNED_TORCH=$(python3 -c "import torch; print(torch.__version__)") && \
+    PINNED_TORCH=$(python3 -c "import torch; print(torch.__version__.split('+')[0])") && \
     echo "torch==${PINNED_TORCH}" > /tmp/wheel-override.txt && \
+    echo "nvidia-cuda-nvcc==13.0.*" >> /tmp/wheel-override.txt && \
+    echo "cuda-bindings==13.0.*" >> /tmp/wheel-override.txt && \
+    echo "nvidia-cuda-cccl==13.0.*" >> /tmp/wheel-override.txt && \
+    echo "nvidia-cuda-crt==13.0.*" >> /tmp/wheel-override.txt && \
+    echo "nvidia-nvvm==13.0.*" >> /tmp/wheel-override.txt && \
+    echo "cuda-python==13.0.*" >> /tmp/wheel-override.txt && \
     echo "fastapi[standard]>=0.115.0,<0.137.0" >> /tmp/wheel-override.txt && \
     if [ "$PRE_TRANSFORMERS" = "1" ]; then \
         echo "transformers>=5.0.0" >> /tmp/wheel-override.txt; \
@@ -979,12 +985,10 @@ ENV PATH=$VLLM_BASE_DIR:$PATH
 # Final extra deps
 # Pin torch via --override so transitive deps (e.g. instanttensor) can't trigger
 # a re-resolve that swaps the CUDA-built torch for PyPI's CPU wheel.
-RUN --mount=type=cache,id=uv-cache,target=/root/.cache/uv \
-    PINNED_TORCH=$(python3 -c "import torch; print(torch.__version__)") && \
-    echo "torch==${PINNED_TORCH}" > /tmp/torch-override.txt && \
-    echo "fastapi[standard]>=0.115.0,<0.137.0" >> /tmp/torch-override.txt && \
+RUN --mount=type=bind,source=wheels,target=/workspace/wheels \
+    --mount=type=cache,id=uv-cache,target=/root/.cache/uv \
     uv pip install ray[default] fastsafetensors instanttensor \
-        --override /tmp/torch-override.txt
+        --override /tmp/wheel-override.txt
 
 # Fix NCCL
 RUN rm /usr/local/lib/python3.12/dist-packages/nvidia/nccl/lib/libnccl.so.2 && \
