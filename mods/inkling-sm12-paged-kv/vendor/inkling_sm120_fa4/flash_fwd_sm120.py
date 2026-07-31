@@ -1,0 +1,76 @@
+# Copyright (c) 2025, Jay Shah, Ganesh Bikshandi, Ying Zhang, Vijay Thakkar, Pradeep Ramani, Tri Dao.
+# SM120 (Blackwell GeForce / DGX Spark) forward pass.
+#
+# SM120 uses the same SM80-era MMA instructions (mma.sync.aligned.m16n8k16) but has
+# a smaller shared memory capacity (99 KB vs 163 KB on SM80). This module subclasses
+# FlashAttentionForwardSm80 and overrides the SMEM capacity check accordingly.
+
+import cutlass
+import cutlass.utils as utils_basic
+from cutlass.base_dsl.arch import Arch
+
+from .flash_fwd import FlashAttentionForwardSm80
+
+
+class FlashAttentionForwardSm120(FlashAttentionForwardSm80):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # Override arch to sm_80 so that __call__ uses CpAsync (not TMA) for the O epilogue.
+        # BaseDSL._get_dsl().get_arch_enum() returns the real GPU arch (sm_121a on DGX Spark),
+        # but SM120 must use the SM80 epilogue path (no TMA-O support in this kernel variant).
+        self.arch = Arch.sm_80
+        # PackGQA on the Sm80 code path is broken for GQA/MQA shapes: cute.domain_offset
+        # at flash_fwd.py:427 and the pack_gqa pointer-resolution path at pack_gqa.py:139
+        # raise crd2idx errors against the packed ((qhead_per_kvhead, seqlen_q), headdim)
+        # layout. Sm90.__call__ and Sm100.__call__ apply pack_gqa_layout before handing
+        # tensors to PackGQA; Sm80.__call__ does not. Even adding those transforms is not
+        # sufficient because the Sm80 mainloop's tile sizing assumes tile_m divides the
+        # seqlen dimension cleanly, which fails when qhead_per_kvhead does not divide
+        # tile_m. Disabling pack_gqa on Sm120 routes GQA through the non-packed path,
+        # which is functionally correct on every GQA/MQA shape we tested. Tracked upstream
+        # as Dao-AILab/flash-attention#2484.
+        self.pack_gqa = False
+
+    @staticmethod
+    def can_implement(
+        dtype,
+        head_dim,
+        head_dim_v,
+        tile_m,
+        tile_n,
+        num_stages,
+        num_threads,
+        is_causal,
+        Q_in_regs=False,
+    ) -> bool:
+        """Check if the kernel can be implemented on SM120.
+
+        Same logic as SM80 but uses SM120's shared memory capacity (99 KB).
+        For split-KV, FP32 partials are written directly from MMA accumulators
+        to GMEM (no SMEM round-trip), so sO doesn't affect SMEM budget.
+        """
+        if dtype not in [cutlass.Float16, cutlass.BFloat16]:
+            return False
+        if head_dim % 8 != 0:
+            return False
+        if head_dim_v % 8 != 0:
+            return False
+        if tile_n % 16 != 0:
+            return False
+        if num_threads % 32 != 0:
+            return False
+        # Shared memory usage: Q tile + (K tile + V tile)
+        smem_usage_Q = tile_m * head_dim * 2
+        smem_usage_K = tile_n * head_dim * num_stages * 2
+        smem_usage_V = tile_n * head_dim_v * num_stages * 2
+        smem_usage_QV = (
+            (smem_usage_Q + smem_usage_V) if not Q_in_regs else max(smem_usage_Q, smem_usage_V)
+        )
+        smem_usage = smem_usage_QV + smem_usage_K
+        # SM120 has 99 KB shared memory (vs 163 KB on SM80)
+        smem_capacity = utils_basic.get_smem_capacity_in_bytes("sm_120")
+        if smem_usage > smem_capacity:
+            return False
+        if (tile_m * 2) % num_threads != 0:
+            return False
+        return True

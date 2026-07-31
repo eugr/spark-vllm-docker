@@ -199,6 +199,8 @@ Launch options:
   --apply-mod PATH            Apply an extra mod directory or zip (repeatable)
   -p, --publish HOST:CONTAINER
                               Publish a container port in solo mode (repeatable)
+  -v, --volume LOCAL:CONTAINER
+                              Map a volume using Docker syntax (repeatable)
   --master-port PORT          Cluster coordination port: Ray head port or PyTorch
                               distributed master port (default: 29501).
                               Alias: --head-port

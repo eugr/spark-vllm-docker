@@ -146,6 +146,40 @@ For periodic maintenance, I recommend using a filter: `docker builder prune --fi
 
 ## CHANGELOG
 
+### 2026-07-30
+
+#### Inkling Small NVFP4 support
+
+Added the support for
+`thinkingmachines/Inkling-Small-NVFP4`. It requires at least dual DGX Spark setup.
+
+```bash
+./run-recipe.sh inkling-small-nvfp4
+```
+
+Add `--setup` on the first run to prepare the container and download and
+distribute the model.
+
+#### Official vLLM earlyoom, InstantTensor, and SciPy support
+
+`mods/use-official-vllm` now installs `earlyoom`, InstantTensor, and SciPy in
+addition to the compatibility packages needed by other mods. This makes
+`launch-cluster.sh --earlyoom`, `--load-format instanttensor`, and SciPy-based
+functionality available when launching official vLLM images such as
+`vllm-openai`. The Python package install pins the image's existing Torch
+packages so the CUDA-enabled build is not replaced during dependency
+resolution.
+
+#### Repeatable Docker volume mappings
+
+`launch-cluster.sh` and `run-recipe.sh` now accept repeatable `-v` / `--volume` mappings using Docker's `local_path:container_path` syntax. In cluster mode, each mapping is applied to every launched node.
+
+```bash
+./launch-cluster.sh --solo \
+  -v "$PWD/models:/models" \
+  exec vllm serve /models/qwen3.6-35b-a4b-nvfp4 ...
+```
+
 ### 2026-07-10
 
 #### Optional earlyoom monitor
@@ -1359,19 +1393,22 @@ The `launch-cluster.sh` script simplifies the process of starting the cluster no
 This will:
 1.  Auto-detect the active InfiniBand and Ethernet interfaces.
 2.  Auto-detect the node IP.
-3.  Launch idle containers on the head and worker nodes.
-4.  Start the Ray cluster unless solo mode or `--no-ray` is selected.
+3.  Verify that the selected Docker image has the same content-addressable image ID on the head and every worker.
+4.  Launch idle containers on the head and worker nodes.
+5.  Start the Ray cluster unless solo mode or `--no-ray` is selected.
 
 Assumptions and limitations:
 
 - It assumes that you've already set up passwordless SSH access on all nodes. If not, follow NVIDIA's [Connect Two Sparks Playbook](https://build.nvidia.com/spark/connect-two-sparks/stacked-sparks). I recommend setting up static IPs in the configuration instead of automatically assigning them every time, but this script should work with automatically assigned addresses too.
 - By default, it assumes that the container image name is `vllm-node`. If it differs, you need to specify it with `-t <name>` parameter.
+- Before launching a multi-node cluster, it compares `docker image inspect` IDs for the selected image on the head and every active worker. The launch is aborted if an image is missing or any ID differs.
 - If both ConnectX **physical** ports are utilized, and both have IP addresses, it will use whatever interface it finds first. Use `--eth-if` to override.
 - It will ignore IPs associated with the 2nd "clone" of the physical interface. For instance, the outermost port on Spark has two logical Ethernet interfaces: `enp1s0f1np1` and `enP2p1s0f1np1`. Only `enp1s0f1np1` will be used. To override, use `--eth-if` parameter.
 - It assumes that the same physical interfaces are named the same on all nodes (IOW, enp1s0f1np1 refers to the same physical port on all nodes). If it's not the case, you will have to launch cluster nodes manually or modify the script.
 - It clears the Docker image entrypoint by default so images that define an entrypoint, such as `vllm-openai`, can still start as idle cluster containers before commands are executed. Use `--keep-entrypoint` to keep the image entrypoint.
 - In solo mode, `-p` / `--publish` can be used to publish ports in Docker format, for example `-p 8000:8000`. When port publishing is used, the launcher does not use host networking. Port publishing is not supported in cluster mode.
-- It mounts `~/.cache/huggingface`, `~/.cache/vllm`, `~/.cache/flashinfer`, `~/.triton`, and `~/.tilelang` by default. Use `--no-cache-dirs` to skip the vLLM/FlashInfer/Triton/TileLang cache mounts. Add any other mounts with the `VLLM_SPARK_EXTRA_DOCKER_ARGS` environment variable, e.g. `VLLM_SPARK_EXTRA_DOCKER_ARGS="-v $HOME/my-data:/data" ./launch-cluster.sh ...`. Use `$HOME` instead of `~` because `~` will not expand when passed through the variable to Docker arguments.
+- It sets `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` in each container by default to reduce allocator fragmentation on DGX Spark. Override it with `-e PYTORCH_CUDA_ALLOC_CONF=<value>` when needed.
+- It mounts `~/.cache/huggingface`, `~/.cache/vllm`, `~/.cache/flashinfer`, `~/.triton`, and `~/.tilelang` by default. Use `--no-cache-dirs` to skip the vLLM/FlashInfer/Triton/TileLang cache mounts. Add other mounts with repeatable Docker-style `-v` / `--volume` options, e.g. `-v "$HOME/my-data:/data"`.
 
 
 **Start in daemon mode (background):**
@@ -1430,6 +1467,7 @@ You can override the auto-detected values if needed:
 | `--check-config` | Check configuration and auto-detection without launching. |
 | `--solo` | Solo mode: skip autodetection, launch only on current node, do not launch Ray cluster |
 | `-p, --publish` | Publish a container port in Docker format, for example `-p 8000:8000`. Solo mode only; replaces host networking. Can be used multiple times. |
+| `-v, --volume` | Map a volume in Docker format, for example `-v /local/path:/container/path`. Applies to every launched node and can be used multiple times. |
 | `--ray` | Opt into Ray for multi-node vLLM and add `--distributed-executor-backend ray` when missing. |
 | `--no-ray` | Default multi-node no-Ray mode; accepted for compatibility. |
 | `--master-port` / `--head-port` | Port for cluster coordination: Ray head port or PyTorch distributed master port (default: 29501). |
@@ -1632,8 +1670,10 @@ The repository includes several pre-configured mods in the `mods/` directory:
 - **drop-caches/**: Periodically clears filesystem caches for large models running near the memory limit.
 - **diffusiongemma/**: Adds DiffusionGemma support, dynamic causal attention compatibility, and Gemma4 reasoning/content-channel fixes used by the DiffusionGemma recipes.
 - **nemotron-nano/** and **nemotron-super/**: Nemotron reasoning parser and model support helpers.
+- **inkling-sm12-paged-kv/**: Routes Inkling's SM12 paged-KV relative attention through a vendored FA4 implementation while leaving other models and GPU architectures unchanged.
+- **instanttensor-hybrid-draft-loader/**: Keeps a target model on InstantTensor while using lazy safetensors for eligible speculative draft weights, including embedded MTP drafts.
 - **exp-b12x/**: Experimental FlashInfer b12x support for builds that include the required upstream vLLM support.
-- **use-official-vllm/**: Installs `git` inside official vLLM containers (Ubuntu/Debian-based) so that other mods that rely on `git apply` work correctly, and redirects the pip-installed NCCL library to the system `libnccl2` library to avoid DGX Spark multi-node NCCL hangs. Apply this mod first when using official vLLM images (e.g. `vllm-openai`).
+- **use-official-vllm/**: Installs `git`, `earlyoom`, InstantTensor, and SciPy inside official vLLM containers (Ubuntu/Debian-based) so that other mods can rely on `git apply`, the launcher can use `--earlyoom`, and vLLM can use `--load-format instanttensor` and SciPy-based functionality. The Python install preserves the image's existing Torch build. The mod also redirects the pip-installed NCCL library to the system `libnccl2` library to avoid DGX Spark multi-node NCCL hangs. Apply this mod first when using official vLLM images (e.g. `vllm-openai`).
 
 Each mod directory typically contains:
 - Patch files (`.patch`) for code modifications and/or other assets.

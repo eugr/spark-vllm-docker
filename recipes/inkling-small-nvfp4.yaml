@@ -1,0 +1,59 @@
+# Recipe: Inkling-Small-NVFP4
+# Inkling Small with NVFP4 quantization and MTP speculative decoding
+
+recipe_version: "1"
+name: Inkling-Small-NVFP4
+description: vLLM serving thinkingmachines/Inkling-Small-NVFP4 on a two-node DGX Spark cluster
+
+# HuggingFace model to download with --setup
+model: thinkingmachines/Inkling-Small-NVFP4
+
+# The launch command uses tensor parallelism across two nodes
+cluster_only: true
+
+# Container image to use
+container: vllm-node
+
+# Required patches and memory-pressure handling
+mods:
+  - mods/inkling-sm12-paged-kv
+  - mods/drop-caches
+  - mods/instanttensor-hybrid-draft-loader
+
+# Default settings (can be overridden via CLI where supported)
+defaults:
+  port: 8000
+  host: 0.0.0.0
+  tensor_parallel: 2
+  gpu_memory_utilization: 0.8
+  max_model_len: 262144
+  max_num_seqs: 2
+  num_speculative_tokens: 1
+
+# Environment variables
+env:
+  LAMPORT_RS_SCONV: "0"
+  VLLM_USE_BREAKABLE_CUDAGRAPH: "0"
+  VLLM_USE_AOT_COMPILE: "1"
+
+# The vLLM serve command template
+command: |
+  vllm serve thinkingmachines/Inkling-Small-NVFP4 \
+    --host {host} \
+    --port {port} \
+    --trust-remote-code \
+    --tokenizer-mode inkling \
+    --tensor-parallel-size {tensor_parallel} \
+    --enable-auto-tool-choice \
+    --tool-call-parser inkling \
+    --reasoning-parser inkling \
+    --gpu-memory-utilization {gpu_memory_utilization} \
+    --max-model-len {max_model_len} \
+    --max-num-seqs {max_num_seqs} \
+    --load-format instanttensor \
+    --quantization nvfp4 \
+    --enable-prefix-caching \
+    --enable-chunked-prefill \
+    --async-scheduling \
+    --compilation-config '{{"cudagraph_mode":"FULL_AND_PIECEWISE","custom_ops":["all"]}}' \
+    --speculative-config '{{"method":"mtp","num_speculative_tokens":{num_speculative_tokens}}}'

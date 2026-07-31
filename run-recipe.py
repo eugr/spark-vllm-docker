@@ -701,6 +701,9 @@ Examples:
   # Publish ports in solo mode
   %(prog)s glm-4.7-nvfp4 --solo -p 8000:8000
 
+  # Map host directories into the container
+  %(prog)s glm-4.7-flash-awq --solo -v /local/models:/models -v /local/output:/output
+
   # List available recipes
   %(prog)s --list
 
@@ -824,6 +827,15 @@ Examples:
         default=[],
         metavar="HOST:CONTAINER",
         help="Publish a container port in solo mode, e.g. -p 8000:8000. Can be used multiple times.",
+    )
+    launch_group.add_argument(
+        "-v",
+        "--volume",
+        action="append",
+        dest="volume_mappings",
+        default=[],
+        metavar="LOCAL:CONTAINER",
+        help="Map a volume using Docker syntax, e.g. -v /local/path:/container/path. Can be used multiple times.",
     )
     backend_group = launch_group.add_mutually_exclusive_group()
     backend_group.add_argument(
@@ -1316,6 +1328,8 @@ Examples:
             cmd_parts.extend(["-e", env_var])
         for port_mapping in args.port_mappings:
             cmd_parts.extend(["-p", port_mapping])
+        for volume_mapping in args.volume_mappings:
+            cmd_parts.extend(["-v", volume_mapping])
         if args.master_port:
             cmd_parts.extend(["--master-port", str(args.master_port)])
         if args.container_name:
@@ -1404,6 +1418,8 @@ Examples:
 
         for port_mapping in args.port_mappings:
             cmd.extend(["-p", port_mapping])
+        for volume_mapping in args.volume_mappings:
+            cmd.extend(["-v", volume_mapping])
 
         if args.master_port:
             cmd.extend(["--master-port", str(args.master_port)])
