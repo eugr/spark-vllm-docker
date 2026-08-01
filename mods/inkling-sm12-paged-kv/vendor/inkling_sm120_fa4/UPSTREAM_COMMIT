@@ -1,0 +1,10 @@
+SecondNatureComputing/flash-attn-4-sm120
+60117041e10fcc6f19882afd274318c755a5ef6e
+
+CUTLASS DSL 4.6 API migration mirrored from:
+vllm-project/tml-fa4
+b206834606ed5b5f21f8eed6b0683f528ea9cf7d
+
+Mechanical substitutions:
+cute.core.ThrMma -> cute.ThrMma
+cute.make_fragment -> cute.make_rmem_tensor

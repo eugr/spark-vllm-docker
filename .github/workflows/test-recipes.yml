@@ -44,11 +44,12 @@ jobs:
     - name: Make scripts executable
       run: |
         chmod +x run-recipe.py run-recipe.sh launch-cluster.sh
-        chmod +x tests/test_recipes.sh
+        chmod +x tests/test_recipes.sh tests/test_launch_cluster_image_sync.sh
     
     - name: Run recipe integration tests
       run: |
         ./tests/test_recipes.sh -v
+        ./tests/test_launch_cluster_image_sync.sh
     
     - name: Verify all recipes with dry-run
       run: |

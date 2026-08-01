@@ -7,7 +7,9 @@ HF_CACHE_DIR="${HF_HOME:-$HOME/.cache/huggingface}"
 CONTAINER_WORKSPACE_DIR="/workspace"
 CONTAINER_EXEC_SCRIPT="$CONTAINER_WORKSPACE_DIR/exec-script.sh"
 # Modify these if you want to pass additional docker args or set VLLM_SPARK_EXTRA_DOCKER_ARGS variable
-DOCKER_ARGS="-e NCCL_IGNORE_CPU_AFFINITY=1 -v $HF_CACHE_DIR:/root/.cache/huggingface"
+DOCKER_ARGS="-e NCCL_IGNORE_CPU_AFFINITY=1"
+DOCKER_ARGS="$DOCKER_ARGS -e PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True"
+DOCKER_ARGS="$DOCKER_ARGS -v $HF_CACHE_DIR:/root/.cache/huggingface"
 
 # Append additional arguments from environment variable
 if [[ -n "$VLLM_SPARK_EXTRA_DOCKER_ARGS" ]]; then
@@ -50,12 +52,13 @@ PIDS_LIMIT="4096"
 SHM_SIZE_GB="64"
 NOFILE_LIMIT="${VLLM_SPARK_NOFILE_LIMIT:-1048576}"
 PORT_MAPPINGS=()
+VOLUME_MAPPINGS=()
 ENABLE_EARLYOOM="false"
 EARLYOOM_ARGS="${VLLM_SPARK_EARLYOOM_ARGS:--M 524288,102400 -s 100 -r 60}"
 
 # Function to print usage
 usage() {
-    echo "Usage: $0 [-n <node_ips>] [-t <image_name>] [--name <container_name>] [--eth-if <if_name>] [--ib-if <if_name>] [--nccl-debug <level>] [--check-config] [--solo] [--ray|--no-ray] [-p <host:container>] [-d] [action] [command]"
+    echo "Usage: $0 [-n <node_ips>] [-t <image_name>] [--name <container_name>] [--eth-if <if_name>] [--ib-if <if_name>] [--nccl-debug <level>] [--check-config] [--solo] [--ray|--no-ray] [-p <host:container>] [-v <local:container>] [-d] [action] [command]"
     echo "  -n, --nodes     Comma-separated list of node IPs (Optional, auto-detected if omitted)"
     echo "  -t              Docker image name (Optional, default: $IMAGE_NAME)"
     echo "  --name          Container name (Optional, default: $DEFAULT_CONTAINER_NAME)"
@@ -70,6 +73,7 @@ usage() {
     echo "  --solo          Solo mode: skip autodetection, launch only on current node, do not launch Ray cluster"
     echo "  --master-port   Port for cluster coordination: Ray head port or PyTorch distributed master port (default: 29501)"
     echo "  -p, --publish   Publish a container port in Docker format (e.g. -p 8000:8000). Solo mode only; can be specified multiple times."
+    echo "  -v, --volume    Map a volume in Docker format (e.g. -v /local/path:/container/path). Can be specified multiple times."
     echo "  --ray           Use Ray for multi-node vLLM and add --distributed-executor-backend ray if missing"
     echo "  --no-ray        Default for multi-node vLLM without Ray (accepted for compatibility)"
     echo "  --no-cache-dirs Do not mount default cache directories (~/.cache/vllm, ~/.cache/flashinfer, ~/.triton, ~/.tilelang)"
@@ -139,6 +143,8 @@ while [[ "$#" -gt 0 ]]; do
         --master-port|--head-port) MASTER_PORT="$2"; shift ;;
         -p|--publish) PORT_MAPPINGS+=("$2"); shift ;;
         -p=*|--publish=*) PORT_MAPPINGS+=("${1#*=}") ;;
+        -v|--volume) VOLUME_MAPPINGS+=("$2"); shift ;;
+        -v=*|--volume=*) VOLUME_MAPPINGS+=("${1#*=}") ;;
         --check-config) CHECK_CONFIG="true" ;;
         --solo) SOLO_MODE="true" ;;
         --ray)
@@ -393,6 +399,12 @@ if [[ "$MOUNT_CACHE_DIRS" == "true" ]]; then
     DOCKER_ARGS="$DOCKER_ARGS -v $HOME/.tilelang:/root/.tilelang"
     CACHE_DIRS_TO_CREATE+=("$HOME/.tilelang")
 fi
+
+# Pass user-provided mappings through unchanged so Docker handles its native
+# local_path:container_path[:options] syntax.
+for mapping in "${VOLUME_MAPPINGS[@]}"; do
+    DOCKER_ARGS="$DOCKER_ARGS -v $mapping"
+done
 
 # Resolve launch script path if specified
 if [[ -n "$LAUNCH_SCRIPT_PATH" ]]; then
@@ -983,6 +995,53 @@ container_keepalive_command() {
     fi
 }
 
+# Verify that the selected image resolves to the same content-addressable image
+# ID on the head and every worker before starting any containers.
+verify_cluster_image_consistency() {
+    if [[ ${#PEER_NODES[@]} -eq 0 ]]; then
+        return 0
+    fi
+
+    echo "Verifying Docker image consistency across cluster nodes..."
+
+    local head_image_id
+    if ! head_image_id=$(docker image inspect --format '{{.Id}}' "$IMAGE_NAME" 2>/dev/null) || [[ -z "$head_image_id" ]]; then
+        echo "Error: Could not inspect image '$IMAGE_NAME' on head node ($HEAD_IP)."
+        echo "       Make sure the image exists and is accessible to the current user."
+        return 1
+    fi
+    echo "  [HEAD] $HEAD_IP: $head_image_id"
+
+    local inspect_cmd
+    printf -v inspect_cmd "docker image inspect --format '{{.Id}}' %q" "$IMAGE_NAME"
+
+    local worker
+    local worker_image_id
+    local image_error=false
+    for worker in "${PEER_NODES[@]}"; do
+        if ! worker_image_id=$(ssh -o BatchMode=yes -o StrictHostKeyChecking=no "$worker" "$inspect_cmd" 2>/dev/null) || [[ -z "$worker_image_id" ]]; then
+            echo "Error: Could not inspect image '$IMAGE_NAME' on worker node ($worker)."
+            echo "       The image may be missing or inaccessible to the remote user."
+            image_error=true
+        elif [[ "$worker_image_id" != "$head_image_id" ]]; then
+            echo "Error: Docker image mismatch on worker node ($worker):"
+            echo "       Head:   $head_image_id"
+            echo "       Worker: $worker_image_id"
+            image_error=true
+        else
+            echo "  [WORKER] $worker: $worker_image_id (match)"
+        fi
+    done
+
+    if [[ "$image_error" == "true" ]]; then
+        echo "Error: Cluster launch aborted because image '$IMAGE_NAME' is not in sync."
+        printf "       Sync it with: ./build-and-copy.sh --no-build -t %q --copy-to <worker-hosts>\n" "$IMAGE_NAME"
+        return 1
+    fi
+
+    echo "Docker image consistency check passed."
+}
+
 # Start Cluster Function
 start_cluster() {
     check_cluster_running
@@ -990,6 +1049,8 @@ start_cluster() {
     if [[ "$CLUSTER_WAS_RUNNING" == "true" ]]; then
         return
     fi
+
+    verify_cluster_image_consistency || exit 1
 
     # Build docker run arguments based on mode
     local docker_entrypoint_args=""

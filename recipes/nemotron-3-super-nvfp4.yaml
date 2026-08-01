@@ -37,7 +37,7 @@ command: |
   --host {host} \
   --port {port} \
   --enable-auto-tool-choice \
-  --load-format fastsafetensors \
+  --load-format instanttensor \
   --tool-call-parser qwen3_coder \
   --reasoning-parser nemotron_v3 \
   --mamba_ssm_cache_dtype float32 \
