@@ -18,6 +18,10 @@ COPY_TO_FLAG=false
 SSH_USER="$USER"
 NO_BUILD=false
 VLLM_REF="main"
+# Build from a fork instead of upstream, e.g. an unmerged hardware-enablement branch.
+VLLM_REPO="https://github.com/vllm-project/vllm.git"
+# Optional: pin the wheel version when the ref's nearest tag is not valid PEP 440.
+SETUPTOOLS_SCM_PRETEND_VERSION=""
 VLLM_REF_SET=false
 FLASHINFER_REF="main"
 FLASHINFER_REF_SET=false
@@ -399,6 +403,9 @@ usage() {
     echo "  --force-vllm-download         : Force download of vLLM wheels (skip cached wheel checks)"
     echo "  --force-download              : Force download of all prebuilt wheels (skip cached wheel checks)"
     echo "  --vllm-ref <ref>              : vLLM commit SHA, branch or tag (default: 'main')"
+    echo "  --vllm-repo <url>             : vLLM git remote (default: upstream vllm-project/vllm)"
+    echo "  --scm-version <ver>           : SETUPTOOLS_SCM_PRETEND_VERSION; use when the ref's"
+    echo "                                  nearest tag is not valid PEP 440"
     echo "  --flashinfer-ref <ref>        : FlashInfer commit SHA, branch or tag (default: 'main')"
     echo "  -c, --copy-to <hosts>         : Host(s) to copy image to. Accepts comma or space-delimited lists; matching remote image IDs are skipped."
     echo "      --copy-to-host            : Alias for --copy-to (backwards compatibility)."
@@ -436,6 +443,8 @@ while [[ "$#" -gt 0 ]]; do
             FORCE_VLLM_DOWNLOAD=true
             ;;
         --vllm-ref) VLLM_REF="$2"; VLLM_REF_SET=true; shift ;;
+        --vllm-repo) VLLM_REPO="$2"; shift ;;
+        --scm-version) SETUPTOOLS_SCM_PRETEND_VERSION="$2"; shift ;;
         --flashinfer-ref) FLASHINFER_REF="$2"; FLASHINFER_REF_SET=true; shift ;;
         -c|--copy-to|--copy-to-host|--copy-to-hosts)
             COPY_TO_FLAG=true
@@ -797,7 +806,9 @@ if [ "$NO_BUILD" = false ]; then
                 "--target" "vllm-export"
                 "--output" "type=local,dest=./wheels"
                 "${COMMON_BUILD_FLAGS[@]}"
-                "--build-arg" "VLLM_REF=$VLLM_REF")
+                "--build-arg" "VLLM_REF=$VLLM_REF"
+                "--build-arg" "VLLM_REPO=$VLLM_REPO"
+                "--build-arg" "SETUPTOOLS_SCM_PRETEND_VERSION=$SETUPTOOLS_SCM_PRETEND_VERSION")
 
             if [ "$APPLY_PRESET_VLLM_PRS" = true ]; then
                 echo "Applying preset vLLM PRs from the Dockerfile (explicitly requested)."

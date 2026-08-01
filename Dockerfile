@@ -242,6 +242,9 @@ WORKDIR $VLLM_BASE_DIR
 # --- VLLM SOURCE CACHE BUSTER ---
 ARG CACHEBUST_VLLM=1
 
+# Upstream repository to build from. Parameterized so the image can be built from a
+# fork -- e.g. hardware-enablement branches that are not merged upstream yet.
+ARG VLLM_REPO=https://github.com/vllm-project/vllm.git
 # Git reference (branch, tag, or SHA) to checkout
 ARG VLLM_REF=main
 
@@ -257,7 +260,7 @@ RUN --mount=type=cache,id=repo-cache,target=/repo-cache \
     cd /repo-cache && \
     if [ ! -d "vllm" ]; then \
         echo "Cache miss: Cloning vLLM from scratch..." && \
-        git clone --recursive https://github.com/vllm-project/vllm.git; \
+        git clone --recursive ${VLLM_REPO} vllm; \
         if [ "$VLLM_REF" != "main" ]; then \
             cd vllm && \
             git checkout ${VLLM_REF}; \
@@ -265,6 +268,7 @@ RUN --mount=type=cache,id=repo-cache,target=/repo-cache \
     else \
         echo "Cache hit: Fetching updates..." && \
         cd vllm && \
+        git remote set-url origin ${VLLM_REPO} && \
         git fetch origin && \
         git fetch origin --tags --force && \
         (git checkout --detach origin/${VLLM_REF} 2>/dev/null || git checkout ${VLLM_REF}) && \
@@ -877,13 +881,21 @@ RUN --mount=type=cache,id=uv-cache,target=/root/.cache/uv \
 # RUN curl -L https://patch-diff.githubusercontent.com/raw/vllm-project/vllm/pull/34758.diff | patch -p1 -R || echo "Cannot revert PR #34758, skipping"
 # RUN curl -L https://patch-diff.githubusercontent.com/raw/vllm-project/vllm/pull/34302.diff | patch -p1 -R || echo "Cannot revert PR #34302, skipping"
 
+# setuptools_scm derives the wheel version from the nearest git tag. Fork branches often
+# carry tags that are not valid PEP 440 -- e.g. a respin suffixed "...-20260727d" yields the
+# candidate version "20260727d" -- which fails the build before anything compiles. Set this to
+# build independently of how the upstream branch happens to be tagged. Empty (the default) is
+# a no-op, so stock builds are unaffected.
+ARG SETUPTOOLS_SCM_PRETEND_VERSION=
+
 # Final Compilation
 RUN --mount=type=cache,id=ccache,target=/root/.ccache \
     --mount=type=cache,id=uv-cache,target=/root/.cache/uv \
     --mount=type=cache,id=cargo-registry,target=/opt/cargo/registry \
     --mount=type=cache,id=cargo-git,target=/opt/cargo/git \
     --mount=type=cache,id=vllm-rust-target,target=/workspace/vllm/vllm/target \
-    VLLM_REQUIRE_RUST_FRONTEND=1 CARGO_BUILD_JOBS=${MAX_JOBS} \
+    env VLLM_REQUIRE_RUST_FRONTEND=1 CARGO_BUILD_JOBS=${MAX_JOBS} \
+    ${SETUPTOOLS_SCM_PRETEND_VERSION:+SETUPTOOLS_SCM_PRETEND_VERSION=$SETUPTOOLS_SCM_PRETEND_VERSION} \
     uv build --no-build-isolation --wheel . --out-dir=/workspace/wheels -v
 
 # Dump git refs in the wheels dir.
