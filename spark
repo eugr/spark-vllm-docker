@@ -1,0 +1,21 @@
+#!/bin/bash
+#
+# spark - fleet manager launcher (wraps spark.py).
+# Run on the MASTER node. Usage:
+#   ./spark scan [--tokens 1M] [--json]
+#   ./spark apply -f fleet.yaml [--execute]
+#   ./spark down  -f fleet.yaml [--execute]
+#
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+if command -v python3 &>/dev/null; then PYTHON=python3; else PYTHON=python; fi
+
+# spark apply needs PyYAML; install on demand (same as run-recipe.sh).
+if ! "$PYTHON" -c "import yaml" 2>/dev/null; then
+    "$PYTHON" -m pip install --quiet pyyaml || {
+        echo "Error: failed to install PyYAML (needed for fleet.yaml). Try: pip install pyyaml" >&2
+        exit 1
+    }
+fi
+
+exec "$PYTHON" "$SCRIPT_DIR/spark.py" "$@"

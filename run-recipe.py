@@ -276,6 +276,24 @@ def list_recipes() -> None:
             print()
 
 
+def _node_is_local(node: str | None) -> bool:
+    """True if `node` refers to this machine (check/run locally, not over SSH).
+
+    Mirrors launch-cluster.sh's `hostname -I` membership test so a remote --node
+    target (e.g. an x86 box whose image the ARM master doesn't have) is handled over
+    SSH, while the master's own deployments stay local (self-ssh isn't set up)."""
+    if not node:
+        return True
+    local = {"127.0.0.1", "localhost", ""}
+    try:
+        local.update(
+            subprocess.run(["hostname", "-I"], capture_output=True, text=True).stdout.split()
+        )
+    except Exception:
+        pass
+    return node in local
+
+
 def check_image_exists(image: str, host: str | None = None) -> bool:
     """
     Check if a Docker image exists locally or on a remote host.
@@ -786,6 +804,10 @@ Examples:
         "--solo", action="store_true", help="Run in solo mode (single node, no Ray)"
     )
     launch_group.add_argument(
+        "--node", metavar="IP",
+        help="Place a single solo container on this node (local or remote, master-orchestrated)",
+    )
+    launch_group.add_argument(
         "-n", "--nodes", help="Comma-separated list of node IPs (first is head node)"
     )
     launch_group.add_argument(
@@ -1021,12 +1043,12 @@ Examples:
     build_args = recipe.get("build_args", [])
 
     # Parse nodes - check command line first, then .env file, then autodiscover
-    nodes = parse_nodes(args.nodes) if not args.solo else []
+    nodes = parse_nodes(args.nodes) if not (args.solo or args.node) else []
     nodes_from_env = False
     eth_if = None
     ib_if = None
 
-    if not args.solo:
+    if not (args.solo or args.node):
         # Try to load from .env file
         env = load_env_file()
         if not nodes:
@@ -1062,7 +1084,7 @@ Examples:
     # Check if recipe requires cluster mode
     cluster_only = recipe.get("cluster_only", False)
     solo_only = recipe.get("solo_only", False)
-    is_solo = args.solo or not is_cluster
+    is_solo = args.solo or bool(args.node) or not is_cluster
 
     use_ray = getattr(args, "ray", False) and not is_solo
 
@@ -1230,9 +1252,12 @@ Examples:
     if args.build_only or args.download_only:
         return 0
 
-    # Check if image exists (if not using --setup)
-    if not args.dry_run and not args.setup and not check_image_exists(container):
-        print(f"Container image '{container}' not found locally.")
+    # Check if image exists (if not using --setup). For a REMOTE --node target the image
+    # lives on that node (e.g. x86 vllm/vllm-openai on a discrete-GPU box), not on the ARM
+    # master — check there, else a heterogeneous fleet always trips the build prompt.
+    image_host = None if _node_is_local(args.node) else args.node
+    if not args.dry_run and not args.setup and not check_image_exists(container, image_host):
+        print(f"Container image '{container}' not found {'on ' + image_host if image_host else 'locally'}.")
         print()
         print("Options:")
         print(f"  1. Use --setup to build and run")
@@ -1392,7 +1417,9 @@ Examples:
             cmd.extend(["--apply-mod", str(mod_path)])
 
         # Add launch options
-        if args.solo:
+        if args.node:
+            cmd.extend(["--node", args.node])   # single container, placed on this node
+        elif args.solo:
             cmd.append("--solo")
         elif not is_cluster:
             # Auto-enable solo mode if no cluster nodes specified
@@ -1407,7 +1434,7 @@ Examples:
             cmd.append("--no-ray")
 
         # Pass nodes to launch-cluster.sh (from command line, .env, or autodiscover)
-        if nodes:
+        if nodes and not args.node:
             cmd.extend(["-n", ",".join(nodes)])
 
         if args.nccl_debug:

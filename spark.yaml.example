@@ -1,0 +1,37 @@
+# spark.yaml — fleet + deployment config (see schema.json for full schema)
+# $schema: ../../spark.schema.json
+#
+# Layout: qwen3.6 models on Spark .31, qwen3.5-122B solo on Spark .30. Retrieval + OCR
+# (embed, rerank, ocr) moved to the x86 box .33 (RTX Pro 4000 Blackwell, 24GB VRAM).
+#
+# Budget:
+#   node .30 (Spark, 120GB unified) = 122B(100)                       -> OCR freed, headroom
+#   node .31 (Spark, 120GB unified) = 27B(42) + 35B(50)        = 92
+#   node .33 (x86,  24GB VRAM)      = embed(.40)+rerank(.40)+ocr(.10) = .90 -> ~21.6GB
+#
+# Spark recipes cap VRAM with --gpu-memory-utilization-gb (absolute GB, unified mem).
+# x86 (-x86) recipes use the standard fractional --gpu-memory-utilization on discrete VRAM.
+
+version: "1"
+
+fleet:
+  - { ip: 192.168.2.30, mem_gb: 120 }   # node 1 — Spark (GB10, unified)
+  - { ip: 192.168.2.31, mem_gb: 120 }   # node 2 — Spark (GB10, unified)
+  - { ip: 192.168.2.33, mem_gb: 24 }    # node 3 — x86, RTX Pro 4000 Blackwell 24GB VRAM
+
+deployments:
+  # Ports are PINNED explicitly — WE decide ports, never assign_ports auto-allocation.
+  # ---- Node .30 (Spark): qwen3.5-122B solo -----------------------------------
+  # 122B (78 GB weights) already cached on .30. OCR moved off to .33.
+  - { name: qwen35, recipe: qwen3.5-122b-a10b-nvfp4-mtp-vision, node: 192.168.2.30, tp: 1, port: 8001 }
+
+  # ---- Node .31 (Spark): both qwen3.6 vision models --------------------------
+  - { name: reasoning, recipe: qwen3.6-27b-nvfp4-mtp-vision,     node: 192.168.2.31, tp: 1, port: 8001 }
+  - { name: general,   recipe: qwen3.6-35b-a3b-nvfp4-mtp-vision, node: 192.168.2.31, tp: 1, port: 8004 }
+
+  # ---- Node .33 (x86 Blackwell 24GB): retrieval + OCR, all on-the-fly fp8 -----
+  # Start SEQUENTIALLY — each vLLM checks free VRAM at init (embed→rerank→ocr).
+  # NOTE: OCR endpoint moved .30:8003 -> .33:8003 (host changed). Update consumers.
+  - { name: ocr,    recipe: glm-ocr-x86,            node: 192.168.2.33, port: 8003 }
+  - { name: rerank, recipe: qwen3-reranker-8b-x86,  node: 192.168.2.33, port: 8002 }
+  - { name: embed,  recipe: qwen3-embedding-8b-x86, node: 192.168.2.33, port: 8005 }

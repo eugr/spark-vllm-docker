@@ -1,0 +1,113 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "spark.yaml — Fleet Manager Configuration",
+  "description": "Declarative fleet + deployment config for spark apply/apply/apply/diff/apply",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["fleet", "deployments"],
+  "properties": {
+    "version": {
+      "description": "Config format version (semantic version).",
+      "type": "string",
+      "examples": ["1", "1.0.0"]
+    },
+    "fleet": {
+      "description": "List of fleet nodes.",
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["ip"],
+        "properties": {
+          "ip": {
+            "description": "Node IP address or hostname.",
+            "type": "string",
+            "format": "ip"
+          },
+          "mem_gb": {
+            "description": "Total GPU memory in GB (validation only, not enforced by vLLM).",
+            "type": "integer",
+            "examples": [120, 24, 48]
+          }
+        }
+      }
+    },
+    "deployments": {
+      "description": "List of model deployments.",
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["name", "recipe", "port"],
+        "additionalProperties": false,
+        "properties": {
+          "name": {
+            "description": "Unique deployment name (also container name `spark-<name>`).",
+            "type": "string"
+          },
+          "recipe": {
+            "description": "Recipe file name in `recipes/` (without `.yaml` suffix).",
+            "type": "string",
+            "examples": ["qwen3.6-27b-nvfp4-mtp-vision", "glm-ocr-x86"]
+          },
+          "node": {
+            "description": "Single-node placement (mutually exclusive with `nodes`).",
+            "type": "string",
+            "format": "ip"
+          },
+          "nodes": {
+            "description": "Multi-node placement (mutually exclusive with `node`).",
+            "type": "array",
+            "items": {
+              "type": "string",
+              "format": "ip"
+            },
+            "minItems": 2
+          },
+          "tp": {
+            "description": "Tensor parallelism size (overrides recipe default).",
+            "type": "integer",
+            "minimum": 1
+          },
+          "port": {
+            "description": "Service port (must be unique per node within the fleet).",
+            "type": "integer",
+            "minimum": 1024,
+            "maximum": 65535
+          },
+          "max_model_len": {
+            "description": "Maximum context length (overrides recipe default).",
+            "type": "integer",
+            "examples": [32768, 262144]
+          },
+          "gpu_mem": {
+            "description": "GPU memory utilization (fraction for discrete GPUs, GB for Spark).",
+            "type": ["number", "integer"]
+          },
+          "kv_cache_gb": {
+            "description": "KV cache size in GB (Phase 2 — future).",
+            "type": "integer"
+          },
+          "kv_dtype": {
+            "description": "KV cache data type (Phase 2 — future).",
+            "type": "string",
+            "enum": ["fp8", "fp16"]
+          },
+          "mtp": {
+            "description": "Enable MTP/speculative decoding (Phase 2 — future).",
+            "type": "boolean",
+            "default": false
+          },
+          "extra_args": {
+            "description": "Additional flags passed to run-recipe.py after `--`.",
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "examples": [
+              ["--enable-prefix-caching", "--no-async-scheduling"]
+            ]
+          }
+        }
+      }
+    }
+  }
+}
