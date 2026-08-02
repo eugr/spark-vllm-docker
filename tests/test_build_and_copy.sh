@@ -450,6 +450,14 @@ test_dockerfile_applies_flashinfer_prs_without_merging_branch_history() {
     pass "FlashInfer PRs apply as patches without merging branch history"
 }
 
+test_dockerfiles_pin_tvm_ffi_regression_version() {
+    if [ "$(grep -Fc 'apache-tvm-ffi==0.1.12' "$PROJECT_DIR/Dockerfile")" -ne 2 ] || \
+       [ "$(grep -Fc 'apache-tvm-ffi==0.1.12' "$PROJECT_DIR/Dockerfile.mxfp4")" -ne 1 ]; then
+        fail "Dockerfiles do not pin every TVM-FFI install to the known-good 0.1.12 release"
+    fi
+    pass "Dockerfiles pin TVM-FFI to the known-good 0.1.12 release"
+}
+
 test_default_uses_prebuilt
 test_tf5_uses_prebuilt_tf5_tag
 test_custom_tag_uses_prebuilt_custom_tag
@@ -477,5 +485,6 @@ test_apply_preset_prs_forces_vllm_rebuild
 test_requested_vllm_prs_apply_to_selected_vllm_ref
 test_copied_vllm_git_index_is_refreshed_before_patch_apply
 test_dockerfile_applies_flashinfer_prs_without_merging_branch_history
+test_dockerfiles_pin_tvm_ffi_regression_version
 
 echo "Passed $TESTS_PASSED build-and-copy tests."

@@ -54,7 +54,7 @@ RUN apt update && \
 # Additional deps
 RUN --mount=type=cache,id=uv-cache,target=/root/.cache/uv \
      uv pip install torch==2.11.0 torchvision torchaudio triton --index-url https://download.pytorch.org/whl/cu130 && \
-     uv pip install nvidia-nvshmem-cu13 "apache-tvm-ffi<0.2" filelock pynvml requests tqdm
+     uv pip install nvidia-nvshmem-cu13 "apache-tvm-ffi==0.1.12" filelock pynvml requests tqdm
 
 # Configure Ccache for CUDA/C++
 ENV PATH=/usr/lib/ccache:$PATH
@@ -950,7 +950,7 @@ ARG PRE_TRANSFORMERS=0
 # Install deps
 RUN --mount=type=cache,id=uv-cache,target=/root/.cache/uv \
      uv pip install torch==2.11.0 torchvision torchaudio triton --index-url https://download.pytorch.org/whl/cu130 && \
-     uv pip install nvidia-nvshmem-cu13 "apache-tvm-ffi<0.2"
+     uv pip install nvidia-nvshmem-cu13 "apache-tvm-ffi==0.1.12"
 
 # Install wheels from host ./wheels/ (bind-mounted from build context — no layer bloat)
 # PRE_TRANSFORMERS=1 is retained for manual legacy builds; build-and-copy.sh no longer sets it for --tf5.
