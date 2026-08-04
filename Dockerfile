@@ -75,7 +75,7 @@ RUN --mount=type=cache,id=uv-cache,target=/root/.cache/uv \
      set -- "torch==$TORCH_VERSION" "$TORCHVISION_SPEC" && \
      if [ -n "$TORCHAUDIO_SPEC" ]; then set -- "$@" "$TORCHAUDIO_SPEC"; fi && \
      uv pip install "$@" triton --index-url https://download.pytorch.org/whl/cu130 && \
-     uv pip install nvidia-nvshmem-cu13 "apache-tvm-ffi<0.2" filelock pynvml requests tqdm
+     uv pip install nvidia-nvshmem-cu13 "apache-tvm-ffi==0.1.12" filelock pynvml requests tqdm
 
 # Configure Ccache for CUDA/C++
 ENV PATH=/usr/lib/ccache:$PATH
@@ -974,7 +974,8 @@ RUN --mount=type=cache,id=ccache,target=/root/.ccache \
 # Dump git refs in the wheels dir.
 RUN \
     git rev-parse HEAD > /workspace/wheels/.vllm-commit && \
-    git -C "$DEEPGEMM_SRC_DIR" rev-parse HEAD > /workspace/wheels/.deepgemm-commit
+    git -C "$DEEPGEMM_SRC_DIR" rev-parse HEAD > /workspace/wheels/.deepgemm-commit && \
+    printf '%s\n' "$TORCH_CUDA_ARCH_LIST" > /workspace/wheels/.vllm-arch
 
 # =========================================================
 # STAGE 5: vLLM Wheel Export
@@ -983,7 +984,7 @@ FROM scratch AS vllm-export
 COPY --from=vllm-builder /workspace/wheels /
 
 # =========================================================
-# STAGE 6: Runner (Installs wheels from host ./wheels/)
+# STAGE 6: Runner (Installs wheels from selected named contexts)
 # =========================================================
 FROM ${CUDA_IMAGE} AS runner
 
@@ -1052,13 +1053,15 @@ RUN --mount=type=cache,id=uv-cache,target=/root/.cache/uv \
      set -- "torch==$TORCH_VERSION" "$TORCHVISION_SPEC" && \
      if [ -n "$TORCHAUDIO_SPEC" ]; then set -- "$@" "$TORCHAUDIO_SPEC"; fi && \
      uv pip install "$@" triton --index-url https://download.pytorch.org/whl/cu130 && \
-     uv pip install nvidia-nvshmem-cu13 "apache-tvm-ffi<0.2"
+     uv pip install nvidia-nvshmem-cu13 "apache-tvm-ffi==0.1.12"
 
-# Install wheels from host ./wheels/ (bind-mounted from build context — no layer bloat)
+# Install the shared/selected FlashInfer and vLLM profiles from independent
+# named contexts (bind-mounted without adding the wheel files to an image layer).
 # PRE_TRANSFORMERS=1 is retained for manual legacy builds; build-and-copy.sh no longer sets it for --tf5.
 # FastAPI 0.137.0 adds _IncludedRouter entries that currently break
 # prometheus-fastapi-instrumentator route name lookup.
-RUN --mount=type=bind,source=wheels,target=/workspace/wheels \
+RUN --mount=type=bind,from=flashinfer_wheels,target=/workspace/flashinfer-wheels \
+    --mount=type=bind,from=vllm_wheels,target=/workspace/vllm-wheels \
     --mount=type=cache,id=uv-cache,target=/root/.cache/uv \
     PINNED_TORCH=$(python3 -c "import torch; print(torch.__version__)") && \
     PINNED_TORCHVISION=$(python3 -c "import importlib.metadata as m; print(m.version('torchvision'))") && \
@@ -1070,7 +1073,8 @@ RUN --mount=type=bind,source=wheels,target=/workspace/wheels \
     if [ "$PRE_TRANSFORMERS" = "1" ]; then \
         echo "transformers>=5.0.0" >> /tmp/wheel-override.txt; \
     fi && \
-    uv pip install /workspace/wheels/*.whl --override /tmp/wheel-override.txt
+    uv pip install /workspace/flashinfer-wheels/*.whl /workspace/vllm-wheels/*.whl \
+        --override /tmp/wheel-override.txt
 
 # Setup environment for runtime
 ARG TORCH_CUDA_ARCH_LIST="12.1a"

@@ -29,6 +29,9 @@ This repository is not affiliated with NVIDIA or their subsidiaries. This is a c
 By default, `build-and-copy.sh` pulls the tested nightly runner image from DockerHub: `eugr/spark-vllm:latest`. Nightly images are built and tested on multiple models in both cluster and solo configuration before `latest` is advanced.
 We will expand the selection of models we test in the pipeline, but since vLLM is a rapidly developing platform, some things may break.
 
+Selecting `--exp-b12x` without local-build flags or customizations pulls the separately tested
+`eugr/spark-vllm-b12x:latest` image and tags it as `vllm-node-b12x`.
+
 If you want to build only the runner from precompiled vLLM and FlashInfer wheels, specify `--use-wheels`. This option never falls back to compiling missing wheels: if a wheel cannot be downloaded or found locally, the command stops with an error. To build the latest vLLM from the main branch, use `--rebuild-vllm`; to target a specific repository, release, or commit, set `--vllm-repo` and/or `--vllm-ref`.
 
 Similarly, `--rebuild-flashinfer`, `--flashinfer-ref`, and `--apply-flashinfer-pr` control the FlashInfer build and force the local build path.
@@ -145,6 +148,26 @@ Don't do it every time you rebuild, because it will slow down compilation times.
 For periodic maintenance, I recommend using a filter: `docker builder prune --filter until=72h`
 
 ## CHANGELOG
+
+### 2026-08-03
+
+#### Profiled wheel caches and prebuilt B12X image
+
+Bare `--exp-b12x` now pulls `eugr/spark-vllm-b12x:latest`. Add
+`--rebuild-vllm` to compile the maintained B12X fork locally. Wheel-based builds
+use independent BuildKit contexts backed by `.wheel-cache`: regular FlashInfer
+is shared by regular and B12X builds, while custom FlashInfer refs, PRs, and GPU
+targets are isolated. vLLM wheels use `regular`, `b12x`, or `custom` profiles.
+
+### 2026-07-31
+
+#### DeepSeek V4 Flash 0731 B12X cluster recipe
+
+Added the cluster-only `deepseek-v4-flash-0731` recipe for serving `deepseek-ai/DeepSeek-V4-Flash-0731` on a dual DGX Spark cluster. The recipe requires B12X container (vllm-node-b12x) that can be built by using `./build-and-copy.sh --exp-b12x -c` (or just allow the recipe system to build it for you).
+
+```bash
+./run-recipe.sh deepseek-v4-flash-0731
+```
 
 ### 2026-07-30
 
@@ -838,7 +861,7 @@ The download logic:
 
 No new flags are required - the download happens transparently unless `--rebuild-flashinfer` is specified.
 
-All wheels (downloaded or built locally) are cached in the `./wheels` directory for subsequent reuse.
+Wheels are cached by component and profile under `./.wheel-cache` for subsequent reuse.
 
 - `--rebuild-flashinfer` will force FlashInfer rebuild from the flashinfer `main` branch.
 - `--rebuild-vllm` will force vLLM rebuild from vLLM `main` branch or specific commit in `--vllm-ref`.
@@ -1366,9 +1389,16 @@ For the maintained experimental B12X combination, the equivalent shortcut is:
 ./build-and-copy.sh --exp-b12x
 ```
 
-This uses `local-inference-lab/vllm@dev/gilded-gnosis`, installs B12X from its
-`master` branch, and tags the image as `vllm-node-b12x` unless `-t` is supplied.
-It can be combined with `--apply-vllm-pr <pr-num>` to add custom vLLM patches.
+Without local-build flags, this pulls `eugr/spark-vllm-b12x:latest` and tags it
+as `vllm-node-b12x` unless `-t` is supplied. To build the maintained combination
+from `local-inference-lab/vllm@dev/gilded-gnosis` and the `master` branch of the
+B12X/SparkInfer repository, run:
+
+```bash
+./build-and-copy.sh --exp-b12x --rebuild-vllm
+```
+
+It can be combined with `--apply-vllm-pr <pr-num>` to build custom vLLM patches.
 The preset preserves the selected SM12x target in vLLM's CUDA 13 CMake
 configuration. It defaults to `12.1a`; the B12X branch's NVFP4 MLA cache
 writer cannot compile if that target is reduced to generic `sm_120`. Explicit
@@ -1380,6 +1410,23 @@ the cached wheel records its architecture so a later build cannot silently reuse
 a wheel for a different target.
 
 Custom vLLM repositories are cloned fresh instead of using the shared upstream checkout cache. Specifying a custom repository forces a vLLM source build. Upstream preset PRs are skipped by default for custom repositories and refs.
+
+Wheel profiles are selected automatically:
+
+```text
+.wheel-cache/
+├── flashinfer/
+│   ├── regular/   # shared by regular and B12X builds
+│   └── custom/    # custom ref/PR or non-default GPU target
+└── vllm/
+    ├── regular/
+    ├── b12x/
+    └── custom/    # custom repository/ref/PR, Torch family, or GPU target
+```
+
+Only regular vLLM wheels are downloaded from the published wheel release.
+`--exp-b12x` is therefore incompatible with `--use-wheels`: use bare
+`--exp-b12x` for the published image or add `--rebuild-vllm` for a source build.
 
 For any branch, tag, or commit selected from `local-inference-lab/vllm`, the runner freshly clones the `master` ref of `https://github.com/lukealonso/b12x.git`, builds and installs its `sparkinfer` distribution automatically. A per-build cache key prevents Docker from reusing a stale source checkout. The install uses `--no-deps` to preserve the dependency versions selected by vLLM, including its CUTLASS DSL pin, and records the exact source commit at `/workspace/sparkinfer-source-commit`. SparkInfer requires PyTorch 2.12 or newer.
 
@@ -1394,7 +1441,7 @@ For any branch, tag, or commit selected from `local-inference-lab/vllm`, the run
 | Flag | Description |
 | :--- | :--- |
 | `-t, --tag <tag>` | Local image tag (default: `vllm-node`; auto-set to `vllm-node-tf5` with `--tf5`, `vllm-node-mxfp4` with `--exp-mxfp4`, or `vllm-node-b12x` with `--exp-b12x`) |
-| `--use-wheels` | Build only the runner image from downloaded or local precompiled wheels; never implicitly compile missing wheels |
+| `--use-wheels` | Build only the runner image from downloaded or local precompiled wheels; never implicitly compile missing wheels. Incompatible with `--exp-b12x`. |
 | `--gpu-arch <arch>` | Target GPU architecture for wheel/source builds. Non-default targets rebuild FlashInfer unless the local cache is marked for that architecture. The default `12.1a` still uses the prebuilt image unless another build-forcing flag is set. |
 | `--rebuild-flashinfer` | Skip prebuilt wheel download; force a fresh local FlashInfer build |
 | `--rebuild-vllm` | Force rebuild vLLM from source |
@@ -1412,7 +1459,7 @@ For any branch, tag, or commit selected from `local-inference-lab/vllm`, the run
 | `--apply-flashinfer-pr <pr-num>` | Apply a FlashInfer PR patch during build. Can be specified multiple times. |
 | `--tf5` | Deprecated compatibility flag; pulls/tags the prebuilt image as `vllm-node-tf5` unless another build-forcing flag is set. Aliases: `--pre-tf, --pre-transformers`. |
 | `--exp-mxfp4` | Build with experimental native MXFP4 support. Alias: `--experimental-mxfp4`. |
-| `--exp-b12x` | Build the B12X preset from `local-inference-lab/vllm@dev/gilded-gnosis` with PyTorch 2.12.0. Defaults to image tag `vllm-node-b12x`. Alias: `--experimental-b12x`. |
+| `--exp-b12x` | Select the B12X profile. Pulls `eugr/spark-vllm-b12x:latest` unless a local wheel/image build is requested; defaults to local tag `vllm-node-b12x`. Alias: `--experimental-b12x`. |
 | `-c, --copy-to <hosts>` | Host(s) to copy the image to after preparation (space- or comma-separated). Hosts with the same image ID are skipped. |
 | `--copy-to-host` | Alias for `--copy-to` (backwards compatibility). |
 | `--copy-parallel` | Copy to all specified hosts concurrently. |
@@ -1421,7 +1468,7 @@ For any branch, tag, or commit selected from `local-inference-lab/vllm`, the run
 | `--full-log` | Enable full Docker build output (`--progress=plain`) |
 | `--no-build` | Skip image preparation entirely, only copy an existing local image tag (requires `--copy-to`) |
 | `--network <name>` | Docker network to use during build (e.g. `host`). |
-| `--cleanup` | Remove all cached `.whl` and `*-commit` files from the `wheels/` directory; this does not force a local build by itself. |
+| `--cleanup` | Remove cached wheel files and provenance markers from every `.wheel-cache` profile; this does not force a local build by itself. |
 | `--config <file>` | Path to `.env` configuration file (default: `.env` in script directory) |
 | `--setup` | Force autodiscovery and save configuration to `.env` (even if `.env` already exists) |
 | `-h, --help` | Show help message |
