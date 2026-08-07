@@ -1920,6 +1920,9 @@ InstantTensor is available with `--load-format instanttensor`. Several large-mod
 
 I recommend using [llama-benchy](https://github.com/eugr/llama-benchy) - a new benchmarking tool that delivers results in the same format as llama-bench from llama.cpp suite.
 
+For a Prometheus and Grafana web dashboard, including speculative decoding and
+MTP metrics, see [Visualizing vLLM metrics](docs/METRICS.md).
+
 ## 10\. Downloading Models
 
 The `hf-download.sh` script provides a convenient way to download models from HuggingFace and distribute them across your cluster nodes. It uses Huggingface CLI via `uvx` for fast downloads and `rsync` for distribution across the cluster.
