@@ -11,6 +11,12 @@ The repository includes a ready-to-run monitoring stack:
   named volumes.
 - `prometheus.yaml` scrapes the vLLM server from the Docker host every five
   seconds.
+- `prometheus-rules.yaml` records one-minute averages for prompt, generation,
+  and total token throughput.
+- `grafana/provisioning/` configures Prometheus as Grafana's default data source
+  and loads dashboards from disk.
+- `grafana/dashboards/vllm-throughput.json` defines the default **vLLM
+  Throughput** dashboard.
 
 The default configuration assumes vLLM is listening on port `8000` on the
 Docker host. Confirm the endpoint first:
@@ -27,6 +33,10 @@ From the repository root, start both services:
 docker compose -f docker-compose.metrics.yaml up -d
 ```
 
+Run the same command after changing the Compose file or provisioning files.
+Compose recreates affected containers when their configuration changes; a plain
+`docker compose restart` does not apply new mounts or environment settings.
+
 If vLLM uses a different host port, update the target in `prometheus.yaml`
 before starting the stack. You can inspect service state and logs with:
 
@@ -42,14 +52,34 @@ of the head node:
 - Prometheus: `http://<spark-ip>:9090`
 
 The initial Grafana login is `admin` / `admin`. Grafana will ask you to
-change the password after the first login.
+change the password after the first login. The provisioned **vLLM Throughput**
+dashboard opens as the home dashboard and shows one-minute averages for prompt,
+generation, and total token throughput.
 
-## Connect Grafana to Prometheus
+## Provisioned data source and dashboard
 
-1. In Grafana, open **Connections > Data sources** and add **Prometheus**.
-2. Set the Prometheus server URL to `http://prometheus:9090`.
-3. Select **Save & test**.
-4. Check `http://<spark-ip>:9090/targets`; the `vllm` target should be `UP`.
+The Compose stack provisions Prometheus as Grafana's default data source at
+startup. No manual data-source setup is required. Check
+`http://<spark-ip>:9090/targets`; the `vllm` target should be `UP`.
+
+The dashboard uses these recording rules from `prometheus-rules.yaml`:
+
+| Recorded metric | Meaning |
+| --- | --- |
+| `vllm:generation_tokens_per_second:rate1m` | Output tokens per second |
+| `vllm:prompt_tokens_per_second:rate1m` | Input/prompt tokens per second |
+| `vllm:total_tokens_per_second:rate1m` | Combined input and output tokens per second |
+
+Inspect loaded rules at `http://<spark-ip>:9090/rules`, or enter one of the
+recorded metric names in the Prometheus query UI. Prometheus needs at least two
+samples before a rate appears, and the panels remain at zero while vLLM is
+idle. The dashboard refreshes every five seconds and displays the most recent
+one-minute averages plus a 15-minute history.
+
+The provisioned dashboard can be edited in Grafana. For a durable,
+version-controlled change, export the updated dashboard JSON and replace
+`grafana/dashboards/vllm-throughput.json`; later provisioning-file changes can
+overwrite a dashboard saved only in Grafana's database.
 
 The upstream vLLM repository provides an example dashboard that can be
 imported into Grafana:

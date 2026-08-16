@@ -1,0 +1,15 @@
+groups:
+  - name: vllm-throughput
+    interval: 5s
+    rules:
+      - record: vllm:generation_tokens_per_second:rate1m
+        expr: sum(rate(vllm:generation_tokens_total{job="vllm"}[1m]))
+
+      - record: vllm:prompt_tokens_per_second:rate1m
+        expr: sum(rate(vllm:prompt_tokens_total{job="vllm"}[1m]))
+
+      - record: vllm:total_tokens_per_second:rate1m
+        expr: >-
+          sum(rate(vllm:generation_tokens_total{job="vllm"}[1m]))
+          +
+          sum(rate(vllm:prompt_tokens_total{job="vllm"}[1m]))
