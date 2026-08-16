@@ -511,6 +511,7 @@ test_custom_vllm_repo_forces_source_build() {
     assert_log_contains '^docker build --target vllm-export .*--build-arg VLLM_REF=main --build-arg VLLM_REPO=https://github.com/example/vllm.git --build-arg VLLM_APPLY_PRESET_PRS=0'
     assert_log_contains '^docker build -t vllm-node .*--build-context flashinfer_wheels=\./\.wheel-cache/flashinfer/regular --build-context vllm_wheels=\./\.wheel-cache/vllm/custom '
     assert_log_not_contains 'B12X_REPO='
+    assert_log_not_contains 'VLLM_PATCH_B12X_C128A_ALIGNMENT=1'
     assert_output_contains 'Rebuilding vLLM wheels \(--vllm-repo specified\)\.\.\.'
     assert_output_contains 'Skipping preset vLLM PRs because --vllm-repo, --vllm-ref, or --apply-vllm-pr was specified\.'
     pass "--vllm-repo forces a source build and suppresses upstream preset PRs"
@@ -529,19 +530,19 @@ test_exp_b12x_rebuild_vllm_uses_preset_source_build() {
     setup_fixture
     run_build --exp-b12x --rebuild-vllm || fail "--exp-b12x --rebuild-vllm run failed"
     assert_log_not_contains '^docker pull eugr/spark-vllm-b12x:latest$'
-    assert_log_contains '^docker build --target vllm-export .*--build-arg TORCH_CUDA_ARCH_LIST=12.1a --build-arg FLASHINFER_CUDA_ARCH_LIST=12.1a .*--build-arg TORCH_VERSION=2.12.0 --build-arg TORCHVISION_VERSION=0.27.0 --build-arg TORCHAUDIO_VERSION=none .*--build-arg VLLM_REF=dev/gilded-gnosis --build-arg VLLM_REPO=https://github.com/local-inference-lab/vllm --build-arg VLLM_APPLY_PRESET_PRS=0 .*--build-arg VLLM_PRESERVE_SM12X_TARGET=1'
+    assert_log_contains '^docker build --target vllm-export .*--build-arg TORCH_CUDA_ARCH_LIST=12.1a --build-arg FLASHINFER_CUDA_ARCH_LIST=12.1a .*--build-arg TORCH_VERSION=2.13.0 --build-arg TORCHVISION_VERSION=0.28.0 --build-arg TORCHAUDIO_VERSION=2.11.0 --build-arg CUTLASS_DSL_VERSION=4.7.0 .*--build-arg VLLM_REF=dev/infernal-invocation --build-arg VLLM_REPO=https://github.com/local-inference-lab/vllm --build-arg VLLM_APPLY_PRESET_PRS=0 .*--build-arg VLLM_PRESERVE_SM12X_TARGET=1 --build-arg VLLM_PATCH_B12X_C128A_ALIGNMENT=1'
     assert_log_contains '^docker build -t vllm-node-b12x .*--build-context flashinfer_wheels=\./\.wheel-cache/flashinfer/regular --build-context vllm_wheels=\./\.wheel-cache/vllm/b12x .*--build-arg B12X_REPO=https://github.com/lukealonso/b12x.git --build-arg B12X_REF=master '
     assert_log_contains '.*--build-arg B12X_CACHEBUST=[0-9]+'
     assert_log_not_contains 'Dockerfile\.mxfp4'
     assert_output_contains 'Rebuilding vLLM wheels \(--exp-b12x preset\)\.\.\.'
-    assert_output_contains 'Building B12X from https://github\.com/lukealonso/b12x\.git ref master for https://github\.com/local-inference-lab/vllm ref dev/gilded-gnosis\.'
+    assert_output_contains 'Building B12X from https://github\.com/lukealonso/b12x\.git ref master for https://github\.com/local-inference-lab/vllm ref dev/infernal-invocation\.'
     pass "--exp-b12x --rebuild-vllm uses the B12X source-build profile"
 }
 
 test_exp_b12x_allows_vllm_prs() {
     setup_fixture
     run_build --exp-b12x --apply-vllm-pr 12345 || fail "--exp-b12x with vLLM PR run failed"
-    assert_log_contains '^docker build --target vllm-export .*--build-arg VLLM_REF=dev/gilded-gnosis --build-arg VLLM_REPO=https://github.com/local-inference-lab/vllm --build-arg VLLM_APPLY_PRESET_PRS=0 --build-arg CACHEBUST_VLLM=[0-9]+ --build-arg VLLM_PRS=12345'
+    assert_log_contains '^docker build --target vllm-export .*--build-arg VLLM_REF=dev/infernal-invocation --build-arg VLLM_REPO=https://github.com/local-inference-lab/vllm --build-arg VLLM_APPLY_PRESET_PRS=0 --build-arg CACHEBUST_VLLM=[0-9]+ --build-arg VLLM_PRS=12345'
     assert_output_contains 'Rebuilding vLLM wheels \(--exp-b12x preset with requested vLLM PRs\)\.\.\.'
     assert_output_contains 'Applying vLLM PRs: 12345'
     pass "--exp-b12x accepts additional vLLM PR patches"
@@ -600,18 +601,21 @@ test_exp_b12x_variable_names_are_generic() {
     pass "B12X preset variables use generic EXP_B12X names"
 }
 
-test_exp_b12x_supports_sm120_arches() {
+test_exp_b12x_preserves_blackwell_arches() {
     local arch
-    for arch in 12.0a 12.0f; do
+    local nccl_arch
+    for arch in 10.3a 12.0a 12.0f; do
+        nccl_arch="${arch%[a-z]}"
+        nccl_arch="${nccl_arch//./}"
         setup_fixture
         run_build --exp-b12x --gpu-arch "$arch" || \
             fail "--exp-b12x --gpu-arch $arch run failed"
         assert_log_contains "^docker build --target flashinfer-export .*--build-arg FLASHINFER_CUDA_ARCH_LIST=${arch} .*--build-arg FLASHINFER_REF=main"
-        assert_log_contains "^docker build --target vllm-export .*--build-arg TORCH_CUDA_ARCH_LIST=${arch} --build-arg FLASHINFER_CUDA_ARCH_LIST=${arch} .*--build-arg NCCL_NVCC_GENCODE=-gencode=arch=compute_120,code=sm_120 .*--build-arg VLLM_PRESERVE_SM12X_TARGET=1"
+        assert_log_contains "^docker build --target vllm-export .*--build-arg TORCH_CUDA_ARCH_LIST=${arch} --build-arg FLASHINFER_CUDA_ARCH_LIST=${arch} .*--build-arg NCCL_NVCC_GENCODE=-gencode=arch=compute_${nccl_arch},code=sm_${nccl_arch} .*--build-arg VLLM_PRESERVE_SM12X_TARGET=1"
         assert_log_contains "^docker build -t vllm-node-b12x .*--build-arg TORCH_CUDA_ARCH_LIST=${arch} --build-arg FLASHINFER_CUDA_ARCH_LIST=${arch} "
         assert_output_contains "Rebuilding FlashInfer wheels for GPU architecture ${arch}\.\.\."
     done
-    pass "--exp-b12x preserves explicit SM120 architecture selections"
+    pass "--exp-b12x preserves explicit Blackwell architecture selections"
 }
 
 test_exp_b12x_rebuilds_mismatched_cached_flashinfer_arch() {
@@ -632,27 +636,121 @@ test_exp_b12x_rebuilds_mismatched_cached_vllm_arch() {
     pass "--exp-b12x does not reuse a vLLM wheel for another architecture"
 }
 
-test_dockerfile_preserves_selected_sm12x_target() {
-    local sm12x_block="$TMP_BASE/sm12x-block"
+test_b12x_c128a_alignment_patch_is_guarded_and_idempotent() {
+    local patch_script="$PROJECT_DIR/docker/patch_vllm_b12x_c128a_topk_alignment.py"
+    local patch_fixture="$TMP_BASE/b12x-c128a-patch"
+    local target_dir="$patch_fixture/vllm/models/deepseek_v4"
+    local helper_dir="$patch_fixture/vllm/v1/attention/backends/mla"
+    local target="$target_dir/sparse_mla.py"
+    local helper="$helper_dir/compressor_utils.py"
+    local output="$patch_fixture/output.log"
+    local unknown_fixture="$TMP_BASE/b12x-c128a-unknown"
+
+    mkdir -p "$target_dir" "$helper_dir"
+    cat > "$target" <<'PY'
+from vllm.v1.attention.backends.mla.compressor_utils import (
+    get_c128a_topk_width,
+    get_compressed_slot_mapping,
+)
+
+
+def active_width(value: int) -> int:
+    return max(value, _C128A_TOPK_ALIGNMENT)
+PY
+    cat > "$helper" <<'PY'
+_C128A_TOPK_ALIGNMENT = 128
+
+
+def get_c128a_topk_width():
+    pass
+
+
+def get_compressed_slot_mapping():
+    pass
+PY
+    cp -a "$patch_fixture" "$unknown_fixture"
+    sed -i 's/_C128A_TOPK_ALIGNMENT = 128/_C128A_TOPK_ALIGNMENT = 64/' \
+        "$unknown_fixture/vllm/v1/attention/backends/mla/compressor_utils.py"
+
+    VLLM_PATCH_B12X_C128A_ALIGNMENT=0 python3 "$patch_script" \
+        "$patch_fixture" > "$output"
+    if grep -Fq '    _C128A_TOPK_ALIGNMENT,' "$target"; then
+        fail "B12X C128A patch changed source while its build guard was disabled"
+    fi
+
+    VLLM_PATCH_B12X_C128A_ALIGNMENT=1 python3 "$patch_script" \
+        "$patch_fixture" >> "$output"
+    if [ "$(grep -Fc '    _C128A_TOPK_ALIGNMENT,' "$target")" -ne 1 ]; then
+        fail "B12X C128A patch did not add exactly one alignment import"
+    fi
+
+    VLLM_PATCH_B12X_C128A_ALIGNMENT=1 python3 "$patch_script" \
+        "$patch_fixture" >> "$output"
+    if ! grep -Fq \
+        'DeepSeek V4 C128A alignment is already defined or imported; skipping' \
+        "$output"; then
+        fail "B12X C128A patch is not idempotent"
+    fi
+
+    if VLLM_PATCH_B12X_C128A_ALIGNMENT=invalid python3 "$patch_script" \
+        "$patch_fixture" >> "$output" 2>&1; then
+        fail "B12X C128A patch accepted an invalid build guard"
+    fi
+
+    if VLLM_PATCH_B12X_C128A_ALIGNMENT=1 python3 "$patch_script" \
+        "$unknown_fixture" >> "$output" 2>&1; then
+        fail "B12X C128A patch accepted an unexpected helper constant"
+    fi
+    if grep -Fq '    _C128A_TOPK_ALIGNMENT,' \
+        "$unknown_fixture/vllm/models/deepseek_v4/sparse_mla.py"; then
+        fail "B12X C128A patch mutated an unknown source shape"
+    fi
+    pass "B12X C128A alignment workaround is guarded and idempotent"
+}
+
+test_dockerfile_preserves_selected_blackwell_target() {
+    local blackwell_block="$TMP_BASE/blackwell-block"
+    local patch_fixture="$TMP_BASE/blackwell-patch"
 
     sed -n '/# CUDA 13 vLLM builds normally collapse/,/# TEMPORARY PATCH: vLLM PR #47914/p' \
-        "$PROJECT_DIR/Dockerfile" > "$sm12x_block"
+        "$PROJECT_DIR/Dockerfile" > "$blackwell_block"
     for expected in \
         'VLLM_PRESERVE_SM12X_TARGET="${VLLM_PRESERVE_SM12X_TARGET}"' \
         '/tmp/vllm-patches/patch_vllm_preserve_sm12x_target.py'; do
-        if ! grep -Fq "$expected" "$sm12x_block"; then
-            fail "Dockerfile SM12x build guard is missing: $expected"
+        if ! grep -Fq "$expected" "$blackwell_block"; then
+            fail "Dockerfile Blackwell build guard is missing: $expected"
         fi
     done
     for expected in \
-        '"7.5;8.0;8.6;8.7;8.9;9.0;10.0;11.0;12.0;12.1"' \
-        'Enabled selected SM12x target preservation for CUDA 13 vLLM build'; do
+        '"7.5;8.0;8.6;8.7;8.9;9.0;10.0;10.3;11.0;12.0;12.1"' \
+        'Enabled selected SM103 and SM12x targets for CUDA 13 vLLM build'; do
         if ! grep -Fq "$expected" \
             "$PROJECT_DIR/docker/patch_vllm_preserve_sm12x_target.py"; then
-            fail "External SM12x patch is missing: $expected"
+            fail "External Blackwell patch is missing: $expected"
         fi
     done
-    pass "B12X preserves the selected SM12x target under CUDA 13"
+
+    mkdir -p "$patch_fixture"
+    printf '%s\n' \
+        'set(CUDA_SUPPORTED_ARCHS "7.5;8.0;8.6;8.7;8.9;9.0;10.0;11.0;12.0")' \
+        > "$patch_fixture/CMakeLists.txt"
+    VLLM_PRESERVE_SM12X_TARGET=1 python3 \
+        "$PROJECT_DIR/docker/patch_vllm_preserve_sm12x_target.py" \
+        "$patch_fixture" > "$patch_fixture/output.log"
+    if ! grep -Fq \
+        'set(CUDA_SUPPORTED_ARCHS "7.5;8.0;8.6;8.7;8.9;9.0;10.0;10.3;11.0;12.0;12.1")' \
+        "$patch_fixture/CMakeLists.txt"; then
+        fail "Blackwell patch did not add both CUDA 13 subarchitectures"
+    fi
+    VLLM_PRESERVE_SM12X_TARGET=1 python3 \
+        "$PROJECT_DIR/docker/patch_vllm_preserve_sm12x_target.py" \
+        "$patch_fixture" >> "$patch_fixture/output.log"
+    if ! grep -Fq \
+        'CUDA 13 Blackwell subarchitecture allow-list already present; skipping' \
+        "$patch_fixture/output.log"; then
+        fail "Blackwell patch is not idempotent"
+    fi
+    pass "B12X preserves selected SM103 and SM12x targets under CUDA 13"
 }
 
 test_custom_torch_versions_are_forwarded() {
@@ -685,8 +783,9 @@ test_local_inference_lab_b12x_requires_torch_212() {
     setup_fixture
     if run_build \
         --vllm-repo https://github.com/local-inference-lab/vllm.git \
-        --vllm-ref dev/spark-fixes-7-14; then
-        fail "local-inference-lab B12X build unexpectedly accepted the default Torch 2.11"
+        --vllm-ref dev/spark-fixes-7-14 \
+        --torch-version 2.11.0; then
+        fail "local-inference-lab B12X build unexpectedly accepted Torch 2.11"
     fi
     assert_log_not_contains '^docker build'
     assert_output_contains 'Error: https://github\.com/local-inference-lab/vllm requires --torch-version 2\.12\.0 or newer for B12X \(got 2\.11\.0\)\.'
@@ -714,7 +813,30 @@ test_dockerfile_uses_configurable_torch_versions() {
        [ "$(grep -Fc 'echo "torchaudio==${PINNED_TORCHAUDIO}"' "$PROJECT_DIR/Dockerfile")" -ne 2 ]; then
         fail "Dockerfile does not preserve the selected Torch-family versions during later installs"
     fi
+    for expected in \
+        'ARG TORCH_VERSION=2.13.0' \
+        'ARG TORCHVISION_VERSION=0.28.0' \
+        'ARG TORCHAUDIO_VERSION=2.11.0'; do
+        if ! grep -Fq "$expected" "$PROJECT_DIR/Dockerfile"; then
+            fail "Dockerfile is missing Torch-family default: $expected"
+        fi
+    done
     pass "Dockerfile uses configurable Torch package versions in build and runner stages"
+}
+
+test_dockerfile_pins_cutlass_dsl_47_everywhere() {
+    for expected in \
+        'ARG CUTLASS_DSL_VERSION=4.7.0' \
+        '"nvidia-cutlass-dsl[cu13]==$CUTLASS_DSL_VERSION"' \
+        'echo "nvidia-cutlass-dsl[cu13]==${CUTLASS_DSL_VERSION}" >> /tmp/wheel-override.txt' \
+        'echo "nvidia-cutlass-dsl[cu13]==${CUTLASS_DSL_VERSION}" >> /tmp/torch-override.txt' \
+        '"$CUTLASS_DSL_VERSION" --expected-count 1 requirements/cuda.txt' \
+        '--expected-count 5 /tmp/b12x-source/pyproject.toml'; do
+        if ! grep -Fq -- "$expected" "$PROJECT_DIR/Dockerfile"; then
+            fail "Dockerfile is missing CUTLASS DSL 4.7 enforcement: $expected"
+        fi
+    done
+    pass "Dockerfile pins CUTLASS DSL 4.7 in regular and B12X builds"
 }
 
 test_dockerfile_uses_profiled_named_wheel_contexts() {
@@ -824,6 +946,31 @@ test_dockerfile_applies_flashinfer_prs_without_merging_branch_history() {
     pass "FlashInfer PRs apply as patches without merging branch history"
 }
 
+test_dockerfile_uses_prepared_python_for_flashinfer_builds() {
+    local flashinfer_builder_block="$TMP_BASE/flashinfer-builder-block"
+
+    sed -n '/FROM base AS flashinfer-builder/,/FROM scratch AS flashinfer-export/p' \
+        "$PROJECT_DIR/Dockerfile" > "$flashinfer_builder_block"
+
+    for expected in \
+        'ARG FLASHINFER_BUILD_PYTHON=/usr/bin/python3' \
+        'ENV UV_PYTHON_DOWNLOADS=never' \
+        'uv pip install --python "$FLASHINFER_BUILD_PYTHON" packaging filelock' \
+        '"$FLASHINFER_BUILD_PYTHON" -c '\''import filelock, packaging, requests, torch, tqdm'\'''; do
+        if ! grep -Fq "$expected" "$flashinfer_builder_block"; then
+            fail "FlashInfer builder does not prepare its selected Python consistently: $expected"
+        fi
+    done
+
+    if [ "$(grep -Fc 'uv build --python "$FLASHINFER_BUILD_PYTHON" --no-build-isolation' "$flashinfer_builder_block")" -ne 3 ]; then
+        fail "FlashInfer builder does not use the prepared Python for all three wheel builds"
+    fi
+    if grep -Fq 'uv build --no-build-isolation' "$flashinfer_builder_block"; then
+        fail "FlashInfer builder still contains a build that can honor upstream .python-version"
+    fi
+    pass "FlashInfer wheel builds use the prepared system Python"
+}
+
 test_dockerfiles_pin_tvm_ffi_regression_version() {
     if [ "$(grep -Fc 'apache-tvm-ffi==0.1.12' "$PROJECT_DIR/Dockerfile")" -ne 2 ] || \
        [ "$(grep -Fc 'apache-tvm-ffi==0.1.12' "$PROJECT_DIR/Dockerfile.mxfp4")" -ne 1 ]; then
@@ -864,8 +1011,8 @@ test_dockerfile_externalizes_vllm_source_patches() {
             fail "Dockerfile does not execute external patch: $patch_name"
         fi
     done
-    if [ "$patch_count" -ne 10 ]; then
-        fail "Expected 10 external vLLM patch scripts, found $patch_count"
+    if [ "$patch_count" -ne 11 ]; then
+        fail "Expected 11 external vLLM patch scripts, found $patch_count"
     fi
     if ! python3 -c '
 from pathlib import Path
@@ -918,19 +1065,22 @@ test_exp_b12x_respects_custom_tag
 test_exp_b12x_rejects_use_wheels
 test_exp_b12x_rejects_preset_overrides
 test_exp_b12x_variable_names_are_generic
-test_exp_b12x_supports_sm120_arches
+test_exp_b12x_preserves_blackwell_arches
 test_exp_b12x_rebuilds_mismatched_cached_flashinfer_arch
 test_exp_b12x_rebuilds_mismatched_cached_vllm_arch
-test_dockerfile_preserves_selected_sm12x_target
+test_b12x_c128a_alignment_patch_is_guarded_and_idempotent
+test_dockerfile_preserves_selected_blackwell_target
 test_custom_torch_versions_are_forwarded
 test_local_inference_lab_b12x_applies_to_any_ref
 test_local_inference_lab_b12x_requires_torch_212
 test_dockerfile_custom_repo_bypasses_shared_cache
 test_dockerfile_uses_configurable_torch_versions
+test_dockerfile_pins_cutlass_dsl_47_everywhere
 test_dockerfile_uses_profiled_named_wheel_contexts
 test_dockerfile_builds_and_verifies_b12x_source
 test_copied_vllm_git_index_is_refreshed_before_patch_apply
 test_dockerfile_applies_flashinfer_prs_without_merging_branch_history
+test_dockerfile_uses_prepared_python_for_flashinfer_builds
 test_dockerfiles_pin_tvm_ffi_regression_version
 test_dockerfile_fetches_vllm_prs_from_upstream
 test_dockerfile_externalizes_vllm_source_patches

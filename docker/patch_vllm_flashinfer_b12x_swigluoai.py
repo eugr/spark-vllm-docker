@@ -148,12 +148,12 @@ def patch_expert(text: str) -> str:
 
     support_check = "            and has_flashinfer_b12x_moe_activation()\n"
     if support_check not in text:
-        old_support = (
+        legacy_support = (
             "    def _supports_activation(activation: MoEActivation) -> bool:\n"
             "        return activation in ("
             "MoEActivation.SILU, MoEActivation.RELU2_NO_MUL)\n"
         )
-        new_support = (
+        patched_legacy_support = (
             "    def _supports_activation(activation: MoEActivation) -> bool:\n"
             "        if activation in ("
             "MoEActivation.SILU, MoEActivation.RELU2_NO_MUL):\n"
@@ -163,9 +163,40 @@ def patch_expert(text: str) -> str:
             + support_check
             + "        )\n"
         )
-        text = replace_once(
-            text, old_support, new_support, "B12x activation support predicate"
+        gelu_support = (
+            "    def _supports_activation(activation: MoEActivation) -> bool:\n"
+            "        return activation in (\n"
+            "            MoEActivation.SILU,\n"
+            "            MoEActivation.GELU_TANH,\n"
+            "            MoEActivation.RELU2_NO_MUL,\n"
+            "        )\n"
         )
+        patched_gelu_support = (
+            "    def _supports_activation(activation: MoEActivation) -> bool:\n"
+            "        if activation in (\n"
+            "            MoEActivation.SILU,\n"
+            "            MoEActivation.GELU_TANH,\n"
+            "            MoEActivation.RELU2_NO_MUL,\n"
+            "        ):\n"
+            "            return True\n"
+            "        return (\n"
+            "            activation == MoEActivation.SWIGLUOAI_UNINTERLEAVE\n"
+            + support_check
+            + "        )\n"
+        )
+        known_support_shapes = (
+            (legacy_support, patched_legacy_support),
+            (gelu_support, patched_gelu_support),
+        )
+        matches = [(old, new) for old, new in known_support_shapes if old in text]
+        match_count = sum(text.count(old) for old, _ in known_support_shapes)
+        if match_count != 1:
+            raise PatchError(
+                "expected one B12x activation support predicate source anchor, "
+                f"found {match_count}; the vLLM source shape has changed"
+            )
+        old_support, new_support = matches[0]
+        text = text.replace(old_support, new_support, 1)
 
     if "        swiglu_kwargs: dict[str, float] = {}\n" not in text:
         wrapper_kwargs = """        swiglu_kwargs: dict[str, float] = {}

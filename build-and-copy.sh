@@ -29,12 +29,12 @@ VLLM_REF="main"
 VLLM_REF_SET=false
 EXP_B12X=false
 EXP_B12X_VLLM_REPO="https://github.com/local-inference-lab/vllm"
-EXP_B12X_VLLM_REF="dev/gilded-gnosis"
+EXP_B12X_VLLM_REF="dev/infernal-invocation"
 EXP_B12X_PACKAGE_REPO="https://github.com/lukealonso/b12x.git"
 EXP_B12X_PACKAGE_REF="master"
-EXP_B12X_TORCH_VERSION="2.12.0"
-EXP_B12X_TORCHVISION_VERSION="0.27.0"
-EXP_B12X_TORCHAUDIO_VERSION="none"
+EXP_B12X_TORCH_VERSION="2.13.0"
+EXP_B12X_TORCHVISION_VERSION="0.28.0"
+EXP_B12X_TORCHAUDIO_VERSION="2.11.0"
 B12X_REPO=""
 B12X_REF=""
 B12X_CACHEBUST=""
@@ -54,13 +54,14 @@ BUILD_JOBS_SET=false
 DEFAULT_GPU_ARCH_LIST="12.1a"
 GPU_ARCH_LIST="$DEFAULT_GPU_ARCH_LIST"
 GPU_ARCH_SET=false
-DEFAULT_TORCH_VERSION="2.11.0"
+DEFAULT_TORCH_VERSION="2.13.0"
 TORCH_VERSION="$DEFAULT_TORCH_VERSION"
 TORCH_VERSION_SET=false
-TORCHVISION_VERSION=""
+TORCHVISION_VERSION="0.28.0"
 TORCHVISION_VERSION_SET=false
-TORCHAUDIO_VERSION=""
+TORCHAUDIO_VERSION="2.11.0"
 TORCHAUDIO_VERSION_SET=false
+CUTLASS_DSL_VERSION="4.7.0"
 NETWORK_ARG=""
 WHEELS_REPO="eugr/spark-vllm-docker"
 FLASHINFER_RELEASE_TAG="prebuilt-flashinfer-current"
@@ -108,6 +109,7 @@ generate_build_metadata() {
     local torchaudio_version="${12}"
     local b12x_repo="${13}"
     local b12x_ref="${14}"
+    local cutlass_dsl_version="${15}"
 
     local base_image
     base_image=$(grep -m1 '^FROM .* AS runner' "$dockerfile" | awk '{print $2}')
@@ -126,6 +128,7 @@ build_args:
   torch_version: "${torch_version}"
   torchvision_version: "${torchvision_version}"
   torchaudio_version: "${torchaudio_version}"
+  cutlass_dsl_version: "${cutlass_dsl_version}"
   b12x_repo: "${b12x_repo}"
   b12x_ref: "${b12x_ref}"
   transformers_5: ${transformers_5}
@@ -524,12 +527,12 @@ usage() {
     echo "  --vllm-repo <url>             : vLLM Git repository (default: '${DEFAULT_VLLM_REPO}'); custom repositories bypass the shared checkout cache"
     echo "  --vllm-ref <ref>              : vLLM commit SHA, branch or tag (default: 'main')"
     echo "  --torch-version <version>     : PyTorch version for build and runner images (default: '${DEFAULT_TORCH_VERSION}')"
-    echo "  --torchvision-version <ver>   : Optional torchvision version (default: resolver-selected for the requested PyTorch version)"
-    echo "  --torchaudio-version <ver>    : Optional torchaudio version; use 'none' to omit it (default: resolver-selected)"
+    echo "  --torchvision-version <ver>   : Optional torchvision version (default: '${TORCHVISION_VERSION}')"
+    echo "  --torchaudio-version <ver>    : Optional torchaudio version; use 'none' to omit it (default: '${TORCHAUDIO_VERSION}')"
     echo "  --flashinfer-ref <ref>        : FlashInfer commit SHA, branch or tag (default: 'main')"
-    echo "  -c, --copy-to <hosts>         : Host(s) to copy image to. Accepts comma or space-delimited lists; matching remote image IDs are skipped."
+    echo "  -c, --copy-to [hosts]         : Copy the image. Omit hosts to use COPY_HOSTS from .env or autodiscovery; matching image IDs are skipped."
     echo "      --copy-to-host            : Alias for --copy-to (backwards compatibility)."
-    echo "      --copy-parallel           : Copy to all hosts in parallel instead of serially."
+    echo "      --copy-parallel           : With -c, copy to all resolved hosts concurrently."
     echo "  -j, --build-jobs <jobs>       : Number of concurrent build jobs (default: ${BUILD_JOBS})"
     echo "  -u, --user <user>             : Username for ssh command (default: \$USER)"
     echo "  --tf5                         : Deprecated compatibility flag; tag defaults to 'vllm-node-tf5' (aliases: --pre-tf, --pre-transformers)"
@@ -938,6 +941,7 @@ if [ "$EXP_MXFP4" = false ]; then
     COMMON_BUILD_FLAGS+=("--build-arg" "TORCH_VERSION=$TORCH_VERSION")
     COMMON_BUILD_FLAGS+=("--build-arg" "TORCHVISION_VERSION=$TORCHVISION_VERSION")
     COMMON_BUILD_FLAGS+=("--build-arg" "TORCHAUDIO_VERSION=$TORCHAUDIO_VERSION")
+    COMMON_BUILD_FLAGS+=("--build-arg" "CUTLASS_DSL_VERSION=$CUTLASS_DSL_VERSION")
 fi
 NCCL_NVCC_GENCODE="$(gpu_arch_to_nccl_gencode "$GPU_ARCH_LIST")"
 COMMON_BUILD_FLAGS+=("--build-arg" "NCCL_NVCC_GENCODE=$NCCL_NVCC_GENCODE")
@@ -982,7 +986,7 @@ if [ "$NO_BUILD" = false ]; then
         MXFP4_FLASHINFER_SHA=$(grep -m1 '^ARG FLASHINFER_SHA=' Dockerfile.mxfp4 | cut -d= -f2)
         generate_build_metadata Dockerfile.mxfp4 "unknown" "$MXFP4_VLLM_SHA" "$MXFP4_FLASHINFER_SHA" \
             "mxfp4-pinned" "false" "true" "" "$MXFP4_VLLM_REPO" "base-image" \
-            "base-image" "base-image" "disabled"
+            "base-image" "base-image" "disabled" "disabled" "base-image"
 
         CMD=("docker" "build" "-t" "$IMAGE_TAG" "${COMMON_BUILD_FLAGS[@]}" "-f" "Dockerfile.mxfp4" ".")
         echo "Building image with command: ${CMD[*]}"
@@ -1138,10 +1142,11 @@ if [ "$NO_BUILD" = false ]; then
             fi
 
             if [ "$EXP_B12X" = true ]; then
-                # Preserve the selected SM12x target. This prevents 12.1a from
-                # being reduced to plain sm_120 without overriding explicit
-                # --gpu-arch 12.0a or 12.0f selections.
+                # Preserve selected Blackwell subarchitectures. This prevents
+                # 10.3a and 12.1a from being reduced to plain sm_100/sm_120
+                # without overriding explicit family-target selections.
                 VLLM_CMD+=("--build-arg" "VLLM_PRESERVE_SM12X_TARGET=1")
+                VLLM_CMD+=("--build-arg" "VLLM_PATCH_B12X_C128A_ALIGNMENT=1")
             fi
 
             VLLM_CMD+=(".")
@@ -1177,7 +1182,7 @@ if [ "$NO_BUILD" = false ]; then
         generate_build_metadata Dockerfile "$VLLM_VERSION" "$VLLM_COMMIT" "$FLASHINFER_COMMIT" \
             "$VLLM_REF" "true" "false" "$VLLM_PRS" "$VLLM_REPO" "$TORCH_VERSION" \
             "${TORCHVISION_VERSION:-resolver-selected}" "${TORCHAUDIO_VERSION:-resolver-selected}" \
-            "${B12X_REPO:-disabled}" "${B12X_REF:-disabled}"
+            "${B12X_REPO:-disabled}" "${B12X_REF:-disabled}" "$CUTLASS_DSL_VERSION"
 
         RUNNER_CMD=("docker" "build"
             "-t" "$IMAGE_TAG"

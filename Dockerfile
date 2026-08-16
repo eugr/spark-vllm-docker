@@ -4,9 +4,10 @@
 ARG BUILD_JOBS=16
 ARG CUDA_IMAGE=nvidia/cuda:13.0.2-devel-ubuntu24.04
 ARG NCCL_NVCC_GENCODE="-gencode=arch=compute_121,code=sm_121"
-ARG TORCH_VERSION=2.11.0
-ARG TORCHVISION_VERSION=""
-ARG TORCHAUDIO_VERSION=""
+ARG TORCH_VERSION=2.13.0
+ARG TORCHVISION_VERSION=0.28.0
+ARG TORCHAUDIO_VERSION=2.11.0
+ARG CUTLASS_DSL_VERSION=4.7.0
 ARG B12X_REPO=""
 ARG B12X_REF=""
 ARG B12X_CACHEBUST=""
@@ -19,6 +20,7 @@ FROM ${CUDA_IMAGE} AS base
 ARG TORCH_VERSION
 ARG TORCHVISION_VERSION
 ARG TORCHAUDIO_VERSION
+ARG CUTLASS_DSL_VERSION
 
 # Build parallemism
 ARG BUILD_JOBS
@@ -74,7 +76,9 @@ RUN --mount=type=cache,id=uv-cache,target=/root/.cache/uv \
      set -- "torch==$TORCH_VERSION" "$TORCHVISION_SPEC" && \
      if [ -n "$TORCHAUDIO_SPEC" ]; then set -- "$@" "$TORCHAUDIO_SPEC"; fi && \
      uv pip install "$@" triton --index-url https://download.pytorch.org/whl/cu130 && \
-     uv pip install nvidia-nvshmem-cu13 "apache-tvm-ffi==0.1.12" filelock pynvml requests tqdm
+     uv pip install nvidia-nvshmem-cu13 \
+        "nvidia-cutlass-dsl[cu13]==$CUTLASS_DSL_VERSION" \
+        "apache-tvm-ffi==0.1.12" filelock pynvml requests tqdm
 
 # Configure Ccache for CUDA/C++
 ENV PATH=/usr/lib/ccache:$PATH
@@ -114,6 +118,12 @@ ARG FLASHINFER_CUDA_ARCH_LIST="12.1a"
 ENV FLASHINFER_CUDA_ARCH_LIST=${FLASHINFER_CUDA_ARCH_LIST}
 WORKDIR $VLLM_BASE_DIR
 ARG FLASHINFER_REF=main
+ARG FLASHINFER_BUILD_PYTHON=/usr/bin/python3
+
+# FlashInfer's source checkout may carry a .python-version. Keep no-isolation
+# builds on the prepared system interpreter instead of letting upstream source
+# select a separate uv-managed Python without the installed build dependencies.
+ENV UV_PYTHON_DOWNLOADS=never
 
 # --- CACHE BUSTER ---
 # Change this argument to force a re-download of FlashInfer
@@ -121,7 +131,7 @@ ARG CACHEBUST_FLASHINFER=1
 
 # Additional deps
 RUN --mount=type=cache,id=uv-cache,target=/root/.cache/uv \
-     uv pip install packaging
+     uv pip install --python "$FLASHINFER_BUILD_PYTHON" packaging filelock
 
 # Smart Git Clone (Fetch changes instead of full re-clone)
 RUN --mount=type=cache,id=repo-cache,target=/repo-cache \
@@ -222,12 +232,13 @@ RUN --mount=type=cache,id=uv-cache,target=/root/.cache/uv \
     patch -p1 < flashinfer_cache.patch && \
     # flashinfer-python
     sed -i -e 's/license = "Apache-2.0"/license = { text = "Apache-2.0" }/' -e '/license-files/d' pyproject.toml && \
-    uv build --no-build-isolation --wheel . --out-dir=/workspace/wheels -v && \
+    "$FLASHINFER_BUILD_PYTHON" -c 'import filelock, packaging, requests, torch, tqdm' && \
+    uv build --python "$FLASHINFER_BUILD_PYTHON" --no-build-isolation --wheel . --out-dir=/workspace/wheels -v && \
     # flashinfer-cubin
-    cd flashinfer-cubin && uv build --no-build-isolation --wheel . --out-dir=/workspace/wheels -v && \
+    cd flashinfer-cubin && uv build --python "$FLASHINFER_BUILD_PYTHON" --no-build-isolation --wheel . --out-dir=/workspace/wheels -v && \
     # flashinfer-jit-cache
     cd ../flashinfer-jit-cache && \
-    uv build --no-build-isolation --wheel . --out-dir=/workspace/wheels -v && \
+    uv build --python "$FLASHINFER_BUILD_PYTHON" --no-build-isolation --wheel . --out-dir=/workspace/wheels -v && \
     # dump git ref and target architecture in the wheels dir
     cd .. && \
     git rev-parse HEAD > /workspace/wheels/.flashinfer-commit && \
@@ -244,6 +255,7 @@ COPY --from=flashinfer-builder /workspace/wheels /
 # =========================================================
 FROM base AS vllm-builder
 ARG RUSTUP_TOOLCHAIN=stable
+ARG CUTLASS_DSL_VERSION
 ENV RUSTUP_HOME=/opt/rustup
 ENV CARGO_HOME=/opt/cargo
 ENV PATH=/opt/cargo/bin:$PATH
@@ -346,6 +358,7 @@ ARG VLLM_PRESET_PRS=""
 ARG VLLM_APPLY_PRESET_PRS=""
 ARG VLLM_PRS=""
 ARG VLLM_PRESERVE_SM12X_TARGET=0
+ARG VLLM_PATCH_B12X_C128A_ALIGNMENT=0
 
 # PR refs include the branch history they were developed on. Use upstream main
 # only to identify each PR's patch range, then apply that patch to VLLM_REF.
@@ -458,7 +471,15 @@ RUN set -eux; \
 # FlashInfer B12x backend without carrying the PR's conflicting tests/docs.
 # It is also safe for older refs (backend absent) and refs that already contain
 # the fix (idempotent); unknown partial source shapes fail the build.
-COPY docker/patch_vllm_*.py /tmp/vllm-patches/
+COPY docker/patch_vllm_*.py docker/pin_cutlass_dsl.py /tmp/vllm-patches/
+
+# TEMPORARY PATCH: local-inference-lab/vllm commit ad848fc41 added a dynamic
+# DeepSeek V4 C128A top-k width but omitted the alignment constant import.
+# Keep this B12X-only and source-aware so it skips refs where the bug is absent
+# or already fixed. Remove after the oldest supported B12X ref contains a fix.
+RUN VLLM_PATCH_B12X_C128A_ALIGNMENT="${VLLM_PATCH_B12X_C128A_ALIGNMENT}" \
+    python3 /tmp/vllm-patches/patch_vllm_b12x_c128a_topk_alignment.py .
+
 RUN python3 /tmp/vllm-patches/patch_vllm_flashinfer_b12x_swigluoai.py .
 
 # TEMPORARY PATCH: vLLM PR #49408 / commit d6dbdb9 misplaced the XPU-only
@@ -468,11 +489,11 @@ RUN python3 /tmp/vllm-patches/patch_vllm_flashinfer_b12x_swigluoai.py .
 # also handles rebases, cherry-picks, and builds that already include the fix.
 RUN python3 /tmp/vllm-patches/patch_vllm_topk_softplus_sqrt_control_flow.py .
 
-# CUDA 13 vLLM builds normally collapse a requested 12.1a target to the
-# generic 12.0 entry. Adding 12.1 to the supported set preserves the selected
-# SM12x target through CMake's intersection logic: 12.1a remains 12.1a, while
-# explicitly selected 12.0a and 12.0f targets remain unchanged. Keep this
-# opt-in so the standard upstream build retains its own architecture policy.
+# CUDA 13 vLLM builds normally collapse requested subarchitectures to generic
+# family entries: 10.3a becomes 10.0 and 12.1a becomes 12.0. Add 10.3 and 12.1
+# to the supported set so CMake preserves the selected target and its a/f
+# suffix. Keep this opt-in so the standard upstream build retains its own
+# architecture policy.
 RUN VLLM_PRESERVE_SM12X_TARGET="${VLLM_PRESERVE_SM12X_TARGET}" \
     python3 /tmp/vllm-patches/patch_vllm_preserve_sm12x_target.py .
 
@@ -551,6 +572,8 @@ RUN python3 /tmp/vllm-patches/patch_vllm_spark_kv_cache_cleanup.py .
 
 # Prepare build requirements
 RUN --mount=type=cache,id=uv-cache,target=/root/.cache/uv \
+    python3 /tmp/vllm-patches/pin_cutlass_dsl.py \
+        "$CUTLASS_DSL_VERSION" --expected-count 1 requirements/cuda.txt && \
     python3 use_existing_torch.py && \
     sed -i "/flashinfer/d" requirements/cuda.txt && \
     sed -i '/^triton\b/d' requirements/test/cuda.txt && \
@@ -598,6 +621,7 @@ FROM ${CUDA_IMAGE} AS runner
 ARG TORCH_VERSION
 ARG TORCHVISION_VERSION
 ARG TORCHAUDIO_VERSION
+ARG CUTLASS_DSL_VERSION
 ARG B12X_REPO
 ARG B12X_REF
 ARG B12X_CACHEBUST
@@ -660,13 +684,17 @@ RUN --mount=type=cache,id=uv-cache,target=/root/.cache/uv \
      set -- "torch==$TORCH_VERSION" "$TORCHVISION_SPEC" && \
      if [ -n "$TORCHAUDIO_SPEC" ]; then set -- "$@" "$TORCHAUDIO_SPEC"; fi && \
      uv pip install "$@" triton --index-url https://download.pytorch.org/whl/cu130 && \
-     uv pip install nvidia-nvshmem-cu13 "apache-tvm-ffi==0.1.12"
+     uv pip install nvidia-nvshmem-cu13 \
+        "nvidia-cutlass-dsl[cu13]==$CUTLASS_DSL_VERSION" \
+        "apache-tvm-ffi==0.1.12"
 
 # Install the shared/selected FlashInfer and vLLM profiles from independent
 # named contexts (bind-mounted without adding the wheel files to an image layer).
 # PRE_TRANSFORMERS=1 is retained for manual legacy builds; build-and-copy.sh no longer sets it for --tf5.
 # FastAPI 0.137.0 adds _IncludedRouter entries that currently break
 # prometheus-fastapi-instrumentator route name lookup.
+# quack-kernels 0.6.4 still declares CUTLASS DSL 4.6.2, so this solve
+# deliberately overrides that transitive constraint with the image-wide pin.
 RUN --mount=type=bind,from=flashinfer_wheels,target=/workspace/flashinfer-wheels \
     --mount=type=bind,from=vllm_wheels,target=/workspace/vllm-wheels \
     --mount=type=cache,id=uv-cache,target=/root/.cache/uv \
@@ -676,6 +704,7 @@ RUN --mount=type=bind,from=flashinfer_wheels,target=/workspace/flashinfer-wheels
     echo "torch==${PINNED_TORCH}" > /tmp/wheel-override.txt && \
     echo "torchvision==${PINNED_TORCHVISION}" >> /tmp/wheel-override.txt && \
     if [ -n "$PINNED_TORCHAUDIO" ]; then echo "torchaudio==${PINNED_TORCHAUDIO}" >> /tmp/wheel-override.txt; fi && \
+    echo "nvidia-cutlass-dsl[cu13]==${CUTLASS_DSL_VERSION}" >> /tmp/wheel-override.txt && \
     echo "fastapi[standard]>=0.115.0,<0.137.0" >> /tmp/wheel-override.txt && \
     if [ "$PRE_TRANSFORMERS" = "1" ]; then \
         echo "transformers>=5.0.0" >> /tmp/wheel-override.txt; \
@@ -694,8 +723,8 @@ ENV PATH=$VLLM_BASE_DIR:$PATH
 
 
 # Final extra deps
-# Pin torch via --override so transitive deps (e.g. instanttensor) can't trigger
-# a re-resolve that swaps the CUDA-built torch for PyPI's CPU wheel.
+# Pin torch and CUTLASS DSL via --override so transitive dependencies cannot
+# trigger an upgrade/downgrade or swap CUDA-built torch for PyPI's CPU wheel.
 RUN --mount=type=cache,id=uv-cache,target=/root/.cache/uv \
     PINNED_TORCH=$(python3 -c "import torch; print(torch.__version__)") && \
     PINNED_TORCHVISION=$(python3 -c "import importlib.metadata as m; print(m.version('torchvision'))") && \
@@ -703,22 +732,26 @@ RUN --mount=type=cache,id=uv-cache,target=/root/.cache/uv \
     echo "torch==${PINNED_TORCH}" > /tmp/torch-override.txt && \
     echo "torchvision==${PINNED_TORCHVISION}" >> /tmp/torch-override.txt && \
     if [ -n "$PINNED_TORCHAUDIO" ]; then echo "torchaudio==${PINNED_TORCHAUDIO}" >> /tmp/torch-override.txt; fi && \
+    echo "nvidia-cutlass-dsl[cu13]==${CUTLASS_DSL_VERSION}" >> /tmp/torch-override.txt && \
     echo "fastapi[standard]>=0.115.0,<0.137.0" >> /tmp/torch-override.txt && \
     uv pip install ray[default] fastsafetensors instanttensor \
         --override /tmp/torch-override.txt
 
 # The local-inference-lab vLLM fork consumes the external B12X kernel package
-# at runtime. Keep this opt-in so ordinary vLLM/Torch 2.11 images do not pull a
-# package that requires Torch 2.12. Build B12X from its source repository but
+# at runtime. Keep this opt-in so ordinary vLLM images do not pull a
+# package that requires Torch 2.12+. Build B12X from its source repository but
 # install it without dependencies: vLLM already provides the runtime packages
-# and pins API-sensitive components such as nvidia-cutlass-dsl. B12X kernels
-# remain JIT-compiled on first use; building its Python wheel here does not
-# compile the CUDA kernels.
+# and this image deliberately advances nvidia-cutlass-dsl to 4.7.0 for both
+# regular and B12X builds. B12X kernels remain JIT-compiled on first use;
+# building its Python wheel here does not compile the CUDA kernels.
+COPY docker/pin_cutlass_dsl.py /tmp/pin_cutlass_dsl.py
 RUN --mount=type=cache,id=uv-cache,target=/root/.cache/uv \
     if [ -n "$B12X_REPO" ]; then \
         echo "Refreshing B12X source (cache key: $B12X_CACHEBUST)" && \
         git clone --depth 1 --branch "$B12X_REF" "$B12X_REPO" /tmp/b12x-source && \
         B12X_COMMIT=$(git -C /tmp/b12x-source rev-parse HEAD) && \
+        python3 /tmp/pin_cutlass_dsl.py "$CUTLASS_DSL_VERSION" \
+            --expected-count 5 /tmp/b12x-source/pyproject.toml && \
         uv pip install --reinstall --no-deps /tmp/b12x-source && \
         printf '%s\n' "$B12X_COMMIT" > /workspace/b12x-source-commit && \
         python3 -c "import importlib.metadata as m, sys; import b12x; print('Verified B12X', m.version('b12x'), 'from source commit', sys.argv[1], 'with CUTLASS DSL', m.version('nvidia-cutlass-dsl'))" "$B12X_COMMIT" && \
