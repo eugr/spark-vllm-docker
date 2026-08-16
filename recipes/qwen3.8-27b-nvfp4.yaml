@@ -1,0 +1,46 @@
+# Recipe: Qwen3.8-27B-NVFP4
+# Unsloth's mixed-precision NVFP4 quant of Qwen/Qwen3.8-27B.
+# A single DGX Spark has enough unified memory for the native 262K context.
+
+recipe_version: "1"
+name: Qwen3.8-27B-NVFP4
+description: vLLM serving unsloth/Qwen3.8-27B-NVFP4 on a single DGX Spark
+
+# Qwen's upstream checkpoint is BF16; use the pre-quantized NVFP4 checkpoint.
+model: unsloth/Qwen3.8-27B-NVFP4
+
+container: vllm-node
+
+# This recipe targets one GB10. Multi-node tensor parallelism is unnecessary
+# for a 27B NVFP4 checkpoint and is not covered by this recipe.
+cluster_only: false
+solo_only: true
+
+defaults:
+  port: 8000
+  host: 0.0.0.0
+  tensor_parallel: 1
+  gpu_memory_utilization: 0.5
+  max_model_len: 262144
+  max_num_seqs: 4
+  max_num_batched_tokens: 8192
+
+env: {}
+
+command: |
+  vllm serve unsloth/Qwen3.8-27B-NVFP4 \
+    --host {host} \
+    --port {port} \
+    --tensor-parallel-size {tensor_parallel} \
+    --gpu-memory-utilization {gpu_memory_utilization} \
+    --max-model-len {max_model_len} \
+    --max-num-seqs {max_num_seqs} \
+    --max-num-batched-tokens {max_num_batched_tokens} \
+    --kv-cache-dtype fp8 \
+    --attention-backend flashinfer \
+    --load-format fastsafetensors \
+    --enable-chunked-prefill \
+    --enable-prefix-caching \
+    --enable-auto-tool-choice \
+    --tool-call-parser qwen3_xml \
+    --reasoning-parser qwen3
