@@ -168,6 +168,18 @@ For periodic maintenance, I recommend using a filter: `docker builder prune --fi
 
 ## CHANGELOG
 
+### 2026-08-16
+
+#### Qwen3.8-27B NVFP4 single-Spark recipe
+
+Added `recipes/qwen3.8-27b-nvfp4.yaml` for serving
+`unsloth/Qwen3.8-27B-NVFP4` on one DGX Spark. The recipe uses an FP8 KV
+cache and supports the model's native 262,144-token context window.
+
+```bash
+./run-recipe.sh qwen3.8-27b-nvfp4 --solo --setup
+```
+
 ### 2026-08-14
 
 #### B12X source branch update
