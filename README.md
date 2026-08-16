@@ -2052,8 +2052,9 @@ InstantTensor is available with `--load-format instanttensor`. Several large-mod
 
 I recommend using [llama-benchy](https://github.com/eugr/llama-benchy) - a new benchmarking tool that delivers results in the same format as llama-bench from llama.cpp suite.
 
-For a Prometheus and Grafana web dashboard, including speculative decoding and
-MTP metrics, see [Visualizing vLLM metrics](docs/METRICS.md).
+For the ready-to-run Prometheus and Grafana monitoring stack, including
+speculative decoding and MTP panels, see
+[Visualizing vLLM metrics](docs/METRICS.md).
 
 ## 10\. Downloading Models
 

@@ -5,8 +5,15 @@ vLLM exposes Prometheus metrics from the OpenAI-compatible server at
 vLLM container, providing a web UI for request latency, throughput, KV-cache
 usage, and speculative-decoding performance.
 
-This example assumes vLLM is listening on port `8000` on the Docker host.
-Confirm the endpoint first:
+The repository includes a ready-to-run monitoring stack:
+
+- `docker-compose.metrics.yaml` runs Prometheus and Grafana with persistent
+  named volumes.
+- `prometheus.yaml` scrapes the vLLM server from the Docker host every five
+  seconds.
+
+The default configuration assumes vLLM is listening on port `8000` on the
+Docker host. Confirm the endpoint first:
 
 ```bash
 curl http://127.0.0.1:8000/metrics
@@ -14,53 +21,18 @@ curl http://127.0.0.1:8000/metrics
 
 ## Start Prometheus and Grafana
 
-Create `prometheus.yaml`:
-
-```yaml
-global:
-  scrape_interval: 5s
-
-scrape_configs:
-  - job_name: vllm
-    static_configs:
-      - targets:
-          - host.docker.internal:8000
-```
-
-Create `docker-compose.metrics.yaml` in the same directory:
-
-```yaml
-services:
-  prometheus:
-    image: prom/prometheus:latest
-    restart: unless-stopped
-    extra_hosts:
-      - host.docker.internal:host-gateway
-    ports:
-      - "9090:9090"
-    volumes:
-      - ./prometheus.yaml:/etc/prometheus/prometheus.yml:ro
-      - prometheus-data:/prometheus
-
-  grafana:
-    image: grafana/grafana:latest
-    restart: unless-stopped
-    depends_on:
-      - prometheus
-    ports:
-      - "3000:3000"
-    volumes:
-      - grafana-data:/var/lib/grafana
-
-volumes:
-  prometheus-data:
-  grafana-data:
-```
-
-Start both services:
+From the repository root, start both services:
 
 ```bash
 docker compose -f docker-compose.metrics.yaml up -d
+```
+
+If vLLM uses a different host port, update the target in `prometheus.yaml`
+before starting the stack. You can inspect service state and logs with:
+
+```bash
+docker compose -f docker-compose.metrics.yaml ps
+docker compose -f docker-compose.metrics.yaml logs prometheus grafana
 ```
 
 Open the services in a browser, replacing `<spark-ip>` with the LAN address
