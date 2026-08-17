@@ -47,9 +47,12 @@ def _nvml_mem_get_info(device_id: int) -> tuple[int, int]:
     pynvml.nvmlInit()
     try:
         try:
-            physical_device_id = current_platform.device_id_to_physical_device_id(
-                device_id
+            map_visible_device = getattr(
+                current_platform,
+                "visible_device_id_to_physical_device_id",
+                current_platform.device_id_to_physical_device_id,
             )
+            physical_device_id = map_visible_device(device_id)
         except Exception:
             physical_device_id = device_id
         handle = pynvml.nvmlDeviceGetHandleByIndex(physical_device_id)
@@ -71,16 +74,18 @@ def cuda_mem_get_info(device: torch.types.Device | None = None) -> tuple[int, in
     else:
         resolved_device = torch.device(device)
 
-    try:
-        cuda_free_memory, cuda_total_memory = current_platform.mem_get_info(
-            resolved_device
-        )
-    except TypeError:
-        cuda_free_memory, cuda_total_memory = current_platform.mem_get_info()
-    except Exception:
-        cuda_free_memory, cuda_total_memory = torch.accelerator.get_memory_info(
-            resolved_device
-        )
+    get_memory_info = getattr(
+        getattr(torch, "accelerator", None), "get_memory_info", None
+    )
+    if get_memory_info is not None:
+        cuda_free_memory, cuda_total_memory = get_memory_info(resolved_device)
+    else:
+        try:
+            cuda_free_memory, cuda_total_memory = current_platform.mem_get_info(
+                resolved_device
+            )
+        except TypeError:
+            cuda_free_memory, cuda_total_memory = current_platform.mem_get_info()
     if not in_wsl():
         return cuda_free_memory, cuda_total_memory
 
@@ -96,10 +101,7 @@ def cuda_mem_get_info(device: torch.types.Device | None = None) -> tuple[int, in
 '''
 MEMORY_MEASURE_BLOCK = '''        device_id = _device_index(device)
         is_wsl = in_wsl()
-        if is_wsl:
-            cuda_free_memory, cuda_total_memory = cuda_mem_get_info(device)
-        else:
-            cuda_free_memory, cuda_total_memory = current_platform.mem_get_info(device)
+        cuda_free_memory, cuda_total_memory = cuda_mem_get_info(device)
         self.free_memory = cuda_free_memory
         self.total_memory = cuda_total_memory
 '''
@@ -114,26 +116,27 @@ def ensure_import(text: str, import_line: str, path: Path) -> tuple[str, bool]:
     if import_line in text:
         return text, False
 
-    lines = text.splitlines(keepends=True)
-    insert_at = None
-    paren_depth = 0
-    for i, line in enumerate(lines):
-        stripped = line.strip()
-        if paren_depth > 0:
-            paren_depth += line.count("(") - line.count(")")
-            insert_at = i + 1
-            continue
-        if stripped.startswith(("import ", "from ")):
-            insert_at = i + 1
-            paren_depth += line.count("(") - line.count(")")
-            continue
-        if insert_at is not None and not stripped:
-            break
-
-    if insert_at is None:
+    ast_mod = __import__("ast")
+    tree = ast_mod.parse(text)
+    import_nodes = [
+        node
+        for node in tree.body
+        if isinstance(node, (ast_mod.Import, ast_mod.ImportFrom))
+    ]
+    if not import_nodes:
         print(f"[uma-fix] Could not find import block in {path}.", file=sys.stderr)
         raise SystemExit(1)
 
+    vllm_imports = [
+        node
+        for node in import_nodes
+        if isinstance(node, ast_mod.ImportFrom)
+        and node.module is not None
+        and (node.module == "vllm" or node.module.startswith("vllm."))
+    ]
+    anchor = vllm_imports[-1] if vllm_imports else import_nodes[-1]
+    lines = text.splitlines(keepends=True)
+    insert_at = anchor.end_lineno
     lines.insert(insert_at, import_line)
     return "".join(lines), True
 
@@ -280,7 +283,14 @@ def patch_mem_utils() -> None:
         raise SystemExit(1)
 
     if uma_if is not None:
-        header_end = uma_if.body[0].lineno - 1 if uma_if.body else uma_if.lineno
+        header_end = uma_if.lineno
+        depth = 0
+        while header_end <= len(lines):
+            header = lines[header_end - 1]
+            depth += header.count("(") - header.count(")")
+            if depth == 0 and header.rstrip().endswith(":"):
+                break
+            header_end += 1
         replacements.append((uma_if.lineno - 1, header_end, "        if not is_wsl and current_platform.is_integrated_gpu(device_id):\n"))
     elif "if not is_wsl and current_platform.is_integrated_gpu(device_id):" not in text:
         print("[uma-fix] MemorySnapshot UMA condition was not found.", file=sys.stderr)
@@ -340,28 +350,55 @@ def patch_file(relative_path: str, replacements: tuple[tuple[str, str], ...]) ->
 patch_mem_utils()
 patch_file(
     "vllm/model_executor/models/gemma4_mm.py",
-    ((r"current_platform\.mem_get_info\(\)", "cuda_mem_get_info()"),),
+    (
+        (
+            r"(?:current_platform\.mem_get_info|torch\.accelerator\.get_memory_info)\(\s*\)",
+            "cuda_mem_get_info()",
+        ),
+    ),
 )
 patch_file(
     "vllm/v1/worker/gpu/model_runner.py",
-    ((r"torch\.cuda\.mem_get_info\(\s*\)\[0\]", "cuda_mem_get_info(self.device)[0]"),),
+    (
+        (
+            r"(?:torch\.cuda\.mem_get_info|torch\.accelerator\.get_memory_info)\(\s*\)\[0\]",
+            "cuda_mem_get_info(self.device)[0]",
+        ),
+    ),
 )
 patch_file(
     "vllm/v1/worker/gpu/spec_decode/eagle/utils.py",
     (
-        (r"torch\.cuda\.mem_get_info\(\s*w\.device\s*\)\[0\]", "cuda_mem_get_info(w.device)[0]"),
-        (r"torch\.cuda\.mem_get_info\(\s*device\s*=\s*w\.device\s*\)\[0\]", "cuda_mem_get_info(w.device)[0]"),
+        (
+            r"(?:torch\.cuda\.mem_get_info|torch\.accelerator\.get_memory_info)\(\s*w\.device\s*\)\[0\]",
+            "cuda_mem_get_info(w.device)[0]",
+        ),
+        (
+            r"(?:torch\.cuda\.mem_get_info|torch\.accelerator\.get_memory_info)\(\s*device\s*=\s*w\.device\s*\)\[0\]",
+            "cuda_mem_get_info(w.device)[0]",
+        ),
     ),
 )
 patch_file(
     "vllm/v1/worker/gpu_model_runner.py",
-    ((r"torch\.cuda\.mem_get_info\(\s*\)\[0\]", "cuda_mem_get_info(self.device)[0]"),),
+    (
+        (
+            r"(?:torch\.cuda\.mem_get_info|torch\.accelerator\.get_memory_info)\(\s*\)\[0\]",
+            "cuda_mem_get_info(self.device)[0]",
+        ),
+    ),
 )
 patch_file(
     "vllm/v1/worker/gpu_worker.py",
     (
-        (r"torch\.cuda\.mem_get_info\(\s*\)\[0\]", "cuda_mem_get_info(self.device)[0]"),
-        (r"torch\.cuda\.mem_get_info\(\s*\)", "cuda_mem_get_info(self.device)"),
+        (
+            r"(?:torch\.cuda\.mem_get_info|torch\.accelerator\.get_memory_info)\(\s*\)\[0\]",
+            "cuda_mem_get_info(self.device)[0]",
+        ),
+        (
+            r"(?:torch\.cuda\.mem_get_info|torch\.accelerator\.get_memory_info)\(\s*\)",
+            "cuda_mem_get_info(self.device)",
+        ),
     ),
 )
 PY

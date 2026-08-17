@@ -7,6 +7,7 @@ on:
       - 'run-recipe.py'
       - 'run-recipe.sh'
       - 'launch-cluster.sh'
+      - 'mods/uma-fix/**'
       - 'recipes/**'
       - 'tests/**'
       - '.github/workflows/test-recipes.yml'
@@ -15,6 +16,7 @@ on:
       - 'run-recipe.py'
       - 'run-recipe.sh'
       - 'launch-cluster.sh'
+      - 'mods/uma-fix/**'
       - 'recipes/**'
       - 'tests/**'
       - '.github/workflows/test-recipes.yml'
@@ -50,6 +52,9 @@ jobs:
       run: |
         ./tests/test_recipes.sh -v
         ./tests/test_launch_cluster_image_sync.sh
+
+    - name: Run uma-fix compatibility test
+      run: python tests/test_uma_fix_mod.py -v
     
     - name: Verify all recipes with dry-run
       run: |
