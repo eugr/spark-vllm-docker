@@ -12,6 +12,5 @@ vllm serve Salyut1/GLM-4.7-NVFP4 \
     -tp 2 \
     --gpu-memory-utilization 0.88 \
     --max-model-len 32000 \
-    --distributed-executor-backend ray \
     --host 0.0.0.0 \
     --port 8000

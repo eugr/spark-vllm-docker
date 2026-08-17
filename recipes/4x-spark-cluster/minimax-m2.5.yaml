@@ -39,7 +39,7 @@ command: |
       -tp {tensor_parallel} \
       --distributed-executor-backend ray \
       --max-model-len {max_model_len} \
-      --load-format fastsafetensors \
+      --load-format instanttensor \
       --enable-auto-tool-choice \
       --tool-call-parser minimax_m2 \
       --reasoning-parser minimax_m2_append_think

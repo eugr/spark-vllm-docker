@@ -37,7 +37,7 @@ command: |
     --gpu-memory-utilization {gpu_memory_utilization} \
     --port {port} \
     --host {host} \
-    --load-format fastsafetensors \
+    --load-format instanttensor \
     --enable-prefix-caching \
     --enable-auto-tool-choice \
     --tool-call-parser qwen3_coder \

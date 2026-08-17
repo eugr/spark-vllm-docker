@@ -1,0 +1,45 @@
+# Recipe: NVIDIA Nemotron 3.5 Lightning 30B-A3B NVFP4
+# Runs with TP=1 on a solo DGX Spark and defaults to TP=2 for a cluster.
+
+recipe_version: "1"
+name: NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4
+description: vLLM serving NVIDIA Nemotron 3.5 Lightning with the DSpark speculative draft model
+
+model: nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4
+container: vllm-node
+
+cluster_only: false
+solo_only: false
+
+defaults:
+  port: 8000
+  host: 0.0.0.0
+  tensor_parallel: 2
+  gpu_memory_utilization: 0.7
+  max_model_len: 1048576
+  max_num_batched_tokens: 16384
+  num_speculative_tokens: 7
+
+command: |
+  vllm serve nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4 \
+    --host {host} \
+    --port {port} \
+    --moe-backend marlin \
+    --kv-cache-dtype fp8 \
+    --max-model-len {max_model_len} \
+    --max-num-batched-tokens {max_num_batched_tokens} \
+    --speculative_config.method dspark \
+    --speculative_config.model nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4-DSpark \
+    --speculative_config.num_speculative_tokens {num_speculative_tokens} \
+    --mamba-backend flashinfer \
+    --mamba-ssm-cache-dtype float16 \
+    --enable-mamba-cache-stochastic-rounding \
+    --mamba-cache-philox-rounds 5 \
+    --enable-prefix-caching \
+    --mamba-cache-mode align \
+    --gpu-memory-utilization {gpu_memory_utilization} \
+    --reasoning-parser nemotron_v3 \
+    --enable-auto-tool-choice \
+    --tool-call-parser qwen3_xml \
+    --load-format instanttensor \
+    -tp {tensor_parallel}
