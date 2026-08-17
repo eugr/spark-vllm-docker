@@ -152,7 +152,16 @@ def save_document(path: Path, document: dict[str, Any]) -> None:
 
 def aggregate_task_results(task_results: list[dict[str, Any]]) -> dict[str, Any]:
     runs = [run for task in task_results for run in task["runs"]]
-    rates = [float(run["decode_tokens_per_second"]) for run in runs]
+    rates = [
+        float(run["decode_tokens_per_second"])
+        for run in runs
+        if run.get("decode_tokens_per_second") is not None
+    ]
+    if not rates:
+        raise CORE.BenchmarkError(
+            "No decode rate could be calculated. Use at least two output tokens; "
+            "for fixed-length comparisons, leave --ignore-eos enabled."
+        )
     ttfts = [float(run["ttft_seconds"]) for run in runs]
     totals = [float(run["total_seconds"]) for run in runs]
     return {

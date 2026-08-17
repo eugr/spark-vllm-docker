@@ -55,6 +55,51 @@ class AggregateTests(unittest.TestCase):
         self.assertTrue(summary["outputs_stable_within_config"])
         self.assertEqual(summary["response_hashes"], {"python": "a", "rust": "b"})
 
+    def test_skips_runs_without_a_decode_rate(self):
+        runs = [
+            {
+                "decode_tokens_per_second": rate,
+                "ttft_seconds": 0.2,
+                "total_seconds": 26.0,
+                "completion_tokens": 512,
+                "response_sha256": "a",
+            }
+            for rate in (20.0, 18.0, 19.0, None)
+        ]
+        task_results = [
+            {"name": "python", "runs": runs, "summary": CODE.CORE.summarize_runs(runs)}
+        ]
+
+        summary = CODE.aggregate_task_results(task_results)
+
+        self.assertEqual(summary["samples"], 4)
+        self.assertEqual(summary["median_decode_tokens_per_second"], 19.0)
+        self.assertTrue(summary["outputs_stable_within_config"])
+
+    def test_raises_when_no_decode_rate_can_be_calculated(self):
+        runs = [
+            {
+                "decode_tokens_per_second": None,
+                "ttft_seconds": 0.2,
+                "total_seconds": 26.0,
+                "completion_tokens": 512,
+                "response_sha256": "a",
+            }
+        ]
+        task_results = [
+            {
+                "name": "python",
+                "runs": runs,
+                "summary": {
+                    "outputs_stable_within_config": True,
+                    "response_sha256": "a",
+                },
+            }
+        ]
+
+        with self.assertRaises(CODE.CORE.BenchmarkError):
+            CODE.aggregate_task_results(task_results)
+
 
 if __name__ == "__main__":
     unittest.main()
