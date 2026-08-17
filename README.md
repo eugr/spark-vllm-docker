@@ -174,7 +174,10 @@ For periodic maintenance, I recommend using a filter: `docker builder prune --fi
 
 Added `recipes/qwen3.8-27b-nvfp4.yaml` for serving
 `unsloth/Qwen3.8-27B-NVFP4` on one DGX Spark. The recipe uses an FP8 KV
-cache and supports the model's native 262,144-token context window.
+cache, enables the checkpoint's native MTP head with three speculative tokens,
+and supports the model's native 262,144-token context window. MTP requires a
+vLLM build containing the Qwen GDN speculative-decoding fixes merged on
+2026-08-14; refresh or rebuild older runner images before launching this recipe.
 
 ```bash
 ./run-recipe.sh qwen3.8-27b-nvfp4 --solo --setup
