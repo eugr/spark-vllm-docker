@@ -108,8 +108,10 @@ recording rules from the `vllm-spec-decode` group in `prometheus-rules.yaml`:
 - **Acceptance rate by draft position** — per-position quality of the MTP
   cascade (`vllm:spec_decode_acceptance_rate_by_pos:rate1m`)
 
-The rules evaluate to no value while vLLM is idle, so the panels show **No
-value** until requests are being generated; this avoids a misleading 100%
+The stat panels query the recorded metrics as instant values. The rules
+evaluate to no value once traffic stops, so the stats show **No value**
+shortly after the last request, when the last recorded sample leaves
+Prometheus' five-minute lookback window; this avoids a misleading 100%
 acceptance rate at idle.
 
 If you add or replace dashboard files on disk, restart the Grafana container

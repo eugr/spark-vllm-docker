@@ -32,7 +32,7 @@
       "id": 1,
       "options": {
         "colorMode": "value",
-        "graphMode": "area",
+        "graphMode": "none",
         "justifyMode": "auto",
         "orientation": "auto",
         "reduceOptions": {
@@ -52,7 +52,7 @@
           "editorMode": "code",
           "expr": "vllm:spec_decode_acceptance_rate:rate1m",
           "legendFormat": "Accepted",
-          "range": true,
+          "range": false,
           "refId": "A"
         }
       ],
@@ -81,7 +81,7 @@
       "id": 2,
       "options": {
         "colorMode": "value",
-        "graphMode": "area",
+        "graphMode": "none",
         "justifyMode": "auto",
         "orientation": "auto",
         "reduceOptions": {
@@ -101,7 +101,7 @@
           "editorMode": "code",
           "expr": "vllm:spec_decode_mean_accepted_length:rate1m",
           "legendFormat": "Tokens / step",
-          "range": true,
+          "range": false,
           "refId": "A"
         }
       ],
@@ -130,7 +130,7 @@
       "id": 3,
       "options": {
         "colorMode": "value",
-        "graphMode": "area",
+        "graphMode": "none",
         "justifyMode": "auto",
         "orientation": "auto",
         "reduceOptions": {
@@ -150,7 +150,7 @@
           "editorMode": "code",
           "expr": "vllm:spec_decode_draft_tokens_per_second:rate1m",
           "legendFormat": "Draft",
-          "range": true,
+          "range": false,
           "refId": "A"
         }
       ],
@@ -259,7 +259,7 @@
           "editorMode": "code",
           "expr": "vllm:spec_decode_acceptance_rate_by_pos:rate1m",
           "legendFormat": "Position {{position}}",
-          "range": true,
+          "range": false,
           "refId": "A"
         }
       ],
@@ -285,6 +285,6 @@
   "timezone": "browser",
   "title": "vLLM Speculative Decoding",
   "uid": "vllm-spec-decode",
-  "version": 1,
+  "version": 2,
   "weekStart": ""
 }
