@@ -194,8 +194,9 @@ and on()
 )
 ```
 
-Use a Bar chart or Time series visualization and set the legend to
-`Position {{position}}`.
+The provisioned dashboard renders this metric as a Bar gauge with one bar
+per draft position. If you build your own panel, use a Bar gauge or Time
+series visualization and set the legend to `Position {{position}}`.
 
 ## Generate test traffic
 

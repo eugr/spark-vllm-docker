@@ -234,24 +234,18 @@
       },
       "id": 5,
       "options": {
-        "barRadius": 0,
-        "barWidth": 0.8,
-        "fullHighlight": false,
-        "groupWidth": 0.7,
+        "displayMode": "gradient",
         "legend": {
           "calcs": [],
           "displayMode": "list",
           "placement": "bottom",
           "showLegend": false
         },
+        "namePlacement": "auto",
         "orientation": "auto",
-        "showValue": "auto",
-        "stacking": "none",
-        "tooltip": {
-          "mode": "single",
-          "sort": "desc"
-        },
-        "xTickLabel": "Position {{text}}"
+        "showUnfilled": true,
+        "sizing": "auto",
+        "valueMode": "color"
       },
       "pluginVersion": "11.0.0",
       "targets": [
@@ -264,7 +258,7 @@
         }
       ],
       "title": "Acceptance rate by draft position (1-minute average)",
-      "type": "barchart"
+      "type": "bargauge"
     }
   ],
   "refresh": "5s",
@@ -285,6 +279,6 @@
   "timezone": "browser",
   "title": "vLLM Speculative Decoding",
   "uid": "vllm-spec-decode",
-  "version": 2,
+  "version": 3,
   "weekStart": ""
 }
