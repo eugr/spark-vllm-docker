@@ -13,3 +13,51 @@ groups:
           sum(rate(vllm:generation_tokens_total{job="vllm"}[1m]))
           +
           sum(rate(vllm:prompt_tokens_total{job="vllm"}[1m]))
+
+  - name: vllm-spec-decode
+    interval: 5s
+    rules:
+      - record: vllm:spec_decode_acceptance_rate:rate1m
+        expr: >-
+          (
+            sum(rate(vllm:spec_decode_num_accepted_tokens_total{job="vllm"}[1m]))
+            /
+            sum(rate(vllm:spec_decode_num_draft_tokens_total{job="vllm"}[1m]))
+          )
+          and on()
+          (
+            sum(rate(vllm:spec_decode_num_draft_tokens_total{job="vllm"}[1m])) > 0
+          )
+
+      - record: vllm:spec_decode_mean_accepted_length:rate1m
+        expr: >-
+          (
+            1 +
+            sum(rate(vllm:spec_decode_num_accepted_tokens_total{job="vllm"}[1m]))
+            /
+            sum(rate(vllm:spec_decode_num_drafts_total{job="vllm"}[1m]))
+          )
+          and on()
+          (
+            sum(rate(vllm:spec_decode_num_drafts_total{job="vllm"}[1m])) > 0
+          )
+
+      - record: vllm:spec_decode_draft_tokens_per_second:rate1m
+        expr: sum(rate(vllm:spec_decode_num_draft_tokens_total{job="vllm"}[1m]))
+
+      - record: vllm:spec_decode_accepted_tokens_per_second:rate1m
+        expr: sum(rate(vllm:spec_decode_num_accepted_tokens_total{job="vllm"}[1m]))
+
+      - record: vllm:spec_decode_acceptance_rate_by_pos:rate1m
+        expr: >-
+          (
+            sum by (position) (
+              rate(vllm:spec_decode_num_accepted_tokens_per_pos_total{job="vllm"}[1m])
+            )
+            /
+            scalar(sum(rate(vllm:spec_decode_num_drafts_total{job="vllm"}[1m])))
+          )
+          and on()
+          (
+            sum(rate(vllm:spec_decode_num_drafts_total{job="vllm"}[1m])) > 0
+          )

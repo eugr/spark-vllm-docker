@@ -1,6 +1,8 @@
 # Recipe: Qwen3.8-27B-NVFP4
 # Unsloth's mixed-precision NVFP4 quant of Qwen/Qwen3.8-27B.
 # A single DGX Spark has enough unified memory for the native 262K context.
+# Native MTP requires vLLM with the Qwen GDN speculative-decoding fixes from
+# vllm-project/vllm#51812 and #51674 (merged 2026-08-14 or later).
 
 recipe_version: "1"
 name: Qwen3.8-27B-NVFP4
@@ -24,6 +26,7 @@ defaults:
   max_model_len: 262144
   max_num_seqs: 4
   max_num_batched_tokens: 8192
+  num_speculative_tokens: 3
 
 env: {}
 
@@ -41,6 +44,7 @@ command: |
     --load-format fastsafetensors \
     --enable-chunked-prefill \
     --enable-prefix-caching \
+    --speculative-config '{{"method":"mtp","num_speculative_tokens":{num_speculative_tokens}}}' \
     --enable-auto-tool-choice \
     --tool-call-parser qwen3_xml \
     --reasoning-parser qwen3
