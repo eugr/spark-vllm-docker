@@ -10,3 +10,4 @@ tests/draft
 benchmark-plots
 backup-wheels
 .codex
+wheels
