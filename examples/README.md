@@ -1,6 +1,6 @@
 # Example Launch Scripts
 
-This directory contains example bash scripts that demonstrate how to use the `--launch-script` option directly with `launch-cluster.sh`. 
+This directory contains example bash scripts that demonstrate how to use the `--launch-script` option directly with `launch-cluster.sh`.
 
 **Note:** For most use cases, the recipe system (`./run-recipe.sh`) is the recommended approach. These examples are provided for reference and for advanced users who need direct control over the launch process.
 
@@ -8,8 +8,8 @@ This directory contains example bash scripts that demonstrate how to use the `--
 
 - **Simple** - Just write a bash script that runs your command
 - **Flexible** - Use any bash features: environment variables, conditionals, loops
-- **Standalone** - Each script can be tested directly on a head node
-- **No magic** - What you see is what gets executed
+- **Focused** - Keep model and inference settings separate from cluster plumbing
+- **Launcher-aware** - `launch-cluster.sh` supplies backend and per-node arguments
 
 ## Usage
 
@@ -26,11 +26,16 @@ This directory contains example bash scripts that demonstrate how to use the `--
 # Combine with mods if needed
 ./launch-cluster.sh --launch-script my-script.sh --apply-mod mods/my-patch
 
-# Combine with other options
-./launch-cluster.sh -n 192.168.1.1,192.168.1.2 --launch-script my-model.sh -d
+# Combine with other launcher options
+./launch-cluster.sh --ray --launch-script my-model.sh -d
 ```
 
 When using `--launch-script`, the `exec` action is automatically implied if no action is specified.
+The launcher loads `.env` or uses autodiscovery, derives the node count from the
+parallelism flags, and supplies the multiprocessing backend and per-node
+arguments. Do not put `--distributed-executor-backend`, `--nnodes`,
+`--node-rank`, `--master-addr`, `--master-port`, or `--headless` in a vLLM launch
+script.
 
 ## Script Structure
 
@@ -58,7 +63,7 @@ The `# PROFILE:` and `# DESCRIPTION:` comments are optional but recommended for 
 ```bash
 #!/bin/bash
 # PROFILE: MiniMax-M2-AWQ Example
-# DESCRIPTION: vLLM serving MiniMax-M2-AWQ with Ray distributed backend
+# DESCRIPTION: vLLM serving MiniMax-M2-AWQ through launch-cluster.sh
 ```
 
 ## Examples
@@ -68,14 +73,13 @@ The `# PROFILE:` and `# DESCRIPTION:` comments are optional but recommended for 
 ```bash
 #!/bin/bash
 # PROFILE: MiniMax-M2-AWQ
-# DESCRIPTION: vLLM serving MiniMax-M2-AWQ with Ray distributed backend
+# DESCRIPTION: vLLM serving MiniMax-M2-AWQ through launch-cluster.sh
 
 vllm serve QuantTrio/MiniMax-M2-AWQ \
     --port 8000 \
     --host 0.0.0.0 \
     --gpu-memory-utilization 0.8 \
     -tp 2 \
-    --distributed-executor-backend ray \
     --max-model-len 128000 \
     --load-format fastsafetensors \
     --enable-auto-tool-choice \
@@ -97,7 +101,6 @@ vllm serve openai/gpt-oss-120b \
     --tool-call-parser openai \
     --enable-auto-tool-choice \
     --tensor-parallel-size 2 \
-    --distributed-executor-backend ray \
     --host 0.0.0.0 \
     --port 8000
 ```
@@ -124,8 +127,7 @@ vllm serve meta-llama/Llama-3.1-70B-Instruct \
     --port 8000 \
     --host 0.0.0.0 \
     -tp $TP_SIZE \
-    --gpu-memory-utilization $MEM_UTIL \
-    --distributed-executor-backend ray
+    --gpu-memory-utilization $MEM_UTIL
 ```
 
 ### SGLang
@@ -162,7 +164,7 @@ vllm serve Salyut1/GLM-4.7-NVFP4 \
 
 Usage:
 ```bash
-./launch-cluster.sh --launch-script vllm-glm-4.7-nvfp4.sh --apply-mod mods/fix-Salyut1-GLM-4.7-NVFP4 exec
+./launch-cluster.sh --launch-script vllm-glm-4.7-nvfp4.sh --apply-mod mods/fix-Salyut1-GLM-4.7-NVFP4
 ```
 
 ## Creating a New Launch Script
@@ -171,17 +173,16 @@ Usage:
 2. Add the shebang `#!/bin/bash`
 3. Add `# PROFILE:` and `# DESCRIPTION:` comments
 4. Write your command (e.g., `vllm serve ...`)
-5. Run with `./launch-cluster.sh --launch-script my-script.sh exec`
+5. Run with `./launch-cluster.sh --launch-script my-script.sh`
 
 ## Testing Scripts
 
-Since launch scripts are standard bash files, you can test them directly:
+Validate shell syntax directly, then use the launcher for runtime testing so it
+can add the required cluster arguments:
 
 ```bash
-# Inside a running container or on a head node with the runtime installed
-cd profiles
-./my-script.sh
+bash -n examples/my-script.sh
+./launch-cluster.sh --launch-script my-script.sh
 ```
 
 This makes development and debugging much easier than complex configuration systems.
-

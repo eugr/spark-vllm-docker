@@ -494,6 +494,13 @@ test_launch_cluster_help() {
         log_fail "--help does not document --volume"
         log_verbose "$output"
     fi
+
+    if echo "$output" | grep -q -- "Do not pass --distributed-executor-backend"; then
+        log_pass "--help documents automatic vLLM multiprocessing orchestration"
+    else
+        log_fail "--help does not document automatic vLLM multiprocessing orchestration"
+        log_verbose "$output"
+    fi
 }
 
 # Test: launch-cluster.sh references examples/ not profiles/
@@ -576,10 +583,11 @@ EOF
     exit_code=$?
     rm -f "$temp_recipe"
     
-    if echo "$output" | grep -q "requires cluster mode"; then
-        log_pass "cluster_only recipe correctly fails in solo mode"
+    if echo "$output" | grep -q "requires cluster mode" && \
+       echo "$output" | grep -q "1\. Auto-discover and save"; then
+        log_pass "cluster_only recipe fails in solo mode and recommends autodiscovery"
     else
-        log_fail "cluster_only recipe did not fail in solo mode"
+        log_fail "cluster_only recipe did not fail with autodiscovery guidance"
         log_verbose "$output"
     fi
 }

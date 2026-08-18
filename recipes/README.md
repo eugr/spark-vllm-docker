@@ -24,23 +24,21 @@ Recipes provide a **one-click solution** for deploying models with pre-configure
 # Run with overrides
 ./run-recipe.sh glm-4.7-flash-awq --solo --port 9000 --gpu-mem 0.8
 
-# Cluster deployment
-./run-recipe.sh glm-4.7-nvfp4 -n 192.168.1.10,192.168.1.11 --setup
+# First cluster deployment: discover once, then run from saved configuration
+./run-recipe.sh --discover
+./run-recipe.sh minimax-m2-awq --setup
 ```
 
 ## Cluster Node Discovery
 
-The recipe runner can automatically discover cluster nodes:
+Autodiscovery is the default way to configure cluster nodes:
 
 ```bash
 # Auto-discover nodes and save to .env
 ./run-recipe.sh --discover
 
-# Show current .env configuration
-./run-recipe.sh --show-env
-
 # Run recipe (uses nodes from .env automatically)
-./run-recipe.sh glm-4.7-nvfp4 --setup
+./run-recipe.sh minimax-m2-awq --setup
 ```
 
 When you run `--discover`, it:
@@ -50,7 +48,9 @@ When you run `--discover`, it:
 4. Prompts for per-node confirmation for `CLUSTER_NODES` and `COPY_HOSTS`.
 5. Saves the full configuration (including mesh NCCL settings if applicable) to `.env`.
 
-Future recipe runs will automatically use nodes from `.env` unless you specify `-n` or `--solo`.
+Future recipe runs automatically use nodes from `.env`. Do not pass IP addresses
+with `-n` unless you were specifically instructed to use a manual node list or
+the network topology prevents autodiscovery from working.
 
 When distributing the container image or model files, the runner uses `COPY_HOSTS` from `.env` (which may differ from `CLUSTER_NODES` in mesh mode) to ensure transfers go over the fastest available path.
 
@@ -60,20 +60,19 @@ When distributing the container image or model files, the runner uses `COPY_HOST
 ```bash
 # Explicitly run in solo mode
 ./run-recipe.sh glm-4.7-flash-awq --solo
-
-# If no nodes configured, defaults to solo
-./run-recipe.sh minimax-m2-awq
 ```
 
 ### Cluster Mode (Multiple Nodes)
 ```bash
-# Specify nodes directly (first IP is head node)
-./run-recipe.sh glm-4.7-nvfp4 -n 192.168.1.10,192.168.1.11 --setup
-
-# Or use auto-discovered nodes from .env
+# Discover nodes and network topology on first use
 ./run-recipe.sh --discover  # First time only
-./run-recipe.sh glm-4.7-nvfp4 --setup
+
+# Deploy using the saved .env automatically
+./run-recipe.sh minimax-m2-awq --setup
 ```
+
+Manual `-n` / `--nodes` input is a fallback for explicitly instructed or
+non-discoverable network topologies, not the normal cluster workflow.
 
 When using cluster mode with `--setup`:
 - Container is built locally and copied to all worker nodes
@@ -84,14 +83,14 @@ When using cluster mode with `--setup`:
 Some models are too large to run on a single node. These recipes have `cluster_only: true` and will fail with a helpful error if you try to run them in solo mode:
 
 ```bash
-$ ./run-recipe.sh glm-4.7-nvfp4 --solo
-Error: Recipe 'GLM-4.7-NVFP4' requires cluster mode.
+$ ./run-recipe.sh minimax-m2-awq --solo
+Error: Recipe 'MiniMax-M2-AWQ' requires cluster mode.
 This model is too large to run on a single node.
 
 Options:
-  1. Specify nodes directly:  ./run-recipe.sh glm-4.7-nvfp4 -n node1,node2
-  2. Auto-discover and save:  ./run-recipe.sh --discover
-     Then run:                ./run-recipe.sh glm-4.7-nvfp4
+  1. Auto-discover and save:  ./run-recipe.sh --discover
+     Then run:                ./run-recipe.sh minimax-m2-awq
+  2. If autodiscovery cannot support the topology, specify nodes as instructed.
 ```
 
 ## Setup Options
@@ -191,7 +190,8 @@ Launch options:
   --solo                      Run in solo mode (single node, no Ray)
   --ray                       Opt into Ray for multi-node vLLM
   --no-ray                    Default multi-node no-Ray mode (accepted for compatibility)
-  -n, --nodes IPS             Comma-separated node IPs (first = head)
+  -n, --nodes IPS             Manual fallback/override: comma-separated node IPs
+                              (first = head)
   -d, --daemon                Run in daemon mode
   -t, --container IMAGE       Override container from recipe
   --name NAME                 Override container name
@@ -233,6 +233,36 @@ Other:
   --earlyoom --earlyoom-args "-M 786432,196608 -s 100 -r 120"
 ```
 
+## Environment Variables and Volumes
+
+Both `run-recipe.sh` and `launch-cluster.sh` accept repeatable `-e VAR=VALUE`
+container environment variables and repeatable `-v LOCAL:CONTAINER` Docker
+volume mappings. Put `launch-cluster.sh` options before `exec`.
+
+```bash
+./run-recipe.sh my-recipe --solo \
+  -e VLLM_LOGGING_LEVEL=DEBUG \
+  -v "$HOME/models:/models"
+
+./launch-cluster.sh --solo \
+  -e VLLM_LOGGING_LEVEL=DEBUG \
+  -v "$HOME/models:/models" \
+  exec vllm serve /models/my-model --port 8000
+```
+
+In cluster mode, each volume mapping is applied to every node. Ensure the local
+path exists with suitable contents and permissions on each host.
+
+For a gated Hugging Face model, export the token for host-side downloads and
+also pass it to the container:
+
+```bash
+export HF_TOKEN="YOUR_TOKEN"
+./run-recipe.sh my-recipe -e HF_TOKEN="$HF_TOKEN" --setup
+```
+
+Avoid printing or sharing the expanded command because it contains the token.
+
 ## Extra vLLM Arguments
 
 Use the Unix-style `--` separator to pass additional arguments directly to vLLM. Any arguments after `--` are appended verbatim to the vLLM command.
@@ -251,9 +281,9 @@ Use the Unix-style `--` separator to pass additional arguments directly to vLLM.
 ./run-recipe.sh my-recipe --solo -- --load-format auto --enforce-eager --seed 42
 ```
 
-These arguments are appended to the end of the generated vLLM command after all template substitutions.
+These arguments are appended to the end of the generated vLLM command after all template substitutions. If an option occurs more than once, vLLM uses its last occurrence.
 
-**Duplicate Detection**: If you pass an argument that conflicts with a CLI override (e.g., `--port` when you also used `--port`), a warning will be shown since your CLI override value may be replaced by the extra arg.
+**Duplicate Detection**: If you pass an argument that conflicts with a CLI override (e.g., `--port` when you also used `--port`), the runner warns that the later extra argument wins. Prefer the built-in `--port`, `--host`, `--tp`, `--gpu-mem`, and `--max-model-len` overrides when they cover the setting you need.
 
 ## Creating a Recipe
 

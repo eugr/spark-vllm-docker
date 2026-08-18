@@ -11,8 +11,8 @@ pre-configured settings. It handles:
 - Both solo (single node) and cluster deployments
 
 Usage:
-    ./run-recipe.py recipes/glm-4.7-nvfp4.yaml
-    ./run-recipe.py glm-4.7-nvfp4 --port 9000 --solo
+    ./run-recipe.py recipes/deepseek-v4-flash-0731.yaml
+    ./run-recipe.py glm-4.7-flash-awq --port 9000 --solo
     ./run-recipe.py minimax-m2-awq --setup  # Full setup: build + download + run
     ./run-recipe.py --list
 
@@ -674,32 +674,32 @@ def main():
         epilog="""
 Examples:
   # Basic usage
-  %(prog)s glm-4.7-nvfp4
-  %(prog)s glm-4.7-nvfp4 --port 9000 --solo
+  %(prog)s glm-4.7-flash-awq --solo
+  %(prog)s glm-4.7-flash-awq --port 9000 --solo
 
   # Full setup (build container + download model + run)
-  %(prog)s glm-4.7-nvfp4 --setup
+  %(prog)s glm-4.7-flash-awq --solo --setup
 
-  # Cluster deployment (manual)
-  %(prog)s glm-4.7-nvfp4 -n 192.168.1.1,192.168.1.2 --setup
-
-  # Cluster deployment (auto-discover)
+  # Cluster deployment (default: auto-discover once, then reuse .env)
   %(prog)s --discover              # Detect nodes and save to .env
-  %(prog)s glm-4.7-nvfp4 --setup   # Uses nodes from .env
+  %(prog)s minimax-m2-awq --setup  # Uses nodes from .env
+
+  # Manual fallback only when autodiscovery cannot support the topology
+  %(prog)s minimax-m2-awq -n HEAD_IP,WORKER_IP --setup
 
   # Just build/download without running
-  %(prog)s glm-4.7-nvfp4 --build-only
-  %(prog)s glm-4.7-nvfp4 --download-only
+  %(prog)s glm-4.7-flash-awq --solo --build-only
+  %(prog)s glm-4.7-flash-awq --solo --download-only
 
   # Pass extra arguments to vLLM (after --)
-  %(prog)s glm-4.7-nvfp4 --solo -- --load-format safetensors
-  %(prog)s glm-4.7-nvfp4 --solo -- --served-model-name my-api
+  %(prog)s glm-4.7-flash-awq --solo -- --load-format safetensors
+  %(prog)s glm-4.7-flash-awq --solo -- --served-model-name my-api
 
   # Apply additional launch-cluster mods
-  %(prog)s glm-4.7-nvfp4 --apply-mod mods/use-official-vllm
+  %(prog)s glm-4.7-flash-awq --solo --apply-mod mods/use-official-vllm
 
   # Publish ports in solo mode
-  %(prog)s glm-4.7-nvfp4 --solo -p 8000:8000
+  %(prog)s glm-4.7-flash-awq --solo -p 8000:8000
 
   # Map host directories into the container
   %(prog)s glm-4.7-flash-awq --solo -v /local/models:/models -v /local/output:/output
@@ -786,7 +786,9 @@ Examples:
         "--solo", action="store_true", help="Run in solo mode (single node, no Ray)"
     )
     launch_group.add_argument(
-        "-n", "--nodes", help="Comma-separated list of node IPs (first is head node)"
+        "-n",
+        "--nodes",
+        help="Manual fallback/override: comma-separated node IPs (first is head node)",
     )
     launch_group.add_argument(
         "-d", "--daemon", action="store_true", help="Run in daemon mode"
@@ -1083,11 +1085,11 @@ Examples:
         print(f"This model is too large to run on a single node.")
         print()
         print("Options:")
-        print(
-            f"  1. Specify nodes directly:  {sys.argv[0]} {args.recipe} -n node1,node2"
-        )
-        print(f"  2. Auto-discover and save:  {sys.argv[0]} --discover")
+        print(f"  1. Auto-discover and save:  {sys.argv[0]} --discover")
         print(f"     Then run:                {sys.argv[0]} {args.recipe}")
+        print(
+            "  2. If autodiscovery cannot support the topology, specify nodes as instructed."
+        )
         return 1
     if solo_only and not is_solo:
         print(f"Error: Recipe '{recipe['name']}' requires solo mode.")

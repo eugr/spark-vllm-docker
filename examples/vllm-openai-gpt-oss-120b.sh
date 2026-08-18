@@ -9,7 +9,6 @@ vllm serve openai/gpt-oss-120b \
     --tool-call-parser openai \
     --enable-auto-tool-choice \
     --tensor-parallel-size 2 \
-    --distributed-executor-backend ray \
     --kv-cache-dtype fp8 \
     --gpu-memory-utilization 0.70 \
     --max-model-len 128000 \

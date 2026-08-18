@@ -1,0 +1,69 @@
+# Recipe: GLM-5.2-NVFP4
+# nvidia/GLM-5.2-NVFP4, TP=8 across 8 DGX Spark nodes
+
+recipe_version: "1"
+name: GLM-5.2-NVFP4 (TP=8)
+description: vLLM serving nvidia/GLM-5.2-NVFP4 with TP=8 across 8 DGX Spark nodes
+
+model: nvidia/GLM-5.2-NVFP4
+container: vllm-node-b12x
+cluster_only: true
+
+mods: []
+
+env:
+  VLLM_ALLOW_LONG_MAX_MODEL_LEN: "1"
+  VLLM_SPARSE_INDEXER_MAX_LOGITS_MB: "256"
+  VLLM_DCP_QUERY_SPLIT: "0"
+  VLLM_B12X_MLA_CKV_GATHER: "1"
+  CUTE_DSL_ARCH: sm_121a
+  VLLM_USE_AOT_COMPILE: "1"
+  VLLM_USE_V2_MODEL_RUNNER: "1"
+  VLLM_USE_B12X_SPARSE_INDEXER: "1"
+  GLM52_BIND_HOST_TRITON: "0"
+  VLLM_B12X_MLA_SPEC_EXTEND_AS_DECODE: "1"
+
+defaults:
+  port: 8000
+  host: 0.0.0.0
+  tensor_parallel: 8
+  pipeline_parallel: 1
+  decode_context_parallel: 1
+  dcp_kv_cache_interleave_size: 1
+  max_model_len: 262144
+  max_num_seqs: 8
+  max_num_batched_tokens: 4096
+  long_prefill_token_threshold: 2048
+  gpu_memory_utilization: 0.726
+  num_speculative_tokens: 4
+
+command: |
+  vllm serve nvidia/GLM-5.2-NVFP4 \
+    --host {host} \
+    --port {port} \
+    --trust-remote-code \
+    --reasoning-parser glm45 \
+    --tool-call-parser glm47 \
+    --enable-auto-tool-choice \
+    --enable-chunked-prefill \
+    --enable-prefix-caching \
+    --async-scheduling \
+    --tensor-parallel-size {tensor_parallel} \
+    --pipeline-parallel-size {pipeline_parallel} \
+    --decode-context-parallel-size {decode_context_parallel} \
+    --dcp-kv-cache-interleave-size {dcp_kv_cache_interleave_size} \
+    --attention-backend B12X_MLA_SPARSE \
+    --hf-overrides '{{"index_topk_pattern":"FFFSSSFSSSFSSSFSSSFSSSFSSSFSSSFSSSFSSSFSSSFSSSFSSSFSSSFSSSFSSSFSSSFSSSFSSSFSSS"}}' \
+    --max-model-len {max_model_len} \
+    --max-num-seqs {max_num_seqs} \
+    --max-num-batched-tokens {max_num_batched_tokens} \
+    --long-prefill-token-threshold {long_prefill_token_threshold} \
+    --gpu-memory-utilization {gpu_memory_utilization} \
+    --kv-cache-dtype fp8 \
+    --distributed-executor-backend ray \
+    --compilation-config '{{"cudagraph_mode":"FULL_AND_PIECEWISE","custom_ops":["all"]}}' \
+    --default-chat-template-kwargs '{{"reasoning_effort":"high","clear_thinking":false}}' \
+    --speculative-config '{{"method":"mtp","quantization":"compressed-tensors","attention_backend":"B12X_MLA_SPARSE","num_speculative_tokens":{num_speculative_tokens},"draft_tensor_parallel_size":1}}' \
+    --seed 42 \
+    --load-format instanttensor \
+    --no-enable-flashinfer-autotune
