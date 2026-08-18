@@ -8,7 +8,8 @@ usage, and speculative-decoding performance.
 The repository includes a ready-to-run monitoring stack:
 
 - `docker-compose.metrics.yaml` runs Prometheus and Grafana with persistent
-  named volumes.
+  named volumes. The images are pinned to Prometheus 3.13.2 and Grafana 13.1.3
+  so deployments do not change unexpectedly when upstream `latest` tags move.
 - `prometheus.yaml` scrapes the vLLM server from the Docker host every five
   seconds.
 - `prometheus-rules.yaml` records one-minute averages for prompt, generation,
@@ -73,6 +74,21 @@ The dashboard uses these recording rules from `prometheus-rules.yaml`:
 | `vllm:generation_tokens_per_second:rate1m` | Output tokens per second |
 | `vllm:prompt_tokens_per_second:rate1m` | Input/prompt tokens per second |
 | `vllm:total_tokens_per_second:rate1m` | Combined input and output tokens per second |
+
+The same dashboard also queries current vLLM metrics directly for latency and
+KV-cache pressure:
+
+| Panel | Source metric | Display |
+| --- | --- | --- |
+| Time to first token | `vllm:time_to_first_token_seconds` | P50 and P95 over five minutes |
+| Inter-token latency | `vllm:inter_token_latency_seconds` | P50 over five minutes |
+| End-to-end request latency | `vllm:e2e_request_latency_seconds` | P50 and P95 over five minutes |
+| KV-cache usage | `vllm:kv_cache_usage_perc` | Maximum utilization across engines |
+
+Latency metrics are Prometheus histograms, so the dashboard calculates rolling
+percentiles with `histogram_quantile`. The KV-cache metric is a fraction from
+0 to 1 and is displayed as a percentage. Latency panels show no value until
+the five-minute window contains completed observations.
 
 Inspect loaded rules at `http://<spark-ip>:9090/rules`, or enter one of the
 recorded metric names in the Prometheus query UI. Prometheus needs at least two

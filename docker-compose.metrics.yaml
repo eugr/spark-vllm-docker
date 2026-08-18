@@ -1,6 +1,6 @@
 services:
   prometheus:
-    image: prom/prometheus:latest
+    image: prom/prometheus:v3.13.2
     restart: unless-stopped
     extra_hosts:
       - host.docker.internal:host-gateway
@@ -12,7 +12,7 @@ services:
       - prometheus-data:/prometheus
 
   grafana:
-    image: grafana/grafana:latest
+    image: grafana/grafana:13.1.3
     restart: unless-stopped
     depends_on:
       - prometheus

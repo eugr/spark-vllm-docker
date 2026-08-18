@@ -2,3 +2,4 @@
 build-metadata.yaml
 .DS_STORE
 .wheel-cache/
+__pycache__/
