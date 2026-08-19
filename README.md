@@ -1595,6 +1595,25 @@ Assumptions and limitations:
 - It mounts `~/.cache/huggingface`, `~/.cache/vllm`, `~/.cache/flashinfer`, `~/.triton`, and `~/.tilelang` by default. Use `--no-cache-dirs` to skip the vLLM/FlashInfer/Triton/TileLang cache mounts. Add other mounts with repeatable Docker-style `-v` / `--volume` options, e.g. `-v "$HOME/my-data:/data"`.
 
 
+### Serving over HTTPS (TLS)
+
+The API is served over HTTPS **by default**. TLS is a single centralized setting rather than a per-recipe option: `run-recipe.py` injects `--ssl-certfile` / `--ssl-keyfile` into every model's `vllm serve` command, so the whole fleet is on TLS from one place instead of editing each recipe (and risking an inconsistent HTTP/HTTPS mix).
+
+The cert and key default to `/root/.cache/vllm/certs/cert.pem` and `key.pem` **inside the container**. Since `~/.cache/vllm` is mounted by default, put them at `~/.cache/vllm/certs/` on the head node. Override the locations with the `SSL_CERTFILE` / `SSL_KEYFILE` environment variables, or set either to empty to serve plain HTTP:
+
+```bash
+# override cert locations for all launches
+export SSL_CERTFILE=/root/.cache/vllm/certs/mycert.pem
+export SSL_KEYFILE=/root/.cache/vllm/certs/mykey.pem
+
+# or disable TLS for a one-off launch
+SSL_CERTFILE= run-recipe.py <recipe> -n node1,node2
+```
+
+> The cert/key must exist at the resolved in-container path, or `vllm serve` will fail to start.
+
+Besides the usual reasons for TLS, HTTPS also avoids a class of network-sandbox truncation: sandboxes that filter egress through an HTTP proxy (e.g. [`fence`](https://github.com/fencesandbox/fence)) may cap plain-HTTP requests with a fixed `http.Client` timeout that *also* interrupts reading the streamed response body — silently cutting off long-streaming completions (e.g. high reasoning-effort turns that generate for longer than the cap). HTTPS traffic takes the sandbox's raw `CONNECT` tunnel, which is not capped.
+
 **Start in daemon mode (background):**
 
 ```bash
