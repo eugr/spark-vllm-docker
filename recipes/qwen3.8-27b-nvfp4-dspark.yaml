@@ -8,16 +8,21 @@
 # Source: https://gist.github.com/Mirrdhyn/d476d17723c9d68eac72f03ec9447f2b
 #   "Qwen3.8-27B-NVFP4 + MTP on a single DGX Spark - recipe, method, benchmarks"
 #
-# Deviations from that gist's launch block, both taken from its own
+# Deviation from that gist's launch block, taken from its own
 # "Appendix: TP=2 on two Sparks":
 #   - tensor_parallel defaults to 2; the gist's block is TP=1. Decode is
 #     bandwidth-bound on this dense checkpoint, so splitting the 22 GB weight
 #     read gave +65% decode and 2.15x the KV pool. --solo forces TP=1.
-#   - --no-enable-flashinfer-autotune replaces the gist's
-#     --enable-flashinfer-autotune. Autotune is harmless at TP=1 but deadlocks
-#     engine startup at TP=2 on multi-node hosts without GPUDirect, with no
-#     error - just a once-a-minute shm_broadcast timeout
-#     (vllm-project/vllm#52291, filed on this hardware).
+#
+# FlashInfer autotune is left at vLLM's own default (on at -O2), matching five
+# of eugr's six multi-node recipes. An earlier version of this recipe passed
+# --no-enable-flashinfer-autotune over vllm-project/vllm#52291, a synchronized-
+# autotune startup deadlock on multi-node hosts without GPUDirect. Tested on
+# this cluster 2026-08-20: that deadlock cannot occur on the image we run -
+# set_autotune_process_group does not exist in it, and flashinfer_autotune()
+# takes the per-rank path whenever world_size > 1. Autotune completed twice,
+# ~11 s tuning fp4_gemm, with single-stream decode unchanged (26.1-26.8 tok/s
+# on vs 22.6-26.4 off). Revisit if a future image regresses.
 #
 # Everything else matches the gist, including the deliberate omission of
 # --generation-config vllm: the checkpoint's own generation_config.json carries
@@ -29,6 +34,24 @@
 # only utilization the gist actually measured with this drafter. The drafter's
 # own weights and cache come out of the same budget, costing KV pool: 3.04M
 # tokens against 4.37M with the in-checkpoint MTP head.
+#
+# Reasoning effort needs no flag here. The served checkpoint ships Qwen's own
+# chat template plus Unsloth's superset patches (a high -> xhigh alias, the
+# developer role, merged leading system messages), so no --chat-template
+# override is wanted; effort is a per-request setting that vLLM forwards from
+# the OpenAI reasoning_effort field into chat_template_kwargs. The template
+# takes xhigh (the default, and the card's), medium and low, plus high. vLLM's
+# API additionally accepts minimal and max, which the template rejects with a
+# 400; none is safe and simply turns thinking off.
+#
+# The sampling inherited from generation_config.json is Qwen's thinking-mode
+# preset. Clients that turn thinking off are expected to send the card's
+# instruct preset themselves (temperature 0.7, top_p 0.80, top_k 20,
+# presence_penalty 1.5): vLLM keeps one set of server-side defaults and cannot
+# switch them per request.
+#
+# For contexts beyond the native 262,144 tokens, see qwen3.8-27b-nvfp4-1m.yaml
+# rather than raising max_model_len here.
 
 recipe_version: "1"
 name: Qwen3.8-27B-NVFP4-DSpark
@@ -66,11 +89,10 @@ command: |
     --max-num-seqs {max_num_seqs} \
     --gpu-memory-utilization {gpu_memory_utilization} \
     --enable-prefix-caching \
-    --limit-mm-per-prompt '{{"image": 4, "video": 0}}' \
+    --limit-mm-per-prompt '{{"image": 4, "video": 1}}' \
     --reasoning-parser qwen3 \
     --enable-auto-tool-choice \
     --tool-call-parser qwen3_xml \
-    --no-enable-flashinfer-autotune \
     --speculative_config.method dspark \
     --speculative_config.model Doopeworld/Qwen3.8-27B-DSpark-vLLM \
     --speculative_config.num_speculative_tokens {num_speculative_tokens} \

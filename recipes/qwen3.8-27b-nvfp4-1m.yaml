@@ -1,0 +1,109 @@
+# Recipe: Qwen3.8-27B-NVFP4 with the in-checkpoint MTP head, extended to 1M
+# context via static YaRN. Same target checkpoint and hardware assumptions as
+# qwen3.8-27b-nvfp4.yaml - see that file's header for the TP=2 and autotune
+# rationale, which applies here unchanged.
+#
+# Source for the rope block: the Qwen3.8-27B model card, "Best Practices ->
+# Processing Ultra-Long Texts", reproduced verbatim apart from doubling the
+# braces (run-recipe.py runs the command through str.format()).
+#
+# Why this is a separate recipe rather than a flag on the two native-context
+# ones: every open-source framework implements *static* YaRN, so the scaling
+# factor applies to every request regardless of length. Short prompts are
+# embedded with a 4x-stretched position basis they were never trained on, which
+# costs quality on the great majority of requests. Qwen's card says as much:
+# "potentially impacting performance on shorter texts." Only run this recipe
+# when a task actually exceeds the native 262,144-token window.
+#
+# Deviations from qwen3.8-27b-nvfp4.yaml:
+#   - max_model_len 1048576 = 4.0 x 262144, matching the rope "factor" exactly.
+#     The card writes 1000000; the power-of-two figure is the same setting
+#     stated without rounding.
+#   - max_num_seqs 4, down from 8. A full-length sequence costs ~32 GiB of KV
+#     (16 full-attention layers x 2 x 4 KV heads x 256 head dim x 1 byte, the
+#     checkpoint quantizes KV to 8 bits), so the measured 4.37M-token pool at
+#     TP=2 holds about four of them. Leaving max_num_seqs at 8 would oversubscribe
+#     the pool by 2x and trade a hang-free start for preemption and recompute -
+#     the worst outcome when a single 1M prefill is already minutes long.
+#   - max_num_batched_tokens 16384 bounds the chunked-prefill activation
+#     footprint, which matters far more at 1M than at 262k.
+#   - VLLM_ALLOW_LONG_MAX_MODEL_LEN=1 is required: the checkpoint declares
+#     max_position_embeddings 262144, and vLLM refuses a longer max_model_len
+#     without it.
+#
+# The base recipe's MTP head is kept rather than the DSpark drafter: DSpark's
+# separate weights and cache cost roughly 1.3M tokens of KV pool (3.04M vs
+# 4.37M measured), which at this context length is a whole concurrent request.
+#
+# Measured on the 2x Spark cluster 2026-08-20, this exact recipe:
+#   - GPU KV cache size 4,989,721 tokens, 4.76x concurrency at 1,048,576 per
+#     request. Higher than the base recipe's 4.37M because max_num_batched_tokens
+#     16384 shrinks the activation reserve.
+#   - Engine init 143 s (compilation 68 s).
+#   - Prefill is the cost that matters: 107,702 tokens took 77.3 s (~1,393 tok/s)
+#     and 323,078 tokens took 278.7 s (~1,159 tok/s). Extrapolating, a cold
+#     full-length 1M prefill is on the order of 15-18 minutes. Prefix caching is
+#     what makes a long session bearable; a cold one is not interactive.
+#   - The 323k request also confirms YaRN is doing its job past the native
+#     262,144-token limit.
+#
+# The served name is qwen3.8-27b-1m, not the qwen3.8-27b the two native-context
+# recipes share. A served name should distinguish what changes the client's
+# contract and nothing else: the context window does - 262,144 against
+# 1,048,576, and a client has to be configured for it - while the drafter does
+# not, since MTP and DSpark take byte-identical requests. That is also why the
+# native pair keeps one shared name: swapping between them stays a systemctl
+# stop/start with no client change. Only one service binds port 8000, so
+# whichever recipe is not running 404s on its name.
+#
+# Everything else - sampling from the checkpoint's generation_config.json, the
+# multimodal limits, the parsers, and leaving FlashInfer autotune at vLLM's
+# default - matches qwen3.8-27b-nvfp4.yaml.
+
+recipe_version: "1"
+name: Qwen3.8-27B-NVFP4-MTP-1M
+description: vLLM serving unsloth/Qwen3.8-27B-NVFP4 with the MTP head and a 1M context via YaRN
+
+model: unsloth/Qwen3.8-27B-NVFP4
+container: vllm-node
+
+cluster_only: false
+solo_only: false
+
+defaults:
+  port: 8000
+  host: 0.0.0.0
+  tensor_parallel: 2
+  gpu_memory_utilization: 0.82
+  max_model_len: 1048576
+  max_num_seqs: 4
+  max_num_batched_tokens: 16384
+  num_speculative_tokens: 3
+
+env:
+  CUTE_DSL_ARCH: "sm_121a"
+  FLASHINFER_CUDA_ARCH_LIST: "12.1a"
+  FLASHINFER_DISABLE_VERSION_CHECK: "1"
+  PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
+  VLLM_USE_FLASHINFER_SAMPLER: "1"
+  VLLM_ALLOW_LONG_MAX_MODEL_LEN: "1"
+
+command: |
+  vllm serve unsloth/Qwen3.8-27B-NVFP4 \
+    --served-model-name qwen3.8-27b-1m \
+    --host {host} \
+    --port {port} \
+    -tp {tensor_parallel} \
+    --max-model-len {max_model_len} \
+    --max-num-seqs {max_num_seqs} \
+    --max-num-batched-tokens {max_num_batched_tokens} \
+    --gpu-memory-utilization {gpu_memory_utilization} \
+    --hf-overrides '{{"text_config": {{"rope_parameters": {{"mrope_interleaved": true, "mrope_section": [11, 11, 10], "rope_type": "yarn", "rope_theta": 10000000, "partial_rotary_factor": 0.25, "factor": 4.0, "original_max_position_embeddings": 262144}}}}}}' \
+    --enable-prefix-caching \
+    --limit-mm-per-prompt '{{"image": 4, "video": 1}}' \
+    --reasoning-parser qwen3 \
+    --enable-auto-tool-choice \
+    --tool-call-parser qwen3_xml \
+    --speculative_config.method mtp \
+    --speculative_config.model unsloth/Qwen3.8-27B-NVFP4 \
+    --speculative_config.num_speculative_tokens {num_speculative_tokens}
