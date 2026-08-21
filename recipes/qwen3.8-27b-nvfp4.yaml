@@ -22,6 +22,27 @@
 # ~11 s tuning fp4_gemm, with single-stream decode unchanged (26.1-26.8 tok/s
 # on vs 22.6-26.4 off). Revisit if a future image regresses.
 #
+# Attention backend, measured on this cluster 2026-08-20. FlashInfer only
+# graph-captures uniform single-token decode (AttentionCGSupport.
+# UNIFORM_SINGLE_TOKEN_DECODE), so under speculative decoding every multi-token
+# verify step ran outside full CUDA graphs and vLLM logged "CUDAGraphMode.
+# FULL_AND_PIECEWISE is not supported with spec-decode for attention backend
+# FlashInferBackend; setting cudagraph_mode=PIECEWISE". That threw away most of
+# what speculation buys: ~2.7-2.8 tokens accepted per step returned only ~1.35x
+# over no speculation. TRITON_ATTN declares AttentionCGSupport.ALWAYS and fixes
+# it. Both flags are required - with only --attention-backend the drafter
+# re-selects FlashInfer ("Using FLASHINFER attention backend out of potential
+# backends") and the warning stays.
+#
+# Single-stream /v1/completions, 256 greedy tokens, TP=2:
+#   no speculation ................................. 19.8 tok/s
+#   DSpark k=7, FlashInfer ......................... 22.6-26.8 tok/s
+#   MTP k=3, FlashInfer ............................ 26.8-27.7 tok/s
+#   MTP k=8, TRITON_ATTN ........................... 28.5-29.4 tok/s
+#   DSpark k=7, TRITON_ATTN ........................ 34.5 tok/s
+#   MTP k=3, TRITON_ATTN ........................... 39.4-39.6 tok/s  <- best
+# k=8 loses to k=3 despite higher acceptance (3.3 vs 3.0): eight sequential
+# drafter passes cost more than the extra accepted tokens return.
 # Everything else matches the gist, including the deliberate omission of
 # --generation-config vllm: the checkpoint's own generation_config.json carries
 # Qwen's recommended sampling, and overriding it drops top_k entirely.
@@ -81,9 +102,11 @@ command: |
     --gpu-memory-utilization {gpu_memory_utilization} \
     --enable-prefix-caching \
     --limit-mm-per-prompt '{{"image": 4, "video": 1}}' \
+    --attention-backend TRITON_ATTN \
     --reasoning-parser qwen3 \
     --enable-auto-tool-choice \
     --tool-call-parser qwen3_xml \
     --speculative_config.method mtp \
     --speculative_config.model unsloth/Qwen3.8-27B-NVFP4 \
-    --speculative_config.num_speculative_tokens {num_speculative_tokens}
+    --speculative_config.num_speculative_tokens {num_speculative_tokens} \
+    --speculative_config.attention_backend TRITON_ATTN
