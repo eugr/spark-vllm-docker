@@ -22,17 +22,24 @@
 # ~11 s tuning fp4_gemm, with single-stream decode unchanged (26.1-26.8 tok/s
 # on vs 22.6-26.4 off). Revisit if a future image regresses.
 #
-# Attention backend, measured on this cluster 2026-08-20. FlashInfer only
-# graph-captures uniform single-token decode (AttentionCGSupport.
-# UNIFORM_SINGLE_TOKEN_DECODE), so under speculative decoding every multi-token
-# verify step ran outside full CUDA graphs and vLLM logged "CUDAGraphMode.
-# FULL_AND_PIECEWISE is not supported with spec-decode for attention backend
-# FlashInferBackend; setting cudagraph_mode=PIECEWISE". That threw away most of
-# what speculation buys: ~2.7-2.8 tokens accepted per step returned only ~1.35x
-# over no speculation. TRITON_ATTN declares AttentionCGSupport.ALWAYS and fixes
-# it. Both flags are required - with only --attention-backend the drafter
-# re-selects FlashInfer ("Using FLASHINFER attention backend out of potential
-# backends") and the warning stays.
+# Attention backend, measured on this cluster 2026-08-20. Under speculative
+# decoding on FlashInfer, every multi-token verify step ran outside full CUDA
+# graphs and vLLM logged "CUDAGraphMode.FULL_AND_PIECEWISE is not supported
+# with spec-decode for attention backend FlashInferBackend (support:
+# AttentionCGSupport.UNIFORM_SINGLE_TOKEN_DECODE); setting
+# cudagraph_mode=PIECEWISE". That threw away most of what speculation buys:
+# ~2.7-2.8 tokens accepted per step returned only ~1.35x over no speculation.
+#
+# This is architectural on GB10, not a tuning mistake, so do not try to fix it
+# on FlashInfer. FlashInferMetadataBuilder.get_cudagraph_support() returns
+# UNIFORM_BATCH only when can_use_trtllm_attention() holds, and
+# supports_trtllm_attention() ends in is_device_capability_family(100). This
+# hardware is sm_121 - family 120 - so it is always False.
+#
+# TRITON_ATTN declares AttentionCGSupport.ALWAYS. Both flags are required:
+# with only --attention-backend the drafter re-selects FlashInfer ("Using
+# FLASHINFER attention backend out of potential backends") and the warning
+# stays.
 #
 # Single-stream /v1/completions, 256 greedy tokens, TP=2:
 #   no speculation ................................. 19.8 tok/s

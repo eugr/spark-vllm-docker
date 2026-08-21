@@ -40,12 +40,52 @@
 #     request. Higher than the base recipe's 4.37M because max_num_batched_tokens
 #     16384 shrinks the activation reserve.
 #   - Engine init 143 s (compilation 68 s).
-#   - Prefill is the cost that matters: 107,702 tokens took 77.3 s (~1,393 tok/s)
-#     and 323,078 tokens took 278.7 s (~1,159 tok/s). Extrapolating, a cold
-#     full-length 1M prefill is on the order of 15-18 minutes. Prefix caching is
-#     what makes a long session bearable; a cold one is not interactive.
+#   - Prefill is the cost that matters. The first figures here (107,702 tokens
+#     at ~1,393 tok/s, 323,078 at ~1,159 tok/s) were measured with prompts that
+#     were nested prefixes of one another, so they scored partly against a warm
+#     prefix cache - the server reported a 19.3% hit rate on a supposedly cold
+#     prefill. Re-measured with per-size salted prompts: 25,140 tokens at
+#     2,156 tok/s, 100,578 at 1,623 tok/s, 420,571 at 845 tok/s (497.8 s).
+#     Extrapolating that decay, a cold full-length 1M prefill is on the order of
+#     30 minutes, not the 15-18 first estimated. Prefix caching is what makes a
+#     long session bearable; a cold one is firmly a batch job.
+#   - max_num_seqs 4 is the ceiling on aggregate throughput, not memory:
+#     22.6 / 37.1 / 82.6 / 81.7 tok/s aggregate at concurrency 1 / 2 / 4 / 8.
+#     Past four slots requests queue. Raising it is untested here, but the KV
+#     pool would hold many more realistically-sized requests.
 #   - The 323k request also confirms YaRN is doing its job past the native
 #     262,144-token limit.
+#   - Decode barely cares about context depth, right up until it falls off a
+#     cliff. Measured decode, 128 tokens generated after a cold prefill:
+#         1,510 tok context ....... 25.6 tok/s   acceptance 3.x
+#        25,143 .................. 26.7 tok/s   acceptance 3.x
+#       100,581 .................. 25.2 tok/s   acceptance 3.x
+#       213,574 .................. 22.8 tok/s   acceptance 3.00
+#       254,652 .................. 23.0 tok/s   acceptance 3.12
+#       287,519 ................... 8.5 tok/s   acceptance 1.00  <- past native
+#       328,574 ................... 8.3 tok/s   acceptance 1.00
+#
+#     The cliff sits exactly on the native 262,144 boundary, and it is not a
+#     bandwidth effect: past that point the MTP head accepts *nothing*
+#     (per-position rates 0.000 / 0.000 / 0.000, against 0.93 / 0.68 / 0.51 at
+#     254k). Not merely degraded - 0 accepted out of 246 drafted. So every step
+#     past 262k pays for three drafter passes and keeps none of them.
+#
+#     The cause is NOT established. The obvious story - that YaRN reaches the
+#     base model but not the draft head - is wrong: for method=mtp vLLM sets
+#     draft_model_config = target_model_config, so the head is the target
+#     checkpoint and shares one rope config. Nor is the base model extrapolating
+#     at 287k; with factor 4.0 that maps to ~72k in the original basis. What is
+#     known is that the head still runs and emits tokens, and the target rejects
+#     every one. Exactly zero rather than merely low points at something
+#     categorical - invalid position indexing, a clamped rotary cache - rather
+#     than quality decay, but that is a hypothesis, not a finding.
+#
+#     Whatever the cause, it is awkward for this recipe specifically, since its
+#     whole purpose is contexts beyond 262,144 - exactly where its speculation
+#     is pure overhead. Measured with --speculative_config.* removed: 14.4 tok/s
+#     at 287,519 against 8.5 with it, at the cost of the 28-47% speculation buys
+#     below the boundary.
 #
 # The served name is qwen3.8-27b-1m, not the qwen3.8-27b the two native-context
 # recipes share. A served name should distinguish what changes the client's
