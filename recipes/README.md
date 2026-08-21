@@ -197,6 +197,8 @@ Launch options:
   --name NAME                 Override container name
   --nccl-debug LEVEL          NCCL debug level (VERSION, WARN, INFO, TRACE)
   --apply-mod PATH            Apply an extra mod directory or zip (repeatable)
+  --apply-vllm-pr PR          Apply an upstream PR to installed vLLM (repeatable,
+                              runtime-only, ordered with --apply-mod)
   -p, --publish HOST:CONTAINER
                               Publish a container port in solo mode (repeatable)
   -v, --volume LOCAL:CONTAINER
@@ -231,6 +233,21 @@ Other:
 ```bash
 ./run-recipe.sh minimax-m2-awq --solo \
   --earlyoom --earlyoom-args "-M 786432,196608 -s 100 -r 120"
+```
+
+`--apply-vllm-pr` is a launch option, including when combined with `--setup`.
+It creates an ephemeral runtime mod and does not pass the PR to the image build.
+It accepts Python/package-only changes under `vllm/`; PRs that modify native
+code, dependencies, build configuration, or packaging must use
+`build-and-copy.sh --apply-vllm-pr` instead. Recipe-declared mods are applied
+first, then command-line `--apply-mod` and `--apply-vllm-pr` layers in their
+specified order:
+
+```bash
+./run-recipe.sh my-recipe --solo \
+  --apply-mod mods/use-official-vllm \
+  --apply-vllm-pr 12345 \
+  --apply-mod mods/my-followup-fix
 ```
 
 ## Environment Variables and Volumes

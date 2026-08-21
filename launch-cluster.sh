@@ -32,6 +32,8 @@ ACTION=""
 CLUSTER_WAS_RUNNING="false"
 MOD_PATHS=()
 MOD_TYPES=()
+VLLM_PRS_REQUESTED="false"
+GENERATED_MOD_ROOT=""
 LAUNCH_SCRIPT_PATH=""
 SCRIPT_DIR="$(dirname "$(realpath "$0")")"
 CONFIG_FILE=""  # Will be set to default after argument parsing
@@ -68,6 +70,7 @@ usage() {
     echo "  -j              Number of parallel jobs for build environment variables (optional)"
     echo "  --nccl-debug    NCCL debug level (Optional, one of: VERSION, WARN, INFO, TRACE). If no level is provided, defaults to INFO."
     echo "  --apply-mod     Path to directory or zip file containing run.sh to apply before launch (Can be specified multiple times)"
+    echo "  --apply-vllm-pr Apply an upstream vLLM PR to the installed runtime package before launch (Can be specified multiple times)"
     echo "  --launch-script Path to bash script to execute in the container (from examples/ directory or absolute path). If launch script is specified, action should be omitted."
     echo "  --check-config  Check configuration and auto-detection without launching"
     echo "  --solo          Solo mode: skip autodetection, launch only on current node, do not launch Ray cluster"
@@ -136,7 +139,17 @@ while [[ "$#" -gt 0 ]]; do
         --ib-if) IB_IF="$2"; shift ;;
         -e|--env) DOCKER_ARGS="$DOCKER_ARGS -e $2"; shift ;;
         -j) BUILD_JOBS="$2"; shift ;;
-        --apply-mod) MOD_PATHS+=("$2"); shift ;;
+        --apply-mod) MOD_PATHS+=("$2"); MOD_TYPES+=("path"); shift ;;
+        --apply-vllm-pr)
+            if [[ -z "${2:-}" || ! "$2" =~ ^[1-9][0-9]*$ ]]; then
+                echo "Error: --apply-vllm-pr requires a positive integer PR number."
+                exit 1
+            fi
+            MOD_PATHS+=("$2")
+            MOD_TYPES+=("vllm-pr")
+            VLLM_PRS_REQUESTED="true"
+            shift
+            ;;
         --launch-script) LAUNCH_SCRIPT_PATH="$2"; shift ;;
         --nccl-debug)
             if [[ -n "$2" && "$2" =~ ^(VERSION|WARN|INFO|TRACE)$ ]]; then
@@ -447,6 +460,9 @@ fi
 # Validate MOD_PATHS if set
 for i in "${!MOD_PATHS[@]}"; do
     mod_path="${MOD_PATHS[$i]}"
+    if [[ "${MOD_TYPES[$i]}" == "vllm-pr" ]]; then
+        continue
+    fi
     if [[ ! -e "$mod_path" ]]; then
         echo "Error: Mod path '$mod_path' does not exist."
         exit 1
@@ -619,13 +635,37 @@ if [[ "$CHECK_CONFIG" == "true" ]]; then
     else
          echo "  Mounting Cache Dirs: (Disabled)"
     fi
+    if [[ "$VLLM_PRS_REQUESTED" == "true" ]]; then
+        runtime_prs=()
+        for i in "${!MOD_PATHS[@]}"; do
+            [[ "${MOD_TYPES[$i]}" == "vllm-pr" ]] && runtime_prs+=("${MOD_PATHS[$i]}")
+        done
+        echo "  Runtime vLLM PRs: ${runtime_prs[*]}"
+    fi
     exit 0
 fi
+
+# Remove temporary, generated PR mods without touching user-provided mod paths.
+cleanup_generated_mods() {
+    if [[ -n "$GENERATED_MOD_ROOT" && -d "$GENERATED_MOD_ROOT" ]]; then
+        case "$GENERATED_MOD_ROOT" in
+            /tmp/vllm-runtime-pr-mod.*)
+                rm -rf -- "$GENERATED_MOD_ROOT"
+                ;;
+            *)
+                echo "Warning: Refusing to remove unexpected generated mod path: $GENERATED_MOD_ROOT" >&2
+                ;;
+        esac
+    fi
+    GENERATED_MOD_ROOT=""
+}
 
 # Cleanup Function
 cleanup() {
     # Remove traps to prevent nested cleanup
     trap - EXIT INT TERM HUP
+
+    cleanup_generated_mods
 
     if [[ "$CLUSTER_WAS_RUNNING" == "true" ]]; then
         echo "Cluster was already running when script started. Skipping cleanup."
@@ -685,6 +725,10 @@ fi
 # Only trap if we are NOT in daemon mode (container should persist in daemon mode)
 if [[ "$DAEMON_MODE" == "false" ]]; then
     trap cleanup EXIT INT TERM HUP
+else
+    # Daemon mode deliberately leaves containers running, but host-side generated
+    # PR bundles are always temporary.
+    trap cleanup_generated_mods EXIT INT TERM HUP
 fi
 
 # Check if cluster is already running
@@ -710,6 +754,245 @@ check_cluster_running() {
         CLUSTER_WAS_RUNNING="true"
         return 0
     fi
+}
+
+download_vllm_pr_diff() {
+    local pr_number="$1"
+    local destination="$2"
+    local url="https://patch-diff.githubusercontent.com/raw/vllm-project/vllm/pull/${pr_number}.diff"
+
+    echo "Fetching upstream vLLM PR #${pr_number}..."
+    if command -v curl >/dev/null 2>&1; then
+        curl -fsSL --retry 3 --retry-delay 1 "$url" -o "$destination"
+    elif command -v wget >/dev/null 2>&1; then
+        wget -qO "$destination" "$url"
+    else
+        echo "Error: curl or wget is required to fetch vLLM PR patches." >&2
+        return 1
+    fi
+
+    if [[ ! -s "$destination" ]]; then
+        echo "Error: Downloaded patch for vLLM PR #${pr_number} is empty." >&2
+        return 1
+    fi
+}
+
+validate_vllm_runtime_diff() {
+    local pr_number="$1"
+    local patch_file="$2"
+
+    python3 - "$pr_number" "$patch_file" <<'PY'
+from __future__ import annotations
+
+import shlex
+import sys
+from pathlib import Path
+
+pr_number = sys.argv[1]
+patch_file = Path(sys.argv[2])
+runtime_paths: set[str] = set()
+ignored_paths: set[str] = set()
+unsupported_paths: set[str] = set()
+
+ignored_prefixes = (
+    ".github/",
+    "benchmarks/",
+    "docs/",
+    "examples/",
+    "tests/",
+)
+native_suffixes = {
+    ".a",
+    ".c",
+    ".cc",
+    ".cpp",
+    ".cu",
+    ".cuh",
+    ".cxx",
+    ".h",
+    ".hpp",
+    ".o",
+    ".so",
+}
+
+for line in patch_file.read_text(errors="replace").splitlines():
+    if not line.startswith("diff --git "):
+        continue
+    try:
+        fields = shlex.split(line)
+    except ValueError as exc:
+        raise SystemExit(
+            f"Error: Could not parse vLLM PR #{pr_number} diff header: {exc}"
+        ) from exc
+    if len(fields) != 4:
+        raise SystemExit(
+            f"Error: Unexpected vLLM PR #{pr_number} diff header: {line}"
+        )
+
+    for raw_path in fields[2:4]:
+        path = raw_path[2:] if raw_path.startswith(("a/", "b/")) else raw_path
+        if path == "/dev/null":
+            continue
+        if path.startswith(ignored_prefixes) or Path(path).suffix.lower() in {".md", ".rst"}:
+            ignored_paths.add(path)
+        elif path.startswith("vllm/"):
+            name = Path(path).name
+            if Path(path).suffix.lower() in native_suffixes or name in {
+                "CMakeLists.txt",
+                "Makefile",
+            }:
+                unsupported_paths.add(path)
+            else:
+                runtime_paths.add(path)
+        else:
+            unsupported_paths.add(path)
+
+if unsupported_paths:
+    rendered = "\n  - ".join(sorted(unsupported_paths))
+    raise SystemExit(
+        f"Error: vLLM PR #{pr_number} is not runtime-only. It changes files that "
+        f"require a source build or cannot be installed safely at launch:\n  - {rendered}\n"
+        f"Use build-and-copy.sh --apply-vllm-pr {pr_number} instead."
+    )
+
+if not runtime_paths:
+    raise SystemExit(
+        f"Error: vLLM PR #{pr_number} has no applicable files under vllm/. "
+        f"Use the build-time --apply-vllm-pr path if the PR is still required."
+    )
+
+print(
+    f"Validated vLLM PR #{pr_number} for runtime application: "
+    f"{len(runtime_paths)} package path(s), {len(ignored_paths)} test/docs path(s) ignored."
+)
+PY
+}
+
+write_vllm_pr_mod_runner() {
+    local destination="$1"
+
+    cat > "$destination" <<'RUN_SH'
+#!/bin/bash
+set -euo pipefail
+
+MOD_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PR_NUMBER="$(tr -d '\r\n' < "$MOD_DIR/pr-number")"
+PATCH_FILE="$MOD_DIR/pr.diff"
+EXPECTED_SHA256="$(tr -d '\r\n' < "$MOD_DIR/pr.sha256")"
+PREFIX="[vllm-pr #${PR_NUMBER}]"
+
+if ! command -v git >/dev/null 2>&1; then
+    echo "$PREFIX git is required to apply this runtime PR." >&2
+    echo "$PREFIX Apply mods/use-official-vllm before --apply-vllm-pr when using an image without git." >&2
+    exit 1
+fi
+
+if ! command -v python3 >/dev/null 2>&1; then
+    echo "$PREFIX python3 is required to locate the installed vLLM package." >&2
+    exit 1
+fi
+
+ACTUAL_SHA256="$(python3 - "$PATCH_FILE" <<'PY'
+import hashlib
+import sys
+from pathlib import Path
+
+print(hashlib.sha256(Path(sys.argv[1]).read_bytes()).hexdigest())
+PY
+)"
+if [[ "$ACTUAL_SHA256" != "$EXPECTED_SHA256" ]]; then
+    echo "$PREFIX Patch checksum mismatch; refusing to apply it." >&2
+    exit 1
+fi
+
+VLLM_PACKAGE_DIR="${VLLM_PACKAGE_DIR:-$(python3 - <<'PY'
+from importlib.util import find_spec
+
+spec = find_spec("vllm")
+if spec is None or not spec.submodule_search_locations:
+    raise SystemExit("Could not locate the installed vLLM package")
+print(next(iter(spec.submodule_search_locations)))
+PY
+)}"
+
+if [[ ! -d "$VLLM_PACKAGE_DIR" || "$(basename "$VLLM_PACKAGE_DIR")" != "vllm" ]]; then
+    echo "$PREFIX Invalid installed vLLM package directory: $VLLM_PACKAGE_DIR" >&2
+    exit 1
+fi
+
+PYTHON_ROOT="$(dirname "$VLLM_PACKAGE_DIR")"
+cd "$PYTHON_ROOT"
+APPLY_ARGS=(--binary --include='vllm/**')
+
+echo "$PREFIX Applying validated runtime patch $EXPECTED_SHA256 to $VLLM_PACKAGE_DIR"
+if git apply --reverse --check "${APPLY_ARGS[@]}" "$PATCH_FILE" >/dev/null 2>&1; then
+    echo "$PREFIX Patch is already applied; skipping."
+elif git apply --check "${APPLY_ARGS[@]}" "$PATCH_FILE"; then
+    git apply "${APPLY_ARGS[@]}" "$PATCH_FILE"
+    echo "$PREFIX Applied successfully."
+else
+    echo "$PREFIX Patch does not apply cleanly to the installed vLLM package." >&2
+    echo "$PREFIX Rebuild with build-and-copy.sh --apply-vllm-pr $PR_NUMBER if this PR is not runtime-compatible." >&2
+    exit 1
+fi
+RUN_SH
+    chmod +x "$destination"
+}
+
+prepare_vllm_pr_mods() {
+    if [[ "$VLLM_PRS_REQUESTED" != "true" ]]; then
+        return 0
+    fi
+
+    GENERATED_MOD_ROOT="$(mktemp -d /tmp/vllm-runtime-pr-mod.XXXXXX)" || {
+        echo "Error: Could not create a temporary directory for runtime vLLM PR mods." >&2
+        return 1
+    }
+    local cache_dir="$GENERATED_MOD_ROOT/cache"
+    mkdir -p "$cache_dir"
+
+    local i
+    for i in "${!MOD_PATHS[@]}"; do
+        if [[ "${MOD_TYPES[$i]}" != "vllm-pr" ]]; then
+            continue
+        fi
+
+        local pr_number="${MOD_PATHS[$i]}"
+        local bundle_dir="$GENERATED_MOD_ROOT/vllm-pr-${pr_number}-${i}"
+        local patch_file="$bundle_dir/pr.diff"
+        local cached_patch="$cache_dir/pr-${pr_number}.diff"
+        local cached_sha256="$cache_dir/pr-${pr_number}.sha256"
+        mkdir -p "$bundle_dir"
+
+        if [[ ! -f "$cached_patch" ]]; then
+            if ! download_vllm_pr_diff "$pr_number" "$cached_patch"; then
+                cleanup_generated_mods
+                return 1
+            fi
+            if ! validate_vllm_runtime_diff "$pr_number" "$cached_patch"; then
+                cleanup_generated_mods
+                return 1
+            fi
+            python3 - "$cached_patch" > "$cached_sha256" <<'PY'
+import hashlib
+import sys
+from pathlib import Path
+
+print(hashlib.sha256(Path(sys.argv[1]).read_bytes()).hexdigest())
+PY
+        fi
+
+        local patch_sha256
+        patch_sha256="$(tr -d '\r\n' < "$cached_sha256")"
+        cp "$cached_patch" "$patch_file"
+        printf '%s\n' "$pr_number" > "$bundle_dir/pr-number"
+        printf '%s\n' "$patch_sha256" > "$bundle_dir/pr.sha256"
+        write_vllm_pr_mod_runner "$bundle_dir/run.sh"
+
+        echo "Prepared runtime vLLM PR #${pr_number} (SHA-256: ${patch_sha256})."
+        MOD_PATHS[$i]="$bundle_dir"
+        MOD_TYPES[$i]="dir"
+    done
 }
 
 # Apply Mod Function
@@ -745,7 +1028,7 @@ apply_mod_to_container() {
         if [[ "$mod_type" == "zip" ]]; then
              if ! scp -o BatchMode=yes -o StrictHostKeyChecking=no "$mod_path" "$node_ip:$remote_tmp/"; then
                 echo "Error: Failed to copy mod to $node_ip"
-                exit 1
+                return 1
              fi
              target_mod_path="$remote_tmp/$(basename "$mod_path")"
         else
@@ -753,7 +1036,7 @@ apply_mod_to_container() {
              # Copy contents using wildcard to avoid creating a subdirectory
              if ! scp -r -o BatchMode=yes -o StrictHostKeyChecking=no "$mod_path"/* "$node_ip:$remote_tmp/"; then
                 echo "Error: Failed to copy mod to $node_ip"
-                exit 1
+                return 1
              fi
              target_mod_path="$remote_tmp"
         fi
@@ -772,7 +1055,7 @@ apply_mod_to_container() {
     # /workspace as WORKDIR but do not create it, which breaks docker exec.
     $cmd_prefix docker exec -w / "$container" mkdir -p "$container_dest" || {
         echo "Error: Failed to create $container_dest in container on $node_ip"
-        exit 1
+        return 1
     }
 
     if [[ "$mod_type" == "zip" ]]; then
@@ -820,8 +1103,7 @@ apply_mod_to_container() {
 
     if [[ $ret_code -ne 0 ]]; then
         echo "Error: Patch script failed on $node_ip"
-        # We should probably stop the cluster here or at least fail hard
-        exit 1
+        return 1
     fi
 
     # 4. Cleanup remote temp
@@ -1053,10 +1335,16 @@ start_cluster() {
     check_cluster_running
 
     if [[ "$CLUSTER_WAS_RUNNING" == "true" ]]; then
+        if [[ "$VLLM_PRS_REQUESTED" == "true" ]]; then
+            echo "Error: --apply-vllm-pr cannot be verified or applied because cluster containers are already running." >&2
+            echo "       Stop and recreate the cluster to apply the requested runtime PR layer." >&2
+            return 1
+        fi
         return
     fi
 
-    verify_cluster_image_consistency || exit 1
+    verify_cluster_image_consistency || return 1
+    prepare_vllm_pr_mods || return 1
 
     # Build docker run arguments based on mode
     local docker_entrypoint_args=""
@@ -1111,14 +1399,21 @@ start_cluster() {
     if [[ ${#MOD_PATHS[@]} -gt 0 ]]; then
         echo "Applying modifications to cluster nodes..."
         for i in "${!MOD_PATHS[@]}"; do
-            apply_mod_to_container "$HEAD_IP" "$CONTAINER_NAME" "true" "${MOD_PATHS[$i]}" "${MOD_TYPES[$i]}"
+            if ! apply_mod_to_container "$HEAD_IP" "$CONTAINER_NAME" "true" "${MOD_PATHS[$i]}" "${MOD_TYPES[$i]}"; then
+                cleanup
+                return 1
+            fi
         done
         for worker in "${PEER_NODES[@]}"; do
             for i in "${!MOD_PATHS[@]}"; do
-                apply_mod_to_container "$worker" "$CONTAINER_NAME" "false" "${MOD_PATHS[$i]}" "${MOD_TYPES[$i]}"
+                if ! apply_mod_to_container "$worker" "$CONTAINER_NAME" "false" "${MOD_PATHS[$i]}" "${MOD_TYPES[$i]}"; then
+                    cleanup
+                    return 1
+                fi
             done
         done
     fi
+    cleanup_generated_mods
 
     # Copy (and patch for no-ray) launch script
     if [[ -n "$LAUNCH_SCRIPT_PATH" ]]; then
@@ -1269,7 +1564,7 @@ if [[ "$ACTION" == "exec" ]]; then
         fi
     fi
 
-    start_cluster
+    start_cluster || exit 1
     echo "Executing command: $COMMAND_TO_RUN"
 
     if [[ "$NO_RAY_MODE" == "true" && ${#PEER_NODES[@]} -gt 0 ]]; then
@@ -1282,7 +1577,7 @@ if [[ "$ACTION" == "exec" ]]; then
         _exec_on_head "$COMMAND_TO_RUN"
     fi
 elif [[ "$ACTION" == "start" ]]; then
-    start_cluster
+    start_cluster || exit 1
     if [[ "$DAEMON_MODE" == "true" ]]; then
         echo "Cluster started in background (Daemon mode)."
     else
