@@ -19,21 +19,66 @@
 #   - max_model_len 1048576 = 4.0 x 262144, matching the rope "factor" exactly.
 #     The card writes 1000000; the power-of-two figure is the same setting
 #     stated without rounding.
-#   - max_num_seqs 4, down from 8. A full-length sequence costs ~32 GiB of KV
-#     (16 full-attention layers x 2 x 4 KV heads x 256 head dim x 1 byte, the
-#     checkpoint quantizes KV to 8 bits), so the measured 4.37M-token pool at
-#     TP=2 holds about four of them. Leaving max_num_seqs at 8 would oversubscribe
-#     the pool by 2x and trade a hang-free start for preemption and recompute -
-#     the worst outcome when a single 1M prefill is already minutes long.
+#   - max_num_seqs 8, same as the base recipe. This was 4 on the reasoning that
+#     a full-length sequence costs ~32 GiB of KV (16 full-attention layers x 2 x
+#     4 KV heads x 256 head dim x 1 byte) so the pool holds about four of them.
+#     That is true only if every request is actually 1M tokens long; real
+#     traffic is nowhere near it, and the cap was costing most of the machine's
+#     capacity. Measured aggregate throughput at concurrency 8 went from 81.7 to
+#     141.6 tok/s (+73%) with the KV pool essentially unchanged. vLLM preempts
+#     and recomputes if genuinely oversubscribed, which is the correct failure
+#     mode for a rare case rather than a permanent 73% tax on the common one.
+#   - gpu_memory_utilization 0.88, up from 0.82. vLLM's own boot log offered
+#     --kv-cache-memory=93.79 GiB against the 82.98 GiB in use. Taking it
+#     measured 5,453,845 KV tokens against 4,997,535 (+9.1%) with no OOM and
+#     decode unchanged.
 #   - max_num_batched_tokens 16384 bounds the chunked-prefill activation
 #     footprint, which matters far more at 1M than at 262k.
 #   - VLLM_ALLOW_LONG_MAX_MODEL_LEN=1 is required: the checkpoint declares
 #     max_position_embeddings 262144, and vLLM refuses a longer max_model_len
 #     without it.
 #
-# The base recipe's MTP head is kept rather than the DSpark drafter: DSpark's
-# separate weights and cache cost roughly 1.3M tokens of KV pool (3.04M vs
-# 4.37M measured), which at this context length is a whole concurrent request.
+# This recipe carries no speculative decoding at all, which is the one place it
+# diverges sharply from the two native-context recipes.
+#
+# Past the native 262,144-token window the MTP head accepts *nothing* -
+# acceptance length 1.00, per-position rates 0.000/0.000/0.000, against 3.12 at
+# 254,652 tokens - 0 accepted out of 246 drafted, not merely degraded - so every
+# step beyond 262k paid for three sequential drafter passes and kept none of
+# them. The cause is unexplained; see the measurement block above for why the
+# obvious YaRN explanation does not hold. Measured decode at 287,519
+# tokens: 8.5 tok/s with speculation, 14.4 without (+69%). Removing the drafter
+# also returns ~7% of the KV pool.
+#
+# Below 262k speculation is still worth +28% to +47%, so this is a deliberate
+# trade against this recipe's actual purpose: it exists to serve contexts past
+# the native window, and short-context work belongs on qwen3.8-27b-nvfp4.yaml,
+# which does it at 35-39 tok/s rather than this recipe's 25.
+#
+# FlashInfer stays as the attention backend, and unlike on the native-context
+# recipes that is not a default left unexamined. Measured on this exact recipe,
+# FlashInfer against TRITON_ATTN:
+#
+#                        FlashInfer   TRITON_ATTN
+#   decode @   1,510 tok    25.6         35.9      Triton +40%
+#   decode @ 213,574 tok    22.8         12.2      Triton -46%
+#   decode @ 287,519 tok     8.5          3.6      Triton -58%
+#   prefill @ 100,578 tok  1,623 tok/s  1,054      Triton -35%
+#   TTFT    @ 213,574 tok    178 s        329 s    Triton +85%
+#
+# Triton is much faster at short context and much slower at long context: step
+# time grows ~0.83 ms per 1k tokens of context against FlashInfer's ~0.11, and
+# the two cross near 42k tokens. A recipe whose whole purpose is long context
+# wants the backend on the right side of that crossover. Two further reasons
+# point the same way here: with no drafter there is no multi-token verify step,
+# so the CUDA-graph argument that governs the native-context recipes does not
+# apply at all, and prefill dominates the wall clock at these lengths.
+#
+# Note the A/B above was run with speculation still enabled, so it measures the
+# backends against each other rather than the exact configuration this recipe
+# now ships. The depth and prefill gaps are wide enough, and the CUDA-graph
+# argument for Triton disappears entirely without a drafter, that removing
+# speculation can only widen FlashInfer's lead here.
 #
 # Measured on the 2x Spark cluster 2026-08-20, this exact recipe:
 #   - GPU KV cache size 4,989,721 tokens, 4.76x concurrency at 1,048,576 per
@@ -49,10 +94,9 @@
 #     Extrapolating that decay, a cold full-length 1M prefill is on the order of
 #     30 minutes, not the 15-18 first estimated. Prefix caching is what makes a
 #     long session bearable; a cold one is firmly a batch job.
-#   - max_num_seqs 4 is the ceiling on aggregate throughput, not memory:
-#     22.6 / 37.1 / 82.6 / 81.7 tok/s aggregate at concurrency 1 / 2 / 4 / 8.
-#     Past four slots requests queue. Raising it is untested here, but the KV
-#     pool would hold many more realistically-sized requests.
+#   - max_num_seqs was the ceiling on aggregate throughput, not memory:
+#     22.6 / 37.1 / 82.6 / 81.7 tok/s aggregate at concurrency 1 / 2 / 4 / 8 with
+#     the old cap of 4. Raising it to 8 gives 23.1 / 37.9 / 83.0 / 141.6.
 #   - The 323k request also confirms YaRN is doing its job past the native
 #     262,144-token limit.
 #   - Decode barely cares about context depth, right up until it falls off a
@@ -114,11 +158,10 @@ defaults:
   port: 8000
   host: 0.0.0.0
   tensor_parallel: 2
-  gpu_memory_utilization: 0.82
+  gpu_memory_utilization: 0.88
   max_model_len: 1048576
-  max_num_seqs: 4
+  max_num_seqs: 8
   max_num_batched_tokens: 16384
-  num_speculative_tokens: 3
 
 env:
   CUTE_DSL_ARCH: "sm_121a"
@@ -143,7 +186,4 @@ command: |
     --limit-mm-per-prompt '{{"image": 4, "video": 1}}' \
     --reasoning-parser qwen3 \
     --enable-auto-tool-choice \
-    --tool-call-parser qwen3_xml \
-    --speculative_config.method mtp \
-    --speculative_config.model unsloth/Qwen3.8-27B-NVFP4 \
-    --speculative_config.num_speculative_tokens {num_speculative_tokens}
+    --tool-call-parser qwen3_xml
