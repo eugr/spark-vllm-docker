@@ -69,6 +69,30 @@
 # presence_penalty 1.5): vLLM keeps one set of server-side defaults and cannot
 # switch them per request.
 #
+# Image input is live, not decoration. This checkpoint is
+# Qwen3_5ForConditionalGeneration: config.json carries image_token_id 248056,
+# video_token_id 248057 and a 27-layer vision_config, and the NVFP4 quantization
+# lists every model.visual.* block under `ignore` so the tower loads in bf16.
+# --limit-mm-per-prompt above is therefore enforced, not an inherited no-op.
+#
+# Verified against this recipe on 2026-08-21 at TP=2: a 128x128 PNG of a blue
+# triangle labelled "42" returned "triangle, 42", and the same image re-encoded
+# as WebP scored identically, so no client-side format conversion is needed.
+# Image cost is floored - preprocessor_config.json sets shortest_edge to
+# 65536 px^2 (256x256), so 96px, 128px and 160px sources all bill 103 prompt
+# tokens; only a source above the floor moves it, a 320px one to 139.
+#
+# Two client-side notes, since neither failure names its own cause:
+#   - The endpoint is HTTPS with a bearer key. A plain-HTTP POST answers
+#     "Empty reply from server", which reads like a server crash.
+#   - Thinking is on by default, so a small max_tokens is spent entirely inside
+#     the reasoning block and returns content: null with finish_reason
+#     "length". Send chat_template_kwargs {"enable_thinking": false}, or
+#     reasoning_effort "none", when a short answer is wanted.
+#
+# tools/quality-probe.py carries vision-1..3 against this recipe, so the image
+# path is a tested claim rather than an asserted one. --no-vision skips them.
+#
 # For contexts beyond the native 262,144 tokens, see qwen3.8-27b-nvfp4-1m.yaml
 # rather than raising max_model_len here.
 

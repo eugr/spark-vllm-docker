@@ -21,6 +21,13 @@ digest per prompt. Run it against config A, then against config B, then diff:
   ./quality-probe.py --model qwen3.8-27b-1m --out /tmp/q-yarn.json
   ./quality-probe.py --compare /tmp/q-triton.json /tmp/q-yarn.json
 
+Image input is part of the served contract, not an extra. The checkpoint is
+Qwen3_5ForConditionalGeneration with a 27-layer vision tower that the NVFP4
+quantization deliberately leaves in bf16, and all three qwen3.8 recipes pass
+--limit-mm-per-prompt, so a config change can regress the image path just as
+easily as the text one. The vision probes below cover it. Use --no-vision when
+the served model is text-only, or those probes will score it as broken.
+
 Graded tasks have checkable answers, so a divergence can be labelled better or
 worse instead of merely different. The set is small and is a regression tripwire,
 not a benchmark suite -- it will not rank models, only tell you whether a config
@@ -65,6 +72,58 @@ PROBES = [
                  "Reply with only the JSON.", '"a"'),
 ]
 
+# A 128x128 two-colour PNG: a blue triangle with a white "42" on it. Kept inline
+# as base64 so this stays a single stdlib-only file with no binary fixture to
+# lose. Small on purpose -- preprocessor_config.json sets a 65536-px^2
+# (256x256) shortest_edge floor, so 96px, 128px and 160px sources all cost an
+# identical 103 prompt tokens; only above the floor does cost move (a 320px
+# source costs 139). Regenerate with:
+#
+#   im = Image.new("P", (128, 128))
+#   im.putpalette([255, 255, 255, 30, 90, 220] + [0] * 762)
+#   d = ImageDraw.Draw(im)
+#   d.polygon([(16, 112), (64, 24), (112, 112)], fill=1)
+#   d.text((64, 86), "42", fill=0, anchor="mm",
+#          font=ImageFont.truetype("DejaVuSans-Bold.ttf", 44))
+#   im.save("v128.png", optimize=True)
+VISION_PROBE_IMAGE = (
+    "iVBORw0KGgoAAAANSUhEUgAAAIAAAACACAMAAAD04JH5AAADAFBMVEX///8eWtwAAAAAAAAA"
+    "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+    "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+    "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+    "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+    "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+    "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+    "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+    "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+    "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+    "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+    "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+    "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+    "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+    "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACU"
+    "oMXfAAABXklEQVR42u3X0a6DIBBFUfb///R9rREFdOhOc895beOsMIhDa0mSJEmSJEmSJC+D"
+    "XR/+NwBkgQ0AWWADQBbYAJAFNgBcAcgCGwCywAaALLABIAtsAMgCGwCuAGSBDQBZYANAFtgA"
+    "kAU2AGSBDQBXALLABoAssAEgC2wAyAIbALLABixU3CK4KtOvtUFwB7j4/+b6A0C1oFNqtN9K"
+    "ATwCsHUBToBOj7bWPwJ6r0ThEowA/fOgDnBc6ek7et1ZcOz09wGfz2URQHkDVgFUN2AMuN25"
+    "7xuwDKB6AUaA08/V9QeAmY/1UwATgFYNOC/ALaA/P70G9DfVeCgrAJwbcAO4nh9rOjAaVW/m"
+    "19qvYBtMJYUzOguANvd2bgO0yePp2VVkoUmlF6V5wMT1qfAuNjsVvz4MbADFAH4NQDmA3wKw"
+    "I3b9FYENAFlgA0AW2ACQBTYAZIENAH0JkiRJkiT5bv4ATo4NdhQcjKgAAAAASUVORK5CYII="
+)
+
+# Same (id, prompt, expected) shape as PROBES, all against VISION_PROBE_IMAGE.
+# Three questions rather than one so a partial failure is legible: glyph
+# recognition, colour, and both-plus-instruction-following degrade separately.
+VISION_PROBES = [
+    ("vision-1", "What number is written in this image? Reply with only the "
+                 "number.", "42"),
+    ("vision-2", "What colour is the shape in this image? Reply with only the "
+                 "colour.", "blue"),
+    ("vision-3", "Reply with exactly two words separated by a comma: the shape "
+                 "you see, then the number written on it. Nothing else.",
+                 "triangle, 42"),
+]
+
 
 def api_key():
     if os.environ.get("VLLM_API_KEY"):
@@ -77,11 +136,21 @@ def api_key():
     raise SystemExit(f"no VLLM_API_KEY in {path}")
 
 
-def ask(base, key, model, prompt, max_tokens, no_think):
+def ask(base, key, model, prompt, max_tokens, no_think, image=None):
     """One greedy chat completion. Returns (visible_text, reasoning_text)."""
+    if image is None:
+        content = prompt
+    else:
+        # vLLM accepts a data URL here; PNG and WebP both decode. The text block
+        # goes first so the question is not split across the visual tokens.
+        content = [
+            {"type": "text", "text": prompt},
+            {"type": "image_url",
+             "image_url": {"url": f"data:image/png;base64,{image}"}},
+        ]
     body = {
         "model": model,
-        "messages": [{"role": "user", "content": prompt}],
+        "messages": [{"role": "user", "content": content}],
         "max_tokens": max_tokens,
         "temperature": 0.0,
         "top_p": 1.0,
@@ -114,9 +183,13 @@ def run(args):
     key = api_key()
     results = {}
     passed = total = 0
-    for pid, prompt, expect in PROBES:
+    probes = [(pid, prompt, expect, None) for pid, prompt, expect in PROBES]
+    if not args.no_vision:
+        probes += [(pid, prompt, expect, VISION_PROBE_IMAGE)
+                   for pid, prompt, expect in VISION_PROBES]
+    for pid, prompt, expect, image in probes:
         text, reasoning = ask(args.base, key, args.model, prompt,
-                              args.max_tokens, args.no_think)
+                              args.max_tokens, args.no_think, image)
         ok = graded(text, expect)
         if ok is not None:
             total += 1
@@ -126,6 +199,7 @@ def run(args):
             "answer": text,
             "digest": hashlib.sha256(text.encode()).hexdigest()[:16],
             "reasoning_chars": len(reasoning),
+            "image": image is not None,
             "expected": expect,
             "correct": ok,
         }
@@ -137,6 +211,7 @@ def run(args):
         "label": args.label,
         "model": args.model,
         "no_think": args.no_think,
+        "vision": not args.no_vision,
         "score": {"passed": passed, "graded": total},
         "results": results,
     }
@@ -192,6 +267,8 @@ def main():
     ap.add_argument("--max-tokens", type=int, default=2048)
     ap.add_argument("--no-think", action="store_true",
                     help="send enable_thinking=false (the card's instruct path)")
+    ap.add_argument("--no-vision", action="store_true",
+                    help="skip the image probes (for a text-only served model)")
     ap.add_argument("--label", default="")
     ap.add_argument("--out", default="")
     ap.add_argument("--compare", nargs=2, metavar=("A.json", "B.json"))
