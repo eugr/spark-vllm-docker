@@ -191,10 +191,21 @@ def acceptance(before, after):
     }
 
 
-def suite_decode(cli, repeats, max_tokens):
-    """Single-stream decode rate per prompt family."""
+def suite_decode(cli, repeats, max_tokens, families=None):
+    """Single-stream decode rate per prompt family.
+
+    ``families`` narrows the set. That is not just convenience: decode spread is
+    acceptance-driven, so prose and chat carry sd ~13 tok/s (~30% of mean) while
+    peak carries ~2. Resolving a 3% effect needs n~60 on a noisy family but n~20
+    on a tight one, so pointing the run at the tight family is ~8x cheaper than
+    brute-forcing all five.
+    """
     results = []
-    for name, prompt in PROMPTS.items():
+    prompts = PROMPTS if families is None else {
+        k: v for k, v in PROMPTS.items() if k in families}
+    if not prompts:
+        raise SystemExit(f"no such prompt family; have {sorted(PROMPTS)}")
+    for name, prompt in prompts.items():
         # One warm-up per family so prefix caching and any lazy kernel
         # selection are settled before the measured passes.
         cli.complete(prompt, 32)
@@ -257,7 +268,7 @@ def suite_concurrency(cli, levels, max_tokens):
     return results
 
 
-def suite_prefill(cli, sizes):
+def suite_prefill(cli, sizes, repeats=1):
     """Prefill rate at increasing prompt lengths, from TTFT.
 
     Prompts are built from a non-repeating filler so prefix caching cannot
@@ -265,11 +276,12 @@ def suite_prefill(cli, sizes):
     """
     results = []
     for idx, target in enumerate(sizes):
+      for rep in range(repeats):
         # This filler runs ~14 tokens per item. Each size gets its own salt so
         # the prompts are not nested prefixes of one another -- otherwise the
         # larger sizes score against a warm prefix cache and read far faster
         # than a genuine cold prefill.
-        salt = f"s{idx}x{target}"
+        salt = f"s{idx}x{target}r{rep}"
         words = " ".join(f"{salt}item{i:07d} value{i * 7 % 9973:05d}"
                          for i in range(max(1, target // 14)))
         prompt = f"Read the following log and reply with only the word OK.\n{words}\nReply:"
@@ -278,6 +290,7 @@ def suite_prefill(cli, sizes):
         rate = round(ptok / ttft, 1) if (ptok and ttft) else None
         results.append({
             "target_tokens": target,
+            "repeat": rep,
             "prompt_tokens": ptok,
             "ttft_s": round(ttft, 3) if ttft else None,
             "total_s": round(total, 3),
@@ -346,6 +359,13 @@ def main():
     ap.add_argument("--max-tokens", type=int, default=256)
     ap.add_argument("--concurrency", default="1,2,4,8")
     ap.add_argument("--prefill-sizes", default="8000,32000,100000")
+    ap.add_argument("--prefill-repeats", type=int, default=1,
+                    help="repeat each prefill size; each repeat gets its own "
+                         "salt so none of them reads a warm prefix cache")
+    ap.add_argument("--families", default="",
+                    help="comma-separated decode prompt families to run "
+                         "(default all); use a low-variance family such as "
+                         "peak to resolve small effects cheaply")
     ap.add_argument("--depths", default="1000,16000,64000,200000")
     ap.add_argument("--depth-gen-tokens", type=int, default=128)
     ap.add_argument("--label", default="")
@@ -361,7 +381,8 @@ def main():
 
     if "decode" in want:
         print("== decode (single stream) ==", flush=True)
-        out["suites"]["decode"] = suite_decode(cli, args.repeats, args.max_tokens)
+        fams = [f.strip() for f in args.families.split(",")] if args.families else None
+        out["suites"]["decode"] = suite_decode(cli, args.repeats, args.max_tokens, fams)
     if "concurrency" in want:
         print("== concurrency ==", flush=True)
         levels = [int(x) for x in args.concurrency.split(",")]
@@ -369,7 +390,7 @@ def main():
     if "prefill" in want:
         print("== prefill ==", flush=True)
         sizes = [int(x) for x in args.prefill_sizes.split(",")]
-        out["suites"]["prefill"] = suite_prefill(cli, sizes)
+        out["suites"]["prefill"] = suite_prefill(cli, sizes, args.prefill_repeats)
 
     if "depth" in want:
         print("== decode at context depth ==", flush=True)

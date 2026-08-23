@@ -188,8 +188,25 @@ def run(args):
         probes += [(pid, prompt, expect, VISION_PROBE_IMAGE)
                    for pid, prompt, expect in VISION_PROBES]
     for pid, prompt, expect, image in probes:
-        text, reasoning = ask(args.base, key, args.model, prompt,
-                              args.max_tokens, args.no_think, image)
+        # A probe that errors must not cost the whole run. Before this, one
+        # HTTP 400 raised out of main() and the JSON was never written, so
+        # --compare had nothing to read even though every other probe had
+        # answered. That is exactly what a model with no vision tower does to
+        # the vision probes: it 400s them, silently discarding a full pass.
+        try:
+            text, reasoning = ask(args.base, key, args.model, prompt,
+                                  args.max_tokens, args.no_think, image)
+        except Exception as exc:
+            print(f"  [ERR ] {pid:<10} {type(exc).__name__}: {str(exc)[:80]}",
+                  flush=True)
+            results[pid] = {
+                "prompt": prompt,
+                "error": f"{type(exc).__name__}: {exc}",
+                "image": image is not None,
+                "expected": expect,
+                "correct": None,
+            }
+            continue
         ok = graded(text, expect)
         if ok is not None:
             total += 1
@@ -236,6 +253,12 @@ def compare(path_a, path_b):
         if pid not in b["results"]:
             continue
         ra, rb = a["results"][pid], b["results"][pid]
+        # A probe can carry an error instead of an answer now that one failure
+        # no longer aborts the run; report it rather than indexing past it.
+        if "digest" not in ra or "digest" not in rb:
+            print(f"SKIPPED  {pid}: "
+                  f"A={ra.get('error', 'ok')} B={rb.get('error', 'ok')}")
+            continue
         if ra["digest"] == rb["digest"]:
             same += 1
             continue
