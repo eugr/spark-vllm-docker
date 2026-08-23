@@ -38,6 +38,10 @@ PROMPTS = {
             "through an itinerary and explain your reasoning for each stop.",
     "repetitive": "Count from 1 to 500, writing each number on its own line as "
                   "'Line N: value N'.",
+    # The prompt third-party DGX Spark writeups use for their headline tok/s.
+    # Kept verbatim so our peak number is comparable to a published one rather
+    # than merely similar; it is a best case, not a workload.
+    "peak": "Count from 1 to 300, separated by commas.",
 }
 
 

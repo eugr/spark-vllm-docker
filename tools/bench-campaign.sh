@@ -9,6 +9,12 @@
 # It expects the cluster to itself. Stop the running unit first:
 #
 #   sudo systemctl stop vllm@qwen3.8-27b-nvfp4-1m.service
+#
+# Stopping the CONTAINERS is not enough. The vllm@ template carries
+# Restart=on-failure with RestartSec=30, so `launch-cluster.sh stop` against a
+# live unit looks like it worked and then systemd relaunches the old recipe
+# ~30s later -- the next variant either measures the wrong model or dies on
+# "Address already in use". The guard below refuses to start in that state.
 #   tools/bench-campaign.sh                 # every variant
 #   tools/bench-campaign.sh mtp-triton 1m-triton   # or a subset
 #
@@ -95,6 +101,29 @@ DEPTHS_1M="1000,130000,175000"
 # reward at 3 accepted tokens. Measured here rather than argued.
 transform_dspark_k3() { sed 's/^  num_speculative_tokens: 7$/  num_speculative_tokens: 3/'; }
 
+# The ds4f filler runs ~0.87 prompt tokens per unit of depth (measured: depth
+# 1000 -> 870 tokens), so 75000 lands just past the model's native 65,536-token
+# YaRN window and 300000 sits deep into the scaled region.
+DEPTHS_DS4F="1000,75000,300000"
+
+# DeepSeek-V4-Flash speaks fp8_ds_mla KV at 584 B/token and cannot do better;
+# these variants vary speculation depth and the attention stack instead.
+transform_ds4f_k3() { sed 's/^  num_speculative_tokens: 5$/  num_speculative_tokens: 3/'; }
+
+# The base recipe pairs DSpark k=5 with B12X_MLA_SPARSE. Past the native window
+# the drafter may accept nothing, in which case five wasted drafter passes per
+# step cost more than they return -- the same shape as the MTP cliff above.
+transform_ds4f_nospec() { sed -e '/^      --speculative-config /d'; }
+
+# Third-party DGX Spark writeups run this model with the attention backend on
+# AUTO and the V2 model runner off, because their older build rejects both. This
+# asks what that costs on our stack rather than assuming it costs nothing.
+transform_ds4f_theirs() {
+  sed -e '/^      --attention-backend B12X_MLA_SPARSE \\$/d' \
+      -e 's/,"attention_backend":"B12X_MLA_SPARSE"//' \
+      -e 's/^  VLLM_USE_V2_MODEL_RUNNER: "1"$/  VLLM_USE_V2_MODEL_RUNNER: "0"/'
+}
+
 # name : source recipe : served model id : transform function : depth list
 variant_spec() {
   case "$1" in
@@ -108,6 +137,14 @@ variant_spec() {
     1m-kvheadroom) echo "qwen3.8-27b-nvfp4-1m|qwen3.8-27b-1m|transform_kv|$DEPTHS_1M" ;;
     dspark-k7)     echo "qwen3.8-27b-nvfp4-dspark|qwen3.8-27b|transform_none|$DEPTHS_262K" ;;
     dspark-k3)     echo "qwen3.8-27b-nvfp4-dspark|qwen3.8-27b|transform_dspark_k3|$DEPTHS_262K" ;;
+    # DeepSeek-V4-Flash. ds4f-base is eugr's recipe untouched, which leaves
+    # max_model_len on "auto" and therefore serves a different window on every
+    # boot; ds4f-1m is the pinned 1,048,576 variant.
+    ds4f-base)     echo "deepseek-v4-flash-0731|deepseek-ai/DeepSeek-V4-Flash-0731|transform_none|$DEPTHS_DS4F" ;;
+    ds4f-1m)       echo "deepseek-v4-flash-0731-1m|deepseek-ai/DeepSeek-V4-Flash-0731|transform_none|$DEPTHS_DS4F" ;;
+    ds4f-1m-k3)    echo "deepseek-v4-flash-0731-1m|deepseek-ai/DeepSeek-V4-Flash-0731|transform_ds4f_k3|$DEPTHS_DS4F" ;;
+    ds4f-1m-nospec) echo "deepseek-v4-flash-0731-1m|deepseek-ai/DeepSeek-V4-Flash-0731|transform_ds4f_nospec|$DEPTHS_DS4F" ;;
+    ds4f-1m-theirs) echo "deepseek-v4-flash-0731-1m|deepseek-ai/DeepSeek-V4-Flash-0731|transform_ds4f_theirs|$DEPTHS_DS4F" ;;
     *) return 1 ;;
   esac
 }
@@ -115,6 +152,17 @@ variant_spec() {
 ALL_VARIANTS="mtp-triton mtp-triton-k5 1m-nospec 1m-triton 1m-seqs8 1m-kvheadroom"
 VARIANTS=("${@:-}")
 [ -z "${VARIANTS[0]:-}" ] && read -ra VARIANTS <<< "$ALL_VARIANTS"
+
+# A live vllm@ unit will relaunch its own recipe under us; see the note above.
+systemd_guard() {
+  local active
+  active="$(systemctl list-units 'vllm@*' --state=active --no-legend 2>/dev/null | awk '{print $1}')"
+  [ -n "$active" ] || return 0
+  echo "refusing to run: active vllm unit(s): $active" >&2
+  for unit in $active; do echo "  sudo systemctl stop $unit" >&2; done
+  exit 1
+}
+systemd_guard
 
 api_key() { sed -n 's/^VLLM_API_KEY=//p' "$KEYFILE" | tr -d "\"' \n"; }
 KEY="$(api_key)"
