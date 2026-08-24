@@ -7,8 +7,12 @@ START_TIME=$(date +%s)
 # Default values
 IMAGE_TAG="vllm-node"
 IMAGE_TAG_SET=false
-PREBUILT_RUNNER_IMAGE="eugr/spark-vllm:latest"
-PREBUILT_B12X_RUNNER_IMAGE="eugr/spark-vllm-b12x:latest"
+# Both prebuilt images honor an environment override so a specific build can
+# be deployed through the normal pull-tag-copy flow (e.g. to hold a known-good
+# nightly while :latest is unverified):
+#   PREBUILT_B12X_RUNNER_IMAGE=eugr/spark-vllm-b12x:nightly-20260812 ./build-and-copy.sh --exp-b12x -c
+PREBUILT_RUNNER_IMAGE="${PREBUILT_RUNNER_IMAGE:-eugr/spark-vllm:latest}"
+PREBUILT_B12X_RUNNER_IMAGE="${PREBUILT_B12X_RUNNER_IMAGE:-eugr/spark-vllm-b12x:latest}"
 USE_WHEELS=false
 REBUILD_FLASHINFER=false
 REBUILD_VLLM=false
