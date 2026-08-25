@@ -14,9 +14,9 @@ CONFIG_FILE_SET=false
 usage() {
     echo "Usage: $0 [OPTIONS] <model-name>"
     echo "  <model-name>                : HuggingFace model name (e.g., 'QuantTrio/MiniMax-M2-AWQ')"
-    echo "  -c, --copy-to <hosts>       : Host(s) to copy the model to. Accepts comma or space-delimited lists after the flag."
+    echo "  -c, --copy-to [hosts]       : Copy the model. Omit hosts to use COPY_HOSTS from .env or autodiscovery."
     echo "      --copy-to-host          : Alias for --copy-to (backwards compatibility)."
-    echo "      --copy-parallel         : Copy to all hosts in parallel instead of serially."
+    echo "      --copy-parallel         : With -c, copy to all resolved hosts concurrently."
     echo "  -u, --user <user>           : Username for ssh commands (default: \$USER)"
     echo "  --config <file>             : Path to .env configuration file (default: .env in script directory)"
     echo "  -h, --help                  : Show this help message"

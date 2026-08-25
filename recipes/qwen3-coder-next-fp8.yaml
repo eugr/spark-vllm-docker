@@ -38,7 +38,7 @@ command: |
     --host {host} \
     --port {port} \
     --kv-cache-dtype fp8 \
-    --load-format fastsafetensors \
+    --load-format instanttensor \
     --attention-backend flashinfer \
     --enable-prefix-caching \
     --max-model-len {max_model_len} \

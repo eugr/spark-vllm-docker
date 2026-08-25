@@ -26,24 +26,25 @@ fi
 
 
 # ---------------------------------------------------------------
-# 1. Pin nvidia-cutlass-dsl + companion libs to 4.4.2
-#    (4.5.x generates bad PTX on SM121 — `_mma` rejected by ptxas).
-#    All THREE packages must match: the python frontend, the base libs,
-#    and the CUDA 13 libs (which contain the MLIR compiler).
+# 1. Preserve the image-wide nvidia-cutlass-dsl 4.7.0 pin.
+#    The frontend and all CUDA 13 companion libraries must match.
 # ---------------------------------------------------------------
 DSL_VER=$(pip show nvidia-cutlass-dsl 2>/dev/null | grep '^Version:' | awk '{print $2}' || true)
 LIBS_BASE_VER=$(pip show nvidia-cutlass-dsl-libs-base 2>/dev/null | grep '^Version:' | awk '{print $2}' || true)
-# LIBS_CU13_VER=$(pip show nvidia-cutlass-dsl-libs-cu13 2>/dev/null | grep '^Version:' | awk '{print $2}' || true)
-if [ "$DSL_VER" != "4.4.2" ] || [ "$LIBS_BASE_VER" != "4.4.2" ] || [ "$LIBS_CU13_VER" != "4.4.2" ]; then
-    echo "[b12x] Pinning nvidia-cutlass-dsl{,-libs-base,-libs-cu13} to 4.4.2"
-    echo "[b12x]   current: dsl=${DSL_VER:-none} libs-base=${LIBS_BASE_VER:-none} libs-cu13=${LIBS_CU13_VER:-none}"
+LIBS_CORE_VER=$(pip show nvidia-cutlass-dsl-libs-core 2>/dev/null | grep '^Version:' | awk '{print $2}' || true)
+LIBS_CU13_VER=$(pip show nvidia-cutlass-dsl-libs-cu13 2>/dev/null | grep '^Version:' | awk '{print $2}' || true)
+if [ "$DSL_VER" != "4.7.0" ] || [ "$LIBS_BASE_VER" != "4.7.0" ] || \
+   [ "$LIBS_CORE_VER" != "4.7.0" ] || [ "$LIBS_CU13_VER" != "4.7.0" ]; then
+    echo "[b12x] Pinning nvidia-cutlass-dsl and CUDA 13 companion libs to 4.7.0"
+    echo "[b12x]   current: dsl=${DSL_VER:-none} libs-base=${LIBS_BASE_VER:-none} libs-core=${LIBS_CORE_VER:-none} libs-cu13=${LIBS_CU13_VER:-none}"
     uv pip install \
-        nvidia-cutlass-dsl==4.4.2 \
-        nvidia-cutlass-dsl-libs-base==4.4.2 \
-        nvidia-cutlass-dsl-libs-cu13==4.4.2 \
+        'nvidia-cutlass-dsl[cu13]==4.7.0' \
+        nvidia-cutlass-dsl-libs-base==4.7.0 \
+        nvidia-cutlass-dsl-libs-core==4.7.0 \
+        nvidia-cutlass-dsl-libs-cu13==4.7.0 \
         -q 2>/dev/null || echo "[b12x] WARNING: cutlass-dsl pin install returned non-zero"
 else
-    echo "[b12x] nvidia-cutlass-dsl + libs already at 4.4.2"
+    echo "[b12x] nvidia-cutlass-dsl + libs already at 4.7.0"
 fi
 
 # ---------------------------------------------------------------
@@ -112,5 +113,4 @@ if grep -q "if current_platform.has_device_capability(120) and has_flashinfer_b1
     echo "[b12x] Patching vLLM PR 40080 to enable sm121 cap"
     sed -i "s/if current_platform.has_device_capability(120) and has_flashinfer_b12x_gemm():/if True:/" $SITE_PACKAGES/vllm/model_executor/kernels/linear/nvfp4/flashinfer.py
 fi
-
 

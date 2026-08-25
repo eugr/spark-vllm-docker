@@ -101,7 +101,7 @@ ARG FLASHINFER_SHA=f349e52496a72a00d8c4ac02c7a1e38523ff7194
 ARG CUTLASS_SHA=fede53000a962b46e05bafe0c86311778caeb380
 
 RUN --mount=type=cache,id=uv-cache,target=/root/.cache/uv \
-     uv pip install "nvidia-nvshmem-cu13<3.6" "apache-tvm-ffi<0.2"
+     uv pip install "nvidia-nvshmem-cu13<3.6" "apache-tvm-ffi==0.1.12"
 
 # Clone FlashInfer (cached for faster rebuilds)
 RUN --mount=type=cache,id=git-flashinfer,target=/git-cache/flashinfer \
