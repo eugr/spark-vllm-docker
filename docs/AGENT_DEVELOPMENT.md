@@ -126,6 +126,13 @@ Common optional fields are `description`, `model`, `mods`, `build_args`,
   alternatives.
 - Validate the declared mode and node count. A two-node dry-run does not validate
   a recipe whose command requires four or eight nodes.
+- Keep recipe headers to the deviation list — each deviation from the official
+  or base config with a one-line rationale — plus a pointer to the recipe's
+  measurement ledger. Benchmark results, tuning campaigns, and post-mortems go
+  in `docs/tuning/<recipe-name>.md`, dated and stating the config they ran
+  against. Do not re-run a campaign the ledger marks as tried; check a flag's
+  build default before benchmarking it (see the ds4f ledger for two levers
+  that "measured" as pure variance because they were already defaults).
 
 ## Tests
 
