@@ -19,9 +19,12 @@
 # and indexer/draft scratch, leaves ~10.6 GiB. vLLM's own log notes that CUDA
 # graph profiling makes 0.85 "equivalent to 0.84", which is most of the gap.
 #
-# So this recipe changes exactly one value, gpu_memory_utilization 0.85 -> 0.90,
-# and pins max_model_len to the same 1,048,576 official intends implicitly.
-# max_num_seqs stays at official's 8: it was measured, not assumed.
+# So this recipe changes exactly one value in official's memory plan,
+# gpu_memory_utilization 0.85 -> 0.90, and pins max_model_len to the same
+# 1,048,576 official intends implicitly. max_num_seqs stayed at official's
+# measured 8 until 2026-08-25; it is now 12, paired with
+# max_cudagraph_capture_size 128 - a fleet-scheduling change with its own
+# measured evidence, see FLEET SCHEDULING below.
 #
 # It also sets --served-model-name deepseek-v4-flash-0731-1m, which official
 # does not. That is a client-facing name, not a serving change: the base recipe
@@ -49,6 +52,9 @@
 #   --max-model-len 1048576 - the value official takes implicitly by omitting
 #     the flag; stating it makes a shortfall a boot failure instead of a
 #     silently shorter window.
+#   max_num_seqs 12 / max_cudagraph_capture_size 128 (official 8 / 64) -
+#     adopted 2026-08-25 for concurrent-agent fleets; evidence, mechanism and
+#     the boot caveat live in FLEET SCHEDULING below.
 #   --served-model-name - so a client can tell this window from the base
 #     recipe's, since both bind port 8000.
 #   --ssl-keyfile / --ssl-certfile - fork-wide policy from PR #2, not a choice
@@ -226,6 +232,53 @@
 # max_num_batched_tokens 4096 is the real lever: pool 1.62x -> 2.76x at about 8%
 # of decode.
 #
+# FLEET SCHEDULING (ADOPTED 2026-08-25)
+#
+# That goal arrived. A coding-agent orchestrator fanning out ~12 concurrent
+# sessions at 44-90k tokens each, every session resubmitting its grown prompt
+# each turn, collapsed the seqs-8 scheduling. Measured live on this recipe,
+# /metrics counters, 12 in-flight agents:
+#
+#   num_requests_running pinned at 8, num_requests_waiting at 4, for hours.
+#   Queue time per request: p50 0.18 s, mean 15.8 s, p90 77.8 s (n=1426).
+#   One agent went 75 minutes between completed turns while others cycled.
+#   Prefix cache hit rate: 94% lifetime, 12% over the final 80-minute window.
+#   In that window the cluster prefilled 16.5M tokens (~3,500 tok/s,
+#   continuously) while generating 75k output tokens (~16 tok/s aggregate).
+#   kv_cache_usage 41% -> 63% across the run; num_preemptions stayed 0.
+#
+# The mechanism is an eviction cycle, not preemption. Running requests' KV is
+# live; the 4 queued agents' cached prefixes are idle blocks - LRU fodder. As
+# running contexts grow, the queued prefixes are evicted; when a starved agent
+# finally gets a slot, its full 60-90k re-prefill floods the pool and evicts
+# the next idle agent's prefix. Repeat: the box spends ~99% of its compute
+# recomputing prefills it already did. Queued-at-server is the poisonous
+# state, so the fix is to stop queueing the fleet:
+#
+#   max_num_seqs 8 -> 12. Every concurrent session admitted means every
+#     working set stays pinned (12 x ~85k = ~1.0M tokens, inside the 1.70M
+#     pool). Batch decode also amortizes the per-step weight read - measured
+#     elsewhere on this checkpoint, seqs 2 -> 8 nearly doubled aggregate
+#     decode - so this buys throughput as well as fairness. Sizing rule:
+#     healthy seqs ~= pool tokens / average session context with ~30%
+#     headroom; at 1.70M that is 12 sessions of ~100k. Past that, adopt
+#     max_num_batched_tokens 4096 (the pool lever above) before raising seqs
+#     further - admitted sequences beyond what the pool can pin just recreate
+#     the eviction cycle with extra steps.
+#
+#   max_cudagraph_capture_size 64 -> 128. Not independent: the dspark k=5
+#     drafter makes a decode step carry ~6 tokens per running sequence, so
+#     8 x 6 = 48 fit official's 64 but 12 x 6 = 72 do not, and decode would
+#     fall off the captured CUDA graphs exactly when the new slots are in
+#     use. 128 covers ~21 running sequences.
+#
+# Boot caveat: this pair has not been A/B-booted at the 1M window - capture
+# memory grows with graph count and the profiler may reprice the KV pool. If
+# init fails on KV arithmetic, drop capture back to 64 first (keeps the
+# thrash fix, costs graph coverage above 10 seqs) and record the numbers
+# here. Client-facing behaviour is unchanged: same model, same window, same
+# served name - scheduling does not change the math.
+#
 # KNOWN RISK: vllm-project/vllm#40969 (open) reports DeepSeek-V4-Flash hanging
 # after ~6 requests with cudagraph_mode=FULL_AND_PIECEWISE plus chunked prefill
 # on SM 12.x, which is what this recipe runs. Not reproduced here across ~100
@@ -255,9 +308,9 @@ defaults:
   gpu_memory_utilization: 0.90
   max_model_len: 1048576
   block_size: 256
-  max_num_seqs: 8
+  max_num_seqs: 12
   max_num_batched_tokens: 8192
-  max_cudagraph_capture_size: 64
+  max_cudagraph_capture_size: 128
   num_speculative_tokens: 5
 
 env:
