@@ -1,0 +1,94 @@
+# Recipe: Qwen3.8-Flash-Next-FP8 on the dedicated upstream container
+# Hybrid MoE (Gated DeltaNet + Qwen Sparse Attention, 125B total / 6B active,
+# plus a 51B n-gram embedding table and a 4B MTP layer). Native context is
+# 262,144 tokens; YaRN extends to 1M.
+#
+# Sources:
+#   https://huggingface.co/Qwen/Qwen3.8-Flash-Next
+#   https://recipes.vllm.ai/Qwen/Qwen3.8-Flash-Next
+#
+# Container: this model does NOT run on the images this cluster already
+# carries. The checkpoint's architecture is Qwen4ExpForConditionalGeneration,
+# and (verified 2026-08-26) it is absent from vllm-node (vLLM
+# 0.26.1rc1.dev515), vllm-node-b12x, eugr/spark-vllm-b12x nightly-20260823,
+# and from vllm-project/vllm main itself. Support currently ships only in the
+# dedicated upstream image the official recipe names, which is multi-arch and
+# includes arm64 (pushed 2026-08-26):
+#
+#   PREBUILT_RUNNER_IMAGE=vllm/vllm-openai:qwen38-flash-next \
+#     ./build-and-copy.sh -t vllm-node-flashnext -c
+#
+# The distinct vllm-node-flashnext tag keeps the shared vllm-node image (used
+# by every other non-b12x recipe) untouched. Re-point this recipe's container
+# back to vllm-node once Qwen4Exp support lands in eugr's nightlies (i.e. once
+# it merges to vLLM main).
+#
+# The upstream image is built for GB200/GB300-class hardware; it has not been
+# validated on GB10/sm_121 the way eugr's spark builds are. Do the first
+# launch in the foreground (never straight into vllm@.service — a failing
+# recipe restart-loops silently there) and watch for missing-kernel or
+# unsupported-arch errors.
+#
+# Configuration matches the official recipe's recommended block (4x GB300,
+# FP8) with one deviation:
+#   - tensor_parallel 4 -> 2. The official notes name TP2 as the validated
+#     minimum, and this cluster has two Sparks. The FP8 checkpoint is 185.5 GB
+#     of safetensors, so it cannot fit one 128 GB node: cluster_only.
+#     ~93 GB of weights per node under gpu_memory_utilization 0.90 leaves
+#     roughly 14 GB per node for KV/state/activations - enough to boot, not
+#     tuned.
+#
+# Kept as official, deliberately untuned for now:
+#   - max_num_seqs stays 256: the official recipe warns that changing it
+#     triggers Mamba-cache errors on this architecture.
+#   - --no-enable-flashinfer-autotune is the official flag set (and harmless
+#     here; see the qwen3.8-27b-nvfp4 recipe's autotune notes).
+#   - --tool-call-parser qwen3_coder and --reasoning-parser qwen3 as official.
+#   - No --max-model-len: vLLM takes the checkpoint's native 262,144.
+#   - Sampling defaults come from the checkpoint's generation_config.json
+#     (thinking preset: temperature 1.0, top_p 0.95, top_k 20); no
+#     --generation-config override, same reasoning as qwen3.8-27b-nvfp4.
+#
+# Deferred to the optimization pass (not in this base config):
+#   - MTP speculative decoding: official option
+#     --speculative-config '{"method":"mtp","num_speculative_tokens":3}'.
+#     Before enabling, re-test the acceptance collapse seen on qwen3.8-27b
+#     beyond the native window, and the sm_121 CUDA-graph backend caveats.
+#   - YaRN 1M context: --rope-scaling '{"rope_type":"yarn","factor":4.0,
+#     "original_max_position_embeddings":262144}' --max-model-len 1000000
+#     with VLLM_ALLOW_LONG_MAX_MODEL_LEN=1. KV headroom at TP=2 makes this
+#     unrealistic without further work.
+#   - VLLM_PLE_CPU_OFFLOAD=1 moves the 51B n-gram table to "host" RAM. On
+#     unified-memory GB10 that frees the vLLM GPU pool without freeing any
+#     physical RAM, so gpu_memory_utilization must come DOWN in step or the
+#     node overcommits. Do not flip it on casually.
+
+recipe_version: "1"
+name: Qwen3.8-Flash-Next-FP8
+description: vLLM serving Qwen/Qwen3.8-Flash-Next-FP8 on dual Sparks via the dedicated upstream qwen38-flash-next image
+
+model: Qwen/Qwen3.8-Flash-Next-FP8
+container: vllm-node-flashnext
+
+cluster_only: true
+
+defaults:
+  port: 8000
+  host: 0.0.0.0
+  tensor_parallel: 2
+  gpu_memory_utilization: 0.90
+  max_num_seqs: 256
+
+command: |
+  vllm serve Qwen/Qwen3.8-Flash-Next-FP8 \
+    --served-model-name qwen3.8-flash-next \
+    --host {host} \
+    --port {port} \
+    -tp {tensor_parallel} \
+    --gpu-memory-utilization {gpu_memory_utilization} \
+    --max-num-seqs {max_num_seqs} \
+    --enable-prefix-caching \
+    --no-enable-flashinfer-autotune \
+    --enable-auto-tool-choice \
+    --tool-call-parser qwen3_coder \
+    --reasoning-parser qwen3
