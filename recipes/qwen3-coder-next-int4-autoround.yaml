@@ -37,7 +37,7 @@ command: |
     --gpu-memory-utilization {gpu_memory_utilization} \
     --host {host} \
     --port {port} \
-    --load-format fastsafetensors \
+    --load-format instanttensor \
     --enable-prefix-caching \
     --max-model-len {max_model_len}
 

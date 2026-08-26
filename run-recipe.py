@@ -11,8 +11,8 @@ pre-configured settings. It handles:
 - Both solo (single node) and cluster deployments
 
 Usage:
-    ./run-recipe.py recipes/glm-4.7-nvfp4.yaml
-    ./run-recipe.py glm-4.7-nvfp4 --port 9000 --solo
+    ./run-recipe.py recipes/deepseek-v4-flash-0731.yaml
+    ./run-recipe.py glm-4.7-flash-awq --port 9000 --solo
     ./run-recipe.py minimax-m2-awq --setup  # Full setup: build + download + run
     ./run-recipe.py --list
 
@@ -110,6 +110,32 @@ ENV_FILE = None  # Will be set from CLI argument or default
 DISTRIBUTED_EXECUTOR_RE = re.compile(
     r"--distributed-executor-backend(?:=|\s+)\S+"
 )
+
+
+def runtime_vllm_pr_number(value: str) -> str:
+    """Validate an upstream vLLM PR number without accepting URL fragments."""
+    if not re.fullmatch(r"[1-9][0-9]*", value):
+        raise argparse.ArgumentTypeError("must be a positive integer PR number")
+    return value
+
+
+class OrderedLaunchLayerAction(argparse.Action):
+    """Collect a repeatable launch layer while preserving mixed CLI ordering."""
+
+    def __call__(
+        self,
+        parser: argparse.ArgumentParser,
+        namespace: argparse.Namespace,
+        values: str,
+        option_string: str | None = None,
+    ) -> None:
+        collected = list(getattr(namespace, self.dest, None) or [])
+        collected.append(values)
+        setattr(namespace, self.dest, collected)
+
+        ordered = list(getattr(namespace, "launch_layers", None) or [])
+        ordered.append((self.dest, values))
+        setattr(namespace, "launch_layers", ordered)
 
 
 def strip_distributed_executor_backend(command: str) -> str:
@@ -674,32 +700,35 @@ def main():
         epilog="""
 Examples:
   # Basic usage
-  %(prog)s glm-4.7-nvfp4
-  %(prog)s glm-4.7-nvfp4 --port 9000 --solo
+  %(prog)s glm-4.7-flash-awq --solo
+  %(prog)s glm-4.7-flash-awq --port 9000 --solo
 
   # Full setup (build container + download model + run)
-  %(prog)s glm-4.7-nvfp4 --setup
+  %(prog)s glm-4.7-flash-awq --solo --setup
 
-  # Cluster deployment (manual)
-  %(prog)s glm-4.7-nvfp4 -n 192.168.1.1,192.168.1.2 --setup
-
-  # Cluster deployment (auto-discover)
+  # Cluster deployment (default: auto-discover once, then reuse .env)
   %(prog)s --discover              # Detect nodes and save to .env
-  %(prog)s glm-4.7-nvfp4 --setup   # Uses nodes from .env
+  %(prog)s minimax-m2-awq --setup  # Uses nodes from .env
+
+  # Manual fallback only when autodiscovery cannot support the topology
+  %(prog)s minimax-m2-awq -n HEAD_IP,WORKER_IP --setup
 
   # Just build/download without running
-  %(prog)s glm-4.7-nvfp4 --build-only
-  %(prog)s glm-4.7-nvfp4 --download-only
+  %(prog)s glm-4.7-flash-awq --solo --build-only
+  %(prog)s glm-4.7-flash-awq --solo --download-only
 
   # Pass extra arguments to vLLM (after --)
-  %(prog)s glm-4.7-nvfp4 --solo -- --load-format safetensors
-  %(prog)s glm-4.7-nvfp4 --solo -- --served-model-name my-api
+  %(prog)s glm-4.7-flash-awq --solo -- --load-format safetensors
+  %(prog)s glm-4.7-flash-awq --solo -- --served-model-name my-api
 
   # Apply additional launch-cluster mods
-  %(prog)s glm-4.7-nvfp4 --apply-mod mods/use-official-vllm
+  %(prog)s glm-4.7-flash-awq --solo --apply-mod mods/use-official-vllm
+
+  # Apply an upstream vLLM PR at container launch time
+  %(prog)s glm-4.7-flash-awq --solo --apply-vllm-pr 12345
 
   # Publish ports in solo mode
-  %(prog)s glm-4.7-nvfp4 --solo -p 8000:8000
+  %(prog)s glm-4.7-flash-awq --solo -p 8000:8000
 
   # Map host directories into the container
   %(prog)s glm-4.7-flash-awq --solo -v /local/models:/models -v /local/output:/output
@@ -786,7 +815,9 @@ Examples:
         "--solo", action="store_true", help="Run in solo mode (single node, no Ray)"
     )
     launch_group.add_argument(
-        "-n", "--nodes", help="Comma-separated list of node IPs (first is head node)"
+        "-n",
+        "--nodes",
+        help="Manual fallback/override: comma-separated node IPs (first is head node)",
     )
     launch_group.add_argument(
         "-d", "--daemon", action="store_true", help="Run in daemon mode"
@@ -813,11 +844,20 @@ Examples:
     )
     launch_group.add_argument(
         "--apply-mod",
-        action="append",
+        action=OrderedLaunchLayerAction,
         dest="apply_mods",
         default=[],
         metavar="PATH",
         help="Mod directory or zip to pass to launch-cluster.sh. Can be used multiple times.",
+    )
+    launch_group.add_argument(
+        "--apply-vllm-pr",
+        action=OrderedLaunchLayerAction,
+        type=runtime_vllm_pr_number,
+        dest="apply_vllm_prs",
+        default=[],
+        metavar="PR",
+        help="Apply an upstream vLLM PR to the installed runtime package. Can be used multiple times.",
     )
     launch_group.add_argument(
         "-p",
@@ -1014,6 +1054,8 @@ Examples:
     print()
 
     cli_mods = args.apply_mods or []
+    cli_vllm_prs = args.apply_vllm_prs or []
+    cli_launch_layers = getattr(args, "launch_layers", []) or []
 
     # Determine container image
     container = args.container_override or recipe["container"]
@@ -1083,11 +1125,11 @@ Examples:
         print(f"This model is too large to run on a single node.")
         print()
         print("Options:")
-        print(
-            f"  1. Specify nodes directly:  {sys.argv[0]} {args.recipe} -n node1,node2"
-        )
-        print(f"  2. Auto-discover and save:  {sys.argv[0]} --discover")
+        print(f"  1. Auto-discover and save:  {sys.argv[0]} --discover")
         print(f"     Then run:                {sys.argv[0]} {args.recipe}")
+        print(
+            "  2. If autodiscovery cannot support the topology, specify nodes as instructed."
+        )
         return 1
     if solo_only and not is_solo:
         print(f"Error: Recipe '{recipe['name']}' requires solo mode.")
@@ -1154,6 +1196,8 @@ Examples:
             print(f"Container name: {args.container_name}")
         if args.non_privileged:
             print("Non-privileged mode: Yes")
+        if cli_vllm_prs:
+            print(f"Runtime vLLM PRs: {', '.join(cli_vllm_prs)}")
         print()
 
     # --- Build Phase ---
@@ -1308,8 +1352,11 @@ Examples:
         cmd_parts = ["   ./launch-cluster.sh", "-t", container]
         for mod in recipe.get("mods", []):
             cmd_parts.extend(["--apply-mod", mod])
-        for mod in cli_mods:
-            cmd_parts.extend(["--apply-mod", mod])
+        for layer_type, value in cli_launch_layers:
+            if layer_type == "apply_mods":
+                cmd_parts.extend(["--apply-mod", value])
+            else:
+                cmd_parts.extend(["--apply-vllm-pr", value])
         if args.solo:
             cmd_parts.append("--solo")
         elif not is_cluster:
@@ -1383,13 +1430,16 @@ Examples:
             if not mod_path.exists():
                 print(f"Warning: Mod path not found: {mod_path}")
             cmd.extend(["--apply-mod", str(mod_path)])
-        for mod in cli_mods:
-            mod_path = Path(mod).expanduser()
-            if not mod_path.is_absolute():
-                mod_path = Path.cwd() / mod_path
-            if not mod_path.exists():
-                print(f"Warning: Mod path not found: {mod_path}")
-            cmd.extend(["--apply-mod", str(mod_path)])
+        for layer_type, value in cli_launch_layers:
+            if layer_type == "apply_mods":
+                mod_path = Path(value).expanduser()
+                if not mod_path.is_absolute():
+                    mod_path = Path.cwd() / mod_path
+                if not mod_path.exists():
+                    print(f"Warning: Mod path not found: {mod_path}")
+                cmd.extend(["--apply-mod", str(mod_path)])
+            else:
+                cmd.extend(["--apply-vllm-pr", value])
 
         # Add launch options
         if args.solo:
@@ -1461,6 +1511,8 @@ Examples:
         all_mods = recipe.get("mods", []) + cli_mods
         if all_mods:
             print(f"Mods: {', '.join(all_mods)}")
+        if cli_vllm_prs:
+            print(f"Runtime vLLM PRs: {', '.join(cli_vllm_prs)}")
         if is_cluster:
             print(f"Cluster: {len(nodes)} nodes")
         else:
