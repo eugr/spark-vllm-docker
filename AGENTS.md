@@ -24,6 +24,18 @@ A recipe `--dry-run` used to validate generated commands is development. A
 non-dry recipe run, `--setup`, discovery, image preparation, model download, or
 container launch is operation.
 
+## Fork Policy
+
+This repository is an internal fork of `eugr/spark-vllm-docker`. The `upstream`
+remote exists for pulling updates only.
+
+- Never push branches, tags, or PRs to `upstream`. All pushes go to `origin`
+  (the fork), and all PRs are opened against the fork for internal review.
+- Do not open, comment on, or modify upstream PRs or issues on the user's
+  behalf unless the user explicitly requests it for a specific change.
+- Pulling/merging from `upstream` into fork branches is allowed and encouraged
+  to stay current.
+
 ## Common Boundaries
 
 - Inspect before changing repository, host, container, or cluster state.
