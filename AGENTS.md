@@ -45,3 +45,6 @@ remote exists for pulling updates only.
   authorize real deployments. Perform both only when the user requests both.
 - Do not prune, overwrite, stop, remove, or force-refresh existing resources
   unless the requested task requires it.
+- Recipe header comments stay minimal: only critical, recipe-specific
+  operational facts. Background, findings, and measurements go to a docs
+  page (`docs/<TOPIC>.md`) that the recipe references.
