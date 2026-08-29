@@ -12,6 +12,10 @@ ARG B12X_REPO=""
 ARG B12X_REF=""
 ARG B12X_CACHEBUST=""
 
+# Empty fallback for ordinary remote-source builds. A caller may override this
+# stage with --build-context vllm_source=/path/to/checkout.
+FROM scratch AS vllm_source
+
 # =========================================================
 # STAGE 1: Base Build Image
 # =========================================================
@@ -280,6 +284,8 @@ ARG CACHEBUST_VLLM=1
 ARG VLLM_UPSTREAM_REPO=https://github.com/vllm-project/vllm.git
 ARG VLLM_REPO=https://github.com/vllm-project/vllm.git
 ARG VLLM_REF=main
+ARG VLLM_SOURCE_MODE=remote
+ARG VLLM_SOURCE_COMMIT=""
 
 # Pinned while investigating an SM121 DeepSeek-V4 MXFP4 grouped scale-factor
 # regression first observed at nv_dev f8e8fb5 (PR #384); last known good.
@@ -290,9 +296,31 @@ ENV DEEPGEMM_SRC_DIR=/workspace/DeepGEMM
 # The upstream repository uses the shared checkout cache. Custom repositories
 # are cloned outside it so a fork can never reuse or mutate the upstream clone.
 RUN --mount=type=cache,id=repo-cache,target=/repo-cache \
+    --mount=type=bind,from=vllm_source,target=/tmp/vllm-local-source \
     set -eux; \
     echo "CACHEBUST_VLLM=${CACHEBUST_VLLM}"; \
-    if [ "$VLLM_REPO" != "$VLLM_UPSTREAM_REPO" ]; then \
+    if [ "$VLLM_SOURCE_MODE" = "local" ]; then \
+        echo "Local vLLM source selected; using the staged build context."; \
+        if [ -z "$VLLM_SOURCE_COMMIT" ]; then \
+            echo "VLLM_SOURCE_COMMIT is required for a local vLLM source build." >&2; \
+            exit 1; \
+        fi; \
+        if [ ! -d /tmp/vllm-local-source/.git ]; then \
+            echo "Local vLLM source context does not contain a self-contained Git checkout." >&2; \
+            exit 1; \
+        fi; \
+        cp -a /tmp/vllm-local-source /tmp/vllm-custom; \
+        cd /tmp/vllm-custom; \
+        if [ "$(git rev-parse HEAD)" != "$VLLM_SOURCE_COMMIT" ]; then \
+            echo "Local vLLM source commit does not match VLLM_SOURCE_COMMIT." >&2; \
+            exit 1; \
+        fi; \
+        git reset --hard "$VLLM_SOURCE_COMMIT"; \
+        git clean -fdx; \
+        git remote remove origin 2>/dev/null || true; \
+        rm -f .git/FETCH_HEAD; \
+        cp -a /tmp/vllm-custom "$VLLM_BASE_DIR/vllm"; \
+    elif [ "$VLLM_REPO" != "$VLLM_UPSTREAM_REPO" ]; then \
         echo "Custom vLLM repository selected; bypassing shared checkout cache."; \
         git clone --recursive "$VLLM_REPO" /tmp/vllm-custom; \
         cd /tmp/vllm-custom; \
@@ -472,6 +500,15 @@ RUN set -eux; \
 # It is also safe for older refs (backend absent) and refs that already contain
 # the fix (idempotent); unknown partial source shapes fail the build.
 COPY docker/patch_vllm_*.py docker/pin_cutlass_dsl.py /tmp/vllm-patches/
+
+# TEMPORARY PATCH: vLLM PR #53306 added a preliminary CUDA-graph memory
+# profiling capture, but only redirects the main graph manager and existing
+# wrappers to its throwaway pool. MTP and other autoregressive speculators own
+# separate prefill/decode managers, so their discarded profiling graphs can
+# invalidate the persistent global pool before the real FULL capture. Keep all
+# speculator managers in the throwaway pool until the oldest supported ref has
+# the equivalent upstream fix.
+RUN python3 /tmp/vllm-patches/patch_vllm_mrv2_speculator_cudagraph_pool.py .
 
 # TEMPORARY PATCH: local-inference-lab/vllm commit ad848fc41 added a dynamic
 # DeepSeek V4 C128A top-k width but omitted the alignment constant import.
@@ -737,9 +774,8 @@ RUN --mount=type=cache,id=uv-cache,target=/root/.cache/uv \
     uv pip install ray[default] fastsafetensors instanttensor \
         --override /tmp/torch-override.txt
 
-# The local-inference-lab vLLM fork consumes the external B12X kernel package
-# at runtime. Keep this opt-in so ordinary vLLM images do not pull a
-# package that requires Torch 2.12+. Build B12X from its source repository but
+# Upstream vLLM and the local-inference-lab fork consume the external B12X
+# kernel package at runtime. Build B12X from its source repository but
 # install it without dependencies: vLLM already provides the runtime packages
 # and this image deliberately advances nvidia-cutlass-dsl to 4.7.0 for both
 # regular and B12X builds. B12X kernels remain JIT-compiled on first use;
