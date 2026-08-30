@@ -4,19 +4,14 @@
 # Deviations from the official DGX Spark profile (recipes.vllm.ai,
 # hardware=dgx_spark_gb10, nodes=2, image eugr/spark-vllm-b12x:latest):
 #
-#   gpu_memory_utilization 0.90 (official 0.85) - forced; 0.85 fails at init
-#     at this window (10.33/10.61 GiB KV available vs 11.04 needed).
+#   tensor_parallel 4 (official profile is nodes=2) - cluster moved to 4x
+#     Sparks over a CRS812 switch, 2026-08-29. Override with --tp 2 to run
+#     on a two-node subset.
 #   --max-model-len 1048576 - the value official takes implicitly by omitting
 #     the flag; stating it makes a shortfall a boot failure instead of a
 #     silently shorter window.
-#   max_num_seqs 12 / max_cudagraph_capture_size 128 (official 8 / 64) -
-#     fleet scheduling for concurrent agent sessions, adopted 2026-08-25.
-#   max_num_batched_tokens 4096 (official 8192) - adopted 2026-08-25, same
-#     campaign: grows the KV pool 1.55M -> ~2.89M tokens so two concurrent
-#     orchestrators (10+ sessions at 100-200k contexts) fit cached, at a
-#     measured ~8% decode cost. TP=2 only: when this cluster moves to TP=4,
-#     A/B 8192 vs 4096 with the expectation that 8192 wins (seats stop
-#     binding at TP=4's much larger pool).
+#   max_num_seqs 16 / max_cudagraph_capture_size 128 (official 8 / 64) -
+#     fleet scheduling for concurrent agent sessions.
 #   --served-model-name deepseek-v4-flash-0731-1m - client-facing id so a
 #     1,048,576-token window is distinguishable from the base recipe's on the
 #     same port.
@@ -34,7 +29,7 @@
 #
 recipe_version: "1"
 name: DeepSeek-V4-Flash-0731-1M
-description: DeepSeek-V4-Flash-0731 on a dual Spark at a pinned 1,048,576-token context
+description: DeepSeek-V4-Flash-0731 on a 4x Spark cluster at a pinned 1,048,576-token context
 
 model: deepseek-ai/DeepSeek-V4-Flash-0731
 container: vllm-node-b12x
@@ -51,12 +46,12 @@ mods:
 defaults:
   port: 8000
   host: 0.0.0.0
-  tensor_parallel: 2
-  gpu_memory_utilization: 0.90
+  tensor_parallel: 4
+  gpu_memory_utilization: 0.85
   max_model_len: 1048576
   block_size: 256
-  max_num_seqs: 12
-  max_num_batched_tokens: 4096
+  max_num_seqs: 16
+  max_num_batched_tokens: 8192
   max_cudagraph_capture_size: 128
   num_speculative_tokens: 5
 

@@ -319,10 +319,39 @@ The ~8% decode cost was accepted knowingly.
 Scope note: this adoption is for TP=2. When the cluster moves to TP=4
 (planned), re-run the A/B between 8192 and 4096 there - expectation is 8192
 wins at TP=4, whose ~6x pool makes seat count a non-issue, restoring the
-decode edge as the deciding factor.
+decode edge as the deciding factor. [Resolved 2026-08-29: see the TP=4
+adoption section below - 8192 restored on this expectation without a fresh
+A/B.]
 
 Client-side pairing (OMP): task.maxConcurrency 4 for two-orchestrator days,
 6 for single-orchestrator days; revive-bypass caveat above still applies.
+
+### TP=4 adoption (2026-08-29)
+
+The cluster grew from 2 to 4 Sparks (two added over a CRS812-DDQ switch),
+and the recipe moved to `tensor_parallel: 4`. Three settings changed with
+it, per the scope note above:
+
+- max_num_batched_tokens 4096 -> 8192, back to the official value. Adopted
+  on the standing expectation (owner decision), NOT re-measured: the TP=4
+  pool makes seat count a non-issue, so the ~8% decode cost 4096 was paying
+  for pool no longer buys anything. If fleet thrash reappears at TP=4, the
+  8192-vs-4096 A/B is still the first thing to run.
+- gpu_memory_utilization 0.90 -> 0.85, back to the official value. 0.90 was
+  forced at TP=2 because 0.85 failed at init at the 1M window (10.33/10.61
+  GiB KV available vs 11.04 needed); at TP=4 the per-rank weight share
+  halves, so the official fraction should clear init. NOT yet boot-verified
+  at TP=4 - the first launch is the verification (foreground, per the GB10
+  launch rules). If init fails on KV shortfall again, restore 0.90.
+- max_num_seqs 12 -> 16. Sized for the same fleet pattern as the 2026-08-25
+  campaign (two orchestrators = ~10 sessions plus ad-hoc) with headroom now
+  that the pool no longer binds; stays under max_cudagraph_capture_size 128.
+  Aggregate throughput saturates by width ~4-5 active streams, so this is a
+  seat-count ceiling, not a throughput setting - raising it further mostly
+  adds per-stream latency under load.
+
+None of the TP=2 measurements in this file transfer to TP=4; treat every
+number above this section as TP=2 history.
 
 ## Known risk
 
