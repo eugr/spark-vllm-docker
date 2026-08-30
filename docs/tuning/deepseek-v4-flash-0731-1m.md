@@ -135,6 +135,17 @@ retrieved the needle every time. Nothing to do with depth, sparse attention,
 or the recipe — treat any future empty completion on /v1/completions as a
 harness artifact until reproduced on the chat endpoint.
 
+Related trap on the chat endpoint (found 2026-08-30 on the GLM-5.3-Flash
+serve config, applies equally here because this recipe runs a reasoning
+parser): lm-eval's max_gen_toks counts THINKING tokens, and the reasoning
+parser strips them out of content — so a small budget (the 256 the RULER
+protocol uses) truncates deep-context answers to little or nothing and
+scores a false low. Same prompts at budget 1024 scored 1.00. Any eval
+against a reasoning-parser endpoint needs max_gen_toks >= 1024, and any
+suspiciously low generative score should be re-checked against the raw
+samples (--log_samples) for truncation before it is believed. Full
+diagnosis: docs/GLM53_FLASH.md, serve-config campaign section.
+
 ## NVFP4 KV is not an option — do not retry it
 
 Tested 2026-08-22: --kv-cache-dtype nvfp4_ds_mla dies in ~2 s at config

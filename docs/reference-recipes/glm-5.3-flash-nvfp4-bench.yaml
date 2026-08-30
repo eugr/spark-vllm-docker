@@ -1,0 +1,93 @@
+# GLM-5.3-Flash, LibertAIDAI NVFP4 (182 GiB), tonyd2wild image + launcher, TP=4.
+# Verbatim port of tonyd2wild/GLM-5.3-Flash-NVFP4-1M-KV-4x-DGX-Spark
+# (launch-glm53-tp4-24g.sh): DFlash2 k=7, fp8_e4m3 KV with a 24 GiB/rank
+# kv-cache-memory pin (1.26M-token pool), 1M context, max_num_seqs 6,
+# enforce-eager, thinking off. 36 tok/s reported on 4x GB10.
+#
+# Image prep:
+#   PREBUILT_RUNNER_IMAGE=ghcr.io/tonyd2wild/vllm-glm53-flash:sm121-v11-dflash2 \
+#     ./build-and-copy.sh -t vllm-node-glm5.3-flash -c
+#
+# Deviations from tony's launcher, all required by eugr orchestration:
+#   - --nnodes/--master-addr/--master-port/VLLM_HOST_IP and NCCL/GLOO/TP
+#     interface env dropped: eugr's launcher generates them per node, and
+#     tony's names (enp1s0f0np0, 192.168.192.0/24) are his wiring, not ours.
+#   - drafter /models/dflash2-draft -> HF id incoai/GLM-5.3-Flash-DFlash2
+#     (present in every node's mounted HF cache). NOTE: drafter weights are
+#     CC BY-NC-ND (non-commercial).
+#   - his continuous page-cache flusher approximated by mods/drop-caches
+#     (one-shot per node at launch); revisit if weight load OOMs.
+#   - his docker --memory 112g pin not applied (eugr launcher owns docker args).
+#
+# kv-cache-memory pin removed (Paul, 2026-08-30): tony pins 24 GiB/rank,
+# but the protocol-matched A/B proved no quality or speed benefit and the
+# auto pool is 1.85x larger (7.2M vs 3.9M tokens). Sole deviation from
+# tony's launcher flags.
+#
+# mods/fix-glm53-topk-sm120 unlocks requests >32K tokens on GB10: without
+# it the sparse indexer's persistent_topk kernel cannot launch (needs
+# 128KB smem/block or a 48-CTA persistent budget; GB10 has 101KB/48) and
+# any long request kills the engine. Validated on the EXL3 stack: RULER
+# 1.000/1.000/1.000 at 65,536 tokens. See issue #27.
+#
+# --moe-backend marlin is mandatory on sm_121: the auto-selected
+# FLASHINFER_CUTLASS NvFp4 MoE backend produces silent garbage output.
+# Background, gotchas, and tuning levers: docs/GLM53_FLASH.md
+
+recipe_version: "1"
+name: GLM-5.3-Flash-NVFP4
+description: vLLM serving LibertAIDAI/GLM-5.3-Flash-NVFP4 on a 4x Spark cluster - tonyd2wild's TP4 recipe on his patched sm121 image
+
+model: LibertAIDAI/GLM-5.3-Flash-NVFP4
+container: vllm-node-glm5.3-flash
+
+cluster_only: true
+
+mods:
+  - mods/drop-caches
+  - mods/fix-glm53-topk-sm120
+  - mods/mia-backports-20260830
+
+defaults:
+  port: 8000
+  host: 0.0.0.0
+  tensor_parallel: 4
+  gpu_memory_utilization: 0.85
+  max_model_len: 1048576
+  max_num_seqs: 6
+
+env:
+  VLLM_ENGINE_READY_TIMEOUT_S: "3600"
+  PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
+  TORCH_CUDA_ARCH_LIST: "12.1a"
+  FLASHINFER_CUDA_ARCH_LIST: "12.1a"
+  FLASHINFER_DISABLE_VERSION_CHECK: "1"
+  NCCL_IB_GID_INDEX: "3"
+  TORCH_NCCL_ASYNC_ERROR_HANDLING: "1"
+  HF_HUB_OFFLINE: "1"
+
+command: |
+  # Serve by pinned snapshot path: upstream README-only pushes move the HF
+  # cache's refs/main to sparse undownloaded revisions (any online tool
+  # refreshes it), and Glm5NextProcessor open()s files relative to the
+  # model argument. 357b45cc is the fully-downloaded, benchmark-validated
+  # revision.
+  vllm serve /root/.cache/huggingface/hub/models--LibertAIDAI--GLM-5.3-Flash-NVFP4/snapshots/357b45cc73a07a541cede88861f7736c9487ebf7 \
+      --served-model-name glm-5.3-flash \
+      --trust-remote-code \
+      --port {port} \
+      --host {host} \
+      -tp {tensor_parallel} \
+      --distributed-executor-backend mp \
+      --gpu-memory-utilization {gpu_memory_utilization} \
+      --max-model-len {max_model_len} \
+      --max-num-seqs {max_num_seqs} \
+      --block-size 2304 \
+      --max-num-batched-tokens 8192 \
+      --kv-cache-dtype fp8_e4m3 \
+      --enforce-eager \
+      --moe-backend marlin \
+      --speculative-config '{{"method":"dflash","model":"incoai/GLM-5.3-Flash-DFlash2","num_speculative_tokens":7}}' \
+      --tool-call-parser glm47 --enable-auto-tool-choice \
+      --reasoning-parser glm45 \
+      --default-chat-template-kwargs '{{"enable_thinking": false}}'

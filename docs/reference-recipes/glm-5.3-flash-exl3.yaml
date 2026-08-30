@@ -1,0 +1,70 @@
+# GLM-5.3-Flash, EXL3 TR3-4bpw (164 GiB), DFlash2 spec decode, TP=4.
+# Replicates MiaAI's EXL3 kit - the fastest measured GLM on GB10: 62.9 tok/s
+# x1 / 146.5 aggregate x4, KLD quality parity with official FP8 at 54% bytes,
+# 900k context. EXL3 kernels run inside vLLM via Mia's prebuilt overlay image.
+#
+# Image prep (prebuilt, no local build):
+#   PREBUILT_RUNNER_IMAGE=ghcr.io/miaai-lab/glm-5.3-flash-2x-dgx-sparks:exl3 \
+#     ./build-and-copy.sh -t vllm-node-glm5.3-flash-exl3 -c
+#
+# EXL3, not NVFP4: do NOT pass --moe-backend marlin, TRITON_ATTN drafts, or
+# bf16 KV. The DFlash2 drafter (incoai/GLM-5.3-Flash-DFlash2) must be in the
+# HF cache on all nodes. Background: docs/GLM53_FLASH.md
+
+recipe_version: "1"
+name: GLM-5.3-Flash-EXL3
+description: vLLM+EXL3 serving Mia-AiLab/GLM-5.3-Flash-EXL3-TR3-4bpw with DFlash2 on a 4x Spark cluster
+
+model: Mia-AiLab/GLM-5.3-Flash-EXL3-TR3-4bpw
+container: vllm-node-glm5.3-flash-exl3
+
+cluster_only: true
+
+mods:
+  - mods/drop-caches
+  - mods/fix-glm53-topk-sm120
+  - mods/mia-backports-20260830
+
+defaults:
+  port: 8000
+  host: 0.0.0.0
+  tensor_parallel: 4
+  gpu_memory_utilization: 0.87
+  max_model_len: 131072
+  max_num_seqs: 4
+  num_speculative_tokens: 7
+
+env:
+  PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
+  VLLM_ENGINE_READY_TIMEOUT_S: "3600"
+  NCCL_IB_GID_INDEX: "3"
+
+# --language-model-only: the multimodal front-end warmup (~15.7 GiB on the
+# API node) OOM-killed the boot on 121 GiB unified memory at 0.87 util.
+# Text-only also matches the NVFP4 recipe for benchmark parity.
+# max_model_len 131072 requires mods/fix-glm53-topk-sm120: without it any
+# request >32K (sparse-indexer activation) kills the engine on GB10
+# (persistent_topk unlaunchable: 48-CTA budget vs 77-90 needed, FilteredTopK
+# needs 128KB smem vs 101KB). See issue #27. Mia's nominal 900000 exceeds
+# the ~346K-token KV pool at TP4 and cannot boot regardless.
+command: |
+  # Serve by local snapshot path, not HF id: Glm5NextProcessor.from_pretrained
+  # does a raw open(<model>/processor_config.json), which only resolves for a
+  # local directory. The file ships in the checkpoint; the id form crashes.
+  MODEL_DIR=$(ls -d /root/.cache/huggingface/hub/models--Mia-AiLab--GLM-5.3-Flash-EXL3-TR3-4bpw/snapshots/*/ | head -1)
+  vllm serve "$MODEL_DIR" \
+      --served-model-name glm-5.3-flash \
+      --host {host} \
+      --port {port} \
+      -tp {tensor_parallel} \
+      --gpu-memory-utilization {gpu_memory_utilization} \
+      --max-model-len {max_model_len} \
+      --max-num-seqs {max_num_seqs} \
+      --kv-cache-dtype fp8_ds_mla \
+      --language-model-only \
+      --enable-prefix-caching \
+      --no-enable-flashinfer-autotune \
+      --cudagraph-capture-sizes 1 2 4 8 16 24 32 \
+      --speculative-config '{{"method":"dflash","model":"incoai/GLM-5.3-Flash-DFlash2","num_speculative_tokens":{num_speculative_tokens},"kv_cache_dtype":"auto","draft_sample_method":"probabilistic","rejection_sample_method":"standard"}}' \
+      --tool-call-parser glm47 --enable-auto-tool-choice \
+      --reasoning-parser glm45

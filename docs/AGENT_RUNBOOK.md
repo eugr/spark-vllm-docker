@@ -344,6 +344,18 @@ an override or existing configuration is present. A successful container start
 is not sufficient verification: confirm that the API becomes ready and reports
 the expected served model.
 
+For any long-running operation (multi-minute boots, benchmark campaigns,
+long evals), verify forward progress on evidence, not on the process being
+alive: GPU utilization is not progress. Reliable signals, in order of
+authority: the server's own counters (`/metrics` —
+`vllm:prompt_tokens_total` / `vllm:generation_tokens_total` climbing
+between samples), log-file growth, fresh output artifacts, and a stack
+sample (`py-spy dump`) when a process looks wedged. Two known
+false-stall phases to tolerate: FlashInfer autotune at first boot (60+
+min, CPU >150% = working) and eval-harness context building for long
+prompts (~10 min of client-side tokenizing with zero server traffic).
+Set a stall check appropriate to the phase before walking away.
+
 ## 8. Handle Failures Conservatively
 
 - Re-run the same recipe with `--dry-run` and the same mode, config, overrides,

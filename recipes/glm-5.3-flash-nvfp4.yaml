@@ -1,0 +1,86 @@
+# GLM-5.3-Flash serve - replication of the official vLLM recipe
+# (recipes.vllm.ai GLM-5.3-Flash, multi-node TP profile).
+#
+# Contract: replicate the official recipe EXCEPT image (official x86 image
+# cannot run on aarch64 GB10; tonyd2wild sm121-v11-dflash2 build), checkpoint
+# (LibertAIDAI NVFP4), and TP x nodes (4 x 1-GPU Sparks; node wiring generated
+# by launch-cluster.sh). Deviation rationale, tuning history, thinking/parser
+# findings, and measurements: docs/GLM53_FLASH.md ("The serve recipe").
+#
+# Reference ports this recipe was measured against (tony bench, Mia EXL3,
+# Mia MM) live in docs/reference-recipes/ - kept for provenance, not
+# maintained as launchable recipes.
+#
+# Boot/correctness-mandatory on GB10 (not tuning):
+#   --gpu-memory-utilization 0.85 - vLLM default exceeds UMA free memory;
+#     engine refuses to start.
+#   --moe-backend marlin - sm_121 auto-select emits silent garbage.
+#   --trust-remote-code - checkpoint refuses to load without it.
+#   HF_HUB_OFFLINE=1 - Glm5NextProcessor needs local-path resolution.
+#   mods/fix-glm53-topk-sm120 - >32K requests crash without it (issue #27).
+#
+# Approved tuning deviations from vLLM defaults (Paul, 2026-08-30):
+#   max-num-seqs 16, max-num-batched-tokens 8192, block-size 2304,
+#   max-model-len 1048576 explicit, DFlash2 k=7 (drafter is CC BY-NC-ND;
+#   MTP-5 is the commercial fallback), served-model-name alias,
+#   deepseek_r1 reasoning parser (LibertAI card; glm45 - official's choice -
+#   not disproven, our early probe read the wrong response field),
+#   clear_thinking=true, --enable-prefix-caching stated explicitly (vLLM
+#   default is already on; stating it makes the assumption visible).
+# Reasoning arrives in message.reasoning; clients dial effort with
+# chat_template_kwargs {"reasoning_effort": "low"|"high"|"max"}.
+
+recipe_version: "1"
+name: GLM-5.3-Flash-NVFP4
+description: GLM-5.3-Flash NVFP4 on 4x Spark - official vLLM recipe replicated; image, checkpoint, and topology adapted
+
+model: LibertAIDAI/GLM-5.3-Flash-NVFP4
+container: vllm-node-glm5.3-flash
+
+cluster_only: true
+
+mods:
+  - mods/fix-glm53-topk-sm120
+  # kpool tail slot-map clamp (silent corruption on generations >~2K tokens,
+  # mechanism credited to vcruz305) + XGrammar termination backports.
+  # Vendored from Mia's overlay; exonerated of side effects by the KV A/B.
+  - mods/mia-backports-20260830
+
+defaults:
+  port: 8000
+  host: 0.0.0.0
+  tensor_parallel: 4
+  gpu_memory_utilization: 0.85
+  max_model_len: 1048576
+  max_num_seqs: 16
+  block_size: 2304
+  max_num_batched_tokens: 8192
+
+env:
+  VLLM_ENGINE_READY_TIMEOUT_S: "3600"
+  # Survival addition: Glm5NextProcessor open()s files relative to the model
+  # argument; offline mode makes vLLM resolve the HF id to the local snapshot
+  # first. tonyd2wild's launcher sets this too (plus TRANSFORMERS_OFFLINE).
+  # Without it the API server crashes on processor_config.json at boot.
+  HF_HUB_OFFLINE: "1"
+
+command: |
+  vllm serve LibertAIDAI/GLM-5.3-Flash-NVFP4 \
+      --served-model-name glm-5.3-flash-nvfp4 \
+      --trust-remote-code \
+      --port {port} \
+      --host {host} \
+      --tensor-parallel-size {tensor_parallel} \
+      --gpu-memory-utilization {gpu_memory_utilization} \
+      --max-model-len {max_model_len} \
+      --max-num-seqs {max_num_seqs} \
+      --max-num-batched-tokens {max_num_batched_tokens} \
+      --block-size {block_size} \
+      --kv-cache-dtype fp8 \
+      --moe-backend marlin \
+      --enable-prefix-caching \
+      --tool-call-parser glm47 \
+      --enable-auto-tool-choice \
+      --reasoning-parser deepseek_r1 \
+      --speculative-config '{{"method":"dflash","model":"incoai/GLM-5.3-Flash-DFlash2","num_speculative_tokens":7,"draft_sample_method":"probabilistic","rejection_sample_method":"standard"}}' \
+      --default-chat-template-kwargs '{{"clear_thinking": true}}'

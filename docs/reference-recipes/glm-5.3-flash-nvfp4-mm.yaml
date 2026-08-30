@@ -1,0 +1,57 @@
+# GLM-5.3-Flash, LibertAIDAI NVFP4, multimodal + concurrency variant, TP=4.
+# Replicates MiaAI's MM+Ray deployment (23-30 tok/s x1, 72 aggregate x8,
+# image/video input live). Launch with --ray (Ray executor is required).
+#
+# Image prep (builds Dockerfile.glm53-mm - Mia's kernel+serving layers):
+#   ./run-recipe.sh glm-5.3-flash-nvfp4-mm --build-only
+#
+# --moe-backend marlin + --enforce-eager is the deployed-stable sm_121 MoE
+# path. Sibling recipe glm-5.3-flash-nvfp4.yaml is the text-only,
+# single-stream, CUDA-graph variant. Background: docs/GLM53_FLASH.md
+
+recipe_version: "1"
+name: GLM-5.3-Flash-NVFP4-MM
+description: vLLM serving LibertAIDAI/GLM-5.3-Flash-NVFP4 with multimodal + concurrency on a 4x Spark cluster (Ray)
+
+model: LibertAIDAI/GLM-5.3-Flash-NVFP4
+container: vllm-node-glm5.3-flash-mm
+
+build_args:
+  - -f
+  - Dockerfile.glm53-mm
+
+cluster_only: true
+
+defaults:
+  port: 8000
+  host: 0.0.0.0
+  tensor_parallel: 4
+  gpu_memory_utilization: 0.84
+  max_model_len: 262144
+  max_num_seqs: 8
+  block_size: 2304
+  num_speculative_tokens: 4
+
+env:
+  PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
+  VLLM_ENGINE_READY_TIMEOUT_S: "3600"
+  NCCL_IB_GID_INDEX: "3"
+
+command: |
+  vllm serve LibertAIDAI/GLM-5.3-Flash-NVFP4 \
+      --trust-remote-code \
+      --port {port} \
+      --host {host} \
+      -tp {tensor_parallel} \
+      --gpu-memory-utilization {gpu_memory_utilization} \
+      --max-model-len {max_model_len} \
+      --max-num-seqs {max_num_seqs} \
+      --block-size {block_size} \
+      --kv-cache-dtype fp8_e4m3 \
+      --limit-mm-per-prompt '{{"image": 4, "video": 1}}' \
+      --chat-template /opt/glm53/chat_template.jinja \
+      --moe-backend marlin \
+      --enforce-eager \
+      --speculative-config '{{"method":"mtp","num_speculative_tokens":{num_speculative_tokens}}}' \
+      --tool-call-parser glm47 --enable-auto-tool-choice \
+      --reasoning-parser glm45
