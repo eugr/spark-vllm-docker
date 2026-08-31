@@ -210,6 +210,13 @@ assert_output_contains() {
     fi
 }
 
+assert_output_not_contains() {
+    local pattern="$1"
+    if grep -Eq "$pattern" "$OUTPUT_LOG"; then
+        fail "Expected output not to match: $pattern"
+    fi
+}
+
 test_default_uses_prebuilt() {
     setup_fixture
     run_build || fail "default run failed"
@@ -570,6 +577,72 @@ test_local_vllm_source_defaults_to_head() {
     assert_log_contains '^docker build --target vllm-export .*--build-arg VLLM_REF='"$LOCAL_VLLM_SOURCE_COMMIT"' --build-arg VLLM_REPO=local-source '
     assert_log_contains 'VLLM_SOURCE_COMMIT='"$LOCAL_VLLM_SOURCE_COMMIT"
     pass "--vllm-source-dir defaults to the checkout HEAD"
+}
+
+test_local_vllm_source_installs_b12x_for_upstream_origin() {
+    setup_fixture
+    create_local_vllm_source
+    git -C "$LOCAL_VLLM_SOURCE_DIR" remote add origin https://github.com/vllm-project/vllm.git
+    run_build --vllm-source-dir "$LOCAL_VLLM_SOURCE_DIR" || \
+        fail "--vllm-source-dir upstream-origin run failed"
+    assert_log_contains '^docker build -t vllm-node .*--build-arg B12X_REPO=https://github\.com/lukealonso/b12x\.git'
+    assert_output_contains 'Building B12X from .* for local source of https://github\.com/vllm-project/vllm ref '
+    pass "--vllm-source-dir installs B12X when the checkout tracks upstream vLLM"
+}
+
+test_local_vllm_source_installs_b12x_for_ssh_origin() {
+    setup_fixture
+    create_local_vllm_source
+    git -C "$LOCAL_VLLM_SOURCE_DIR" remote add origin git@github.com:vllm-project/vllm.git
+    run_build --vllm-source-dir "$LOCAL_VLLM_SOURCE_DIR" || \
+        fail "--vllm-source-dir ssh-origin run failed"
+    assert_log_contains 'B12X_REPO=https://github\.com/lukealonso/b12x\.git'
+    pass "B12X eligibility matches an ssh-spelled upstream origin"
+}
+
+test_local_vllm_source_installs_b12x_for_fork_origin() {
+    setup_fixture
+    create_local_vllm_source
+    git -C "$LOCAL_VLLM_SOURCE_DIR" remote add origin https://github.com/local-inference-lab/vllm
+    run_build --vllm-source-dir "$LOCAL_VLLM_SOURCE_DIR" || \
+        fail "--vllm-source-dir fork-origin run failed"
+    assert_log_contains 'B12X_REPO=https://github\.com/lukealonso/b12x\.git'
+    pass "B12X eligibility matches a local checkout of the B12X fork"
+}
+
+test_local_vllm_source_warns_when_b12x_is_skipped() {
+    setup_fixture
+    create_local_vllm_source
+    git -C "$LOCAL_VLLM_SOURCE_DIR" remote add origin https://github.com/someone/vllm-fork.git
+    run_build --vllm-source-dir "$LOCAL_VLLM_SOURCE_DIR" || \
+        fail "--vllm-source-dir unknown-origin run failed"
+    assert_log_not_contains 'B12X_REPO='
+    assert_output_contains "Warning: The local vLLM checkout's origin \\(https://github\\.com/someone/vllm-fork\\) is not upstream vLLM or the B12X fork\\."
+    assert_output_contains 'B12X kernels will NOT be installed'
+    assert_output_contains 'Re-run with --with-b12x'
+    pass "an unrecognised local checkout warns instead of silently dropping B12X"
+}
+
+test_local_vllm_source_warns_without_origin() {
+    setup_fixture
+    create_local_vllm_source
+    run_build --vllm-source-dir "$LOCAL_VLLM_SOURCE_DIR" || \
+        fail "--vllm-source-dir no-origin run failed"
+    assert_log_not_contains 'B12X_REPO='
+    assert_output_contains 'Warning: The local vLLM checkout has no origin remote to identify it by\.'
+    pass "a checkout without an origin warns instead of silently dropping B12X"
+}
+
+test_with_b12x_forces_the_kernel_package() {
+    setup_fixture
+    create_local_vllm_source
+    git -C "$LOCAL_VLLM_SOURCE_DIR" remote add origin https://github.com/someone/vllm-fork.git
+    run_build --vllm-source-dir "$LOCAL_VLLM_SOURCE_DIR" --with-b12x || \
+        fail "--with-b12x run failed"
+    assert_log_contains 'B12X_REPO=https://github\.com/lukealonso/b12x\.git'
+    assert_output_contains 'Building B12X from .* \(--with-b12x\) ref '
+    assert_output_not_contains 'B12X kernels will NOT be installed'
+    pass "--with-b12x installs the kernel package for an unrecognised source"
 }
 
 test_local_vllm_source_rejects_conflicting_repo() {
@@ -1300,6 +1373,12 @@ test_local_vllm_source_defaults_to_head
 test_local_vllm_source_rejects_conflicting_repo
 test_local_vllm_source_rejects_dirty_checkout
 test_local_vllm_source_rejects_missing_ref
+test_local_vllm_source_installs_b12x_for_upstream_origin
+test_local_vllm_source_installs_b12x_for_ssh_origin
+test_local_vllm_source_installs_b12x_for_fork_origin
+test_local_vllm_source_warns_when_b12x_is_skipped
+test_local_vllm_source_warns_without_origin
+test_with_b12x_forces_the_kernel_package
 test_exp_b12x_uses_prebuilt_image
 test_exp_b12x_rebuild_vllm_uses_preset_source_build
 test_exp_b12x_allows_vllm_prs

@@ -32,11 +32,13 @@ VLLM_SOURCE_DIR_SET=false
 VLLM_SOURCE_COMMIT=""
 VLLM_SOURCE_STAGING_DIR=""
 VLLM_SOURCE_CONTEXT=""
+WITH_B12X=false
 EXP_B12X=false
 EXP_B12X_VLLM_REPO="https://github.com/local-inference-lab/vllm"
 EXP_B12X_VLLM_REF="dev/infernal-invocation"
 B12X_PACKAGE_REPO="https://github.com/lukealonso/b12x.git"
-B12X_PACKAGE_REF="master"
+# 2026-08-31: needed to match latest local-inference-lab/vllm
+B12X_PACKAGE_REF="1.2.6"
 EXP_B12X_TORCH_VERSION="2.13.0"
 EXP_B12X_TORCHVISION_VERSION="0.28.0"
 EXP_B12X_TORCHAUDIO_VERSION="2.11.0"
@@ -169,6 +171,24 @@ gpu_arch_to_nccl_gencode() {
     echo "-gencode=arch=compute_${sm},code=sm_${sm}"
 }
 
+# Compare Git URLs by host and path so https, ssh, and git@ spellings of the
+# same repository match: https://github.com/vllm-project/vllm.git and
+# git@github.com:vllm-project/vllm both normalise to github.com/vllm-project/vllm.
+normalize_git_url() {
+    local url="$1"
+
+    url="${url%/}"
+    url="${url%.git}"
+    url="${url#ssh://}"
+    url="${url#git+ssh://}"
+    url="${url#https://}"
+    url="${url#http://}"
+    url="${url#git://}"
+    url="${url#git@}"
+    url="${url/://}"
+    printf '%s' "$url" | tr '[:upper:]' '[:lower:]'
+}
+
 prepare_local_vllm_source() {
     local requested_dir="$1"
     local source_dir
@@ -239,6 +259,9 @@ prepare_local_vllm_source() {
 
     VLLM_SOURCE_COMMIT="$resolved_commit"
     VLLM_SOURCE_CONTEXT="$VLLM_SOURCE_STAGING_DIR/vllm"
+    # VLLM_REPO becomes a sentinel below, which erases the upstream identity that
+    # B12X eligibility keys on. Remember where the checkout came from instead.
+    VLLM_SOURCE_ORIGIN_URL=$(git -C "$source_dir" remote get-url origin 2>/dev/null || true)
     VLLM_REPO="local-source"
     echo "Using clean local vLLM source at commit $VLLM_SOURCE_COMMIT."
 }
@@ -621,6 +644,7 @@ usage() {
     echo "  --tf5                         : Deprecated compatibility flag; tag defaults to 'vllm-node-tf5' (aliases: --pre-tf, --pre-transformers)"
     echo "  --exp-mxfp4, --experimental-mxfp4 : Build with experimental native MXFP4 support"
     echo "  --exp-b12x, --experimental-b12x   : Select B12X; pulls its prebuilt image unless a local wheel/image build is requested"
+    echo "  --with-b12x                   : Install the B12X kernel package even when the vLLM source is not recognised as upstream or the B12X fork"
     echo "  --apply-vllm-pr <pr-num>      : Apply a specific PR patch to vLLM source. Can be specified multiple times."
     echo "  --apply-preset-vllm-prs       : Apply preset vLLM PRs even with --vllm-repo, --vllm-ref, or --apply-vllm-pr."
     echo "  --apply-flashinfer-pr <pr-num>: Apply a specific PR patch to FlashInfer source. Can be specified multiple times."
@@ -716,6 +740,7 @@ while [[ "$#" -gt 0 ]]; do
         --tf5|--pre-tf|--pre-transformers) PRE_TRANSFORMERS=true ;;
         --exp-mxfp4|--experimental-mxfp4) EXP_MXFP4=true ;;
         --exp-b12x|--experimental-b12x) EXP_B12X=true ;;
+        --with-b12x) WITH_B12X=true ;;
         --apply-vllm-pr)
             if [ -n "$2" ] && [[ "$2" != -* ]]; then
                if [ -n "$VLLM_PRS" ]; then
@@ -830,21 +855,61 @@ if [ "$VLLM_REPO" != "$DEFAULT_VLLM_REPO" ] || [ "$VLLM_SOURCE_DIR_SET" = true ]
     CUSTOM_VLLM_REPO=true
 fi
 
-NORMALIZED_VLLM_REPO="${VLLM_REPO%/}"
-NORMALIZED_VLLM_REPO="${NORMALIZED_VLLM_REPO%.git}"
-NORMALIZED_DEFAULT_VLLM_REPO="${DEFAULT_VLLM_REPO%/}"
-NORMALIZED_DEFAULT_VLLM_REPO="${NORMALIZED_DEFAULT_VLLM_REPO%.git}"
-if [ "$NORMALIZED_VLLM_REPO" = "$NORMALIZED_DEFAULT_VLLM_REPO" ] || \
-   [ "$NORMALIZED_VLLM_REPO" = "$EXP_B12X_VLLM_REPO" ]; then
+# B12X kernels ship as an external package that both upstream vLLM and the
+# local-inference-lab fork load at runtime, so the wheel source decides whether
+# it is worth installing. --vllm-source-dir replaces VLLM_REPO with a sentinel,
+# which used to fail this check silently and produce an image whose B12X linear
+# and MoE backends abort at startup; fall back to the checkout's origin remote.
+NORMALIZED_VLLM_REPO=$(normalize_git_url "$VLLM_REPO")
+NORMALIZED_DEFAULT_VLLM_REPO=$(normalize_git_url "$DEFAULT_VLLM_REPO")
+NORMALIZED_B12X_VLLM_REPO=$(normalize_git_url "$EXP_B12X_VLLM_REPO")
+NORMALIZED_SOURCE_ORIGIN=$(normalize_git_url "$VLLM_SOURCE_ORIGIN_URL")
+
+# Normalised forms are for comparison only. Messages keep the URL as configured,
+# minus the trailing-slash and .git noise.
+B12X_DISPLAY_REPO="${VLLM_REPO%/}"
+B12X_DISPLAY_REPO="${B12X_DISPLAY_REPO%.git}"
+B12X_DISPLAY_ORIGIN="${VLLM_SOURCE_ORIGIN_URL%/}"
+B12X_DISPLAY_ORIGIN="${B12X_DISPLAY_ORIGIN%.git}"
+
+repo_supports_b12x() {
+    local candidate="$1"
+    [ -n "$candidate" ] || return 1
+    [ "$candidate" = "$NORMALIZED_DEFAULT_VLLM_REPO" ] || [ "$candidate" = "$NORMALIZED_B12X_VLLM_REPO" ]
+}
+
+B12X_ELIGIBLE=false
+B12X_SOURCE_LABEL="$B12X_DISPLAY_REPO"
+if repo_supports_b12x "$NORMALIZED_VLLM_REPO"; then
+    B12X_ELIGIBLE=true
+elif [ "$VLLM_SOURCE_DIR_SET" = true ] && repo_supports_b12x "$NORMALIZED_SOURCE_ORIGIN"; then
+    B12X_ELIGIBLE=true
+    B12X_SOURCE_LABEL="local source of ${B12X_DISPLAY_ORIGIN}"
+elif [ "$WITH_B12X" = true ]; then
+    B12X_ELIGIBLE=true
+    B12X_SOURCE_LABEL="${B12X_SOURCE_LABEL} (--with-b12x)"
+fi
+
+if [ "$B12X_ELIGIBLE" = true ]; then
     B12X_REPO="$B12X_PACKAGE_REPO"
     B12X_REF="$B12X_PACKAGE_REF"
     B12X_CACHEBUST="$(date +%s)"
     TORCH_BASE_VERSION="${TORCH_VERSION%%+*}"
     if [ "$(printf '%s\n' "2.12.0" "$TORCH_BASE_VERSION" | sort -V | head -n1)" != "2.12.0" ]; then
-        echo "Error: ${NORMALIZED_VLLM_REPO} requires --torch-version 2.12.0 or newer for B12X (got ${TORCH_VERSION})."
+        echo "Error: ${B12X_SOURCE_LABEL} requires --torch-version 2.12.0 or newer for B12X (got ${TORCH_VERSION})."
         exit 1
     fi
-    echo "Building B12X from ${B12X_REPO} ref ${B12X_REF} for ${NORMALIZED_VLLM_REPO} ref ${VLLM_REF}."
+    echo "Building B12X from ${B12X_REPO} ref ${B12X_REF} for ${B12X_SOURCE_LABEL} ref ${VLLM_REF}."
+elif [ "$VLLM_SOURCE_DIR_SET" = true ]; then
+    # Never leave this decision implicit: the failure otherwise only surfaces as a
+    # missing-kernel ValueError once a model is served.
+    if [ -n "$NORMALIZED_SOURCE_ORIGIN" ]; then
+        echo "Warning: The local vLLM checkout's origin (${B12X_DISPLAY_ORIGIN}) is not upstream vLLM or the B12X fork."
+    else
+        echo "Warning: The local vLLM checkout has no origin remote to identify it by."
+    fi
+    echo "         B12X kernels will NOT be installed, so --moe-backend b12x and --linear-backend b12x will fail at startup."
+    echo "         Re-run with --with-b12x to install the B12X kernel package anyway."
 fi
 
 # Source autodiscover.sh to load .env file
