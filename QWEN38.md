@@ -179,6 +179,28 @@ driver hangs. There is no 5 GiB test-client cancellation policy in this recipe.
 
 ## Qualification observations
 
+### Benchmark methodology
+
+The README decode table reports the August 31 single-Spark retain-12/MTP2
+run on `local/qwen38-flash-next-vllm:arm64-qsa-fused-mtp-v1`, with a
+40,960-token request limit, 12-GiB FP8 KV pool, graphs [3,12,24,48], and
+16-token prefix matching plus explicit cache primers. It is the same model
+but not the final release-image/cache configuration. All three 1K/C16 cells
+recorded a preemption and are not clean uninterrupted C16 measurements.
+
+Rates count streamed token IDs during the common decode interval, excluding
+warm-up and TTFT. Thinking was off; sampling used temperature 0.7, top-p 0.8,
+top-k 20 and presence penalty 1.5. The 512-token limit was a cap, not a forced
+length: answers stopped naturally. The small coding helper/test task had
+approximately 94% draft acceptance; summarization and creative writing were
+approximately 47% and 43%. Coding rates should not be generalized to every
+agentic task. Runners and fixtures are not bundled in this release.
+
+The prefill table uses the final release image. Native prefill time runs from
+first scheduling to first generated token; it is not isolated GPU-kernel time.
+Throughput counts newly processed input plus prefix recomputation. Client TTFT
+is a separate measurement, not additional time to add to prefill duration.
+
 ### Final-recipe prefill at increasing context depths
 
 The [README performance tables](README.md#single-spark-performance-observations)

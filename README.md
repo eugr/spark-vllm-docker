@@ -1,34 +1,10 @@
 # Qwen3.8 Flash Next on a single DGX Spark
 
-> **Fork notice:** This is a community fork of
-> [eugr/spark-vllm-docker](https://github.com/eugr/spark-vllm-docker), adding a
-> single-Spark recipe for
-> [Qwen3.8-Flash-Next-MXFP4-FP8-R12](https://huggingface.co/MJPansa/Qwen3.8-Flash-Next-MXFP4-FP8-R12).
-> Credit for the underlying Spark Docker infrastructure belongs to upstream.
-> This custom recipe is not an upstream-endorsed release.
+Fork of [eugr/spark-vllm-docker](https://github.com/eugr/spark-vllm-docker) for running [Qwen3.8-Flash-Next-MXFP4-FP8-R12](https://huggingface.co/MJPansa/Qwen3.8-Flash-Next-MXFP4-FP8-R12) on one DGX Spark: mixed MXFP4/FP8 weights, dynamic MXFP8 activations, and NVMe-backed PLE n-gram lookup.
 
-The model retains 12 routed-expert layers in FP8; the remaining routed experts
-use MXFP4 weights with dynamic MXFP8 activations. NVMe-backed PLE n-gram lookup
-makes it fit on **one 128-GB DGX Spark**. The recipe provides approximately
-**800K shared FP8 KV-cache token slots**, **262,144 tokens per request**,
-**32,768 maximum output tokens**, up to **16 active requests**, MTP-2,
-decode CUDA graphs, text/tool calling and bounded image support. The 800K figure
-is aggregate cache capacity, **not an 800K single-request context window**;
-requests share this pool and cannot all fill their individual maximum at once.
+## Run
 
-**Release candidate:** bounded image and long-context prefill checks passed.
-Image-heavy workloads still have narrow memory headroom, and startup driver
-allocation warnings remain unresolved. Keep the included 2-GiB TERM / 1-GiB KILL
-safeguard. See [QWEN38.md](QWEN38.md) for limits, dependencies and test details.
-
-## Run this Qwen recipe
-
-Run these commands **on the DGX Spark**, not on a Mac. Prerequisites are
-NVIDIA-enabled Docker, local NVMe storage, Python 3.10+ with PyYAML, and `uv`/`uvx`.
-Allow space for approximately **146.55 GB of checkpoint files**, the Docker
-images and compilation caches. Start on an otherwise available Spark.
-While the Hugging Face model is private, your account needs access and you must
-authenticate locally with Hugging Face; never put a token into this repository.
+Run these commands on the DGX Spark:
 
 ```bash
 git clone --branch qwen38-single-spark-release https://github.com/marco-jeffrey/spark-vllm-docker.git
@@ -36,74 +12,47 @@ cd spark-vllm-docker
 ./run-recipe.sh qwen3.8-flash-next-mxfp4-fp8-r12 --setup --solo
 ```
 
-Setup builds our derived image on a pinned **eugr Spark image**, obtains the
-pinned model in the standard Hugging Face cache (reusing a complete existing
-snapshot), and launches the API on port 8000. vLLM preview replacement, Triton
-3.8 compatibility changes and our patches are baked into the derived image at
-build time, not reapplied at each launch. First-use GPU compilation is separate.
-No calibration data or original FP8 checkpoint is needed.
+## Specs
 
-The served model name is
-`Qwen/Qwen3.8-Flash-Next-MXFP4-MXFP8-retain-12-single-spark`.
-Use the OpenAI-compatible `POST /v1/chat/completions` endpoint. Images must be
-inline PNG/JPEG/WebP and obey the documented budgets; video is disabled.
-Use a trusted network or an authenticated gateway; the quick start is not an
-internet-facing security configuration.
+| Setting | Value |
+|---|---|
+| Hardware | 1× DGX Spark, 128 GB unified memory |
+| Context / max output | 262,144 / 32,768 tokens per request |
+| Shared KV cache | ~800K token slots, FP8 E4M3 |
+| Concurrency | Up to 16 requests |
+| Speculation / graphs | MTP-2; decode graphs for C1/2/4/6/8/10/12/14/16 |
+| Images | Up to 32; 32,768 visual tokens total; automatic resizing |
+| API | Port 8000, `/v1/chat/completions` |
+| Served model | `Qwen/Qwen3.8-Flash-Next-MXFP4-MXFP8-retain-12-single-spark` |
+
+[Installation details, limits and patches](QWEN38.md).
 
 ## Single-Spark performance observations
 
-### Coding decode — earlier runtime, not the final recipe
+### Decode
 
-Measured August 31, 2026 on one DGX Spark with retain-12 and MTP-2. Each cell is
-**aggregate tokens/s (mean tokens/s per request)** during the common interval
-when all streams overlap, excluding warm-up and time to first token. C denotes
-concurrent requests. Counts use streamed token IDs, not network chunk counts.
+Aggregate tok/s **(per-request tok/s)** during shared decode overlap, excluding warm-up and TTFT. MTP-2, thinking off, 512-token output cap.
 
-| Coding prompt context | C1 | C4 | C8 | C16 |
-|---|---:|---:|---:|---:|
-| Approximately 1K | 38.5 (38.5) | 95.9 (24.0) | 174.3 (21.8) | 251.1 (15.7) † |
-| Approximately 32K | 40.0 (40.0) | 96.5 (24.1) | 175.5 (21.9) | 255.7 (16.0) |
+| Task | Context | C1 | C4 | C8 | C16 |
+|---|---:|---:|---:|---:|---:|
+| Coding | 1K | 38.5 | 95.9 (24.0) | 174.3 (21.8) | 251.1 (15.7) † |
+| Coding | 32K | 40.0 | 96.5 (24.1) | 175.5 (21.9) | 255.7 (16.0) |
+| Summarization | 1K | 25.6 | 58.4 (14.6) | 96.0 (12.0) | 151.0 (9.4) † |
+| Summarization | 32K | 27.6 | 58.5 (14.6) | 96.5 (12.1) | 151.1 (9.4) |
+| Creative writing | 1K | 24.4 | 57.4 (14.3) | 94.4 (11.8) | 150.7 (9.4) † |
+| Creative writing | 32K | 24.7 | 58.6 (14.7) | 95.8 (12.0) | 146.3 (9.1) |
 
-† The 1K/C16 batch recorded a preemption, so it is **not a clean uninterrupted
-C16 measurement**. The 32K/C16 coding overlap lasted 14.33 seconds.
+† Preemption observed. Decode used earlier runtime settings; [measurement details](QWEN38.md#benchmark-methodology).
 
-The task requested a small cache-fraction helper and four compact pytest tests.
-Thinking was disabled and output was capped at 512 tokens; answers ended
-naturally at 226–373 tokens (1K) and 232–360 tokens (32K). Draft acceptance was
-approximately 94%: these predictable coding tasks are **not representative of
-all coding or agentic workloads**. Sampling used temperature 0.7, top-p 0.8,
-top-k 20 and presence penalty 1.5.
+### Prefill
 
-These historical measurements used image
-`local/qwen38-flash-next-vllm:arm64-qsa-fused-mtp-v1`, a 40,960-token request
-limit, 12-GiB FP8 KV pool, graph sizes `[3,12,24,48]`, and 16-token prefix
-matching with explicit cache primers. They **do not establish decode speeds for
-the final 262K-context / ~800K-cache recipe**. The custom decode runner and
-fixtures are not bundled in this release; this table is a reported observation,
-not yet a self-contained reproduction package.
+C1, **32,768 new tokens** after a warmed prefix; rates include recomputed prefix tokens.
 
-### Prefill — final recipe, 32K additional input at each depth
-
-Measured August 31, 2026 at concurrency 1, using the final Spark-base image and
-the recipe's unchanged cache/context settings. Each prefix was warmed first,
-then **32,768 new input tokens** were appended, with one generated token,
-thinking disabled and temperature 0. Warm-up is excluded from the table.
-
-| Existing context | Final prompt | Cached prefix tokens | Actual computed input tokens | Prefill time | Prefill tokens/s | TTFT |
-|---:|---:|---:|---:|---:|---:|---:|
-| 32,768 | 65,536 | 25,472 | 40,064 | 18.91 s | 2,119 | 19.84 s |
-| 131,072 | 163,840 | 124,176 | 39,664 | 21.36 s | 1,857 | 22.69 s |
-| 204,800 | 237,568 | 197,408 | 40,160 | 23.30 s | 1,723 | 23.91 s |
-
-Throughput is actual computed input divided by vLLM's native prefill duration,
-which runs from first scheduling to first generated token; it is not isolated
-GPU-kernel timing. Cache boundaries required recomputing roughly 6.9–7.4K
-prefix tokens in addition to the new 32K. TTFT is shown separately and is not
-added to prefill duration. All three probes passed with no preemptions, OOMs
-or safety interventions; minimum sampled available host memory was 4.98 GiB.
-The prompts were deterministic synthetic engineering text, not image inputs.
-The prefill runner and fixtures remain outside this release too; these are
-qualification observations, not a claim of bundled benchmark reproducibility.
+| Existing context | Final prompt | Computed tokens | Prefill time | Prefill tok/s | TTFT |
+|---:|---:|---:|---:|---:|---:|
+| 32,768 | 65,536 | 40,064 | 18.91 s | 2,119 | 19.84 s |
+| 131,072 | 163,840 | 39,664 | 21.36 s | 1,857 | 22.69 s |
+| 204,800 | 237,568 | 40,160 | 23.30 s | 1,723 | 23.91 s |
 
 ---
 
