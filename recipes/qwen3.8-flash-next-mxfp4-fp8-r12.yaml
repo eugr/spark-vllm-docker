@@ -1,0 +1,98 @@
+# Qwen3.8 Flash Next, retain-12 mixed MXFP4/FP8 checkpoint for one DGX Spark.
+
+recipe_version: "1"
+name: Qwen3.8-Flash-Next-MXFP4-FP8-R12
+description: >-
+  Single-DGX-Spark qualification candidate for the private retain-12 checkpoint:
+  MXFP4 routed experts with dynamic MXFP8 activations, 12 retained FP8 expert
+  layers, FP8 KV cache, NVMe-backed PLE, packed MXFP4 MTP head, bounded still
+  images, hybrid prefix caching, and full decode CUDA graphs. Sequential-image
+  bounded qualification passes, including 16 large images and C16 text/mixed
+  submissions. Release candidate: narrow headroom and startup driver warnings
+  remain; see QWEN38.md. Keep the 2/1 GiB emergency guard.
+
+model: MJPansa/Qwen3.8-Flash-Next-MXFP4-FP8-R12
+model_revision: 92e1187ab292e2320edc5d9bccc477450b83e5ff
+# Opt in to offline completeness checks before --setup skips a cached download.
+# All shards referenced by the index are checked in addition to these assets.
+model_required_files:
+  - chat_template.jinja
+  - tokenizer.json
+  - tokenizer_config.json
+  - vocab.json
+  - merges.txt
+  - preprocessor_config.json
+  - video_preprocessor_config.json
+  - generation_config.json
+  - hybrid-conversion-manifest.json
+  - draft_lm_head_mxfp4.safetensors
+  - config.json
+  - model.safetensors.index.json
+
+container: vllm-node-qwen38-r12
+build_args:
+  - --qwen38-r12
+solo_only: true
+
+defaults:
+  port: 8000
+  host: 0.0.0.0
+  tensor_parallel: 1
+  gpu_memory_utilization: 0.80
+  kv_cache_memory_bytes: 13774094336
+  max_model_len: 262144
+  max_num_seqs: 16
+  max_num_batched_tokens: 8192
+
+# Keep existing safeguards during C16/image-memory qualification. CLI values
+# still override numeric settings; the two safety modes are always on.
+launch:
+  earlyoom: true
+  earlyoom_args: >-
+    -M 2097152,1048576 -s 100,100 -r 5
+    --prefer (VLLM|vllm|python3) --avoid earlyoom
+  non_privileged: true
+  mem_limit_gb: 116
+  mem_swap_limit_gb: 116
+  pids_limit: 8192
+  shm_size_gb: 1
+  extra_docker_args:
+    - --cap-add=SYS_PTRACE
+    - --ipc=host
+
+env:
+  QWEN38_MODEL_REVISION: 92e1187ab292e2320edc5d9bccc477450b83e5ff
+  VLLM_MAX_IMAGE_PIXELS: "16777216"
+  VLLM_MEDIA_LOADING_THREAD_COUNT: "1"
+  QWEN38_SEQUENTIAL_IMAGE_ENCODER: "1"
+  QWEN38_IMAGE_ENCODER_PRESSURE_CLEANUP: "1"
+  QWEN38_IMAGE_ENCODER_TIMING: "1"
+
+command: |
+  qwen38-r12-serve \
+    --served-model-name Qwen/Qwen3.8-Flash-Next-MXFP4-MXFP8-retain-12-single-spark \
+    --host {host} \
+    --port {port} \
+    --tensor-parallel-size {tensor_parallel} \
+    --moe-backend flashinfer_cutlass_afp8 \
+    --load-format fastsafetensors \
+    --gpu-memory-utilization {gpu_memory_utilization} \
+    --kv-cache-dtype fp8_e4m3 \
+    --kv-cache-memory-bytes {kv_cache_memory_bytes} \
+    --max-model-len {max_model_len} \
+    --max-num-seqs {max_num_seqs} \
+    --max-num-batched-tokens {max_num_batched_tokens} \
+    --enable-chunked-prefill \
+    --enable-prefix-caching \
+    --no-enable-flashinfer-autotune \
+    --compilation-config '{{"mode":0,"cudagraph_mode":"FULL","cudagraph_capture_sizes":[3,6,12,18,24,30,36,42,48]}}' \
+    --speculative-config '{{"method":"mtp","num_speculative_tokens":2}}' \
+    --skip-mm-profiling \
+    --mm-processor-cache-gb 0.125 \
+    --limit-mm-per-prompt '{{"image":32,"video":0}}' \
+    --mm-processor-kwargs '{{"min_pixels":65536,"max_pixels":2097152}}' \
+    --middleware qwen38_image_policy.ImagePolicyMiddleware \
+    --reasoning-parser qwen3 \
+    --enable-auto-tool-choice \
+    --tool-call-parser qwen3_coder \
+    --enable-prompt-tokens-details

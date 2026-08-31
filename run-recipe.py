@@ -63,6 +63,7 @@ RECIPE YAML SCHEMA:
     command: str           # Required: vLLM serve command with {placeholders}
     description: str       # Optional: Brief description
     model: str             # Optional: HuggingFace model ID for --setup
+    model_required_files: list[str]  # Optional: Validate pinned local cache before skipping download
     mods: list[str]        # Optional: Mod directories to apply
     defaults: dict         # Optional: Default values for command placeholders
     env: dict              # Optional: Environment variables
@@ -84,6 +85,7 @@ RELATED FILES:
 """
 
 import argparse
+import json
 import os
 import re
 import subprocess
@@ -110,6 +112,41 @@ ENV_FILE = None  # Will be set from CLI argument or default
 DISTRIBUTED_EXECUTOR_RE = re.compile(
     r"--distributed-executor-backend(?:=|\s+)\S+"
 )
+# Bound metadata parsing and file probes; never read weight contents here.
+MODEL_INDEX_MAX_BYTES = 64 * 1024 * 1024
+MODEL_CONFIG_MAX_BYTES = 1024 * 1024
+MODEL_INDEX_MAX_ENTRIES = 1_000_000
+MODEL_REQUIRED_FILES_MAX = 256
+
+
+def safe_model_relative_path(value: Any) -> bool:
+    """Validate lexical snapshot paths without rejecting HF blob symlinks."""
+    return (
+        isinstance(value, str)
+        and 0 < len(value) <= 4096
+        and not any(ord(char) < 32 or char in "\\:" for char in value)
+        and len(value.split("/")) <= 32
+        and all(part not in ("", ".", "..") and len(part) <= 255
+                for part in value.split("/"))
+    )
+
+
+def model_hub_cache() -> Path:
+    """Match hf-download.sh and launch-cluster.sh's HF_HOME-based mount."""
+    return Path(os.environ.get("HF_HOME") or Path.home() / ".cache/huggingface") / "hub"
+
+
+def validate_model_cache_environment() -> None:
+    """Reject cache overrides that the downloader/launcher cannot share."""
+    hub = model_hub_cache().resolve()
+    for variable in ("HF_HUB_CACHE", "HUGGINGFACE_HUB_CACHE"):
+        override = os.environ.get(variable)
+        if override is not None and (not override or Path(override).resolve() != hub):
+            raise ValueError(
+                f"{variable} conflicts with this recipe's mounted cache. "
+                f"Unset {variable} and use HF_HOME to select the cache; "
+                "only its hub subdirectory is supported."
+            )
 
 
 def runtime_vllm_pr_number(value: str) -> str:
@@ -177,10 +214,19 @@ def load_recipe(recipe_path: Path) -> dict[str, Any]:
         command (str, required): vLLM serve command template with {placeholders}
         description (str, optional): Brief description shown in --list
         model (str, optional): HuggingFace model ID for --setup downloads
+        model_revision (str, optional): Hugging Face branch, tag, or commit.
+        model_required_files (list[str], optional): Opt in to local pinned-snapshot
+            validation: nonempty config/index, all indexed shards, and these
+            auxiliary files. Paths are snapshot-relative; HF blob links are allowed.
+            Missing/invalid files resume the download. No weight hashing or network
+            is performed. Requires model and model_revision; respects HF_HOME and
+            rejects conflicting Hub cache overrides before any operational action.
         mods (list[str], optional): List of mod directories to apply (e.g., 'mods/fix-glm')
         defaults (dict, optional): Default values for command placeholders
         env (dict, optional): Environment variables to export before running
         build_args (list[str], optional): Extra args for build-and-copy.sh (e.g., ['-f', 'Dockerfile.mxfp4'])
+        launch (dict, optional): Safe container-launch defaults such as
+            earlyoom, non_privileged, memory limits, and extra Docker args.
         cluster_only (bool, optional): If True, recipe cannot run in solo mode
         solo_only (bool, optional): If True, recipe cannot run in cluster mode
 
@@ -226,11 +272,40 @@ def load_recipe(recipe_path: Path) -> dict[str, Any]:
     # Set defaults for optional fields
     recipe.setdefault("description", "")
     recipe.setdefault("model", None)
+    recipe.setdefault("model_revision", None)
     recipe.setdefault("mods", [])
     recipe.setdefault("defaults", {})
     recipe.setdefault("env", {})
+    recipe.setdefault("launch", {})
     recipe.setdefault("cluster_only", False)
     recipe.setdefault("solo_only", False)
+
+    if "model_required_files" in recipe:
+        required_files = recipe["model_required_files"]
+        model = recipe["model"]
+        revision = recipe["model_revision"]
+        if (
+            not isinstance(required_files, list)
+            or not 0 < len(required_files) <= MODEL_REQUIRED_FILES_MAX
+            or not all(safe_model_relative_path(name) for name in required_files)
+            or not safe_model_relative_path(model)
+            or len(model.split("/")) > 2
+            or not safe_model_relative_path(revision)
+            or "/" in revision
+        ):
+            print("Error: model_required_files must be a nonempty bounded list of "
+                  "safe relative file paths, with model and a pinned model_revision")
+            sys.exit(1)
+
+    if not isinstance(recipe["launch"], dict):
+        print("Error: Recipe launch field must be a mapping")
+        sys.exit(1)
+    extra_docker_args = recipe["launch"].get("extra_docker_args", [])
+    if not isinstance(extra_docker_args, list) or not all(
+        isinstance(value, str) for value in extra_docker_args
+    ):
+        print("Error: launch.extra_docker_args must be a list of strings")
+        sys.exit(1)
 
     # Validate recipe version compatibility
     # EXTENSIBILITY: When adding new schema versions, update SUPPORTED_VERSIONS
@@ -388,7 +463,11 @@ def build_image(
     return result.returncode == 0
 
 
-def download_model(model: str, copy_to: list[str] | None = None) -> bool:
+def download_model(
+    model: str,
+    copy_to: list[str] | None = None,
+    revision: str | None = None,
+) -> bool:
     """
     Download model from HuggingFace using hf-download.sh.
 
@@ -413,6 +492,8 @@ def download_model(model: str, copy_to: list[str] | None = None) -> bool:
         return False
 
     cmd = [str(DOWNLOAD_SCRIPT), model]
+    if revision:
+        cmd.extend(["--revision", revision])
     if copy_to:
         cmd.extend(["--copy-to", ",".join(copy_to), "--copy-parallel"])
 
@@ -424,15 +505,80 @@ def download_model(model: str, copy_to: list[str] | None = None) -> bool:
     return result.returncode == 0
 
 
-def check_model_exists(model: str) -> bool:
+def _unique_model_json_object(pairs: list[tuple[str, Any]]) -> dict:
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("Duplicate model metadata key")
+        result[key] = value
+    return result
+
+
+def _invalid_model_json_constant(value: str) -> None:
+    raise ValueError("Non-finite constant in model metadata")
+
+
+def _read_model_json(path: Path, max_bytes: int) -> dict:
+    if not path.is_file() or not 0 < path.stat().st_size <= max_bytes:
+        raise ValueError("Missing, empty, or oversized model metadata")
+    with path.open("rb") as stream:
+        data = stream.read(max_bytes + 1)
+    if len(data) > max_bytes:
+        raise ValueError("Oversized model metadata")
+    value = json.loads(
+        data, object_pairs_hook=_unique_model_json_object,
+        parse_constant=_invalid_model_json_constant,
+    )
+    if not isinstance(value, dict) or not value:
+        raise ValueError("Model metadata must be a nonempty JSON object")
+    return value
+
+
+def _validated_model_snapshot(snapshot: Path, required_files: list[str]) -> bool:
+    """Check presence, not cryptographic integrity; follow normal cache links."""
+    try:
+        if (
+            not isinstance(required_files, list)
+            or not 0 < len(required_files) <= MODEL_REQUIRED_FILES_MAX
+            or not all(safe_model_relative_path(name) for name in required_files)
+        ):
+            return False
+        _read_model_json(snapshot / "config.json", MODEL_CONFIG_MAX_BYTES)
+        index = _read_model_json(snapshot / "model.safetensors.index.json", MODEL_INDEX_MAX_BYTES)
+        weight_map = index.get("weight_map")
+        if (
+            not isinstance(weight_map, dict)
+            or not 0 < len(weight_map) <= MODEL_INDEX_MAX_ENTRIES
+            or not all(
+                isinstance(tensor, str) and 0 < len(tensor) <= 4096
+                and safe_model_relative_path(filename)
+                for tensor, filename in weight_map.items()
+            )
+        ):
+            return False
+        # Do not filter out PLE entries: those shards are needed for NVMe reads.
+        for name in set(required_files) | set(weight_map.values()):
+            path = snapshot / name
+            if not path.is_file() or path.stat().st_size == 0:
+                return False
+        return True
+    except (OSError, ValueError, RecursionError, RuntimeError):
+        # Includes malformed JSON, broken/looping links and interrupted downloads.
+        return False
+
+
+def check_model_exists(
+    model: str, revision: str | None = None,
+    required_files: list[str] | None = None,
+) -> bool:
     """
     Check if a model exists in the HuggingFace cache.
 
-    Checks the standard HF cache location for completed downloads.
+    With required_files, validate the exact snapshot in the HF_HOME-based cache.
+    Without it, preserve the legacy cache-directory heuristic for other recipes.
 
     EXTENSIBILITY:
-    - To support custom cache locations: Add HF_HOME env var support
-    - To verify model integrity: Check for complete snapshot with config.json
+    - Presence validation does not hash weights or prove their integrity.
     - To support other model sources: Add URL/path prefix detection
 
     Args:
@@ -441,6 +587,16 @@ def check_model_exists(model: str) -> bool:
     Returns:
         True if model appears to be fully downloaded, False otherwise
     """
+    if required_files is not None:
+        if (
+            not safe_model_relative_path(model) or len(model.split("/")) > 2
+            or not safe_model_relative_path(revision) or "/" in revision
+        ):
+            return False
+        snapshot = (model_hub_cache() / f"models--{model.replace('/', '--')}"
+                    / "snapshots" / revision)
+        return _validated_model_snapshot(snapshot, required_files)
+
     # Convert model name to cache directory format
     # e.g., "Salyut1/GLM-4.7-NVFP4" -> "models--Salyut1--GLM-4.7-NVFP4"
     cache_name = f"models--{model.replace('/', '--')}"
@@ -449,7 +605,9 @@ def check_model_exists(model: str) -> bool:
     if cache_path.exists():
         # Check for snapshots directory which indicates complete download
         snapshots = cache_path / "snapshots"
-        if snapshots.exists() and any(snapshots.iterdir()):
+        if revision and (snapshots / revision).is_dir():
+            return True
+        if not revision and snapshots.exists() and any(snapshots.iterdir()):
             return True
     return False
 
@@ -1007,6 +1165,17 @@ Examples:
     if extra_args and extra_args[0] == "--":
         extra_args = extra_args[1:]
 
+    # Check opt-in cache contracts even before an explicit --discover can act.
+    recipe = None
+    if args.recipe and not args.list:
+        recipe = load_recipe(Path(args.recipe))
+        if "model_required_files" in recipe:
+            try:
+                validate_model_cache_environment()
+            except (OSError, ValueError, RuntimeError) as exc:
+                print(f"Error: {exc}")
+                return 1
+
     # Handle --discover (can be run with or without a recipe)
     if args.discover:
         env = run_autodiscover()
@@ -1045,8 +1214,8 @@ Examples:
         return 1
 
     # Load recipe
-    recipe_path = Path(args.recipe)
-    recipe = load_recipe(recipe_path)
+    if recipe is None:
+        recipe = load_recipe(Path(args.recipe))
 
     print(f"Recipe: {recipe['name']}")
     if recipe.get("description"):
@@ -1060,7 +1229,25 @@ Examples:
     # Determine container image
     container = args.container_override or recipe["container"]
     model = recipe.get("model")
+    model_revision = recipe.get("model_revision")
+    model_required_files = recipe.get("model_required_files")
     build_args = recipe.get("build_args", [])
+    launch_defaults = recipe.get("launch", {})
+    if launch_defaults.get("earlyoom", False):
+        args.earlyoom = True
+    if args.earlyoom_args is None:
+        args.earlyoom_args = launch_defaults.get("earlyoom_args")
+    if launch_defaults.get("non_privileged", False):
+        args.non_privileged = True
+    for option in (
+        "mem_limit_gb",
+        "mem_swap_limit_gb",
+        "pids_limit",
+        "shm_size_gb",
+    ):
+        if getattr(args, option) is None and option in launch_defaults:
+            setattr(args, option, launch_defaults[option])
+    recipe_extra_docker_args = launch_defaults.get("extra_docker_args", [])
 
     # Parse nodes - check command line first, then .env file, then autodiscover
     nodes = parse_nodes(args.nodes) if not args.solo else []
@@ -1171,6 +1358,8 @@ Examples:
             print(f"Build args: {' '.join(build_args)}")
         if model:
             print(f"Model: {model}")
+            if model_revision:
+                print(f"Model revision: {model_revision}")
         if cluster_only:
             print("Cluster only: Yes (model too large for single node)")
         if solo_only:
@@ -1196,6 +1385,11 @@ Examples:
             print(f"Container name: {args.container_name}")
         if args.non_privileged:
             print("Non-privileged mode: Yes")
+        if recipe_extra_docker_args:
+            print(
+                "Extra Docker args: "
+                + " ".join(shlex.quote(value) for value in recipe_extra_docker_args)
+            )
         if cli_vllm_prs:
             print(f"Runtime vLLM PRs: {', '.join(cli_vllm_prs)}")
         print()
@@ -1245,7 +1439,7 @@ Examples:
     # --- Download Phase ---
     if model and (args.download_only or args.setup or args.force_download):
         if args.dry_run:
-            model_exists = check_model_exists(model)
+            model_exists = check_model_exists(model, model_revision, model_required_files)
             if args.force_download or not model_exists:
                 print(f"Would download model: {model}")
                 if copy_targets:
@@ -1254,11 +1448,11 @@ Examples:
                 print(f"Model '{model}' already exists in cache.")
             print()
         else:
-            model_exists = check_model_exists(model)
+            model_exists = check_model_exists(model, model_revision, model_required_files)
 
             if args.force_download or not model_exists:
                 print("=== Downloading Model ===")
-                if not download_model(model, copy_targets):
+                if not download_model(model, copy_targets, model_revision):
                     print("Error: Failed to download model")
                     return 1
                 print()
@@ -1520,7 +1714,16 @@ Examples:
         print()
 
         # Execute
-        result = subprocess.run(cmd)
+        launch_env = os.environ.copy()
+        if recipe_extra_docker_args:
+            inherited = launch_env.get("VLLM_SPARK_EXTRA_DOCKER_ARGS", "").strip()
+            packaged = " ".join(
+                shlex.quote(value) for value in recipe_extra_docker_args
+            )
+            launch_env["VLLM_SPARK_EXTRA_DOCKER_ARGS"] = " ".join(
+                value for value in (inherited, packaged) if value
+            )
+        result = subprocess.run(cmd, env=launch_env)
         return result.returncode
 
     finally:

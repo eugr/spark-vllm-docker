@@ -9,6 +9,7 @@ SSH_USER="$USER"
 PARALLEL_COPY=false
 CONFIG_FILE=""
 CONFIG_FILE_SET=false
+REVISION=""
 
 # Help function
 usage() {
@@ -18,6 +19,7 @@ usage() {
     echo "      --copy-to-host          : Alias for --copy-to (backwards compatibility)."
     echo "      --copy-parallel         : With -c, copy to all resolved hosts concurrently."
     echo "  -u, --user <user>           : Username for ssh commands (default: \$USER)"
+    echo "  --revision <revision>       : Pin a Hugging Face branch, tag, or commit"
     echo "  --config <file>             : Path to .env configuration file (default: .env in script directory)"
     echo "  -h, --help                  : Show this help message"
     exit 1
@@ -71,6 +73,7 @@ while [[ "$#" -gt 0 ]]; do
             ;;
         --copy-parallel) PARALLEL_COPY=true ;;
         -u|--user) SSH_USER="$2"; shift ;;
+        --revision) REVISION="$2"; shift ;;
         --config) CONFIG_FILE="$2"; CONFIG_FILE_SET=true; shift ;;
         -h|--help) usage ;;
         *)
@@ -145,7 +148,11 @@ START_TIME=$(date +%s)
 # Download model
 echo "Downloading model '$MODEL_NAME' using uvx..."
 DOWNLOAD_START=$(date +%s)
-if uvx hf download "$MODEL_NAME"; then
+HF_DOWNLOAD_ARGS=(hf download "$MODEL_NAME")
+if [ -n "$REVISION" ]; then
+    HF_DOWNLOAD_ARGS+=(--revision "$REVISION")
+fi
+if uvx "${HF_DOWNLOAD_ARGS[@]}"; then
     DOWNLOAD_END=$(date +%s)
     DOWNLOAD_TIME=$((DOWNLOAD_END - DOWNLOAD_START))
     printf "Download completed in %02d:%02d:%02d\n" $((DOWNLOAD_TIME/3600)) $((DOWNLOAD_TIME%3600/60)) $((DOWNLOAD_TIME%60))

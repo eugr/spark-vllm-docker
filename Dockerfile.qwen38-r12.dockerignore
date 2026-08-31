@@ -1,0 +1,8 @@
+# Only the runtime bundle enters this image's build context.
+**
+!Dockerfile.qwen38-r12
+!docker/
+!docker/qwen38-r12/
+!docker/qwen38-r12/**
+**/__pycache__/
+**/*.py[cod]

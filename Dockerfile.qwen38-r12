@@ -1,0 +1,63 @@
+# syntax=docker/dockerfile:1.7
+
+# The final OS, Torch, CUDA, NCCL and RDMA stack come from this Spark image.
+# Its vLLM predates Flash-Next; fetch only the pinned public preview's vLLM
+# distribution below. No second complete Docker image is pulled or inherited.
+ARG BASE_IMAGE=docker.io/eugr/spark-vllm@sha256:1342a788154051e7d526d096b992ca88ae21d3da1ecc7326a9328172478da843
+
+FROM ${BASE_IMAGE} AS qwen-vllm
+USER root
+COPY docker/qwen38-r12/fetch_preview_vllm.py /tmp/fetch_preview_vllm.py
+RUN python3 /tmp/fetch_preview_vllm.py --output /artifact
+
+FROM ${BASE_IMAGE} AS native-builder
+USER root
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends build-essential linux-libc-dev \
+    && rm -rf /var/lib/apt/lists/*
+COPY docker/qwen38-r12/native/ple_linux_aio.c /tmp/ple_linux_aio.c
+RUN mkdir -p /out \
+    && cc -O3 -fPIC -shared -std=c11 -Wall -Wextra -Werror \
+      /tmp/ple_linux_aio.c -o /out/libple_linux_aio.so
+
+FROM ${BASE_IMAGE}
+USER root
+
+# Replace the distribution; never merge old and new vLLM Python/native files.
+RUN python3 -m pip uninstall -y vllm \
+    && python3 -c "from pathlib import Path; import shutil; p=Path('/usr/local/lib/python3.12/dist-packages/vllm'); shutil.rmtree(p) if p.exists() else None; assert not list(p.parent.glob('vllm-*.dist-info')), 'old vLLM metadata remains'"
+COPY --from=qwen-vllm /artifact/usr/local/ /usr/local/
+COPY --from=qwen-vllm /artifact/provenance.json /opt/qwen38-vllm-provenance.json
+
+COPY docker/qwen38-r12 /opt/qwen38-r12
+COPY --from=native-builder /out/libple_linux_aio.so \
+    /usr/local/lib/qwen38/libple_linux_aio.so
+
+# Triton 3.8 provides the SM120/SM121 FP8/FP4 compiler/runtime. The three
+# language-frontend files retain the compatibility behavior validated on GB10.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends earlyoom \
+    && rm -rf /var/lib/apt/lists/* \
+    && python3 -m pip install --no-cache-dir --no-deps triton==3.8.0 \
+    && /opt/qwen38-r12/install.sh \
+    && install -m 0755 /opt/qwen38-r12/qwen38-r12-serve \
+      /usr/local/bin/qwen38-r12-serve
+
+LABEL org.opencontainers.image.title="Qwen3.8 Flash Next MXFP4/FP8 retain-12 for DGX Spark" \
+      org.opencontainers.image.description="Single-Spark vLLM runtime with NVMe-backed PLE and packed MXFP4 MTP head" \
+      qwen38.base="eugr/spark-vllm@sha256:1342a788154051e7d526d096b992ca88ae21d3da1ecc7326a9328172478da843" \
+      qwen38.vllm_source_layer="sha256:bfecc5abad27302cf3d93f03f9fdc5b57a90eb6f2da5f42c46fb1b070a323ef5" \
+      qwen38.recipe="mxfp4-fp8-r12-spark-port-unqualified" \
+      qwen38.model_manifest_sha256="99814db876744b92cf8851f551665b80ef8a657f45c3cd573aee760eb801220e" \
+      qwen38.draft_head_sha256="78ec4328d865502f0c44de8e9e5a4438f17724069b9e62cc28c863a442037a48" \
+      qwen38.mixed_runtime="fp8-retained-layers-plus-mxfp4-mxfp8" \
+      qwen38.ple_storage="local-nvme-indexed-safetensors" \
+      qwen38.ple_runtime="native-linux-aio" \
+      qwen38.qsa_fp8_kv="triton-sm121-v1" \
+      qwen38.draft_head_mxfp4="flashinfer-sm121-v1" \
+      qwen38.gdn_projection_overlap="bit-exact-v1" \
+      qwen38.triton.version="3.8.0" \
+      qwen38.triton.compat="validated-sm121-frontend-v1"
+
+WORKDIR /vllm-workspace
+CMD ["sleep", "infinity"]

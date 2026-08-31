@@ -1329,4 +1329,13 @@ test_dockerfiles_pin_tvm_ffi_regression_version
 test_dockerfile_fetches_vllm_prs_from_upstream
 test_dockerfile_externalizes_vllm_source_patches
 
+setup_fixture
+if ! run_build --qwen38-r12 --qwen38-no-cache; then
+    fail "Qwen38 no-cache build command failed"
+fi
+if ! grep -Fq -- '-f Dockerfile.qwen38-r12 --no-cache' "$TEST_LOG"; then
+    fail "Qwen38 fresh build omitted --no-cache"
+fi
+pass "Qwen38 fresh build forwards --no-cache to Docker"
+
 echo "Passed $TESTS_PASSED build-and-copy tests."

@@ -1,0 +1,121 @@
+#!/usr/bin/env python3
+"""Validate and serve the private Qwen3.8 retain-12 checkpoint."""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+from pathlib import Path
+import sys
+
+from huggingface_hub import snapshot_download
+
+
+DEFAULT_MODEL = "MJPansa/Qwen3.8-Flash-Next-MXFP4-FP8-R12"
+MANIFEST_SHA256 = "99814db876744b92cf8851f551665b80ef8a657f45c3cd573aee760eb801220e"
+DRAFT_HEAD_SHA256 = "78ec4328d865502f0c44de8e9e5a4438f17724069b9e62cc28c863a442037a48"
+RETAINED_LAYERS = [19, 20, 21, 23, 28, 32, 33, 40, 41, 43, 44, 45]
+
+
+def sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(8 * 1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def resolve_model() -> Path:
+    requested = os.environ.get("QWEN38_MODEL", DEFAULT_MODEL)
+    candidate = Path(requested).expanduser()
+    if candidate.is_dir():
+        return candidate.resolve()
+    revision = os.environ.get("QWEN38_MODEL_REVISION") or None
+    try:
+        return Path(
+            snapshot_download(
+                requested,
+                revision=revision,
+                local_files_only=True,
+            )
+        ).resolve()
+    except Exception as exc:
+        raise SystemExit(
+            f"The private model {requested!r} is not in the mounted Hugging Face "
+            "cache. Run the recipe with --setup (and an authorized HF_TOKEN) "
+            f"first. Original error: {exc}"
+        ) from exc
+
+
+def validate_model(model: Path) -> None:
+    manifest = model / "hybrid-conversion-manifest.json"
+    draft = model / "draft_lm_head_mxfp4.safetensors"
+    config_path = model / "config.json"
+    index_path = model / "model.safetensors.index.json"
+    for path in (manifest, draft, config_path, index_path):
+        if not path.is_file():
+            raise SystemExit(f"Required retain-12 checkpoint file is missing: {path}")
+    if sha256(manifest) != MANIFEST_SHA256:
+        raise SystemExit("Hybrid conversion manifest hash does not match the recipe")
+    if sha256(draft) != DRAFT_HEAD_SHA256:
+        raise SystemExit("Packed MXFP4 draft-head hash does not match the recipe")
+
+    config = json.loads(config_path.read_text())
+    quant = config.get("quantization_config", {})
+    retained_names = quant.get("fp8_routed_layers", [])
+    retained = []
+    for name in retained_names:
+        try:
+            retained.append(int(name.split(".layers.", 1)[1].split(".", 1)[0]))
+        except (IndexError, ValueError) as exc:
+            raise SystemExit(f"Unexpected retained FP8 layer name: {name}") from exc
+    if retained != RETAINED_LAYERS:
+        raise SystemExit(
+            f"Unexpected retained FP8 layer set: {retained}; expected {RETAINED_LAYERS}"
+        )
+
+
+def set_runtime_defaults(model: Path) -> None:
+    defaults = {
+        "VLLM_CUDA_MEMORY_FRACTION": "0.88",
+        "QWEN_FAST_SOURCE_VIEW_DUPLICATES_IDENTICAL": "1",
+        "QWEN_FASTSAFETENSORS_EP_LOCAL": "1",
+        "QWEN_FASTSAFETENSORS_EP_NUM_EXPERTS": "512",
+        "QWEN_FASTSAFETENSORS_ASSUME_IMMEDIATE_COPY": "0",
+        "QWEN_FASTSAFETENSORS_EMPTY_CACHE_PER_BATCH": "1",
+        "QWEN_FASTSAFETENSORS_EMPTY_CACHE_INTERVAL": "1",
+        "QWEN_DEFER_MM_PROCESSOR_WARMUP": "1",
+        "QWEN_DRAFT_HEAD_MXFP4_ENABLED": "1",
+        "QWEN_DRAFT_HEAD_MXFP4_ARTIFACT": str(
+            model / "draft_lm_head_mxfp4.safetensors"
+        ),
+        "QWEN_DRAFT_HEAD_MXFP4_TILE_N": "32",
+        "QWEN_QSA_FUSED_MTP_METADATA": "0",
+        "QWEN_FLASHINFER_MOE_GEMM1_TACTIC": "16",
+        "QWEN_FLASHINFER_MOE_GEMM2_TACTIC": "-1",
+        "QWEN_SINGLE_SPARK_AGGRESSIVE_CLEANUP": "1",
+        "QWEN_SINGLE_SPARK_POSTPROCESS_CLEANUP": "moe",
+        "QWEN38_GDN_PROJECTION_OVERLAP": "1",
+        "QWEN38_GDN_OVERLAP_MAX_TOKENS": "3",
+        "VLLM_PLE_CPU_OFFLOAD": "1",
+        "VLLM_PLE_NVME_PATH": str(model),
+        "VLLM_PLE_NVME_BACKEND": "linux_aio",
+        "VLLM_PLE_NVME_PREAD_WORKERS": "16",
+        "VLLM_PLE_NVME_PREAD_MAX_TOKENS": "32",
+        "VLLM_PLE_NVME_AIO_ENTRIES": "512",
+    }
+    for key, value in defaults.items():
+        os.environ.setdefault(key, value)
+
+
+def main() -> None:
+    model = resolve_model()
+    validate_model(model)
+    set_runtime_defaults(model)
+    print(f"Validated Qwen3.8 retain-12 checkpoint at {model}", flush=True)
+    os.execvp("vllm", ["vllm", "serve", str(model), *sys.argv[1:]])
+
+
+if __name__ == "__main__":
+    main()

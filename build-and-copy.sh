@@ -48,6 +48,8 @@ FLASHINFER_REF_SET=false
 TMP_IMAGE=""
 PARALLEL_COPY=false
 EXP_MXFP4=false
+QWEN38_R12=false
+QWEN38_NO_CACHE=false
 VLLM_PRS=""
 APPLY_PRESET_VLLM_PRS=false
 FLASHINFER_PRS=""
@@ -620,6 +622,8 @@ usage() {
     echo "  -u, --user <user>             : Username for ssh command (default: \$USER)"
     echo "  --tf5                         : Deprecated compatibility flag; tag defaults to 'vllm-node-tf5' (aliases: --pre-tf, --pre-transformers)"
     echo "  --exp-mxfp4, --experimental-mxfp4 : Build with experimental native MXFP4 support"
+    echo "  --qwen38-r12                 : Build the pinned single-Spark Qwen3.8 retain-12 runtime"
+    echo "  --qwen38-no-cache            : With --qwen38-r12, rebuild all derived Docker layers"
     echo "  --exp-b12x, --experimental-b12x   : Select B12X; pulls its prebuilt image unless a local wheel/image build is requested"
     echo "  --apply-vllm-pr <pr-num>      : Apply a specific PR patch to vLLM source. Can be specified multiple times."
     echo "  --apply-preset-vllm-prs       : Apply preset vLLM PRs even with --vllm-repo, --vllm-ref, or --apply-vllm-pr."
@@ -715,6 +719,8 @@ while [[ "$#" -gt 0 ]]; do
         --copy-parallel) PARALLEL_COPY=true ;;
         --tf5|--pre-tf|--pre-transformers) PRE_TRANSFORMERS=true ;;
         --exp-mxfp4|--experimental-mxfp4) EXP_MXFP4=true ;;
+        --qwen38-r12) QWEN38_R12=true ;;
+        --qwen38-no-cache) QWEN38_NO_CACHE=true ;;
         --exp-b12x|--experimental-b12x) EXP_B12X=true ;;
         --apply-vllm-pr)
             if [ -n "$2" ] && [[ "$2" != -* ]]; then
@@ -815,6 +821,8 @@ if [ "$IMAGE_TAG_SET" = false ]; then
         IMAGE_TAG="vllm-node-tf5"
     elif [ "$EXP_MXFP4" = true ]; then
         IMAGE_TAG="vllm-node-mxfp4"
+    elif [ "$QWEN38_R12" = true ]; then
+        IMAGE_TAG="vllm-node-qwen38-r12"
     elif [ "$EXP_B12X" = true ]; then
         IMAGE_TAG="vllm-node-b12x"
     fi
@@ -908,6 +916,28 @@ if [ "$EXP_MXFP4" = true ]; then
     if [ "$REBUILD_VLLM" = true ]; then echo "Error: --exp-mxfp4 is incompatible with --rebuild-vllm"; exit 1; fi
 fi
 
+if [ "$QWEN38_NO_CACHE" = true ] && [ "$QWEN38_R12" != true ]; then
+    echo "Error: --qwen38-no-cache requires --qwen38-r12"
+    exit 1
+fi
+if [ "$QWEN38_R12" = true ]; then
+    if [ "$EXP_MXFP4" = true ]; then echo "Error: --qwen38-r12 is incompatible with --exp-mxfp4"; exit 1; fi
+    if [ "$EXP_B12X" = true ]; then echo "Error: --qwen38-r12 is incompatible with --exp-b12x"; exit 1; fi
+    if [ "$USE_WHEELS" = true ]; then echo "Error: --qwen38-r12 is incompatible with --use-wheels"; exit 1; fi
+    if [ "$VLLM_REPO_SET" = true ] || [ "$VLLM_SOURCE_DIR_SET" = true ] || [ "$VLLM_REF_SET" = true ]; then
+        echo "Error: --qwen38-r12 uses a pinned base and is incompatible with vLLM source/ref overrides"
+        exit 1
+    fi
+    if [ -n "$VLLM_PRS" ] || [ "$APPLY_PRESET_VLLM_PRS" = true ] || [ -n "$FLASHINFER_PRS" ]; then
+        echo "Error: --qwen38-r12 is incompatible with runtime PR build overrides"
+        exit 1
+    fi
+    if [ "$REBUILD_FLASHINFER" = true ] || [ "$REBUILD_VLLM" = true ]; then
+        echo "Error: --qwen38-r12 is incompatible with dependency rebuild flags"
+        exit 1
+    fi
+fi
+
 if [ "$EXP_B12X" = true ] && [ "$FORCE_VLLM_DOWNLOAD" = true ]; then
     echo "Error: B12X vLLM wheels are not published; --force-vllm-download cannot be used with --exp-b12x."
     echo "       Use --rebuild-vllm or provide a cached B12X wheel."
@@ -975,6 +1005,7 @@ fi
 
 CUSTOM_BUILD_REQUESTED=false
 if [ "$EXP_MXFP4" = true ]; then CUSTOM_BUILD_REQUESTED=true; fi
+if [ "$QWEN38_R12" = true ]; then CUSTOM_BUILD_REQUESTED=true; fi
 if [ "$GPU_ARCH_SET" = true ] && [ "$GPU_ARCH_LIST" != "$DEFAULT_GPU_ARCH_LIST" ]; then CUSTOM_BUILD_REQUESTED=true; fi
 if [ "$VLLM_PROFILE" = "custom" ]; then CUSTOM_BUILD_REQUESTED=true; fi
 if [ "$VLLM_REF_SET" = true ]; then CUSTOM_BUILD_REQUESTED=true; fi
@@ -1098,6 +1129,24 @@ if [ "$NO_BUILD" = false ]; then
         fi
         PULL_END=$(date +%s)
         PREBUILT_PULL_TIME=$((PULL_END - PULL_START))
+    elif [ "$QWEN38_R12" = true ]; then
+        echo "Building pinned Qwen3.8 Flash Next retain-12 runtime..."
+        QWEN38_CMD=("docker" "build" "-t" "$IMAGE_TAG" "-f" "Dockerfile.qwen38-r12")
+        if [ "$QWEN38_NO_CACHE" = true ]; then
+            QWEN38_CMD+=("--no-cache")
+        fi
+        if [ "$FULL_LOG" = true ]; then
+            QWEN38_CMD+=("--progress=plain")
+        fi
+        if [ -n "$NETWORK_ARG" ]; then
+            QWEN38_CMD+=("--network" "$NETWORK_ARG")
+        fi
+        QWEN38_CMD+=(".")
+        echo "Building image with command: ${QWEN38_CMD[*]}"
+        BUILD_START=$(date +%s)
+        "${QWEN38_CMD[@]}"
+        BUILD_END=$(date +%s)
+        RUNNER_BUILD_TIME=$((BUILD_END - BUILD_START))
     elif [ "$EXP_MXFP4" = true ]; then
         echo "Building with experimental MXFP4 support..."
 
