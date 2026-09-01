@@ -45,11 +45,13 @@ jobs:
       run: |
         chmod +x run-recipe.py run-recipe.sh launch-cluster.sh
         chmod +x tests/test_recipes.sh tests/test_launch_cluster_image_sync.sh
+        chmod +x tests/test_launch_cluster_vllm_pr.sh
     
     - name: Run recipe integration tests
       run: |
         ./tests/test_recipes.sh -v
         ./tests/test_launch_cluster_image_sync.sh
+        ./tests/test_launch_cluster_vllm_pr.sh
     
     - name: Verify all recipes with dry-run
       run: |

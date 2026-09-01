@@ -495,6 +495,13 @@ test_launch_cluster_help() {
         log_verbose "$output"
     fi
 
+    if echo "$output" | grep -q -- "--apply-vllm-pr"; then
+        log_pass "--help documents launch-time --apply-vllm-pr"
+    else
+        log_fail "--help does not document launch-time --apply-vllm-pr"
+        log_verbose "$output"
+    fi
+
     if echo "$output" | grep -q -- "Do not pass --distributed-executor-backend"; then
         log_pass "--help documents automatic vLLM multiprocessing orchestration"
     else
@@ -783,6 +790,42 @@ test_launch_cmd_cli_apply_mod_passthrough() {
         log_fail "CLI --apply-mod passthrough failed"
         log_verbose "Launch cmd: $launch_cmd"
         log_verbose "vLLM cmd: $vllm_cmd"
+    fi
+}
+
+# Test: CLI --apply-vllm-pr is passed to launch-cluster.sh in mixed layer order
+test_launch_cmd_cli_apply_vllm_pr_passthrough() {
+    log_test "Launch command includes ordered runtime vLLM PR layers"
+
+    recipe_name=$(find_solo_recipe)
+    if [[ -z "$recipe_name" ]]; then
+        log_skip "No solo-capable recipes found"
+        return
+    fi
+
+    output=$("$PROJECT_DIR/run-recipe.py" "$recipe_name" --dry-run --solo \
+        --apply-mod mods/use-official-vllm \
+        --apply-vllm-pr 12345 \
+        --apply-mod mods/gpu-mem-util-gb \
+        --apply-vllm-pr 23456 2>&1)
+    launch_cmd=$(extract_launch_cmd "$output")
+    vllm_cmd=$(extract_vllm_command "$output")
+
+    if echo "$launch_cmd" | grep -q -- \
+        "--apply-mod mods/use-official-vllm --apply-vllm-pr 12345 --apply-mod mods/gpu-mem-util-gb --apply-vllm-pr 23456" \
+        && ! echo "$vllm_cmd" | grep -q -- "--apply-vllm-pr"; then
+        log_pass "CLI runtime PR flags preserve launch layer order"
+    else
+        log_fail "CLI --apply-vllm-pr passthrough or ordering failed"
+        log_verbose "Launch cmd: $launch_cmd"
+        log_verbose "vLLM cmd: $vllm_cmd"
+    fi
+
+    if "$PROJECT_DIR/run-recipe.py" "$recipe_name" --dry-run --solo \
+        --apply-vllm-pr invalid > /dev/null 2>&1; then
+        log_fail "Invalid runtime vLLM PR number was accepted"
+    else
+        log_pass "Invalid runtime vLLM PR number is rejected"
     fi
 }
 
@@ -1570,6 +1613,7 @@ main() {
     test_launch_cmd_container_image
     test_launch_cmd_mods
     test_launch_cmd_cli_apply_mod_passthrough
+    test_launch_cmd_cli_apply_vllm_pr_passthrough
     test_launch_cmd_daemon_flag
     test_launch_cmd_nccl_debug
     test_launch_cmd_launch_script
