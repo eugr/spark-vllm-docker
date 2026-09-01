@@ -1,0 +1,42 @@
+# Recipe: Qwen3.8-27B-NVFP4 with DFlash2 speculative decoding
+# Uses TP=1 on a solo DGX Spark and defaults to TP=2 on a cluster.
+
+recipe_version: "1"
+name: Qwen3.8-27B-NVFP4-DFlash2
+description: vLLM serving RadixArk/Qwen3.8-27B-NVFP4 with the z-lab DFlash2 draft model
+
+model: RadixArk/Qwen3.8-27B-NVFP4
+container: vllm-node
+
+cluster_only: false
+solo_only: false
+
+defaults:
+  port: 8000
+  host: 0.0.0.0
+  tensor_parallel: 2
+  gpu_memory_utilization: 0.7
+  max_model_len: 262144
+  max_num_seqs: 8
+  max_num_batched_tokens: 16384
+  num_speculative_tokens: 8
+
+command: |
+  vllm serve RadixArk/Qwen3.8-27B-NVFP4 \
+    --host {host} \
+    --port {port} \
+    --trust-remote-code \
+    --kv-cache-dtype fp8 \
+    --gpu-memory-utilization {gpu_memory_utilization} \
+    --max-model-len {max_model_len} \
+    --max-num-seqs {max_num_seqs} \
+    --max-num-batched-tokens {max_num_batched_tokens} \
+    --enable-chunked-prefill \
+    --async-scheduling \
+    --enable-prefix-caching \
+    --speculative-config '{{"method":"dflash","model":"z-lab/Qwen3.8-27B-DFlash2","num_speculative_tokens":{num_speculative_tokens},"draft_tensor_parallel_size":{tensor_parallel}}}' \
+    --load-format instanttensor \
+    --reasoning-parser qwen3 \
+    --tool-call-parser qwen3_xml \
+    --enable-auto-tool-choice \
+    --tensor-parallel-size {tensor_parallel}

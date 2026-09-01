@@ -237,11 +237,12 @@ Other:
 
 `--apply-vllm-pr` is a launch option, including when combined with `--setup`.
 It creates an ephemeral runtime mod and does not pass the PR to the image build.
-It accepts Python/package-only changes under `vllm/`; PRs that modify native
-code, dependencies, build configuration, or packaging must use
-`build-and-copy.sh --apply-vllm-pr` instead. Recipe-declared mods are applied
-first, then command-line `--apply-mod` and `--apply-vllm-pr` layers in their
-specified order:
+It accepts Python/package-only changes under `vllm/`; tests, docs, CI files,
+and `setup.py` are ignored. The container must already provide dependencies
+declared by an ignored `setup.py` change. PRs that modify native code or other
+build/source-tree files must use `build-and-copy.sh --apply-vllm-pr` instead.
+Recipe-declared mods are applied first, then command-line `--apply-mod` and
+`--apply-vllm-pr` layers in their specified order:
 
 ```bash
 ./run-recipe.sh my-recipe --solo \

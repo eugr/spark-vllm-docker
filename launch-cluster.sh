@@ -795,12 +795,18 @@ ignored_paths: set[str] = set()
 unsupported_paths: set[str] = set()
 
 ignored_prefixes = (
+    ".buildkite/",
     ".github/",
     "benchmarks/",
     "docs/",
     "examples/",
     "tests/",
 )
+ignored_files = {
+    # setup.py is source-tree packaging metadata and is not present beside an
+    # installed wheel. Runtime PR application never installs dependency changes.
+    "setup.py",
+}
 native_suffixes = {
     ".a",
     ".c",
@@ -833,7 +839,11 @@ for line in patch_file.read_text(errors="replace").splitlines():
         path = raw_path[2:] if raw_path.startswith(("a/", "b/")) else raw_path
         if path == "/dev/null":
             continue
-        if path.startswith(ignored_prefixes) or Path(path).suffix.lower() in {".md", ".rst"}:
+        if (
+            path.startswith(ignored_prefixes)
+            or path in ignored_files
+            or Path(path).suffix.lower() in {".md", ".rst"}
+        ):
             ignored_paths.add(path)
         elif path.startswith("vllm/"):
             name = Path(path).name
@@ -863,7 +873,8 @@ if not runtime_paths:
 
 print(
     f"Validated vLLM PR #{pr_number} for runtime application: "
-    f"{len(runtime_paths)} package path(s), {len(ignored_paths)} test/docs path(s) ignored."
+    f"{len(runtime_paths)} package path(s), "
+    f"{len(ignored_paths)} non-runtime path(s) ignored."
 )
 PY
 }

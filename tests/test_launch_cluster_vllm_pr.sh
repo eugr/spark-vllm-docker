@@ -199,7 +199,7 @@ test_runtime_pr_is_applied_in_cli_layer_order() {
     [[ "$(sed -n '2p' "$LAYER_LOG")" == vllm-pr-12345-* ]] || fail "runtime PR was not second"
     [[ "$(sed -n '3p' "$LAYER_LOG")" == "mod-b" ]] || fail "mod-b was not third"
     [[ "$(grep -c '^curl ' "$COMMAND_LOG")" -eq 1 ]] || fail "PR diff was not fetched exactly once"
-    assert_output_contains 'Validated vLLM PR #12345 for runtime application: 1 package path\(s\), 1 test/docs path\(s\) ignored\.'
+    assert_output_contains 'Validated vLLM PR #12345 for runtime application: 1 package path\(s\), 1 non-runtime path\(s\) ignored\.'
     assert_output_contains '\[vllm-pr #12345\] Applied successfully\.'
     pass "runtime PR is fetched once and applied in CLI layer order"
 }
@@ -222,6 +222,49 @@ DIFF
     assert_output_contains 'Use build-and-copy\.sh --apply-vllm-pr 23456 instead\.'
     assert_log_not_contains '^docker run '
     pass "native/build PR is rejected before containers start"
+}
+
+test_pr_52017_source_tree_metadata_is_ignored() {
+    setup_fixture
+    cat > "$FAKE_PR_DIFF" <<'DIFF'
+diff --git a/.buildkite/test_areas/kernels.yaml b/.buildkite/test_areas/kernels.yaml
+--- a/.buildkite/test_areas/kernels.yaml
++++ b/.buildkite/test_areas/kernels.yaml
+@@ -1 +1 @@
+-b12x==1.2.6
++b12x==1.3.0
+diff --git a/docs/design/attention_backends.md b/docs/design/attention_backends.md
+--- a/docs/design/attention_backends.md
++++ b/docs/design/attention_backends.md
+@@ -1 +1 @@
+-old docs
++new docs
+diff --git a/setup.py b/setup.py
+--- a/setup.py
++++ b/setup.py
+@@ -1 +1 @@
+-"b12x": ["b12x==1.2.6"]
++"b12x": ["b12x==1.3.0"]
+diff --git a/tests/v1/attention/test_b12x.py b/tests/v1/attention/test_b12x.py
+--- a/tests/v1/attention/test_b12x.py
++++ b/tests/v1/attention/test_b12x.py
+@@ -1 +1 @@
+-old test
++new test
+diff --git a/vllm/runtime_test.py b/vllm/runtime_test.py
+--- a/vllm/runtime_test.py
++++ b/vllm/runtime_test.py
+@@ -1 +1 @@
+-old_value = 1
++new_value = 2
+DIFF
+
+    run_launch --apply-vllm-pr 52017 || fail "PR #52017-shaped runtime launch failed"
+    grep -q '^new_value = 2$' "$FAKE_CONTAINER_ROOT/site-packages/vllm/runtime_test.py" \
+        || fail "PR #52017-shaped fixture did not patch installed vLLM"
+    assert_output_contains 'Validated vLLM PR #52017 for runtime application: 1 package path\(s\), 4 non-runtime path\(s\) ignored\.'
+    assert_output_contains '\[vllm-pr #52017\] Applied successfully\.'
+    pass "PR #52017 CI, docs, tests, and setup metadata paths are ignored"
 }
 
 test_repeated_pr_is_downloaded_once_and_idempotent() {
@@ -260,6 +303,7 @@ test_invalid_pr_number_is_rejected() {
 
 test_runtime_pr_is_applied_in_cli_layer_order
 test_build_only_pr_is_rejected_before_container_start
+test_pr_52017_source_tree_metadata_is_ignored
 test_repeated_pr_is_downloaded_once_and_idempotent
 test_existing_cluster_refuses_unverifiable_runtime_pr
 test_invalid_pr_number_is_rejected
