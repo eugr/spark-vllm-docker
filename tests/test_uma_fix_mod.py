@@ -3,15 +3,32 @@
 import ast
 import hashlib
 import os
+import runpy
 import subprocess
 import tempfile
 import textwrap
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 
 PROJECT_DIR = Path(__file__).resolve().parents[1]
 MOD = PROJECT_DIR / "mods/uma-fix/run.sh"
+PIN_MEMORY_ENV = "VLLM_WSL2_ENABLE_PIN_MEMORY"
+
+ENVS = '''
+import os
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    VLLM_WSL2_ENABLE_PIN_MEMORY: bool = False
+
+environment_variables = {
+    "VLLM_WSL2_ENABLE_PIN_MEMORY": lambda: bool(
+        int(os.getenv("VLLM_WSL2_ENABLE_PIN_MEMORY", "0"))
+    ),
+}
+'''
 
 MEM_UTILS = '''
 from functools import cache
@@ -54,154 +71,128 @@ class MemorySnapshot:
         self.cuda_memory = self.total_memory - self.free_memory
 '''
 
-CALL_SITES = {
-    "vllm/model_executor/models/gemma4_mm.py": '''
+UNRELATED_CALL_SITE = '''
 import torch
 
-from vllm.platforms import current_platform
 
-
-def profile():
-    first = torch.accelerator.get_memory_info()
-    second = torch.accelerator.get_memory_info()
-    return first, second
-''',
-    "vllm/v1/worker/gpu/model_runner.py": '''
-import torch
-
-from vllm.logger import init_logger
-
-
-class GPUModelRunner:
-    def capture(self):
-        start = torch.accelerator.get_memory_info()[0]
-        end = torch.accelerator.get_memory_info()[0]
-        return start - end
-''',
-    "vllm/v1/worker/gpu/spec_decode/eagle/utils.py": '''
-import torch
-
-from vllm.config import VllmConfig
-
-
-def should_share(w):
-    return torch.accelerator.get_memory_info(w.device)[0]
-''',
-    "vllm/v1/worker/gpu_model_runner.py": '''
-import torch
-
-from vllm.logger import init_logger
-
-
-class GPUModelRunner:
-    def capture(self):
-        before = torch.accelerator.get_memory_info()[0]
-        after = torch.accelerator.get_memory_info()[0]
-        return before - after
-''',
-    "vllm/v1/worker/gpu_worker.py": '''
-import torch
-
-from vllm.logger import init_logger
-
-
-class Worker:
-    def sleep(self):
-        before = torch.accelerator.get_memory_info()[0]
-        after, total = torch.accelerator.get_memory_info()
-        return before, after, total
-''',
-}
+def profile(device):
+    return torch.accelerator.get_memory_info(device)
+'''
 
 
 class UmaFixModTests(unittest.TestCase):
-    def test_latest_accelerator_api_is_patched_idempotently(self):
-        with tempfile.TemporaryDirectory() as temp_dir:
-            root = Path(temp_dir) / "site-packages"
-            mem_utils = root / "vllm/utils/mem_utils.py"
-            mem_utils.parent.mkdir(parents=True)
-            mem_utils.write_text(textwrap.dedent(MEM_UTILS).lstrip())
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp_dir.cleanup)
+        self.root = Path(self.temp_dir.name) / "site-packages"
 
-            targets = [mem_utils]
-            for relative_path, source in CALL_SITES.items():
-                target = root / relative_path
-                target.parent.mkdir(parents=True, exist_ok=True)
-                target.write_text(textwrap.dedent(source).lstrip())
-                targets.append(target)
+        self.envs = self.root / "vllm/envs.py"
+        self.envs.parent.mkdir(parents=True)
+        self.envs.write_text(textwrap.dedent(ENVS).lstrip())
 
-            # Keep this fixture focused on the dynamic memory patcher; the UVA
-            # patch is validated separately against current upstream source.
-            bin_dir = Path(temp_dir) / "bin"
-            bin_dir.mkdir()
-            git = bin_dir / "git"
-            git.write_text("#!/bin/sh\nexit 0\n")
-            git.chmod(0o755)
+        self.mem_utils = self.root / "vllm/utils/mem_utils.py"
+        self.mem_utils.parent.mkdir(parents=True)
+        self.mem_utils.write_text(textwrap.dedent(MEM_UTILS).lstrip())
 
-            env = os.environ.copy()
-            env["PYTHON_ROOT"] = str(root)
-            env["PATH"] = f"{bin_dir}:{env['PATH']}"
+        self.call_site = self.root / "vllm/v1/worker/gpu_worker.py"
+        self.call_site.parent.mkdir(parents=True)
+        self.call_site.write_text(textwrap.dedent(UNRELATED_CALL_SITE).lstrip())
 
-            first = subprocess.run(
-                ["bash", str(MOD)],
-                cwd=PROJECT_DIR,
-                env=env,
-                check=True,
-                text=True,
-                capture_output=True,
-            )
-            self.assertIn("Patched vllm/utils/mem_utils.py.", first.stdout)
-            for relative_path in CALL_SITES:
-                self.assertIn(f"Patched {relative_path}.", first.stdout)
+        self.env = os.environ.copy()
+        self.env["PYTHON_ROOT"] = str(self.root)
 
-            patched_hashes = {
-                path: hashlib.sha256(path.read_bytes()).digest() for path in targets
-            }
-            second = subprocess.run(
-                ["bash", str(MOD)],
-                cwd=PROJECT_DIR,
-                env=env,
-                check=True,
-                text=True,
-                capture_output=True,
-            )
-            self.assertIn(
-                "vllm/utils/mem_utils.py is already patched; skipping.",
-                second.stdout,
-            )
-            self.assertEqual(
-                patched_hashes,
-                {path: hashlib.sha256(path.read_bytes()).digest() for path in targets},
-            )
+    def run_mod(self, *, check: bool = True) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            ["bash", str(MOD)],
+            cwd=PROJECT_DIR,
+            env=self.env,
+            check=check,
+            text=True,
+            capture_output=True,
+        )
 
-            mem_source = mem_utils.read_text()
-            ast.parse(mem_source)
-            self.assertIn('"visible_device_id_to_physical_device_id"', mem_source)
-            self.assertIn(
-                'getattr(torch, "accelerator", None), "get_memory_info", None',
-                mem_source,
-            )
-            self.assertIn(
-                "cuda_free_memory, cuda_total_memory = cuda_mem_get_info(device)",
-                mem_source,
-            )
-            self.assertNotIn(
-                "cuda_free_memory, cuda_total_memory = current_platform.mem_get_info(device)",
-                mem_source,
-            )
-            self.assertIn(
-                "if not is_wsl and current_platform.is_integrated_gpu(device_id):",
-                mem_source,
-            )
-            self.assertIn("# On UMA (Unified Memory Architecture)", mem_source)
+    def test_defaults_pin_memory_and_preserves_raw_cuda_reporting(self):
+        call_site_hash = hashlib.sha256(self.call_site.read_bytes()).digest()
 
-            for target in targets[1:]:
-                source = target.read_text()
-                ast.parse(source)
-                self.assertIn(
-                    "from vllm.utils.mem_utils import cuda_mem_get_info", source
-                )
-                self.assertNotIn("torch.accelerator.get_memory_info(", source)
+        first = self.run_mod()
+        self.assertIn(
+            f"Set {PIN_MEMORY_ENV}=1 as the vLLM default.", first.stdout
+        )
+        self.assertIn(
+            "Disabled host UMA accounting under WSL", first.stdout
+        )
 
+        env_source = self.envs.read_text()
+        ast.parse(env_source)
+        self.assertIn(f"{PIN_MEMORY_ENV}: bool = True", env_source)
+        self.assertIn(
+            f'os.getenv("{PIN_MEMORY_ENV}", "1")', env_source
+        )
+
+        namespace = runpy.run_path(str(self.envs))
+        get_pin_memory = namespace["environment_variables"][PIN_MEMORY_ENV]
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop(PIN_MEMORY_ENV, None)
+            self.assertTrue(get_pin_memory())
+        with patch.dict(os.environ, {PIN_MEMORY_ENV: "0"}):
+            self.assertFalse(get_pin_memory())
+        with patch.dict(os.environ, {PIN_MEMORY_ENV: "1"}):
+            self.assertTrue(get_pin_memory())
+
+        mem_source = self.mem_utils.read_text()
+        ast.parse(mem_source)
+        self.assertIn(
+            "from vllm.platforms.interface import in_wsl", mem_source
+        )
+        self.assertIn("or in_wsl()", mem_source)
+        self.assertIn("not in_wsl()", mem_source)
+        self.assertIn(
+            "self.free_memory, self.total_memory = "
+            "torch.accelerator.get_memory_info(device)",
+            mem_source,
+        )
+        self.assertNotIn("cuda_mem_get_info", mem_source)
+        self.assertNotIn("import_pynvml", mem_source)
+        self.assertEqual(
+            call_site_hash,
+            hashlib.sha256(self.call_site.read_bytes()).digest(),
+        )
+
+    def test_application_is_idempotent(self):
+        self.run_mod()
+        patched_hashes = {
+            path: hashlib.sha256(path.read_bytes()).digest()
+            for path in (self.envs, self.mem_utils, self.call_site)
+        }
+
+        second = self.run_mod()
+        self.assertIn(
+            f"{PIN_MEMORY_ENV} already defaults to 1; skipping.",
+            second.stdout,
+        )
+        self.assertIn(
+            "WSL memory accounting is already patched; skipping.",
+            second.stdout,
+        )
+        self.assertEqual(
+            patched_hashes,
+            {
+                path: hashlib.sha256(path.read_bytes()).digest()
+                for path in (self.envs, self.mem_utils, self.call_site)
+            },
+        )
+
+    def test_missing_upstream_pin_memory_support_fails_clearly(self):
+        self.envs.write_text(
+            "import os\n\nenvironment_variables = {}\n"
+        )
+
+        result = self.run_mod(check=False)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(
+            f"{PIN_MEMORY_ENV} runtime default was not found",
+            result.stderr,
+        )
 
 if __name__ == "__main__":
     unittest.main()
