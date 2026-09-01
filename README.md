@@ -1974,7 +1974,7 @@ The repository includes several pre-configured mods in the `mods/` directory:
 - **dspark-instanttensor/**: Filters embedded `mtp.*` DSpark draft weights before InstantTensor or safetensors I/O, preventing a second full-checkpoint load.
 - **gpu-mem-util-gb/**: Adds experimental `--gpu-memory-utilization-gb` support.
 - **kv-cache-prealloc-cleanup/**: Applies model-specific manual KV-cache startup tweaks: skip CUDA graph profiling when disabled by env and allow `--gpu-memory-utilization-gb` with `--kv-cache-memory-bytes`.
-- **uma-fix/**: Uses CUDA/NVML memory accounting under WSL and skips host-memory UMA accounting there.
+- **uma-fix/**: Enables vLLM's native WSL2 pinned-memory/UVA path by default and preserves raw CUDA aggregate memory reporting instead of Linux host-memory UMA accounting. Set `VLLM_WSL2_ENABLE_PIN_MEMORY=0` to opt out.
 - **drop-caches/**: Periodically clears filesystem caches for large models running near the memory limit.
 - **diffusiongemma/**: Adds DiffusionGemma support, dynamic causal attention compatibility, and Gemma4 reasoning/content-channel fixes used by the DiffusionGemma recipes.
 - **nemotron-nano/** and **nemotron-super/**: Nemotron reasoning parser and model support helpers.
