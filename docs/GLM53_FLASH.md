@@ -376,3 +376,94 @@ this stack; probe scripts in the session scratchpad.
 Still unmeasured on the serve config: >131K prompts, DFlash2 acceptance
 under 16-seat concurrency, MM under load/large images (probes were
 smoke-grade).
+
+## The Uncensored variant (recipes/glm-5.3-flash-uncensored-nvfp4.yaml, 2026-08-31)
+
+Byte-identical to the serve recipe except the checkpoint:
+orcarouter/GLM-5.3-Flash-Uncensored-NVFP4 (MIT), an experts-only NVFP4
+re-quant of OrcaRouter's abliterated GLM-5.3-Flash. Card-reported quality
+vs the official FP8 reference: PPL +3.8%, KLD 0.073, top-1 agreement
+91.7%; harmful-refusal rate ~17.2% (vs ~90% stock), benign over-refusal
+0%. Because the config is unchanged, every measurement below is a delta
+against the base-recipe table above.
+
+### Model-card deviations (deliberate)
+
+The card's launch example (official x86 image, 8xH100 TP8) sets
+`VLLM_SSM_CONV_STATE_LAYOUT=DS` and `VLLM_KV_CACHE_LAYOUT=HND`. We set
+neither, verified against this build's source and boot log:
+
+- `VLLM_KV_CACHE_LAYOUT=HND` is a no-op here: the selector already picks
+  HND for the FLASHINFER_MLA_SPARSE backend (boot log states it).
+- `VLLM_SSM_CONV_STATE_LAYOUT` defaults to SD; both layouts are correct.
+  The only hard `DS` requirement in vLLM is the NIXL KV-transfer
+  connector (disaggregated prefill), which we do not run.
+- Empirical backstop: the base recipe ran this stack without either var
+  and scored perfect RULER retrieval through 131K.
+
+The card's "Hopper does not support FP8 KV" warning does not apply to
+GB10 (sm_121); fp8 KV was validated on the base recipe.
+
+### Measured results - 4x Spark TP=4 (2026-08-31)
+
+Same protocol as the base campaign. Boot: full 1M window served
+(assert-window clean), KV pool 6,596,420 tokens (6.29x concurrency at
+1M), reasoning field and glm47 tool calls verified.
+
+| Metric | Uncensored NVFP4 | Base NVFP4 (2026-08-30) |
+| --- | --- | --- |
+| Prefill pp2048 | 1674 +/- 74 tok/s | 1792 +/- 89 tok/s |
+| Decode tg128 | 56.0 +/- 7.3 (peak 68) | 52.5 +/- 0.5 (peak 66) |
+| TTFT @2K | 1.23 s | 1.15 s |
+| DFlash2 acceptance (pos-0 / tok-per-step) | 0.751 / 3.24 (temp 0.7) | 0.918 / 6.43 (Mia EXL3 figure) |
+| GSM8K 200q (flex/strict) | 91.0 / 91.0 % (+/-2.0) | 89.0 / 87.5 % |
+| RULER 8K (s2/mk1/vt) | 1.0 / 1.0 / 1.0 | 1.0 / 1.0 / 1.0 |
+| RULER 64K (>32K, topk mod) | 1.0 / 1.0 / 1.0 | 1.0 / 1.0 / 1.0 |
+| RULER 131K | 1.0 / 1.0 / 1.0 | 1.0 / 1.0 / 1.0 @131072 |
+| Refusal - benign over-refusal | 0/8 (0%) | not measured (stock model) |
+| Refusal - sensitive tier | 0/8 (0%) | ~90% on stock GLM |
+| MM vision smoke (shapes+text, bar chart) | described exactly | validated (base recipe) |
+
+The acceptance drop (0.751 vs the ~0.918 stock reference) is the expected
+consequence of drafting with the original-weights DFlash2 against an
+abliterated target - the card's 91.7% top-1 agreement predicts it. It is
+not a correctness concern: standard rejection sampling keeps outputs
+lossless regardless of acceptance. The two acceptance figures are not a
+clean A/B (ours: temp 0.7, few prompts; the 0.918 is the Mia EXL3 number
+under different conditions), and single-stream decode variance here is
+high (+/-7.3), so we do not claim a precise decode delta - measured
+decode sits within noise of the base recipe.
+
+k stays at 7 (not swept down): DFlash2 drafts all speculative tokens in
+ONE parallel forward pass (vllm .../spec_decode/dflash/speculator.py:
+"DFlash processes all speculative tokens in one forward pass"), so the
+drafter cost is ~flat in k. Lowering k would only discard accepted tokens
+(positions 4-6 still contribute ~0.42 tok/step) for no compute saving, so
+k=7 is at or near optimal for a parallel-draft drafter; no-spec is the
+slow floor. A downward k-sweep was therefore judged not worthwhile.
+
+### Repeatable measurement protocol
+
+The harness mechanics - TLS/pfSense CA, llama-benchy and lm-eval
+invocations, the lm-eval landmines (validate request count; one RULER
+length per invocation; long-context `num_concurrent<=2` + `timeout=3600`;
+never pipe through `head`), and reading spec-decode acceptance off
+/metrics - are in `docs/BENCHMARKING.md`. GLM-specific parameters:
+
+- served-model-name `glm-5.3-flash-uncensored-nvfp4`; snapshot under
+  `models--orcarouter--GLM-5.3-Flash-Uncensored-NVFP4`.
+- Speed: llama-benchy `--pp 2048 --tg 128 --runs 3`.
+- GSM8K: 200q, `--num_fewshot 5` (short-context, num_concurrent=8 fine).
+- RULER: `niah_single_2,niah_multikey_1,ruler_vt`, `--gen_kwargs
+  max_gen_toks=256`, `--limit 25`, one length per run at 8192 / 65536 /
+  131072. 131072 requires `num_concurrent<=2 timeout=3600` (see
+  BENCHMARKING.md) - it will fail with "Session is closed" otherwise.
+- Refusal: `tools/refusal-probe.py --insecure` - measurement-grade
+  tripwire for the abliteration (the only gate that fails if the config
+  silently served the stock checkpoint). Uncensored recipe: 0/8 benign,
+  0/8 sensitive (mild tier), consistent with the card's residual ~17% on
+  a harder set.
+- MM vision: the checkpoint keeps the bf16 visual tower, so a PIL-drawn
+  shapes/text image and a bar chart sent as base64 data URIs to
+  /v1/chat/completions are described exactly (no extra serve flags needed;
+  matches the base recipe's MM validation).

@@ -1,0 +1,63 @@
+# GLM-5.3-Flash Uncensored serve - copy of glm-5.3-flash-nvfp4.yaml with a
+# single deviation: checkpoint (orcarouter/GLM-5.3-Flash-Uncensored-NVFP4
+# uncensored re-quant instead of LibertAIDAI NVFP4). Image, mods, and tuning
+# are identical; rationale, tuning history, and measurements:
+# docs/GLM53_FLASH.md ("The serve recipe").
+#
+# Boot/correctness-mandatory on GB10 (see base recipe for rationale):
+#   --gpu-memory-utilization 0.85, --moe-backend marlin,
+#   --trust-remote-code, HF_HUB_OFFLINE=1, mods/fix-glm53-topk-sm120.
+
+recipe_version: "1"
+name: GLM-5.3-Flash-Uncensored-NVFP4
+description: GLM-5.3-Flash Uncensored NVFP4 on 4x Spark - copy of glm-5.3-flash-nvfp4 with the orcarouter uncensored checkpoint
+
+model: orcarouter/GLM-5.3-Flash-Uncensored-NVFP4
+container: vllm-node-glm5.3-flash
+
+cluster_only: true
+
+mods:
+  - mods/fix-glm53-topk-sm120
+  # kpool tail slot-map clamp (silent corruption on generations >~2K tokens,
+  # mechanism credited to vcruz305) + XGrammar termination backports.
+  # Vendored from Mia's overlay; exonerated of side effects by the KV A/B.
+  - mods/mia-backports-20260830
+
+defaults:
+  port: 8000
+  host: 0.0.0.0
+  tensor_parallel: 4
+  gpu_memory_utilization: 0.85
+  max_model_len: 1048576
+  max_num_seqs: 16
+  block_size: 2304
+  max_num_batched_tokens: 8192
+
+env:
+  VLLM_ENGINE_READY_TIMEOUT_S: "3600"
+  # Survival addition: Glm5NextProcessor open()s files relative to the model
+  # argument; offline mode makes vLLM resolve the HF id to the local snapshot
+  # first. Without it the API server crashes on processor_config.json at boot.
+  HF_HUB_OFFLINE: "1"
+
+command: |
+  vllm serve orcarouter/GLM-5.3-Flash-Uncensored-NVFP4 \
+      --served-model-name glm-5.3-flash-uncensored-nvfp4 \
+      --trust-remote-code \
+      --port {port} \
+      --host {host} \
+      --tensor-parallel-size {tensor_parallel} \
+      --gpu-memory-utilization {gpu_memory_utilization} \
+      --max-model-len {max_model_len} \
+      --max-num-seqs {max_num_seqs} \
+      --max-num-batched-tokens {max_num_batched_tokens} \
+      --block-size {block_size} \
+      --kv-cache-dtype fp8 \
+      --moe-backend marlin \
+      --enable-prefix-caching \
+      --tool-call-parser glm47 \
+      --enable-auto-tool-choice \
+      --reasoning-parser deepseek_r1 \
+      --speculative-config '{{"method":"dflash","model":"incoai/GLM-5.3-Flash-DFlash2","num_speculative_tokens":7,"draft_sample_method":"probabilistic","rejection_sample_method":"standard"}}' \
+      --default-chat-template-kwargs '{{"clear_thinking": true}}'
