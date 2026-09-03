@@ -24,8 +24,7 @@ Two prompt sets:
 
 Usage:
   KEY=$(docker exec vllm_node printenv VLLM_API_KEY)
-  SSL_CERT_FILE=~/.config/certs/ca-bundle-plus-pfsense.pem \\
-  ./refusal-probe.py --base https://spark-d388.leviathan:8000/v1 \\
+  ./refusal-probe.py --base https://<node>.<tailnet>.ts.net:8000/v1 \\
       --model glm-5.3-flash-uncensored-nvfp4 --api-key "$KEY" \\
       --out ~/refusal-uncensored.json
 

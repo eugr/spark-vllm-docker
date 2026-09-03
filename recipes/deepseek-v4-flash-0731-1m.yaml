@@ -15,8 +15,6 @@
 #   --served-model-name deepseek-v4-flash-0731-1m - client-facing id so a
 #     1,048,576-token window is distinguishable from the base recipe's on the
 #     same port.
-#   --ssl-keyfile / --ssl-certfile - fork-wide policy from PR #2, supplied by
-#     the launcher; every recipe here serves TLS.
 #   mods/instanttensor-hybrid-draft-loader - inherited from the base recipe;
 #     untested off.
 #

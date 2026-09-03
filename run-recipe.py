@@ -155,44 +155,6 @@ def ensure_ray_backend(command: str) -> str:
     return command.rstrip() + " --distributed-executor-backend ray"
 
 
-SSL_CERTFILE_RE = re.compile(r"--ssl-certfile(?:=|\s+)\S+")
-SSL_KEYFILE_RE = re.compile(r"--ssl-keyfile(?:=|\s+)\S+")
-
-# Centralized TLS setting: serve every model over HTTPS by default. Paths resolve
-# inside the container (~/.cache/vllm is mounted by default). Override the
-# locations with SSL_CERTFILE / SSL_KEYFILE, or set either to empty for plain HTTP.
-SSL_CERTFILE = os.environ.get("SSL_CERTFILE", "/root/.cache/vllm/certs/cert.pem")
-SSL_KEYFILE = os.environ.get("SSL_KEYFILE", "/root/.cache/vllm/certs/key.pem")
-
-
-def ensure_ssl(command: str, certfile: str | None = None, keyfile: str | None = None) -> str:
-    """Serve the API over HTTPS by injecting --ssl-certfile/--ssl-keyfile.
-
-    TLS is a single centralized setting (SSL_CERTFILE / SSL_KEYFILE) applied to
-    every model's serve command, rather than configured per recipe -- so the whole
-    fleet is served over HTTPS from one place. This is not cosmetic: fence-style
-    network sandboxes cap plain-HTTP proxied requests (e.g. a 30s http.Client
-    timeout that also cuts the response body), silently truncating long-streaming
-    vLLM responses; HTTPS takes the sandbox's raw CONNECT tunnel and is not capped.
-
-    Defaults to the module-level SSL_CERTFILE / SSL_KEYFILE. No-op if the resolved
-    path is empty, the command already sets the flag, or it is not a `vllm serve`
-    command. Paths are the cert/key locations *inside the container*.
-    """
-    certfile = SSL_CERTFILE if certfile is None else certfile
-    keyfile = SSL_KEYFILE if keyfile is None else keyfile
-    if "vllm serve" not in command:
-        return command
-    extra = []
-    if certfile and not SSL_CERTFILE_RE.search(command):
-        extra.append(f"--ssl-certfile {shlex.quote(certfile)}")
-    if keyfile and not SSL_KEYFILE_RE.search(command):
-        extra.append(f"--ssl-keyfile {shlex.quote(keyfile)}")
-    if not extra:
-        return command
-    return command.rstrip() + " " + " ".join(extra)
-
-
 
 def load_recipe(recipe_path: Path) -> dict[str, Any]:
     """
@@ -584,9 +546,6 @@ def generate_launch_script(
         command = strip_distributed_executor_backend(command)
     else:
         command = ensure_ray_backend(command)
-
-    # Serve over HTTPS via the centralized SSL setting (applies to every recipe).
-    command = ensure_ssl(command)
 
     lines.append("# Run the model")
     lines.append(command.strip())

@@ -7,26 +7,16 @@ model-specific deviations live in that recipe's own docs page (e.g.
 `docs/GLM53_FLASH.md`), which references this file rather than repeating
 it. Everything here applies equally to the qwen, ds4f, and GLM lanes.
 
-## TLS: the pfSense CA (one-time per bench host)
+## TLS: use the tailnet URL
 
-The `vllm@` units serve HTTPS with a leaf cert issued by the local
-**pfSense CA**, and the server presents only the leaf. Every verifying
-client (llama-benchy, lm-eval, requests) then fails with
-`unable to get local issuer certificate`. `curl -k` works, but those
-tools have no skip-verify flag, so append the CA to a bundle:
-
-```bash
-# CA lives at ~/.config/certs/pfsense-ca.pem on the workstation
-cat /etc/ssl/certs/ca-certificates.crt ~/.config/certs/pfsense-ca.pem \
-  > ~/.config/certs/ca-bundle-plus-pfsense.pem
-```
-
-Then export `SSL_CERT_FILE=~/.config/certs/ca-bundle-plus-pfsense.pem`
-(and `REQUESTS_CA_BUNDLE=` the same, for requests-based tools). Do NOT
-point `SSL_CERT_FILE` at the CA alone - it replaces the system bundle and
-breaks uv's own PyPI fetches. `tools/bench-serving.py` sidesteps all of
-this with `CERT_NONE` (verification off); the probe scripts take
-`--insecure` for the same reason.
+The `vllm@` units serve plain HTTP on the head node; `tailscale serve` in
+front of them presents a publicly trusted certificate for the node's
+tailnet name. Point every client at
+`https://<node>.<tailnet>.ts.net:8000/v1` and no custom trust bundle is
+needed. Never point `SSL_CERT_FILE` at a lone CA file - it replaces the
+system bundle and breaks uv's own PyPI fetches. `tools/bench-serving.py`
+uses `CERT_NONE` and the probe scripts take `--insecure`; neither is
+required against the tailnet URL.
 
 The API key is `docker exec vllm_node printenv VLLM_API_KEY` (the host
 `~/.vllm-api-key` may not match). Never echo it into a shared log.
@@ -43,9 +33,8 @@ huggingface.co, so run evals on a node and pass LOCAL paths.
 ```bash
 KEY=$(docker exec vllm_node printenv VLLM_API_KEY)
 SNAP=$(ls -d ~/.cache/huggingface/hub/models--<ORG>--<MODEL>/snapshots/*/)
-SSL_CERT_FILE=~/.config/certs/ca-bundle-plus-pfsense.pem \
 uvx llama-benchy@0.4.0 \
-  --base-url https://<node>:8000/v1 --api-key "$KEY" \
+  --base-url https://<node>.<tailnet>.ts.net:8000/v1 --api-key "$KEY" \
   --model <served-name> --tokenizer "$SNAP" \
   --pp 2048 --tg 128 --runs 3 \
   --save-result ~/bench.json --format json
@@ -66,12 +55,10 @@ without it). For RULER add `,ruler` to the extra plus
 `--with wonderwords --with nltk`.
 
 ```bash
-SSL_CERT_FILE=~/.config/certs/ca-bundle-plus-pfsense.pem \
-REQUESTS_CA_BUNDLE=~/.config/certs/ca-bundle-plus-pfsense.pem \
 OPENAI_API_KEY="$KEY" \
 uvx --from "lm_eval[api]" --with transformers lm_eval \
   --model local-completions \
-  --model_args "model=<served-name>,base_url=https://<node>:8000/v1/completions,num_concurrent=8,max_retries=3,tokenizer=$SNAP,trust_remote_code=True" \
+  --model_args "model=<served-name>,base_url=https://<node>.<tailnet>.ts.net:8000/v1/completions,num_concurrent=8,max_retries=3,tokenizer=$SNAP,trust_remote_code=True" \
   --tasks gsm8k --num_fewshot 5 --limit 200 \
   --output_path ~/lm-eval-results/gsm8k
 ```

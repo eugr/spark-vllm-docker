@@ -1631,24 +1631,20 @@ Assumptions and limitations:
 - It mounts `~/.cache/huggingface`, `~/.cache/vllm`, `~/.cache/flashinfer`, `~/.triton`, and `~/.tilelang` by default. Use `--no-cache-dirs` to skip the vLLM/FlashInfer/Triton/TileLang cache mounts. Add other mounts with repeatable Docker-style `-v` / `--volume` options, e.g. `-v "$HOME/my-data:/data"`.
 
 
-### Serving over HTTPS (TLS)
+### Serving over HTTPS (Tailscale)
 
-The API is served over HTTPS **by default**. TLS is a single centralized setting rather than a per-recipe option: `run-recipe.py` injects `--ssl-certfile` / `--ssl-keyfile` into every model's `vllm serve` command, so the whole fleet is on TLS from one place instead of editing each recipe (and risking an inconsistent HTTP/HTTPS mix).
-
-The cert and key default to `/root/.cache/vllm/certs/cert.pem` and `key.pem` **inside the container**. Since `~/.cache/vllm` is mounted by default, put them at `~/.cache/vllm/certs/` on the head node. Override the locations with the `SSL_CERTFILE` / `SSL_KEYFILE` environment variables, or set either to empty to serve plain HTTP:
+The launcher serves plain HTTP. Recipes carry no TLS flags and `run-recipe.py` injects none. Terminate TLS in front of the head node with [`tailscale serve`](https://tailscale.com/kb/1312/serve), which obtains and renews a publicly trusted certificate for the node's tailnet name:
 
 ```bash
-# override cert locations for all launches
-export SSL_CERTFILE=/root/.cache/vllm/certs/mycert.pem
-export SSL_KEYFILE=/root/.cache/vllm/certs/mykey.pem
-
-# or disable TLS for a one-off launch
-SSL_CERTFILE= run-recipe.py <recipe> -n node1,node2
+# on the head node
+sudo tailscale serve --bg --https=8000 http://localhost:8000
 ```
 
-> The cert/key must exist at the resolved in-container path, or `vllm serve` will fail to start.
+Clients on the tailnet use `https://<head-node>.<tailnet>.ts.net:8000/v1` with no custom trust bundle. Pass `--host 127.0.0.1` to the launcher so the plain-HTTP listener is reachable only through the proxy; the recipe default `0.0.0.0` also exposes it to the LAN.
 
-Besides the usual reasons for TLS, HTTPS also avoids a class of network-sandbox truncation: sandboxes that filter egress through an HTTP proxy (e.g. [`fence`](https://github.com/fencesandbox/fence)) may cap plain-HTTP requests with a fixed `http.Client` timeout that *also* interrupts reading the streamed response body — silently cutting off long-streaming completions (e.g. high reasoning-effort turns that generate for longer than the cap). HTTPS traffic takes the sandbox's raw `CONNECT` tunnel, which is not capped.
+Sandboxes that proxy egress over HTTP (e.g. [`fence`](https://github.com/fencesandbox/fence)) can cap plain-HTTP requests and cut long streamed completions; the HTTPS tailnet URL takes the sandbox's `CONNECT` tunnel and is not capped, so use it from such clients.
+
+To have vLLM terminate TLS itself, pass `--ssl-certfile` / `--ssl-keyfile` after `--` on the command line. vLLM reads the files only at startup, so renewals need a restart.
 
 **Start in daemon mode (background):**
 

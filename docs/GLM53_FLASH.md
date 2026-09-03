@@ -444,7 +444,7 @@ slow floor. A downward k-sweep was therefore judged not worthwhile.
 
 ### Repeatable measurement protocol
 
-The harness mechanics - TLS/pfSense CA, llama-benchy and lm-eval
+The harness mechanics - TLS via the tailnet URL, llama-benchy and lm-eval
 invocations, the lm-eval landmines (validate request count; one RULER
 length per invocation; long-context `num_concurrent<=2` + `timeout=3600`;
 never pipe through `head`), and reading spec-decode acceptance off
