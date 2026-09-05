@@ -6,16 +6,22 @@ on:
     paths:
       - 'run-recipe.py'
       - 'run-recipe.sh'
+      - 'run-stack.py'
+      - 'run-stack.sh'
       - 'launch-cluster.sh'
       - 'recipes/**'
+      - 'stacks/**'
       - 'tests/**'
       - '.github/workflows/test-recipes.yml'
   pull_request:
     paths:
       - 'run-recipe.py'
       - 'run-recipe.sh'
+      - 'run-stack.py'
+      - 'run-stack.sh'
       - 'launch-cluster.sh'
       - 'recipes/**'
+      - 'stacks/**'
       - 'tests/**'
       - '.github/workflows/test-recipes.yml'
   workflow_dispatch:
@@ -43,16 +49,20 @@ jobs:
     
     - name: Make scripts executable
       run: |
-        chmod +x run-recipe.py run-recipe.sh launch-cluster.sh
-        chmod +x tests/test_recipes.sh tests/test_launch_cluster_image_sync.sh
+        chmod +x run-recipe.py run-recipe.sh run-stack.py run-stack.sh launch-cluster.sh
+        chmod +x tests/test_recipes.sh tests/test_stack.sh tests/test_launch_cluster_image_sync.sh
         chmod +x tests/test_launch_cluster_vllm_pr.sh
-    
+
     - name: Run recipe integration tests
       run: |
         ./tests/test_recipes.sh -v
         ./tests/test_launch_cluster_image_sync.sh
         ./tests/test_launch_cluster_vllm_pr.sh
-    
+
+    - name: Run stack integration tests
+      run: |
+        ./tests/test_stack.sh -v
+
     - name: Verify all recipes with dry-run
       run: |
         for recipe in recipes/*.yaml; do
@@ -63,4 +73,13 @@ jobs:
           else
             ./run-recipe.py "$name" --dry-run --solo || exit 1
           fi
+        done
+
+    - name: Verify all stacks with dry-run
+      run: |
+        for stack in stacks/*.yaml stacks/*.yml; do
+          [ -e "$stack" ] || continue
+          name=$(basename "$stack")
+          echo "Testing stack: $name"
+          ./run-stack.py "$stack" --dry-run || exit 1
         done
