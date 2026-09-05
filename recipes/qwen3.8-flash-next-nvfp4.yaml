@@ -1,0 +1,82 @@
+# Recipe: Qwen3.8-Flash-Next NVFP4 on a single DGX Spark (GB10)
+# Single-node TP=1 serving of RadixArk/Qwen3.8-Flash-Next-NVFP4 on the Anemll
+# dspark-vllm-gx10 image, with native MTP speculative decoding.
+#
+# Model facts (from HF config.json):
+#   arch Qwen4ExpForConditionalGeneration / model_type qwen4_exp
+#   NVFP4 (modelopt) weights+acts, 48 layers, 512 experts / top-10,
+#   hybrid linear+full attention (full_attention_interval=4), PLE, DSA indexer,
+#   native 262144 ctx, MTP layers present (mtp.* is quant-ignored -> spec works).
+# No public DFlash/Eagle draft exists for Flash-Next, so we use the model's own
+# MTP head (vLLM "mtp" speculative method) rather than a separate draft model.
+
+recipe_version: "1"
+# REQUIRES vLLM >= 0.28.0. Qwen3.8-Flash-Next uses the qwen4_exp arch
+# (Qwen4ExpForConditionalGeneration), first supported in vLLM 0.28.0. Older
+# runner images fail at load with: model type qwen4_exp not recognized.
+# Per recipes.vllm.ai/Qwen/Qwen3.8-Flash-Next the reference image is
+# vllm/vllm-openai:qwen38-flash-next (PyPI install unsupported for this model).
+# The eugr/anemll images below must be on a >=0.28.0 build; --force-build to
+# re-pull, or set container: to a 0.28.0+ image.
+name: Qwen3.8-Flash-Next-NVFP4 - single Spark (GB10) + MTP
+description: >-
+  vLLM serving RadixArk/Qwen3.8-Flash-Next-NVFP4 on one DGX Spark/GB10 using the
+  Anemll dspark-vllm-gx10 0.1.1 image, TP=1, fp8 KV cache, native MTP speculative
+  decoding. Follows the vLLM Qwen3.8-Flash-Next serving guide
+  (recipes.vllm.ai/Qwen/Qwen3.8-Flash-Next) adapted to a single Spark.
+
+# Pinned by digest so the recipe is reproducible.
+container: ghcr.io/anemll/dspark-vllm-gx10:0.1.1@sha256:a83948492cf13df455170fb42885f5ef4db54fefe0feff0f841ecbff464ac9d8
+model: RadixArk/Qwen3.8-Flash-Next-NVFP4
+
+cluster_only: false
+solo_only: false
+
+defaults:
+  port: 8000
+  host: 0.0.0.0
+  tensor_parallel: 1
+  gpu_memory_utilization: 0.85
+  max_model_len: 262144          # native context; drop if you hit KV OOM
+  max_num_seqs: 4              # 4 concurrent requests
+  max_num_batched_tokens: 8192
+  num_speculative_tokens: 3      # per vLLM Flash-Next guide (MTP)
+
+# Env: PLE CPU offload frees unified memory (this arch has partial-layer
+# embeddings); long-ctx guard for the full 256K window.
+env:
+  # N-gram (PLE) embeddings are ~51B params. Lookup indices are known ahead of
+  # time, so the table is kept in host memory and async-prefetched in parallel
+  # with compute instead of sitting resident in the CUDA allocator (per
+  # @TheDavidTai, x.com/TheDavidTai/status/2092597690827669753). On Spark
+  # memory is unified so this does not free capacity, but it keeps the 51B out
+  # of the gpu-memory-utilization budget and enables the async prefetch path.
+  VLLM_PLE_CPU_OFFLOAD: "1"
+  VLLM_ALLOW_LONG_MAX_MODEL_LEN: "1"
+  FLASHINFER_DISABLE_VERSION_CHECK: "1"
+  TORCH_CUDA_ARCH_LIST: "12.1a"
+  FLASHINFER_CUDA_ARCH_LIST: "12.1a"
+  PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
+
+# NOTE: literal JSON braces are doubled for str.format(). To serve WITHOUT MTP,
+# delete the --speculative-config line (and num_speculative_tokens above).
+command: |
+  vllm serve RadixArk/Qwen3.8-Flash-Next-NVFP4 \
+      --served-model-name qwen3.8-flash-next \
+      --host {host} \
+      --port {port} \
+      --trust-remote-code \
+      --tensor-parallel-size {tensor_parallel} \
+      --kv-cache-dtype fp8 \
+      --gpu-memory-utilization {gpu_memory_utilization} \
+      --max-model-len {max_model_len} \
+      --max-num-seqs {max_num_seqs} \
+      --max-num-batched-tokens {max_num_batched_tokens} \
+      --enable-chunked-prefill \
+      --enable-prefix-caching \
+      --async-scheduling \
+      --speculative-config '{{"method":"mtp","num_speculative_tokens":{num_speculative_tokens}}}' \
+      --reasoning-parser qwen3 \
+      --tool-call-parser qwen3_coder \
+      --enable-auto-tool-choice \
+      --no-enable-flashinfer-autotune

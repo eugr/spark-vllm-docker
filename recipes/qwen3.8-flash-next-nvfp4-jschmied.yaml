@@ -1,0 +1,56 @@
+# Recipe: Qwen3.8-Flash-Next NVFP4 on a single DGX Spark (GB10) — jschmied config.
+# Port of github.com/jschmied/qwen38-flash-next-gb10 (scripts/serve-flashnext.sh)
+# into this recipe folder, on the official vllm/vllm-openai:qwen38-flash-next image.
+#
+# Based on jschmied config, but with MTP speculative decoding ENABLED and 256K
+# ctx (from the official recipe). MTP calls fused_gdn_decode_post_conv_mtp; the
+# official qwen38-flash-next image already carries that kernel (vLLM PR #53896),
+# so no source build / PR overlay is needed. max-num-seqs 2 concurrent.
+
+recipe_version: "1"
+name: Qwen3.8-Flash-Next-NVFP4 - single Spark (GB10), jschmied config + MTP
+description: >-
+  vLLM serving RadixArk/Qwen3.8-Flash-Next-NVFP4 on one DGX Spark/GB10 using the
+  official vllm/vllm-openai:qwen38-flash-next image. Port of
+  github.com/jschmied/qwen38-flash-next-gb10 — TP=1, MTP speculative decoding,
+  256K ctx, 2 concurrent.
+
+container: vllm/vllm-openai:qwen38-flash-next
+model: RadixArk/Qwen3.8-Flash-Next-NVFP4
+
+cluster_only: false
+solo_only: false
+
+defaults:
+  port: 8000
+  host: 0.0.0.0
+  tensor_parallel: 1
+  gpu_memory_utilization: 0.90
+  max_model_len: 16384         # from official recipe (native 256K ctx)
+  max_num_seqs: 2
+  max_num_batched_tokens: 4096
+  num_speculative_tokens: 3      # MTP, from official recipe
+
+# From serve-flashnext.sh. expandable_segments + marlin atomic-add are the
+# memory/perf knobs; flashinfer version check disabled for the pinned image.
+env:
+  VLLM_MARLIN_USE_ATOMIC_ADD: "1"
+  PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
+  FLASHINFER_DISABLE_VERSION_CHECK: "1"
+
+# NOTE: literal JSON braces are doubled for str.format(). To add prefix caching,
+# append --enable-prefix-caching.
+command: |
+  vllm serve RadixArk/Qwen3.8-Flash-Next-NVFP4 \
+      --served-model-name flashnext \
+      --host {host} \
+      --port {port} \
+      --trust-remote-code \
+      --tensor-parallel-size {tensor_parallel} \
+      --max-model-len {max_model_len} \
+      --max-num-seqs {max_num_seqs} \
+      --max-num-batched-tokens {max_num_batched_tokens} \
+      --enable-chunked-prefill \
+      --gpu-memory-utilization {gpu_memory_utilization} \
+      --speculative-config '{{"method":"mtp","num_speculative_tokens":{num_speculative_tokens}}}' \
+      --distributed-executor-backend mp

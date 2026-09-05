@@ -1,0 +1,89 @@
+# Recipe: literal port of upstream's deepseek-v4-flash-nvfp4-mtp.yaml
+# https://github.com/MykhailoTamarin/vllm-starter/blob/main/models/deepseek-v4-flash-nvfp4-mtp.yaml
+#
+# New file, does not replace deepseek-v4-flash-180b-reap-gb10-v026-mtp.yaml.
+# That recipe was built off the local -tuned recipes' flag set (container:
+# vllm-node-v026, mods, etc.) rather than a literal port of upstream's args:
+# list. Originally a literal port for apples-to-apples testing, but since
+# patched after live debugging:
+#   --moe-backend auto -> marlin: vLLM 0.26's auto dispatch picks DeepGEMM for
+#     SM121/GB10, which crashes with CUDA_ERROR_LAUNCH_FAILED. Marlin is the
+#     only viable MXFP4 MoE backend on this hardware (see
+#     mods/deepseek-v4-reap-gb10/patch_vllm_reap_gb10.py, vllm-project/vllm#41834).
+#   num_speculative_tokens 2 -> 3, matching the local -tuned recipes' value.
+#   served-model-name now denotes size (deepseek-v4-flash-180b) rather than
+#   the ambiguous bare "deepseek-v4-flash".
+#
+# Upstream runs vllm/vllm-openai:v0.26.0 directly with volumes: .../models/files:/patch:ro
+# mounted and command: 'python3 /patch/patch_vllm_reap_gb10.py && exec vllm serve'.
+# This repo's run-recipe.py has no `volumes:` recipe key (build_image() always
+# goes through build-and-copy.sh; mods apply via --apply-mod docker exec, not
+# bind mounts) — so container/build_args/mods below is the only way to express
+# "v0.26.0 + this patch" here, same mechanism as deepseek-v4-flash-180b-reap-gb10-v026-mtp.yaml.
+# Reuses the vllm-node-v026 image (already built) and the same
+# mods/deepseek-v4-reap-gb10-v026 patch (confirmed working: router fallback
+# already native, sqrtsoftplus dispatch patch applies cleanly).
+
+recipe_version: "1"
+name: DeepSeek-V4-Flash-NVFP4-MTP-v026
+description: >-
+  Literal port of upstream vllm-starter's deepseek-v4-flash-nvfp4-mtp.yaml —
+  0xSero/DeepSeek-V4-Flash-180B on vLLM v0.26.0 with --moe-backend auto and
+  upstream's exact args, to test whether explicit MoE backend selection avoids
+  the DeepGEMM grouped FP8->FP4 GEMM crash seen with local defaults.
+
+model: 0xSero/DeepSeek-V4-Flash-180B
+# container pinned to the eugr-spark-vllm-deepseek-v4-reap-gb10:0.26-dgfix
+# rebuild (same vLLM 568afb3a1 / DeepGEMM f8e8fb583 commits as vllm-node-v026,
+# just a fresh build) rather than vllm-node-v026 directly: 180B on
+# vllm-node-v026 hit the identical DeepGEMM UE8M0 warmup assertion
+# (smxx_layout.cuh:131) that 162B hit, whereas this exact tag has an actual
+# confirmed-working 180B run (fix-git terminal-bench task, reward 1.00) behind it.
+container: eugr-spark-vllm-deepseek-v4-reap-gb10:0.26-dgfix
+
+mods:
+  - mods/deepseek-v4-reap-gb10-v026
+
+defaults:
+  port: 8000
+  host: 0.0.0.0
+  gpu_memory_utilization: 0.9
+  max_model_len: 262144
+  max_num_seqs: 2
+  max_num_batched_tokens: 4096
+  num_speculative_tokens: 3
+
+env:
+  VLLM_ALLOW_LONG_MAX_MODEL_LEN: "1"
+  VLLM_HTTP_TIMEOUT_KEEP_ALIVE: "600"
+  PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
+
+command: |
+  vllm serve 0xSero/DeepSeek-V4-Flash-180B \
+    --served-model-name deepseek-v4-flash-180b \
+    --host {host} \
+    --port {port} \
+    --trust-remote-code \
+    --tensor-parallel-size 1 \
+    --pipeline-parallel-size 1 \
+    --moe-backend marlin \
+    --kv-cache-dtype fp8 \
+    --block-size 256 \
+    --max-model-len {max_model_len} \
+    --max-num-seqs {max_num_seqs} \
+    --max-num-batched-tokens {max_num_batched_tokens} \
+    --gpu-memory-utilization {gpu_memory_utilization} \
+    --distributed-executor-backend mp \
+    --tokenizer-mode deepseek_v4 \
+    --load-format safetensors \
+    --enable-chunked-prefill \
+    --async-scheduling \
+    --enable-prefix-caching \
+    --tool-call-parser deepseek_v4 \
+    --enable-auto-tool-choice \
+    --reasoning-parser deepseek_v4 \
+    --reasoning-config '{{"reasoning_parser":"deepseek_v4","reasoning_start_str":"<thinking>","reasoning_end_str":"</thinking>"}}' \
+    --default-chat-template-kwargs '{{"thinking":true}}' \
+    --compilation-config '{{"cudagraph_mode":"FULL_AND_PIECEWISE","custom_ops":["all"]}}' \
+    --speculative-config '{{"method":"mtp","num_speculative_tokens":{num_speculative_tokens}}}' \
+    --disable-access-log-for-endpoints /health,/metrics,/ping

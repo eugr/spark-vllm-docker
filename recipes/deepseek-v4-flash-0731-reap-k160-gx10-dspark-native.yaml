@@ -1,0 +1,135 @@
+# Recipe: DeepSeek-V4-Flash-0731 REAP K160 on GB10 — Anemll dspark-vllm-gx10 image, NATIVE DSpark
+#
+# New, separate recipe — does not touch or replace
+# deepseek-v4-flash-0731-reap-k160-gb10-v026-dspark-mod.yaml (the proven,
+# working vllm/vllm-openai:v0.26.0 + ported-overlay recipe). This one takes
+# a completely different path: ghcr.io/anemll/dspark-vllm-gx10:0.1.1, the
+# prebuilt image from https://github.com/Weschera/DeepSeek-V4-Flash-0731-DSpark-2x-DGX-Spark
+# (itself derived from https://github.com/MiaAI-Lab/DeepSeek-v4-Flash-DSpark-2x-DGX-Spark).
+#
+# Why this image needs a DIFFERENT mod than the v026-dspark recipe:
+#   - vLLM here is 0.25.2.dev0+g752a3a504.d20260714 (confirmed via
+#     `python3 -c "import vllm; print(vllm.__version__)"` inside the pulled
+#     image) — an older, distinct build from our from-source v0.26.0.
+#   - DSpark support (v1/worker/gpu/spec_decode/dspark/,
+#     models/deepseek_v4/nvidia/dspark.py) and nvfp4_ds_mla (config/cache.py)
+#     are NATIVE in this image — confirmed by grepping the container
+#     filesystem directly. Applying our ported dspark_overlay/ +
+#     patch_vllm_k160_dspark.py here would be redundant at best (overlaying
+#     vLLM-internal files this image already has its own — likely
+#     different — versions of) and risks actively conflicting at worst.
+#   - This recipe therefore reuses mods/deepseek-v4-reap-gb10-v026 (the
+#     ORIGINAL REAP mod: router fallback for nonstandard expert counts,
+#     MXFP4 memory hygiene, cutedsl fallback, FlashInfer IPC fix) UNCHANGED
+#     — confirmed via direct test to apply cleanly against this exact image
+#     (patch_vllm_reap_gb10.py: 4/4 PATCH_APPLIED, PATCH_COMPILE_OK, exit 0).
+#     Not mods/deepseek-v4-reap-gb10-v026-dspark (the overlay variant) —
+#     that one is specifically for vllm/vllm-openai:v0.26.0's missing-DSpark
+#     gap, which doesn't exist here.
+#
+# --attention-backend is deliberately NOT set. The SM120 tile-scheduler gap
+# we hit on v0.26.0 (build_tile_scheduler returns all-None on
+# is_device_capability_family(120) in sparse_swa.py, but stock
+# models/deepseek_v4/nvidia/flashmla.py unconditionally asserts
+# tile_sched_swaonly is non-None for compress_ratio<=1 layers when
+# FLASHMLA_SPARSE is forced) EXISTS IN THIS IMAGE TOO — confirmed via the
+# same grep. This image is validated on real GB10 hardware (see Weschera's
+# README benchmarks) without forcing the backend, so auto-selection is
+# assumed to route swaonly layers around this gap here too, same as our
+# working v026-dspark-mod recipe. UNTESTED end-to-end below this point —
+# CLI flags were verified against `vllm serve --help=all` inside this exact
+# image (kv-cache-dtype includes nvfp4_ds_mla; tokenizer-mode, tool-call-parser
+# include deepseek_v4; speculative-config, moe-backend flashinfer_b12x all
+# present) but the actual boot has not been run yet.
+#
+# --moe-backend flashinfer_b12x matches this image's own documented default
+# ("MoE: FlashInfer B12X" per Weschera's README) rather than the `marlin`
+# workaround our other recipes use — that workaround was specifically for a
+# DeepGEMM/SM121 crash on the vllm-openai:v0.26.0 build; untested whether it
+# applies here too, so following this image's own validated default instead.
+#
+# num_speculative_tokens: 5 is the hard floor (dspark_block_size=5 in this
+# checkpoint's config.json), same constraint we hit on the other recipe —
+# not a free choice, going lower raises a pydantic ValidationError.
+#
+# gpu_memory_utilization/max_num_batched_tokens/max_num_seqs are carried
+# over from the proven single-GPU v026-dspark-mod values, NOT from
+# Weschera's README defaults (those are tuned for their TP=2 dual-node 1M
+# profile with 2x the aggregate HBM — not directly applicable to this
+# single-Spark TP=1 setup).
+
+recipe_version: "1"
+name: DeepSeek-V4-Flash-0731-REAP-K160-GX10-DSpark-Native
+description: >-
+  vLLM 0.25.2.dev0 (Anemll dspark-vllm-gx10:0.1.1 prebuilt image) serving
+  0xSero/DeepSeek-V4-Flash-0731-REAP (REAP K160, MXFP4 experts) on a single
+  DGX Spark GB10 node, using this image's NATIVE DSpark speculative decoding
+  and nvfp4_ds_mla KV cache support (no ported overlay needed) plus this
+  repo's existing REAP K160 expert-count/MoE-memory/cutedsl/FlashInfer-IPC
+  mod.
+
+model: 0xSero/DeepSeek-V4-Flash-0731-REAP
+model_revision: ddc04540efda3d2a0788b129f1fad828ddc19b60
+container: ghcr.io/anemll/dspark-vllm-gx10:0.1.1
+
+mods:
+  - mods/deepseek-v4-reap-gb10-v026
+
+defaults:
+  port: 8000
+  host: 0.0.0.0
+  gpu_memory_utilization: 0.94
+  max_model_len: 262144
+  max_num_seqs: 2
+  max_num_batched_tokens: 4104
+  num_speculative_tokens: 5
+
+env:
+  VLLM_ALLOW_LONG_MAX_MODEL_LEN: "1"
+  VLLM_HTTP_TIMEOUT_KEEP_ALIVE: "10000"
+  FLASHINFER_DISABLE_VERSION_CHECK: "1"
+  TILELANG_CLEANUP_TEMP_FILES: "1"
+  DG_JIT_USE_NVRTC: "0"
+  DG_JIT_NVCC_COMPILER: "/usr/local/cuda/bin/nvcc"
+  NCCL_IB_DISABLE: "1"
+  NCCL_DEBUG: "WARN"
+  K160_DISABLE_CUTEDSL: "0"
+  CUTEDSL_VERSION: ""
+  PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
+  VLLM_USE_FLASHINFER_SAMPLER: "1"
+  VLLM_SPARSE_INDEXER_MAX_LOGITS_MB: "256"
+  VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS: "0"
+
+command: |
+  vllm serve 0xSero/DeepSeek-V4-Flash-0731-REAP \
+    --revision ddc04540efda3d2a0788b129f1fad828ddc19b60 \
+    --served-model-name deepseek-v4-flash-0731-REAP-K160-gx10-dspark \
+    --host {host} \
+    --port {port} \
+    --trust-remote-code \
+    --tensor-parallel-size 1 \
+    --pipeline-parallel-size 1 \
+    --moe-backend flashinfer_b12x \
+    --kv-cache-dtype nvfp4_ds_mla \
+    --block-size 256 \
+    --max-model-len {max_model_len} \
+    --max-num-seqs {max_num_seqs} \
+    --max-num-batched-tokens {max_num_batched_tokens} \
+    --gpu-memory-utilization {gpu_memory_utilization} \
+    --distributed-executor-backend mp \
+    --tokenizer-mode deepseek_v4 \
+    --load-format safetensors \
+    --enable-chunked-prefill \
+    --async-scheduling \
+    --enable-prefix-caching \
+    --tool-call-parser deepseek_v4 \
+    --enable-auto-tool-choice \
+    --reasoning-parser deepseek_v4 \
+    --reasoning-config '{{"reasoning_parser":"deepseek_v4","reasoning_start_str":"<think>","reasoning_end_str":"</think>"}}' \
+    --default-chat-template-kwargs '{{"thinking":true}}' \
+    --default-chat-template-kwargs.reasoning_effort=high \
+    --compilation-config '{{"cudagraph_mode":"FULL_AND_PIECEWISE","custom_ops":["all"]}}' \
+    --speculative-config '{{"method":"dspark","num_speculative_tokens":{num_speculative_tokens},"draft_sample_method":"greedy"}}' \
+    --generation-config vllm \
+    --enable-flashinfer-autotune \
+    --disable-access-log-for-endpoints /health,/metrics,/ping
