@@ -1,0 +1,13 @@
+diff --git a/vllm/utils/mem_utils.py b/vllm/utils/mem_utils.py
+index a123456..b123456 100644
+--- a/vllm/utils/mem_utils.py
++++ b/vllm/utils/mem_utils.py
+@@ -266,6 +266,8 @@
+     diff_from_create = result.after_profile - result.before_create
+     result.torch_peak_increase = diff_profile.torch_peak
+     result.non_torch_increase = diff_from_create.non_torch_memory
++    if current_platform.is_integrated_gpu(baseline_snapshot.device_.index):
++        result.non_torch_increase = min(result.non_torch_increase, 2 * 1024 * 1024 * 1024)
+     result.profile_time = diff_profile.timestamp
+ 
+     non_torch_memory = result.non_torch_increase
