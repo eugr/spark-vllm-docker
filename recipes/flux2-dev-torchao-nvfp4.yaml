@@ -1,0 +1,76 @@
+# Recipe: FLUX.2-dev + on-the-fly torchao NVFP4 (Blackwell speedup)
+# 32B rectified-flow FLUX.2-dev quantized on the fly to NVFP4 (W4A4, Triton).
+# ~4x faster than BF16 on a DGX Spark GB10 (sm_121a): 28-step 1024^2 ~33s
+# (steady, warm) vs ~2.3min BF16, and ~66GB VRAM vs ~112GB.
+#
+# NOT a vLLM model — a diffusers FastAPI server (servers/flux2/). Build first:
+#   docker build -f servers/flux2/Dockerfile -t flux2-torchao servers/flux2
+# Weights: the plain BF16 FLUX.2-dev repo (quantized on the fly at load — no
+# pre-quantized checkpoint, no modelopt).
+
+recipe_version: "1"
+name: FLUX.2-dev-torchao-NVFP4
+description: FLUX.2-dev on-the-fly torchao NVFP4 on Blackwell (OpenAI Images API)
+
+model: black-forest-labs/FLUX.2-dev
+
+container: flux2-torchao:latest
+
+solo_only: true
+
+mods: []
+
+defaults:
+  port: 8000
+  host: 0.0.0.0
+
+env:
+  # BASE BF16 FLUX.2-dev — the ONLY model needed (NVFP4 applied on the fly; no
+  # separate quantized checkpoint). HF id → downloaded to / resolved from the
+  # default HF cache (~/.cache/huggingface). Downloads on first run if absent
+  # (FLUX.2 is gated — needs an HF token in your environment).
+  MODEL_PATH: black-forest-labs/FLUX.2-dev
+  SERVED_MODEL_NAME: black-forest-labs/FLUX.2-dev
+  TORCHAO_QUANT: nvfp4         # on-the-fly quant: nvfp4 | mxfp8 | (unset=BF16)
+  # MIXED quant: keep these sensitive linears BF16, NVFP4 the rest (better
+  # quality). Default names are a FLUX.2 best-guess — verify against
+  # transformer.named_modules(). "" = full quant. Change freely; the cache is
+  # content-addressed so a new setting just makes a new cache entry.
+  TORCHAO_SKIP_MODULES: "proj_out,x_embedder,context_embedder,time_guidance_embed"
+  # Quantize once → save → fast-boot after. Content-addressed: per-config
+  # subdirs keyed by md5(model+quant+skip), so different configs coexist and
+  # switching back to a prior config still fast-loads. First boot of each key:
+  # ~2min BF16 load + quant + save; later boots: fast load of the saved copy.
+  # Nested under the auto-mounted HF cache so the saved quant persists on the
+  # host (~/.cache/huggingface/quant-cache/) and survives container rebuilds.
+  QUANT_CACHE_DIR: /root/.cache/huggingface/quant-cache/flux2-dev-nvfp4
+  DEFAULT_STEPS: "28"
+  DEFAULT_GUIDANCE: "4.0"
+  PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
+  # (no HF_HUB_OFFLINE — let it download from HF / use the cache normally)
+
+# The HF cache (~/.cache/huggingface) is mounted automatically, so the model
+# download and the saved quant both persist on the host across runs.
+
+command: |
+  uvicorn server:app \
+    --host {host} \
+    --port {port}
+
+#####
+# OpenAI Images API: GET /v1/models, POST /v1/images/generations (JSON),
+# POST /v1/images/edits (multipart file upload). steps/guidance/seed are
+# extensions (extra_body / -F form fields).
+#
+# NOTES:
+#  - First request of each new SHAPE (resolution/aspect, gen vs edit) pays a
+#    one-time Triton JIT (frozen 0/N, GPU idle a few min) — NVFP4 tensors have
+#    no stable compile cache, so it recompiles per shape and doesn't persist
+#    across restart. Warm the shapes you use, or drop compile_repeated_blocks
+#    in server.py for consistent (slightly slower) behavior with no stalls.
+#  - Multi-reference edits (2+ images) are much slower (longer sequence);
+#    downscale references to reduce conditioning tokens.
+#  - SPARK-only: on-the-fly quant loads BF16 resident first (won't fit a 16GB
+#    card). CUDA 13 + Blackwell (sm_120a/121a) required for the FP4 kernels.
+#
+# Credit: PyTorch "Faster Diffusion on Blackwell (MXFP8/NVFP4 + TorchAO)".
