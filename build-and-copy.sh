@@ -147,6 +147,23 @@ EOF
     echo "Generated build-metadata.yaml"
 }
 
+# Resolve a stable cache-bust value from upstream git ref.
+# Falls back to timestamp (current behavior) on network / resolution failure,
+# so the script remains usable offline.
+#
+# Usage: resolve_cachebust <repo_url> <ref>
+resolve_cachebust() {
+    local repo_url="$1"
+    local ref="$2"
+    local sha
+    sha=$(git ls-remote "$repo_url" "$ref" 2>/dev/null | head -n1 | cut -f1)
+    if [ -n "$sha" ]; then
+        echo "$sha"
+    else
+        echo "$(date +%s)"
+    fi
+}
+
 add_copy_hosts() {
     local token part
     for token in "$@"; do
@@ -1158,7 +1175,7 @@ if [ "$NO_BUILD" = false ]; then
                 "--build-arg" "FLASHINFER_REF=$FLASHINFER_REF")
 
             if [ "$REBUILD_FLASHINFER" = true ]; then
-                FI_CMD+=("--build-arg" "CACHEBUST_FLASHINFER=$(date +%s)")
+                FI_CMD+=("--build-arg" "CACHEBUST_FLASHINFER=$(resolve_cachebust https://github.com/flashinfer-ai/flashinfer.git "$FLASHINFER_REF")")
             fi
 
             if [ -n "$FLASHINFER_PRS" ]; then
@@ -1265,7 +1282,7 @@ if [ "$NO_BUILD" = false ]; then
             fi
 
             if [ "$REBUILD_VLLM" = true ]; then
-                VLLM_CMD+=("--build-arg" "CACHEBUST_VLLM=$(date +%s)")
+                VLLM_CMD+=("--build-arg" "CACHEBUST_VLLM=$(resolve_cachebust https://github.com/vllm-project/vllm.git "$VLLM_REF")")
             fi
 
             if [ -n "$VLLM_PRS" ]; then
