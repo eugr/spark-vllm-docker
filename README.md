@@ -536,6 +536,27 @@ Run:
 
 Please note that `--no-ray` is required for FP8 to fit with full context!
 
+##### NVFP4 + MTP (speculative decoding)
+
+The official NVFP4 export ships **no MTP (next-n predict) weights** — ModelOpt strips
+layers 45-47 and truncates several per-layer config lists during quantization — so the
+plain `step-3.7-flash-nvfp4` recipe runs without speculative decoding. To enable MTP-3
+on NVFP4, graft the BF16 MTP weights back into the cached checkpoint (one-time, ~5-7 GB
+download from the original `stepfun-ai/Step-3.7-Flash`). On **each** Spark in the cluster:
+
+```bash
+./hf-download.sh stepfun-ai/Step-3.7-Flash-NVFP4 -c
+./graft-step-3.7-mtp.sh      # idempotent: extracts + grafts MTP weights, extends config
+./run-recipe.sh step-3.7-flash-nvfp4-mtp
+```
+
+`graft-step-3.7-mtp.sh` adds the MTP weights (kept BF16); the `step-3.7-flash-nvfp4-mtp`
+recipe enables `--speculative-config method=mtp`; and the `step-3.7-flash` mod patches the
+drafter so its MTP block stays unquantized on NVFP4 (FP8 keeps its FP8 MTP unchanged —
+the draft model's quant config is filtered to target-model modules, so `exclude_modules`
+cannot reach these layers). Verified on dual DGX Spark (GB10): mean acceptance length
+~2.4-2.6 tokens/step.
+
 #### `use-official-vllm` NCCL Workaround
 
 Updated `mods/use-official-vllm` to also handle the NCCL load-order bug tracked in [vllm-project/vllm#42354](https://github.com/vllm-project/vllm/issues/42354). When both the pip-installed `nvidia/nccl/lib/libnccl.so.2` and system `libnccl2` are present, the mod redirects the pip-installed NCCL path to the system `/usr/lib` soname, matching the manual workaround that fixes multi-node DGX Spark hangs.
