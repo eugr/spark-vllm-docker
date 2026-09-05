@@ -463,6 +463,68 @@ The default CUDA base image was changed to `nvidia/cuda:13.0.2-devel-ubuntu24.04
 
 The Dockerfile also now passes `--allow-change-held-packages` when installing the custom NCCL Debian packages, avoiding apt failures when replacing held CUDA/NCCL packages during image builds.
 
+#### DeepSeek-V4-Flash on 2x DGX Spark (GB10 / sm_121)
+
+Added `deepseek-v4-flash-jasl-gb10`, a recipe for serving [`deepseek-ai/DeepSeek-V4-Flash`](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash) on a two-node GB10 cluster, tracking [vllm-project/vllm#41834](https://github.com/vllm-project/vllm/pull/41834) (jasl's SM12x DSv4 work).
+
+DeepSeek-V4-Flash does not run on consumer Blackwell (sm_120/121) with stock vLLM: its config sets `swiglu_limit=10.0`, and the only NVFP4 MoE backend that honors the SwiGLU clamp (`FLASHINFER_TRTLLM`) requires sm_100 family. The sparse-attention indexer additionally needs DeepGEMM kernels that do not exist for sm_120/121. The [jasl/vllm `codex/ds4-sm120-min-enable`](https://github.com/jasl/vllm/tree/codex/ds4-sm120-min-enable) branch addresses both: Triton replacements for the sparse-MLA / FP8 indexer paths, MegaMoE that externalises the SwiGLU clamp via runtime `activation_clamp`, and SM121-tuned kernels with a custom NCCL build that avoids the DGX Spark NCCL load-order hang.
+
+This recipe is **not** compatible with the stock `vllm-node` image. Build the bespoke image first, per [jasl/vllm-ds4-sm120-harness `docker/gb10-pr`](https://github.com/jasl/vllm-ds4-sm120-harness/tree/main/docker/gb10-pr):
+
+```bash
+git clone https://github.com/jasl/vllm-ds4-sm120-harness.git
+cd vllm-ds4-sm120-harness/docker/gb10-pr
+docker build --progress=plain -t ds4-vllm-gb10:pr --build-arg BUILD_JOBS=8 .
+```
+
+The build runs on a GB10 host and takes 25-40 minutes. Distribute the image to the second Spark via `docker save | ssh ... docker load` (or your preferred path).
+
+Download the model:
+
+```bash
+./hf-download.sh deepseek-ai/DeepSeek-V4-Flash -c
+```
+
+Run:
+
+```bash
+./run-recipe.sh deepseek-v4-flash-jasl-gb10
+```
+
+The recipe sets `--distributed-executor-backend ray` (jasl's own GB10 README uses `mp`, which only works for single-node multi-GPU; our two-node single-GPU-per-node cluster needs `ray`). `--enable-expert-parallel` engages MegaMoE and is required.
+
+Per jasl's HANDOFF.md, GB10 acceptance is currently no-thinking with the 128K long-context gate; treat `think-high` as exploratory.
+
+##### Performance settings baked into the recipe
+
+Validated on a 2x DGX Spark (GB10) cluster, ISL 1024 / OSL 256, 32 prompts per run via `vllm bench serve`:
+
+| Setting | Result |
+| --- | --- |
+| `max_num_seqs: 4` (raised from `2`) | +45% aggregate tok/s at C≥4 (real concurrency was the cap, not the GPU) |
+| `--enable-prefix-caching` | safe default for repeated-prefix workloads |
+| `--enable-flashinfer-autotune` | minor steady-state win |
+| `--served-model-name deepseek-v4-flash deepseek-ai/DeepSeek-V4-Flash` | zero-downtime model-swap alias trick from `tonyd2wild/deepseek-v4-flash-dgx-spark` |
+| `--speculative-config '{"method":"mtp","num_speculative_tokens":2}'` | +25% single-stream decode tok/s. MTP works fine on GB10 in this build despite jasl's `HANDOFF.md` caveat (~50% acceptance on random tokens; up to ~78% reported by `tonyd2wild` on structured/code) |
+| `VLLM_USE_FLASHINFER_MOE_FP8=1` + `VLLM_FLASHINFER_ALLREDUCE_BACKEND=trtllm` | additional +3-4% at C≥4. Will be replaced by `--moe-backend` flag in vLLM v0.23 |
+| `gpu_memory_utilization: 0.80` | matches the new upstream default (eugr 2026-06-09 bump). KV pool ~17 GiB/rank, 1.7M-token cluster pool, ~6.4× concurrency at 256K. Host stays at ~11 GB available throughout. |
+| `max_model_len: 262144` (raised from `131072`) | 256K per-request context (jasl's tested gate is 128K). KV math at the new pool size gives ~6.4× concurrency headroom at 256K — fits comfortably with `max_num_seqs: 4`. |
+
+Combined: **+28% C=1, +56% C=4, +60% C=8** vs the all-defaults launch (jasl's baseline GB10 README command without these tunings).
+
+###### Higher-concurrency variant (for shared multi-user endpoints)
+
+If your workload is 6-10 concurrent users instead of 1-4, raise both:
+
+- `gpu_memory_utilization: 0.85`
+- `max_num_seqs: 8`
+
+That config measured **+131% aggregate tok/s at C=8** (37 → 86 tok/s, TTFT collapse 37 s → 1.3 s) at the cost of ~10% loss at C=4 and tighter host memory margin (10 GB vs 11 GB available). Not the default because most setups will see better numbers at C=1-4 with `max_num_seqs: 4`.
+
+###### Knobs we tried that did NOT work on this image
+
+`--kernel-config linear_backend=flashinfer_cutlass` / `flashinfer_trtllm` (both reject DSv4's ScaledMM — `flashinfer_cutlass` needs DeepGEMM which isn't installed; `flashinfer_trtllm` has no kernel implementation for this layer type), `VLLM_USE_B12X_MOE=1` (env var ignored; the b12x MoE backend isn't selectable for DSv4's `deepseek_v4_fp8` quant path — that env var appears to be specific to `aidendle94/sparkrun-vllm-ds4-gb10:production-ready`).
+
 ### 2026-06-06
 
 #### MiniMax Multi-Node Regression Workaround
