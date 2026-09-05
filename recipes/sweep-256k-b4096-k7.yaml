@@ -1,0 +1,126 @@
+# Recipe: DeepSeek-V4-Flash-0731 REAP K160 on GB10 — single DGX Spark,
+#         160K/176K-context 4-concurrent profile, WITH the DSpark 2x project's
+#         live vLLM 0.27.0 backport + issue-hotfix chain applied at boot.
+#
+# Base: deepseek-v4-flash-0731-reap-k160-gx10-dspark-miaai-4x.yaml. The serving
+# profile (defaults: block) is kept INTACT. The only additions are the "new
+# changes suggested by Mia" from DeepSeek-v4-Flash-DSpark-2x-DGX-Spark/ (2026-08-14):
+#
+#   1. Digest-pinned image (same 0.1.1 bytes, immutable @sha256 manifest so an
+#      upstream re-tag cannot silently change what you run).
+#
+#   2. New mod  mods/deepseek-v4-dspark-027-backports  ports the exact live
+#      hotfix chain the DSpark 2x compose applies before `exec vllm`, in order:
+#        - python: #21 encoder args, #31 v2 GPU thinking-budget, #55 tool-call
+#          truncation finish_reason;
+#        - vLLM 0.27.0 backports: mtp-buffer #50312, adaptive-topk #50004,
+#          skip-topk #49486, dense-prefill-indexer #48407 (dormant by design),
+#          skip-empty-c128 #48957, flashmla-workspace #50298, grammar-advance;
+#        - scheduler/cache: #27 partial-prefill, #43 decode fairness, #26 hybrid-SWA;
+#        - suppress-stops-in-reasoning (client `stop` dormant until </think>).
+#      All idempotent, auto-detect their in-container target, never restart vllm.
+#      DSPARK_SKIP_HOTFIX=1 skips the .sh backports; DSPARK_SKIP_SUPPRESS_STOPS_HOTFIX=1
+#      skips the stops guard. (docker-compose.single.yml does NOT run this chain;
+#      only the 2x docker-compose.dspark.yml does — this mod brings it to single node.)
+#
+#   3. 0.27-era env companions: VLLM_PREFIX_CACHE_RETENTION_INTERVAL=4096 (#26),
+#      DSPARK_ISSUE43_SCHED_DIAG=0 (#43), VLLM_B12X_W4A16_FORCE_TILE_CONFIG="".
+#
+# Base mods (K160 router fallback, encoding_effort low->low remap) unchanged.
+# UNTESTED end-to-end.
+
+recipe_version: "1"
+name: DeepSeek-V4-Flash-0731-REAP-K160-GX10-DSpark-Single-v027-256K4x
+description: >-
+  0xSero/DeepSeek-V4-Flash-0731-REAP (REAP K160, MXFP4 experts) on one DGX
+  Spark GB10 via Anemll dspark-vllm-gx10:0.1.1 (digest-pinned), miaai-4x profile
+  kept intact (4 concurrent @ 256K ctx, native DSpark k=7 greedy,
+  flashinfer_b12x, fp8 KV, thinking=high), WITH the DSpark 2x live vLLM 0.27.0
+  backport + issue-hotfix chain applied at boot.
+
+model: 0xSero/DeepSeek-V4-Flash-0731-REAP
+container: ghcr.io/anemll/dspark-vllm-gx10:0.1.1@sha256:a83948492cf13df455170fb42885f5ef4db54fefe0feff0f841ecbff464ac9d8
+
+mods:
+  - mods/deepseek-v4-reap-gb10-official_0xsero
+  - mods/deepseek-v4-dsv4-encoding-low
+  - mods/deepseek-v4-dspark-027-backports
+
+defaults:
+  port: 8000
+  host: 0.0.0.0
+  tensor_parallel: 1
+  gpu_memory_utilization: 0.945
+  max_model_len: 262144
+  max_num_seqs: 4                  # 4 concurrent streams
+  max_num_batched_tokens: 4128
+  max_cudagraph_capture_size: 32
+  num_speculative_tokens: 7
+  kv_cache_type: "fp8"              # was nvfp4_ds_mla; fp8 = same KV capacity, higher precision
+
+env:
+  VLLM_ALLOW_LONG_MAX_MODEL_LEN: "0"
+  VLLM_HTTP_TIMEOUT_KEEP_ALIVE: "60000"
+  VLLM_SPARSE_INDEXER_MAX_LOGITS_MB: "256"
+  VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS: "0"
+  VLLM_USE_FLASHINFER_SAMPLER: "1"
+  VLLM_USE_BREAKABLE_CUDAGRAPH: "0"
+  VLLM_USE_B12X_MOE: "1"
+  VLLM_B12X_W4A16_FORCE_BLOCKS_PER_SM: "0"
+  VLLM_B12X_W4A16_FORCE_BLOCKS_MAX_M: "16"
+  VLLM_B12X_W4A16_FORCE_TILE_CONFIG: ""           # Mia .env new key
+  VLLM_PREFIX_CACHE_RETENTION_INTERVAL: "4096"    # Mia new (#26): keep sparse SWA tails warm
+  DSPARK_ISSUE43_SCHED_DIAG: "0"                  # Mia new (#43): 1 = per-step scheduler diag line
+  TORCH_CUDA_ARCH_LIST: "12.1a"
+  FLASHINFER_CUDA_ARCH_LIST: "12.1a"
+  CUTE_DSL_ARCH: "sm_121a"
+  FLASHINFER_DISABLE_VERSION_CHECK: "1"
+  TILELANG_CLEANUP_TEMP_FILES: "1"
+  DG_JIT_USE_NVRTC: "0"
+  DG_JIT_NVCC_COMPILER: "/usr/local/cuda/bin/nvcc"
+  PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
+  NCCL_IB_DISABLE: "1"
+
+# --- mods/deepseek-v4-dspark-027-backports control knobs (defaults = Mia's
+# on-by-default chain; uncomment to override). #21/#31/#55 and #27/#26/#43
+# python hotfixes ALWAYS run and are not gated. ---
+#   DSPARK_SKIP_ISSUE22_HOTFIX: "0"        # 1 = skip nvfp4_ds_mla long-ctx decode fix
+#                                          #     (no-op on fp8 KV; don't skip if KV=nvfp4_ds_mla)
+#   DSPARK_SKIP_HOTFIX: "0"                # 1 = skip the six v0.27 perf backports (#22 still applies)
+#   DSPARK_SKIP_SUPPRESS_STOPS_HOTFIX: "0" # 1 = don't apply the stop-in-<think> guard
+#   DSPARK_SUPPRESS_STOPS_IN_REASONING: "1"# 0 = let client stop strings fire inside <think>
+# ENABLE_VLLM_GB10_PATCH (experimental hybrid NVFP4 plugin) is NOT part of this
+# mod chain and stays off. Stage-C-only VLLM_DSPARK_* keys warn/no-op on 0.1.1.
+
+# literal JSON braces are doubled for str.format(). Delete --speculative-config
+# to run WITHOUT DSpark. To change thinking, edit --default-chat-template-kwargs
+# (off: {{"thinking":false}} ; high/max: reasoning_effort high|max).
+command: |
+  vllm serve 0xSero/DeepSeek-V4-Flash-0731-REAP \
+      --served-model-name deepseek-v4-flash-0731-reap-k160 \
+      --host {host} \
+      --port {port} \
+      --trust-remote-code \
+      --tensor-parallel-size {tensor_parallel} \
+      --pipeline-parallel-size 1 \
+      --kv-cache-dtype {kv_cache_type} \
+      --block-size 256 \
+      --max-model-len {max_model_len} \
+      --max-num-seqs {max_num_seqs} \
+      --max-num-batched-tokens {max_num_batched_tokens} \
+      --max-cudagraph-capture-size {max_cudagraph_capture_size} \
+      --gpu-memory-utilization {gpu_memory_utilization} \
+      --enable-prefix-caching \
+      --enable-prompt-tokens-details \
+      --async-scheduling \
+      --enable-chunked-prefill \
+      --speculative-config '{{"method":"dspark","num_speculative_tokens":{num_speculative_tokens},"draft_sample_method":"greedy"}}' \
+      --tokenizer-mode deepseek_v4 \
+      --moe-backend flashinfer_b12x \
+      --tool-call-parser deepseek_v4 \
+      --enable-auto-tool-choice \
+      --reasoning-parser deepseek_v4 \
+      --reasoning-config '{{"reasoning_parser":"deepseek_v4","reasoning_start_str":"<think>","reasoning_end_str":"</think>"}}' \
+      --default-chat-template-kwargs '{{"thinking":true,"reasoning_effort":"low"}}' \
+      --generation-config vllm \
+      --enable-flashinfer-autotune

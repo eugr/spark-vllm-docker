@@ -1,0 +1,86 @@
+# Recipe: Qwen3.8-Flash-Next on a single DGX Spark (GB10) — blazux MODE=nvfp4
+# End-to-end mirror of blazux/qwen3.8-Flash-DGX scripts/serve.sh (default mode):
+#   https://github.com/blazux/qwen3.8-Flash-DGX
+#
+# MODE=nvfp4: the RadixArk NVFP4 checkpoint exactly as published — routed experts
+# NVFP4, dense side layers (GDN proj, QSA q/k/v/o, shared experts) bf16. No prep.
+# ~26 tok/s decode, ~580k-token KV. Prefix caching ON (this image fixes the
+# zero-Mamba-state bug) and deterministic QSA top-k ON (temperature-0 output is
+# byte-stable). Serves the ~51B-param n-gram (PLE) table from disk via mmap.
+#
+# IMAGE: qwen38-flash-dgx — the blazux image, which is FROM the official
+# vllm/vllm-openai:qwen38-flash-next + 6 patches (PLE mmap, GB10 FLA fixes, Mamba
+# state-copy race fix, prefix-caching block_size fix, exact QSA top-k, fp8 hybrid
+# mode). run-recipe.py's build-and-copy.sh CANNOT build this (it only builds this
+# repo's own Dockerfiles) — build it directly, as 0xBakeer's setup.sh does:
+#   git clone https://github.com/blazux/qwen3.8-Flash-DGX.git
+#   docker build -t qwen38-flash-dgx qwen3.8-Flash-DGX
+# (Already built on this box from sha b6dae9f under build/qwen3.8-Flash-DGX.)
+# NOTE: an unrelated image is tagged plain `qwen38-flash-dgx` on this box (a
+# repo-built vLLM-source image WITHOUT these patches) — do not use that one.
+
+recipe_version: "1"
+name: Qwen3.8-Flash-Next - blazux nvfp4 (published checkpoint, prefix-cache + exact-topk)
+description: >-
+  vLLM serving RadixArk/Qwen3.8-Flash-Next-NVFP4 as published (bf16 side layers)
+  on one DGX Spark/GB10 via the blazux qwen38-flash-dgx image. Prefix caching and
+  deterministic QSA top-k on, MTP=2, 262k context, PLE table mmapped from disk.
+  ~26 tok/s decode, no prep required. Mirror of blazux serve.sh MODE=nvfp4.
+
+container: qwen38-flash-dgx
+model: RadixArk/Qwen3.8-Flash-Next-NVFP4
+
+cluster_only: false
+solo_only: true
+
+# blazux serve.sh defaults: SEQS=8 GPU_MEM=0.85 MTP=2 CTX=262144.
+# (serve.sh warns 0.875 OOM-killed a 300k prefill with MTP — keep the margin.)
+defaults:
+  port: 8000
+  host: 0.0.0.0
+  max_model_len: 262144
+  max_num_seqs: 16
+  gpu_memory_utilization: 0.945
+  num_speculative_tokens: 4
+
+# VLLM_QSA_EXACT_TOPK=1 -> deterministic top-k. VLLM_PLE_MMAP=1 -> n-gram table
+# from disk. KV stays bf16 (fp8 refused by QSA), set via --kv-cache-dtype auto.
+env:
+  VLLM_PLE_MMAP: "1"
+  VLLM_PLE_MMAP_WORKERS: "32"
+  VLLM_PLE_MMAP_PREWARM: "0"
+  VLLM_QSA_EXACT_TOPK: "1"
+  VLLM_USE_FLASHINFER_SAMPLER: "1"
+
+# The PLE-mmap patch mmaps the checkpoint shards directly, so --model must be a
+# local snapshot dir. Resolve the published snapshot (excluding any -fp8hybrid
+# sibling), exactly as serve.sh MODE=nvfp4 does. The PLE gather is a CPU op +
+# host->device copy: it MUST stay outside CUDA graphs (PIECEWISE, never FULL).
+# To serve WITHOUT MTP (A/B), delete the --speculative-config line and the
+# num_speculative_tokens default above.
+command: |
+  REPO_DIR="/root/.cache/huggingface/hub/models--RadixArk--Qwen3.8-Flash-Next-NVFP4"
+  SNAP_DIR="$(ls -d "$REPO_DIR"/snapshots/*/ 2>/dev/null | grep -v -- '-fp8hybrid' | head -1)"
+  if [ -z "$SNAP_DIR" ]; then
+    echo "!! checkpoint not found under $REPO_DIR — download it first (--download-only)" >&2
+    exit 1
+  fi
+  vllm serve "$SNAP_DIR" \
+      --served-model-name openai/qwen3.8-flash-next \
+      --host {host} \
+      --port {port} \
+      --load-format safetensors \
+      --max-model-len {max_model_len} \
+      --max-num-seqs {max_num_seqs} \
+      --gpu-memory-utilization {gpu_memory_utilization} \
+      --enable-prefix-caching \
+      --enable-chunked-prefill \
+      --max-num-batched-tokens 4096 \
+      -cc.cudagraph_mode=PIECEWISE \
+      -cc.splitting_ops='["vllm::unified_attention_with_output","vllm::unified_mla_attention_with_output","vllm::mamba_mixer2","vllm::mamba_mixer","vllm::short_conv","vllm::qwen3_8_flash_next_ple_short_conv","vllm::qwen3_8_flash_next_qsa_with_output","vllm::linear_attention","vllm::qwen_gdn_attention_core","vllm::qwen_gdn_attention_core_fused_norm_packed","vllm::sparse_attn_indexer","vllm::ple_mmap_lookup"]' \
+      --no-enable-flashinfer-autotune \
+      --kv-cache-dtype auto \
+      --enable-auto-tool-choice \
+      --tool-call-parser qwen3_coder \
+      --reasoning-parser qwen3 \
+      --speculative-config '{{"method":"mtp","num_speculative_tokens":{num_speculative_tokens}}}'

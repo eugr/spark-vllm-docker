@@ -1,0 +1,76 @@
+# Recipe: MiniMax-M2.7-REAP-172B-A10B-NVFP4-GB10
+# scottgl reformat of catplusplus/MiniMax-M2.7-REAP-172B-A10B-NVFP4, layout-matched
+# to saricles/MiniMax-M2.5-REAP-172B-A10B-NVFP4-GB10. NVFP4 W4A4 compressed-tensors
+# experts/attention (group_size=16), FP8 per-tensor lm_head, bfloat16 embed/norms/routers.
+# Tuned for the NVIDIA GB10 Grace Blackwell (SM 12.1) DGX Spark single node.
+#
+# Needs the minimax-m2.7-reap-nvfp4-gb10 mod, which patches:
+#   * the Humming FP8 lm_head crash on ParallelLMHead + GB10 NVML fallbacks,
+#   * the WFP8A16 kernel order (Marlin before Humming for the FP8 lm_head),
+#   * the NaN NVFP4 activation global scale on layers 60/61 of this checkpoint
+#     (failed calibration -> NaN qkv input_global_scale -> token-0 garbage).
+
+recipe_version: "1"
+name: MiniMax-M2.7-REAP-172B-NVFP4-GB10
+description: >-
+  vLLM serving scottgl/MiniMax-M2.7-REAP-172B-A10B-NVFP4-GB10 (REAP K192/256 experts,
+  NVFP4 W4A4 compressed-tensors, FP8 lm_head) on a single DGX Spark GB10 node.
+
+model: scottgl/MiniMax-M2.7-REAP-172B-A10B-NVFP4-GB10
+container: vllm-node
+
+cluster_only: false
+mods:
+  - mods/minimax-m2.7-reap-nvfp4-gb10
+
+defaults:
+  port: 8000
+  host: 0.0.0.0
+  gpu_memory_utilization: 0.95
+  max_model_len: 102400
+  max_num_seqs: 3
+  max_num_batched_tokens: 8192
+  # num_speculative_tokens: 3
+
+env:
+  VLLM_ALLOW_LONG_MAX_MODEL_LEN: "1"
+  VLLM_HTTP_TIMEOUT_KEEP_ALIVE: "10000"
+  FLASHINFER_DISABLE_VERSION_CHECK: "1"
+  TILELANG_CLEANUP_TEMP_FILES: "1"
+  DG_JIT_USE_NVRTC: "0"
+  DG_JIT_NVCC_COMPILER: "/usr/local/cuda/bin/nvcc"
+  NCCL_IB_DISABLE: "1"
+  NCCL_DEBUG: "WARN"
+  PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
+  VLLM_USE_BREAKABLE_CUDAGRAPH: "0"
+  VLLM_USE_FLASHINFER_MOE_FP4: "0"
+  HF_HUB_OFFLINE: "1"
+
+command: |
+  vllm serve scottgl/MiniMax-M2.7-REAP-172B-A10B-NVFP4-GB10 \
+    --served-model-name openai/minimax-m27-reap-nvfp4-gb10 \
+    --host {host} \
+    --port {port} \
+    --trust-remote-code \
+    --quantization compressed-tensors \
+    --tensor-parallel-size 1 \
+    --pipeline-parallel-size 1 \
+    --kv-cache-dtype fp8 \
+    --block-size 128 \
+    --max-model-len {max_model_len} \
+    --max-num-seqs {max_num_seqs} \
+    --max-num-batched-tokens {max_num_batched_tokens} \
+    --gpu-memory-utilization {gpu_memory_utilization} \
+    --distributed-executor-backend mp \
+    --load-format instanttensor \
+    --enable-chunked-prefill \
+    --async-scheduling \
+    --enable-prefix-caching \
+    --enable-auto-tool-choice \
+    --tool-call-parser minimax_m2 \
+    --reasoning-parser minimax_m2_optthink \
+    --reasoning-parser-plugin /workspace/mods/minimax-m2.7-reap-nvfp4-gb10/minimax_m2_optthink_reasoning_parser.py \
+    --default-chat-template-kwargs '{{"thinking":true}}' \
+    --default-chat-template-kwargs.reasoning_effort=high \
+    --compilation-config '{{"mode":"VLLM_COMPILE","cudagraph_mode":"FULL_AND_PIECEWISE","custom_ops":["all"]}}' \
+    --disable-access-log-for-endpoints /health,/metrics,/ping

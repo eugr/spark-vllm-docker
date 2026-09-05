@@ -1,0 +1,54 @@
+# Recipe: Laguna-S-2.1-NVFP4 + DFlash speculative decoding
+# Ported from https://github.com/MiaAI-Lab/Laguna-S-2.1-DGX-Spark-RTX-6000-PRO
+#
+# 117.6B-param MoE, NVFP4 (~71GB weights) + DFlash draft model (~2GB).
+# Upstream repo runs plain `vllm/vllm-openai:v0.25.1` docker image; here we
+# pin the same vLLM version via --vllm-ref so it builds through this repo's
+# vllm-node image instead (keeps mods/patches available).
+#
+# --max-num-seqs 4 is REQUIRED: DFlash crashes at vLLM's default of 256.
+# Do NOT add --linear-backend flashinfer_b12x (broken on 0.25.1, slower than
+# auto-selected FlashInferCutlass). Do NOT put min_p in
+# --override-generation-config (rejected under speculative decoding).
+#
+# gpu_memory_utilization 0.95 per user request — upstream recommends 0.85
+# on DGX Spark (128GB unified) for JIT/graph-capture headroom; watch for
+# OOM during first-start JIT compilation and back off if it fails.
+
+recipe_version: "1"
+name: Laguna-S-2.1-NVFP4-DFlash
+description: vLLM 0.25.1 serving poolside/Laguna-S-2.1-NVFP4 with DFlash speculative decoding on DGX Spark
+
+model: poolside/Laguna-S-2.1-NVFP4
+
+container: vllm-node
+
+build_args:
+  - --vllm-ref
+  - v0.25.1
+
+defaults:
+  port: 8000
+  host: 0.0.0.0
+  tensor_parallel: 1
+  gpu_memory_utilization: 0.95
+  max_model_len: 262144
+  max_num_seqs: 4
+
+env:
+  CUTE_DSL_ARCH: "sm_121a"
+
+command: |
+  vllm serve poolside/Laguna-S-2.1-NVFP4 \
+    --host {host} \
+    --port {port} \
+    --trust-remote-code \
+    --tensor-parallel-size {tensor_parallel} \
+    --gpu-memory-utilization {gpu_memory_utilization} \
+    --max-model-len {max_model_len} \
+    --max-num-seqs {max_num_seqs} \
+    --enable-auto-tool-choice \
+    --tool-call-parser poolside_v1 \
+    --reasoning-parser poolside_v1 \
+    --override-generation-config '{{"temperature":0.7,"top_p":0.95}}' \
+    --speculative-config '{{"model":"poolside/Laguna-S-2.1-DFlash-NVFP4","num_speculative_tokens":15,"method":"dflash"}}'
