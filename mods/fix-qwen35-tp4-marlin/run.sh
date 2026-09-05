@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # Fix Marlin TP=4 constraint for Qwen3.5-397B: in_proj_ba output_size=128 / TP=4 = 32 < min_thread_n=64
 # Solution: Replace MergedColumnParallelLinear with two ReplicatedLinear for B/A projections
 # Delivery: unified diff patches (portable across vLLM versions)

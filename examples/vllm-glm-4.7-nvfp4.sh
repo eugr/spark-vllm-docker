@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # PROFILE: Salyut1/GLM-4.7-NVFP4
 # DESCRIPTION: vLLM serving GLM-4.7-NVFP4
 # NOTE: This profile requires --apply-mod mods/fix-Salyut1-GLM-4.7-NVFP4 to fix k/v scales incompatibility
