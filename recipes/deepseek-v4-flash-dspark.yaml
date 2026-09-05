@@ -1,0 +1,84 @@
+# Recipe: DeepSeek V4 Flash — DSpark speculative decoding
+# Same as deepseek-v4-flash.yaml but with DSpark speculation instead of MTP.
+#
+# DSpark is a Markov multi-token speculation module baked into the
+# DeepSeek-V4-Flash-DSpark checkpoint (dspark_block_size 5, target layers
+# [40,41,42], markov_rank 256).
+#
+# REQUIRES a vllm-node recent enough to include the DSpark method (vLLM #46995).
+# An older/cached image errors "unknown speculative method 'dspark'" at startup —
+# rebuild from main (`build-and-copy.sh --rebuild-vllm`) or use a recent nightly.
+# The DeepSeek-V4 cute-DSL/preset fixes required to load on main (VLLM_PRESET_PRS
+# 47392 47618) are applied automatically by the main build, same as
+# deepseek-v4-flash.yaml — no manual step.
+#
+# SM120 note (DGX Spark / GB10): the DSpark draft issues a sparse-MLA decode with
+# topk=256, which FlashInfer's SM120 decode_dsv4 kernel has no compiled bucket for
+# ({128,512,1024}), so warmup crashes with `num_tokens > 64`. The bundled mod
+# `mods/fix-dspark-sm120-topk` rounds the draft's topk to a supported bucket
+# (correctness-safe — the target verifies every drafted token). Remove the mod on
+# platforms/kernels that already support topk=256.
+
+recipe_version: "1"
+name: DeepSeek-V4-Flash-DSpark
+description: vLLM serving deepseek-ai/DeepSeek-V4-Flash-DSpark (DSpark speculation) on a DGX Spark cluster
+
+# HuggingFace model to download (optional, for --download-model)
+model: deepseek-ai/DeepSeek-V4-Flash-DSpark
+
+# Container image to use
+container: vllm-node
+
+# Can only be run in a cluster
+cluster_only: true
+
+# DSpark draft topk fix for SM120 (see header)
+mods:
+  - mods/fix-dspark-sm120-topk
+
+# Default settings (can be overridden via CLI where supported)
+defaults:
+  port: 8000
+  host: 0.0.0.0
+  tensor_parallel: 2
+  # DSpark's persistent draft adds memory pressure the MTP recipe doesn't have.
+  # 0.85 / 200k loads the draft cleanly and sizes a healthy KV pool on 2x GB10;
+  # climb max_model_len from here and re-read the "GPU KV cache size" line.
+  gpu_memory_utilization: 0.85
+  max_model_len: 200000
+  block_size: 256
+  max_num_seqs: 4
+  max_num_batched_tokens: 8192
+  # DSpark requires num_speculative_tokens >= dspark_block_size (5).
+  num_speculative_tokens: 5
+
+# Environment variables
+env:
+  DG_JIT_USE_NVRTC: "0"
+  VLLM_ALLOW_LONG_MAX_MODEL_LEN: "1"
+  VLLM_USE_BREAKABLE_CUDAGRAPH: "0"
+
+# The vLLM serve command template
+command: |
+  vllm serve deepseek-ai/DeepSeek-V4-Flash-DSpark \
+      --host {host} \
+      --port {port} \
+      --trust-remote-code \
+      --tensor-parallel-size {tensor_parallel} \
+      --kv-cache-dtype fp8_ds_mla \
+      --block-size {block_size} \
+      --max-model-len {max_model_len} \
+      --max-num-seqs {max_num_seqs} \
+      --max-num-batched-tokens {max_num_batched_tokens} \
+      --gpu-memory-utilization {gpu_memory_utilization} \
+      --enable-prefix-caching \
+      --speculative-config '{{"method":"dspark","num_speculative_tokens":{num_speculative_tokens},"draft_sample_method":"probabilistic"}}' \
+      --tokenizer-mode deepseek_v4 \
+      --distributed-executor-backend ray \
+      --tool-call-parser deepseek_v4 \
+      --enable-auto-tool-choice \
+      --reasoning-parser deepseek_v4 \
+      --reasoning-config '{{"reasoning_parser":"deepseek_v4","reasoning_start_str":"","reasoning_end_str":""}}' \
+      --default-chat-template-kwargs.thinking=true \
+      --default-chat-template-kwargs.reasoning_effort=high \
+      --load-format instanttensor
