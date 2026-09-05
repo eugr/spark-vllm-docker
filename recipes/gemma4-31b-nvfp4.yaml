@@ -1,0 +1,65 @@
+# Recipe: Gemma4-31B-NVFP4
+# Gemma-4-31B-IT in NVFP4, running across a two-spark pair.
+#
+# NVFP4 config derived from nemotron-3-super-nvfp4.yaml (the only other
+# cluster-capable NVFP4 recipe in this repo): FLASHINFER_ALLREDUCE=trtllm
+# is required for NVFP4 multi-node collectives, and kv-cache-dtype fp8 +
+# fastsafetensors match the rest of the NVFP4 family.
+#
+# Gemma-specific bits (tf5 container, fix-gemma4-tool-parser mod, gemma4
+# parsers) come from gemma4-26b-a4b.yaml — the NVFP4 weights don't change
+# the model architecture, so the same gemma4 code paths apply.
+
+recipe_version: "1"
+name: Gemma4-31B-NVFP4
+description: vLLM serving Gemma4-31B-NVFP4 across a spark pair
+
+# HuggingFace model to download (optional, for --download-model)
+model: nvidia/Gemma-4-31B-IT-NVFP4
+
+# Must run across two sparks — 31B in NVFP4 still needs 2x GB10 memory
+# plus comfortable KV cache headroom.
+cluster_only: true
+
+# Gemma4 architecture requires the transformers-5 build of vllm-node.
+container: vllm-node-tf5
+
+build_args:
+  - --tf5
+
+# Gemma4 tool-parser fix (same mod the 26B-A4B recipe uses).
+mods:
+  - mods/fix-gemma4-tool-parser
+
+# Default settings (can be overridden via CLI)
+defaults:
+  port: 8000
+  host: 0.0.0.0
+  tensor_parallel: 2
+  gpu_memory_utilization: 0.75
+  max_model_len: 262144
+  max_num_batched_tokens: 8192
+
+# Environment variables — NVFP4 multi-node collectives need the
+# TensorRT-LLM allreduce backend; VLLM_ALLOW_LONG_MAX_MODEL_LEN lets us
+# push max_model_len past the model's declared ceiling if needed.
+env:
+  VLLM_FLASHINFER_ALLREDUCE_BACKEND: trtllm
+  VLLM_ALLOW_LONG_MAX_MODEL_LEN: 1
+
+# The vLLM serve command template
+command: |
+  vllm serve nvidia/Gemma-4-31B-IT-NVFP4 \
+    --port {port} \
+    --host {host} \
+    --max-model-len {max_model_len} \
+    --gpu-memory-utilization {gpu_memory_utilization} \
+    --max-num-batched-tokens {max_num_batched_tokens} \
+    --kv-cache-dtype fp8 \
+    --load-format fastsafetensors \
+    --enable-prefix-caching \
+    --enable-auto-tool-choice \
+    --tool-call-parser gemma4 \
+    --reasoning-parser gemma4 \
+    -tp {tensor_parallel} \
+    --distributed-executor-backend ray
