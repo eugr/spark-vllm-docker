@@ -606,6 +606,16 @@ RUN python3 /tmp/vllm-patches/patch_vllm_routed_experts_weight_shape.py .
 # reservations behind just before vLLM sizes and allocates KV cache blocks.
 RUN python3 /tmp/vllm-patches/patch_vllm_spark_kv_cache_cleanup.py .
 
+# Sampler._requires_logits_processing (V2 GPU model runner) checks every
+# per-request sampling feature except thinking_token_budget, so a request that
+# sets only a thinking budget (with otherwise-default sampling params) skips
+# the whole logits-processing pipeline and the budget kernel never runs: the
+# model burns the full max_tokens on reasoning and returns content: null with
+# finish_reason "length". ThinkingBudgetState itself (add_request/apply/
+# apply_staged_writes) and ReasoningConfig's marker resolution are unaffected;
+# only this gate is missing the check. Not B12X-specific.
+RUN python3 /tmp/vllm-patches/patch_vllm_thinking_budget_gate.py .
+
 
 # Prepare build requirements
 RUN --mount=type=cache,id=uv-cache,target=/root/.cache/uv \
