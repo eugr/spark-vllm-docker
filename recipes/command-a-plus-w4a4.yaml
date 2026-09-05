@@ -1,0 +1,47 @@
+# Recipe: Command-A-Plus-W4A4
+# Cohere Command A+ model with W4A4 quantization
+
+recipe_version: "1"
+name: Command-A-Plus-W4A4
+description: vLLM serving CohereLabs Command-A-Plus with W4A4 quantization
+
+# HuggingFace model to download (optional, for --download-model)
+model: CohereLabs/command-a-plus-05-2026-w4a4
+
+# Container image to use
+container: vllm-node-tf5
+
+build_args:
+  - --tf5
+
+# Mods required for Cohere tool parser
+mods:
+  - mods/fix-cohere-command-a
+
+# Default settings (can be overridden via CLI)
+defaults:
+  port: 8000
+  host: 0.0.0.0
+  tensor_parallel: 2
+  gpu_memory_utilization: 0.7
+  max_model_len: 131072
+  max_num_batched_tokens: 8192
+
+# Environment variables
+env: {}
+
+# The vLLM serve command template
+command: |
+  vllm serve CohereLabs/command-a-plus-05-2026-w4a4 \
+    --max-model-len {max_model_len} \
+    --gpu-memory-utilization {gpu_memory_utilization} \
+    --port {port} \
+    --host {host} \
+    --load-format fastsafetensors \
+    --enable-prefix-caching \
+    --enable-auto-tool-choice \
+    --tool-call-parser cohere_command4 \
+    --max-num-batched-tokens {max_num_batched_tokens} \
+    --trust-remote-code \
+    -tp {tensor_parallel} \
+    --distributed-executor-backend ray
