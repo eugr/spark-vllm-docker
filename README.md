@@ -168,6 +168,27 @@ For periodic maintenance, I recommend using a filter: `docker builder prune --fi
 
 ## CHANGELOG
 
+### 2026-09-08
+
+#### DeepSeek-V4-Flash-Vision-Exp recipe
+
+Added the cluster-only `deepseek-v4-flash-vision-exp` recipe for serving
+`deepseek-ai/DeepSeek-V4-Flash-Vision-Exp` on a dual DGX Spark cluster with
+unified vision + DSpark speculative decoding. The recipe builds the runner
+image with `--apply-vllm-pr 634` (the
+[local-inference-lab b12x vision PR](https://github.com/local-inference-lab/vllm/pull/634),
+not yet merged into `dev/jovian-judgement`) and applies the b12x runtime
+overlay + LMCache dev+5 install via the new `mods/jj-ds4-vision-deps` mod at
+container start.
+
+```bash
+./run-recipe.sh deepseek-v4-flash-vision-exp
+```
+
+Requires `vllm-node-b12x` image built with `--exp-b12x` (and the PR
+[#634](https://github.com/local-inference-lab/vllm/pull/634) bake for vision).
+See `docs/deepseek-v4-flash-vision-exp.md` for details.
+
 ### 2026-09-06
 
 #### Experimental b12x loader

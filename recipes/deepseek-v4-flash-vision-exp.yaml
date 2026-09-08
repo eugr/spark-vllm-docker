@@ -1,0 +1,125 @@
+# Recipe: DeepSeek-V4-Flash-Vision-Exp
+#
+# DeepSeek-V4-Flash-Vision-Exp (FP8) — unified serving: full-quality vision
+# (index_topk=512, rms_norm_eps=1e-20 as shipped) + DSpark speculative decoding
+# for text, on 2x DGX Spark (GB10), TP=2 over RoCE.
+# Measured 2026-09: structured 66.4 / prose 36.0 tok/s, 320K context, AEB 1.00.
+#
+# Requires the pinned vLLM fork ref dev/jovian-judgement (vLLM
+# https://github.com/local-inference-lab/vllm/pull/634 target) + b12x topk512
+# dual-cache support baked into the runner image. Since the
+# vLLM PR #634 update (2026-09-07), the vision feature is NOT merged into the
+# branch, so the image must be built with the PR #634 bake:
+#
+#   ./build-and-copy.sh --exp-b12x --rebuild-vllm \
+#       --apply-vllm-pr 634
+#
+#    applies a 10-commit / 40-file patch, verified clean 3-way apply onto
+#    dev/jovian-judgement. The branch already contains the #553/#671
+#    functionality (https://github.com/local-inference-lab/vllm/pull/553,
+#    https://github.com/local-inference-lab/vllm/pull/671) in equivalent form,
+#    so those do NOT need --apply-vllm-pr. The b12x runtime overlay
+#    (#301/#246/#306, https://github.com/local-inference-lab/b12x) and LMCache
+#    dev+5 install are applied at container start by mods/jj-ds4-vision-deps
+#    (this recipe's mods).
+#
+# Notes:
+# - --hf-overrides architectures is required: the upstream draft PR's config
+#   convertor computes the VL class, but the model loader resolves from raw
+#   hf_config.architectures (see PORTING_NOTES.md in the vLLM fork).
+# - Weights must be present in the HF cache of BOTH nodes (this stack keeps
+#   per-node copies; rsync over the cluster link beats re-downloading).
+# - Run with a custom container name via --name (e.g.
+#   ./run-recipe.sh deepseek-v4-flash-vision-exp --name vllm_dsv4f_vision).
+recipe_version: "1"
+name: DeepSeek-V4-Flash-Vision-Exp
+description: DeepSeek-V4-Flash-Vision-Exp (FP8) — unified vision + DSpark speculative decoding on 2x GB10
+
+model: deepseek-ai/DeepSeek-V4-Flash-Vision-Exp
+container: vllm-node-b12x:latest
+
+# build_args are passed to build-and-copy.sh. Only PR #634 needs explicit
+# --apply-vllm-pr: the dev/jovian-judgement branch already contains the
+# #553/#671 functionality (verified identical code) and the b12x overlay /
+# LMCache dev+5 install happen at container start via mods/jj-ds4-vision-deps.
+# The corresponding PRs are:
+#   https://github.com/local-inference-lab/vllm/pull/634
+#   https://github.com/local-inference-lab/vllm/pull/553
+#   https://github.com/local-inference-lab/vllm/pull/671
+build_args:
+  - --exp-b12x
+  - --rebuild-vllm
+  - --apply-vllm-pr
+  - "634"
+
+cluster_only: true
+
+mods:
+  - mods/instanttensor-hybrid-draft-loader
+  - mods/jj-ds4-vision-deps
+
+defaults:
+  port: 8000
+  host: 0.0.0.0
+  tensor_parallel: 2
+  gpu_memory_utilization: 0.87  # includes the 3-layer MTP draft; 0.80 leaves too little KV
+  max_model_len: auto
+  block_size: 256
+  max_num_seqs: 8
+  max_num_batched_tokens: 8192
+  max_cudagraph_capture_size: 48
+  num_speculative_tokens: 6   # must be a multiple of 3 (n_predict=3) and >=5 (dspark block); 9 measured worse
+
+env:
+  CUTE_DSL_ARCH: "sm_121a"
+  VLLM_USE_AOT_COMPILE: "1"
+  VLLM_USE_BREAKABLE_CUDAGRAPH: "0"
+  VLLM_USE_MEGA_AOT_ARTIFACT: "1"
+  VLLM_MEMORY_PROFILE_INCLUDE_ATTN: "1"
+  VLLM_USE_FLASHINFER_SAMPLER: "1"
+  VLLM_USE_B12X_WO_PROJECTION: "1"
+  VLLM_USE_B12X_MHC: "1"  # fused mHC; requires the b12x branch (arbitrary rms/hc eps support)
+  VLLM_USE_B12X_FP8_GEMM: "1"
+  VLLM_USE_B12X_MOE: "1"
+  VLLM_USE_B12X_SPARSE_INDEXER: "1"
+  VLLM_USE_V2_MODEL_RUNNER: "1"
+  VLLM_MOE_SKIP_PADDING: "0"
+  B12X_MLA_SM120_UNIFIED: "1"
+  B12X_MOE_FORCE_A8: "1"
+  # log_outputs() is logger.info, so INFO is enough for output logging.
+  # Set to DEBUG to also log the rendered prompt (log_inputs is DEBUG-gated) --
+  # useful for confirming residual DSML is contaminating the next turn's context.
+  VLLM_LOGGING_LEVEL: "INFO"
+
+command: |
+  vllm serve deepseek-ai/DeepSeek-V4-Flash-Vision-Exp \
+      --host {host} \
+      --port {port} \
+      --trust-remote-code \
+      --tensor-parallel-size {tensor_parallel} \
+      --kv-cache-dtype fp8 \
+      --block-size {block_size} \
+      --max-model-len {max_model_len} \
+      --max-num-seqs {max_num_seqs} \
+      --max-num-batched-tokens {max_num_batched_tokens} \
+      --gpu-memory-utilization {gpu_memory_utilization} \
+      --enable-prefix-caching \
+      --limit-mm-per-prompt '{{"image":4}}' \
+      --hf-overrides '{{"architectures":["DeepseekV4ForConditionalGeneration"]}}' \
+      --tokenizer-mode deepseek_v4 \
+      --tool-call-parser deepseek_v4 \
+      --enable-auto-tool-choice \
+      --reasoning-parser deepseek_v4 \
+      --reasoning-config '{{"reasoning_parser":"deepseek_v4","reasoning_start_str":"","reasoning_end_str":""}}' \
+      --default-chat-template-kwargs.thinking=true \
+      --default-chat-template-kwargs.reasoning_effort=high \
+      --load-format instanttensor \
+      --moe-backend b12x \
+      --linear-backend b12x \
+      --attention-backend B12X \
+      --max-cudagraph-capture-size {max_cudagraph_capture_size} \
+      --compilation-config '{{"cudagraph_mode":"FULL_AND_PIECEWISE","custom_ops":["all"]}}' \
+      --speculative-config '{{"method":"dspark","num_speculative_tokens":{num_speculative_tokens},"draft_sample_method":"probabilistic","attention_backend":"B12X"}}'\
+      --enable-log-requests \
+      --enable-log-outputs \
+      --no-enable-log-deltas
