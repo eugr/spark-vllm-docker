@@ -280,7 +280,7 @@ ib_write_bw -d rocep1s0f1 --report_gbits -q 4 -R --force-link IB
 Then run on `spark`:
 
 ```bash
-$ ib_write_bw 192.168.177.12 -d rocep1s0f1 --report_gbits -q 4 -R --force-link IB
+ib_write_bw 192.168.177.12 -d rocep1s0f1 --report_gbits -q 4 -R --force-link IB
 ```
 
 ```
