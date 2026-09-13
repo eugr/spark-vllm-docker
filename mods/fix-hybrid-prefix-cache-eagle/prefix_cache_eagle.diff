@@ -1,0 +1,113 @@
+--- vllm/v1/core/sched/scheduler.py
++++ vllm/v1/core/sched/scheduler.py
+@@ -332,6 +332,21 @@
+             and self.hash_block_size < self.block_size
+             and self.kv_cache_manager.coordinator.enable_partial_hash_hits
+         )
++        # PCFIX: with an eagle-family drafter, the reconciled prefix hit lands
++        # one hash unit BELOW the prompt's last hash boundary (the eagle drop),
++        # so the deliberately-split step must end there instead — otherwise the
++        # mamba tail state registers 16 tokens above the only position the
++        # coordinator will ever ask for, and every lookup collapses to zero.
++        spec = self.vllm_config.speculative_config
++        self.mamba_tail_eagle_shift = (
++            self.hash_block_size
++            if (
++                self.mamba_partial_cache_hit
++                and spec is not None
++                and spec.use_eagle()
++            )
++            else 0
++        )
+ 
+         # Counts of non-empty steps scheduled / processed. update_from_output
+         # is called once per scheduled step in FIFO order, so these stay in sync.
+@@ -401,7 +416,13 @@
+         # The last block-aligned position whose state can be cached. With
+         # Eagle, FullAttn prunes the last matching block, so back off one
+         # block to avoid a Mamba cache miss.
+-        last_cache_position = request.num_tokens - request.num_tokens % block_size
++        # PCFIX: (n-1)-based to match the finder, whose search caps at
++        # num_tokens - 1. n-based flooring differs exactly when the length is
++        # block-aligned, leaving the state one block above the only position
++        # the coordinator will ask for.
++        last_cache_position = (request.num_tokens - 1) - (
++            (request.num_tokens - 1) % block_size
++        )
+         if self.use_eagle:
+             last_cache_position = max(last_cache_position - block_size, 0)
+ 
+@@ -421,8 +442,14 @@
+                 end = aligned_end
+ 
+         next_block_boundary = (start // block_size + 1) * block_size
++        # PCFIX: (n-1)-based, matching max_cache_hit_length = num_prompt - 1
++        # and reachable_boundaries — an n-based boundary is unreachable when
++        # the prompt length is exactly hash-aligned (the finder caps at n-1).
+         tail_boundary = (
+-            request.num_prompt_tokens // self.hash_block_size * self.hash_block_size
++            (request.num_prompt_tokens - 1)
++            // self.hash_block_size
++            * self.hash_block_size
++            - self.mamba_tail_eagle_shift
+             if self.mamba_partial_cache_hit
+             else 0
+         )
+--- vllm/v1/core/single_type_kv_cache_manager.py
++++ vllm/v1/core/single_type_kv_cache_manager.py
+@@ -802,7 +802,11 @@
+         block are intentionally skipped.
+         """
+         hash_block_size = self.block_pool.hash_block_size
+-        boundary_tokens = request.num_prompt_tokens // hash_block_size * hash_block_size
++        # PCFIX: (n-1)-based — the finder's search caps at num_prompt - 1, so an
++        # n-based tail is unreachable exactly when the prompt is hash-aligned.
++        boundary_tokens = (
++            (request.num_prompt_tokens - 1) // hash_block_size * hash_block_size
++        )
+         if boundary_tokens == 0 or boundary_tokens > num_tokens:
+             return
+         if boundary_tokens % self.block_size == 0:
+@@ -1057,6 +1061,25 @@
+                 end = aligned // block_size + shift
+                 for j in range(max(start_block, end - need), min(end_block, end)):
+                     mask[j - start_block] = True
++                # PCFIX: the coordinator reconciles hits at HASH granularity
++                # when fine-grained partial hits are on, and the eagle drop
++                # lands one unit below the fine tail. The alignment-floored
++                # tail above (scheduler-block granularity) can sit a whole
++                # segment below where mamba's fine tail entry lives, leaving
++                # no boundary at which every group has state. Also retain the
++                # need-block tail ending at the fine, eagle-shifted boundary.
++                # SWA block_size equals the hash unit on these hybrids, so
++                # block_size flooring IS fine flooring.
++                fine = boundary_tokens // block_size * block_size
++                if use_eagle:
++                    fine -= block_size
++                fine_end = fine // block_size + shift
++                if fine_end != end:
++                    for j in range(
++                        max(start_block, fine_end - need),
++                        min(end_block, fine_end),
++                    ):
++                        mask[j - start_block] = True
+ 
+         return mask
+ 
+@@ -1728,9 +1751,15 @@
+             return None
+         if num_tokens % hash_block_size != 0:
+             return None
++        # PCFIX: (n-1)-based — see the scheduler's tail_boundary comment.
+         latest_prompt_hash_boundary = (
+-            request.num_prompt_tokens // hash_block_size
++            (request.num_prompt_tokens - 1) // hash_block_size
+         ) * hash_block_size
++        # PCFIX: mirror the scheduler's eagle shift — the reconciled hit sits
++        # one hash unit below the tail when an eagle-family drafter drops a
++        # unit, so the registered state must too.
++        if self.use_eagle:
++            latest_prompt_hash_boundary -= hash_block_size
+         if num_tokens != latest_prompt_hash_boundary:
+             return None
+ 
