@@ -28,6 +28,8 @@ defaults:
   max_model_len: 262144
   max_num_seqs: 2
   max_num_batched_tokens: 16384
+  # JSON-valued args live here whole: the renderer can't substitute inside JSON braces
+  speculative_config: '{"method":"mtp","num_speculative_tokens":4,"moe_backend":"triton","attention_backend":"TRITON_ATTN"}'
 
 command: |
   vllm serve nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-NVFP4 \
@@ -54,7 +56,7 @@ command: |
     -cc.mode 0 \
     -cc.cudagraph_mode FULL_DECODE_ONLY \
     --cudagraph-capture-sizes 5 10 15 20 \
-    --speculative-config '{{"method":"mtp","num_speculative_tokens":4,"moe_backend":"triton","attention_backend":"TRITON_ATTN"}}' \
+    --speculative-config '{speculative_config}' \
     --enable-prefix-caching \
     --enable-flashinfer-autotune \
     --reasoning-parser nemotron_v3 \
