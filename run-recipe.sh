@@ -28,15 +28,36 @@ if [[ "$PY_MAJOR" -lt 3 ]] || [[ "$PY_MAJOR" -eq 3 && "$PY_MINOR" -lt 10 ]]; the
     exit 1
 fi
 
-# Check for PyYAML and install if missing
-if ! $PYTHON -c "import yaml" 2>/dev/null; then
-    echo "Installing PyYAML..."
-    $PYTHON -m pip install --quiet pyyaml
-    if [[ $? -ne 0 ]]; then
-        echo "Error: Failed to install PyYAML. Try: pip install pyyaml"
-        exit 1
+# Check for PyYAML. Keep wrapper-only dependencies in a virtual environment
+# instead of modifying an externally managed Homebrew/system Python (PEP 668).
+if ! "$PYTHON" -c "import yaml" 2>/dev/null; then
+    VENV_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/spark-vllm-docker/run-recipe-venv-py${PY_MAJOR}.${PY_MINOR}"
+    VENV_PYTHON="$VENV_DIR/bin/python"
+    PYTHON_ID=$("$PYTHON" -c 'import os, sys; print(os.path.realpath(sys.executable))')
+    VENV_PYTHON_ID=""
+
+    if [[ -x "$VENV_PYTHON" ]]; then
+        VENV_PYTHON_ID=$("$VENV_PYTHON" -c 'import os, sys; print(os.path.realpath(sys._base_executable))' 2>/dev/null || true)
     fi
+
+    if [[ "$VENV_PYTHON_ID" != "$PYTHON_ID" ]]; then
+        echo "Creating an isolated Python environment..."
+        if ! "$PYTHON" -m venv --clear "$VENV_DIR"; then
+            echo "Error: Failed to create $VENV_DIR." >&2
+            exit 1
+        fi
+    fi
+
+    if ! "$VENV_PYTHON" -c "import yaml" 2>/dev/null; then
+        echo "Installing PyYAML in the isolated Python environment..."
+        if ! "$VENV_PYTHON" -m pip install --quiet pyyaml; then
+            echo "Error: Failed to install PyYAML in $VENV_DIR." >&2
+            exit 1
+        fi
+    fi
+
+    PYTHON="$VENV_PYTHON"
 fi
 
 # Run the recipe script
-exec $PYTHON "$RECIPE_SCRIPT" "$@"
+exec "$PYTHON" "$RECIPE_SCRIPT" "$@"
