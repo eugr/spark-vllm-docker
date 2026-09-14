@@ -1,0 +1,73 @@
+stack_version: "1"
+name: example-dual-stack
+description: >
+  Two NVFP4 models co-located on one DGX Spark GB10 — a 35B MoE alongside a
+  smaller single-node model. Illustrative only: tune the memory budgets and
+  load order to your actual models and hardware.
+
+# Seconds to wait for each recipe's /health before giving up (optional).
+health_timeout: 1200
+
+# Recipes are served in the order listed, and that order MUST be
+# DESCENDING memory usage: the largest model claims its slice of the unified
+# memory pool first (and fails fast if it won't fit), then the next is started
+# only after the previous one reports healthy.
+#
+# SINGLE-HOST example: run it on a machine with no cluster configured, and both
+# models load here side by side. Neither entry sets 'placement:', so both take
+# the default, 'all' -- every node available to this host. With no CLUSTER_NODES
+# that is just this one machine, exactly as if each entry had been pinned to
+# LOCAL_IP.
+#
+# On a host that DOES have a cluster configured, 'all' means what it says and
+# this stack is refused (exit 3): nemotron-3-nano-nvfp4 is solo_only and cannot
+# be sharded. To co-locate both models on one node of a cluster, pin every entry
+# with 'placement: <that node's IP>'. For a stack that genuinely spans a
+# cluster, see example-cluster-stack.yaml.
+recipes:
+  # ---- Largest first ----
+  - recipe: qwen3.6-35b-a3b-nvfp4
+    container_name: qwen_nvfp4     # Docker --name; must be unique across the stack
+    port: 8000                     # served on http://host:8000
+    gpu_mem: 0.45                  # fraction of unified memory (run-recipe.py --gpu-mem); recipe default is 0.4
+    # extra_args are passed to vLLM (after run-recipe's `--`). --load-format
+    # instanttensor slashes the PEAK memory spike while weights load, which is
+    # what usually decides whether a second model still fits alongside the first.
+    extra_args: ["--load-format", "instanttensor"]
+
+  # ---- Smaller second ----
+  - recipe: nemotron-3-nano-nvfp4
+    container_name: nemotron_nano
+    port: 8001                     # served on http://host:8001
+    gpu_mem: 0.40                  # recipe default is 0.7 — must be lowered to fit beside the first model
+    extra_args: ["--load-format", "instanttensor"]
+    # Extra bind mounts for this entry only (Docker -v host:container[:options]).
+    # A relative host path is resolved against the repo root; a bare token with
+    # no '/' stays a named Docker volume. NOTE: paths are resolved on THIS
+    # machine but mounted on the placement node, and an entry with placement
+    # 'all' mounts on EVERY node it runs on -- so prefer absolute paths and make
+    # sure they exist there, or docker silently mounts an empty root-owned dir.
+    # volumes: ["/srv/models:/models:ro"]
+
+# The two gpu_mem fractions above sum to 0.85, leaving headroom for CUDA
+# context and non-torch allocations on the shared 128 GB pool.
+#
+# ----------------------------------------------------------------------------
+# PREFERRED for stacking: absolute GiB budgets compose more predictably than
+# fractions-of-total. Add the gpu-mem-util-gb mod (which patches vLLM to accept
+# --gpu-memory-utilization-gb) and pass the flag via extra_args. Every vLLM flag
+# for one entry goes in the SAME extra_args list, so combine it with the
+# load-format override above, e.g.:
+#
+#   - recipe: qwen3.6-35b-a3b-nvfp4
+#     container_name: qwen_nvfp4
+#     port: 8000
+#     mods: [mods/gpu-mem-util-gb]
+#     extra_args: ["--load-format", "instanttensor", "--gpu-memory-utilization-gb", "60"]
+#
+#   - recipe: nemotron-3-nano-nvfp4
+#     container_name: nemotron_nano
+#     port: 8001
+#     mods: [mods/gpu-mem-util-gb]
+#     extra_args: ["--load-format", "instanttensor", "--gpu-memory-utilization-gb", "40"]
+# ----------------------------------------------------------------------------
