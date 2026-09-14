@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 set -e
 
 cd /usr/local/lib/python3.12/dist-packages

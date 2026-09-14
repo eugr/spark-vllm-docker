@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 set -e
 
 # NGC vLLM mod: container initialization is now handled by launch-cluster.sh

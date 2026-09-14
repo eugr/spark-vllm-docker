@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 #
 # run-recipe.sh - Wrapper for run-recipe.py
 #
