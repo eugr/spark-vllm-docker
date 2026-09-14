@@ -1,0 +1,119 @@
+# Recipe: Qwen3.8-Flash-Next NVFP4 on a single DGX Spark (GB10) — PLE mmap
+# Ports blazux/qwen3.8-Flash-DGX: https://github.com/blazux/qwen3.8-Flash-DGX
+#
+# Uses the official vllm/vllm-openai:qwen38-flash-next image directly (already
+# local, no build/pull needed) and applies the repo's PLE-mmap patch at
+# container start via mods/qwen38-flash-dgx-ple-mmap, instead of baking a
+# separate derivative image. Serves the ~51B-param n-gram ("PLE") table from
+# disk via mmap (VLLM_PLE_MMAP=1) instead of keeping it resident in the
+# 128 GB unified pool. Weights drop from ~122 GiB to ~76 GiB, leaving room
+# for a real KV cache.
+#
+# NOTE: vllm-node (the standard runner image) does NOT have this arch
+# (qwen3_8_flash_next) — it must be vllm/vllm-openai:qwen38-flash-next.
+#
+# Container is --privileged by default, so shm defaults to the host's. If you
+# add --non-privileged, also pass --shm-size-gb 64 (blazux's own docker run
+# uses --shm-size 16g; 64 matches this repo's own --non-privileged default
+# and gives more headroom for the PLE mmap gather's worker threads).
+#
+# VARIANT: 3 concurrent requests at 65k ctx, bf16 KV (NOT fp8), MTP=3.
+# fp8 KV cache is NOT supported for this arch: Qwen3.8-Flash-Next's QSA
+# attention kernel hard-raises NotImplementedError("... requires a BF16
+# main KV cache") if kv_cache_dtype != auto/bf16 (confirmed by an actual
+# boot). --kv-cache-dtype fp8 has been removed from the command below.
+#
+# Measured baseline (bf16 KV, util 0.78, ctx 32768): weights+non-torch
+# 82.34 GiB, activation 1.78 GiB, CUDA graph 0.36 GiB = 84.48 GiB fixed
+# overhead; KV got 10.75 GiB -> 252,506 tokens (23,489 tok/GiB, bf16).
+# At util 0.87: budget 105.82 GiB - 84.48 GiB fixed = 21.34 GiB KV
+#   -> ~501,300 tokens capacity vs 3 x 65,000 = 195,000 needed.
+#   ~306,300 tokens (~157%) of headroom -- lots of slack at this ctx/seqs.
+#   Confirm the real number with an actual boot.
+
+recipe_version: "1"
+name: Qwen3.8-Flash-Next-NVFP4 - PLE mmap 3x65k MTP3 (blazux/qwen3.8-Flash-DGX)
+description: >-
+  vLLM serving RadixArk/Qwen3.8-Flash-Next-NVFP4 on one DGX Spark/GB10 on the
+  official vllm/vllm-openai:qwen38-flash-next image with blazux's PLE-mmap
+  patch applied as a mod, bf16 KV cache (fp8 unsupported by this arch), and
+  gpu_memory_utilization 0.87 tuned for 3 concurrent requests at 65k
+  context, MTP=3 speculative decoding. Serves the ~44 GiB n-gram/PLE
+  embedding table from NVMe via mmap instead of resident memory, so the
+  122 GiB NVFP4 checkpoint fits next to a usable KV cache in the 128 GB
+  unified pool.
+
+container: vllm/vllm-openai:qwen38-flash-next
+model: RadixArk/Qwen3.8-Flash-Next-NVFP4
+
+mods:
+  - mods/qwen38-flash-dgx-ple-mmap
+
+cluster_only: false
+solo_only: true   # PLE-mmap patch and env are tuned for a single GB10 box
+
+defaults:
+  port: 8000
+  host: 0.0.0.0
+  max_model_len: 262144           # 3x65k = 195,000 tokens; well under ~501,300 tok cap at util 0.87
+  max_num_seqs: 4
+  gpu_memory_utilization: 0.94   # bf16 KV only; fp8 unsupported by this arch's QSA attention kernel
+  num_speculative_tokens: 7      # model's own MTP head; MTP=5
+
+# VLLM_PLE_MMAP=1 turns on the mmap patch (no-op otherwise, same behavior as
+# stock upstream). Workers/prewarm tune the mmap gather; see repo README.
+env:
+  VLLM_PLE_MMAP: "1"
+  VLLM_PLE_MMAP_WORKERS: "10"
+  VLLM_PLE_MMAP_PREWARM: "0"   # 1 streams the 48 GiB table once at boot (~10s extra startup)
+  VLLM_USE_FLASHINFER_SAMPLER: "1"
+
+# The PLE-mmap patch checks that --model is a local directory (it mmaps the
+# checkpoint's model-plefp8-*.safetensors shards directly) and errors on a
+# bare HF repo id, so the command below resolves the downloaded snapshot dir
+# itself, exactly like blazux's own scripts/serve.sh does.
+#
+# The PLE gather is a CPU op + pageable host->device copy: it MUST run outside
+# CUDA graphs, hence the splitting ops under PIECEWISE capture (never FULL*).
+# MTP speculative decoding (the model's own MTP head) is on by default via
+# num_speculative_tokens above. To serve WITHOUT MTP, delete the
+# --speculative-config line below (and num_speculative_tokens in defaults).
+#
+# --block-size 1632 is REQUIRED for --enable-prefix-caching + MTP together.
+# This model's QSA kernel needs attention block_size % capacity == 0, where
+# capacity = indexer_compress_ratio * ceil((indexer_compress_ratio +
+# num_speculative_tokens) / indexer_compress_ratio). Checkpoint's
+# indexer_compress_ratio is 4 (config.json). At num_speculative_tokens=5:
+# span=4+5=9, capacity=4*ceil(9/4)=4*3=12. vLLM's auto block size (computed
+# from mamba-page alignment, ~1616-1620 depending on config) is NOT a
+# multiple of 12, so prefix caching + MTP crashes at KV cache init with
+# "QSA ring capacity N must divide the attention block size M" unless
+# --block-size is forced to a multiple of the capacity. 1632 = 12*136,
+# comfortably above the mamba-alignment floor. If num_speculative_tokens
+# changes, recompute capacity and re-pick a block-size multiple of it.
+command: |
+  REPO_DIR="/root/.cache/huggingface/hub/models--RadixArk--Qwen3.8-Flash-Next-NVFP4"
+  SNAP_DIR="$(ls -d "$REPO_DIR"/snapshots/*/ 2>/dev/null | head -1)"
+  if [ -z "$SNAP_DIR" ]; then
+    echo "!! checkpoint not found under $REPO_DIR — download it first (--download-only)" >&2
+    exit 1
+  fi
+  vllm serve "$SNAP_DIR" \
+      --served-model-name qwen/qwen3.8-flash-next \
+      --host {host} \
+      --port {port} \
+      --load-format safetensors \
+      --max-model-len {max_model_len} \
+      --max-num-seqs {max_num_seqs} \
+      --gpu-memory-utilization {gpu_memory_utilization} \
+      --enable-prefix-caching \
+      --block-size 1632 \
+      --enable-chunked-prefill \
+      --max-num-batched-tokens 2048 \
+      -cc.cudagraph_mode=PIECEWISE \
+      -cc.splitting_ops='["vllm::unified_attention_with_output","vllm::unified_mla_attention_with_output","vllm::mamba_mixer2","vllm::mamba_mixer","vllm::short_conv","vllm::qwen3_8_flash_next_ple_short_conv","vllm::qwen3_8_flash_next_qsa_with_output","vllm::linear_attention","vllm::qwen_gdn_attention_core","vllm::qwen_gdn_attention_core_fused_norm_packed","vllm::sparse_attn_indexer","vllm::ple_mmap_lookup"]' \
+      --no-enable-flashinfer-autotune \
+      --enable-auto-tool-choice \
+      --tool-call-parser qwen3_xml \
+      --reasoning-parser qwen3 \
+      --speculative-config '{{"method":"mtp","num_speculative_tokens":{num_speculative_tokens}}}'

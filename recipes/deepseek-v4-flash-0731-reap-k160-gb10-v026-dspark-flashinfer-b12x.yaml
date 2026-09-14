@@ -1,0 +1,124 @@
+# Recipe: DeepSeek-V4-Flash-0731 REAP K160 on GB10 — vLLM v0.26.0, DSpark
+# speculative, native B12X_MLA_SPARSE attention + b12x MoE + b12x linear
+#
+# DSpark sibling of deepseek-v4-flash-0731-reap-k160-gb10-v026-mtp.yaml —
+# see deepseek-v4-flash-0731-reap-k160-gb10-v026-dspark-mod-marlin.yaml
+# (this recipe's blueprint) for the full DSpark/nvfp4_ds_mla/pristine-image
+# background. Same container, same mods/deepseek-v4-reap-gb10-v026-dspark
+# base mod. The only change: MoE backend is no longer pinned to Marlin —
+# it's swapped for this box's real, working B12X_MLA_SPARSE attention +
+# b12x MoE + b12x linear kernels via the extra mods/b12x-native-backend mod.
+#
+# Where these kernels came from: local-inference-lab/vllm commit 3003860
+# (the fork built into ghcr.io/0xsero/deepseek-v4-flash-0731-spark-sparkinfer)
+# has native, first-class support for all three — vllm/config/kernel.py
+# there defines real Literal["...","b12x",...] types for MoEBackend and
+# LinearBackend (distinct from "flashinfer_b12x", a different, FlashInfer-
+# native kernel already present in pristine v0.26.0 too), and
+# v1/attention/backends/registry.py registers
+# B12X_MLA_SPARSE -> B12xMLASparseBackend (v1/attention/backends/mla/
+# b12x_mla_sparse.py). mods/b12x-native-backend overlays those files (plus
+# b12x_attn.py, b12x_moe.py, b12x_ep_moe.py, and the mxfp4/nvfp4/scaled_mm
+# linear kernel files) onto pristine v0.26.0 as-is, and patches registry.py
+# + config/kernel.py's two Literals to wire them in (oracle/mxfp4.py and
+# kernels/linear/__init__.py are wholesale-replaced, not hand-patched — the
+# fork's real B12X wiring touches each at 6-8+ sites, well past what a
+# couple of surgical text edits can safely express; diff against pristine
+# is small and purely additive in both, +115 / +56 lines).
+#
+# Import path difference from the fork: those files call SparkInfer
+# (sparkinfer.attention.*, sparkinfer.moe.*, sparkinfer.gemm.*) — a
+# same-org, same-API sibling of the public
+# https://github.com/local-inference-lab/b12x package. Every `sparkinfer.`
+# import in the overlaid files has been mechanically rewritten to `b12x.`
+# (verified the module layout and call signatures match: b12x.moe.fused_moe/
+# ep_moe expose the same Caps/plan/run/prepare_expert_map,
+# b12x.gemm.blockscaled/block_fp8_linear/tensor_fp8_linear and
+# b12x._lib.intrinsics exist at the same paths) so this mod depends on
+# `pip install b12x` (done in the mod's own run.sh), not SparkInfer.
+# None of the overlaid files touch b12x.integration — unlike the OTHER
+# DSpark overlay file (dspark_overlay/vllm/model_executor/layers/
+# fused_moe/experts/b12x_mxfp4_moe.py, from vllm-starter, still present in
+# the base DSpark mod but NOT reachable by this recipe since --moe-backend
+# is b12x not the old dormant wiring) which imports the nonexistent private
+# `b12x.integration.tp_moe` — that one is dead code, unrelated to this mod.
+#
+# Not yet run end-to-end on real hardware — patches/compiles clean and
+# every cross-referenced module path was confirmed to exist in both the
+# fork and the public b12x package, but nothing beyond that has been
+# verified (no load, no forward pass, no generation).
+
+recipe_version: "1"
+name: DeepSeek-V4-Flash-0731-REAP-K160-GB10-v026-DSpark-B12X-MLA-Sparse
+description: >-
+  vLLM v0.26.0 serving 0xSero/DeepSeek-V4-Flash-0731-REAP (REAP K160, MXFP4
+  experts) on a single DGX Spark GB10 node, with DSpark speculative decoding
+  (nvfp4_ds_mla KV cache) ported from vllm-starter, and native
+  B12X_MLA_SPARSE attention + b12x MoE + b12x linear kernels ported from
+  local-inference-lab/vllm onto the real public b12x package.
+
+model: 0xSero/DeepSeek-V4-Flash-0731-REAP
+model_revision: ddc04540efda3d2a0788b129f1fad828ddc19b60
+container: vllm/vllm-openai:v0.26.0
+
+mods:
+  - mods/deepseek-v4-reap-gb10-v026-dspark
+
+defaults:
+  port: 8000
+  host: 0.0.0.0
+  gpu_memory_utilization: 0.9425
+  max_model_len: 262144
+  max_num_seqs: 2
+  max_num_batched_tokens: 4104
+  num_speculative_tokens: 7
+
+env:
+  VLLM_ALLOW_LONG_MAX_MODEL_LEN: "1"
+  VLLM_HTTP_TIMEOUT_KEEP_ALIVE: "10000"
+  FLASHINFER_DISABLE_VERSION_CHECK: "1"
+  TILELANG_CLEANUP_TEMP_FILES: "1"
+  DG_JIT_USE_NVRTC: "0"
+  DG_JIT_NVCC_COMPILER: "/usr/local/cuda/bin/nvcc"
+  NCCL_IB_DISABLE: "1"
+  NCCL_DEBUG: "WARN"
+  K160_DISABLE_CUTEDSL: "0"
+  CUTEDSL_VERSION: ""
+  PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
+  VLLM_USE_FLASHINFER_SAMPLER: "1"
+  VLLM_SPARSE_INDEXER_MAX_LOGITS_MB: "256"
+  VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS: "0"
+
+command: |
+  vllm serve 0xSero/DeepSeek-V4-Flash-0731-REAP \
+    --revision ddc04540efda3d2a0788b129f1fad828ddc19b60 \
+    --served-model-name deepseek-v4-flash-0731-REAP-K160-dspark-flashinfer-cutlass \
+    --host {host} \
+    --port {port} \
+    --trust-remote-code \
+    --tensor-parallel-size 1 \
+    --pipeline-parallel-size 1 \
+    --moe-backend flashinfer_cutlass \
+    --kv-cache-dtype fp8_ds_mla \
+    --block-size 256 \
+    --max-model-len {max_model_len} \
+    --max-num-seqs {max_num_seqs} \
+    --max-num-batched-tokens {max_num_batched_tokens} \
+    --gpu-memory-utilization {gpu_memory_utilization} \
+    --distributed-executor-backend mp \
+    --tokenizer-mode deepseek_v4 \
+    --load-format safetensors \
+    --enable-chunked-prefill \
+    --async-scheduling \
+    --enable-prefix-caching \
+    --tool-call-parser deepseek_v4 \
+    --enable-auto-tool-choice \
+    --reasoning-parser deepseek_v4 \
+    --reasoning-config '{{"reasoning_parser":"deepseek_v4","reasoning_start_str":"<think>","reasoning_end_str":"</think>"}}' \
+    --default-chat-template-kwargs '{{"thinking":true}}' \
+    --default-chat-template-kwargs.reasoning_effort=low \
+    --compilation-config '{{"cudagraph_mode":"FULL_AND_PIECEWISE","custom_ops":["all"]}}' \
+    --speculative-config '{{"method":"dspark","num_speculative_tokens":{num_speculative_tokens},"draft_sample_method":"greedy"}}' \
+    --generation-config vllm \
+    --enable-flashinfer-autotune \
+    --disable-access-log-for-endpoints /health,/metrics,/ping

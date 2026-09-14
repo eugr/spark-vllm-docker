@@ -1,0 +1,61 @@
+# Recipe: Qwen3.8-Flash-Next NVFP4 on a single DGX Spark (GB10)
+# Uses the OFFICIAL vLLM image vllm/vllm-openai:qwen38-flash-next, which is the
+# only supported way to serve this model (per recipes.vllm.ai/Qwen/Qwen3.8-Flash-Next;
+# PyPI/source builds are unsupported and the qwen4_exp arch needs vLLM >= 0.28.0).
+#
+# Command follows the page's "N-gram Embedding CPU Offload" variant, adapted to a
+# single Spark: TP=1, the RadixArk NVFP4 checkpoint, 4 concurrent
+# @ 256K, and native MTP speculative decoding.
+#
+# Model facts (HF config.json): arch Qwen4ExpForConditionalGeneration / qwen4_exp,
+# NVFP4 (modelopt), 48 layers, 512 experts / top-10, hybrid linear+full attention,
+# 51B N-gram (PLE) embeddings, native 262144 ctx, MTP layers present.
+
+recipe_version: "1"
+name: Qwen3.8-Flash-Next-NVFP4 - single Spark (GB10), official vLLM image + MTP
+description: >-
+  vLLM serving RadixArk/Qwen3.8-Flash-Next-NVFP4 on one DGX Spark/GB10 using the
+  official vllm/vllm-openai:qwen38-flash-next image, TP=1, fp8 KV cache, 4
+  concurrent @ 256K, native MTP speculative decoding. Command per
+  recipes.vllm.ai/Qwen/Qwen3.8-Flash-Next (N-gram CPU-offload variant).
+
+container: vllm/vllm-openai:qwen38-flash-next
+model: RadixArk/Qwen3.8-Flash-Next-NVFP4
+
+cluster_only: false
+solo_only: false
+
+defaults:
+  port: 8000
+  host: 0.0.0.0
+  tensor_parallel: 1
+  gpu_memory_utilization: 0.90    # page uses 0.90; drop if KV OOM at load
+  max_model_len: 262144           # native context
+  max_num_seqs: 4                 # 4 concurrent requests
+  num_speculative_tokens: 3       # page MTP default
+
+# Per the vLLM page. The 51B N-gram (PLE) table stays in host memory and is
+# async-prefetched instead of occupying the CUDA allocator; keeps it out of the
+# gpu-memory-utilization budget (@TheDavidTai,
+# x.com/TheDavidTai/status/2092597690827669753).
+env:
+  VLLM_PLE_CPU_OFFLOAD: "1"
+  VLLM_ALLOW_LONG_MAX_MODEL_LEN: "1"
+
+# NOTE: literal JSON braces are doubled for str.format(). To serve WITHOUT MTP,
+# delete the --speculative-config line (and num_speculative_tokens above).
+command: |
+  vllm serve RadixArk/Qwen3.8-Flash-Next-NVFP4 \
+      --served-model-name qwen3.8-flash-next \
+      --host {host} \
+      --port {port} \
+      --tensor-parallel-size {tensor_parallel} \
+      --gpu-memory-utilization {gpu_memory_utilization} \
+      --max-model-len {max_model_len} \
+      --max-num-seqs {max_num_seqs} \
+      --enable-prefix-caching \
+      --no-enable-flashinfer-autotune \
+      --speculative-config '{{"method":"mtp","num_speculative_tokens":{num_speculative_tokens}}}' \
+      --enable-auto-tool-choice \
+      --tool-call-parser qwen3_coder \
+      --reasoning-parser qwen3
