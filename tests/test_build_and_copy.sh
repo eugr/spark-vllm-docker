@@ -1379,8 +1379,8 @@ test_dockerfile_externalizes_vllm_source_patches() {
             fail "Dockerfile does not execute external patch: $patch_name"
         fi
     done
-    if [ "$patch_count" -ne 12 ]; then
-        fail "Expected 12 external vLLM patch scripts, found $patch_count"
+    if [ "$patch_count" -ne 14 ]; then
+        fail "Expected 14 external vLLM patch scripts, found $patch_count"
     fi
     if ! python3 -c '
 from pathlib import Path
@@ -1392,6 +1392,18 @@ for path in files:
         fail "An external vLLM patch script has invalid Python syntax"
     fi
     pass "Dockerfile externalizes every active vLLM source patch"
+}
+
+test_swa_block_size_patch() {
+    if ! python3 "$PROJECT_DIR/tests/test_vllm_swa_block_size_patch.py"; then
+        fail "SWA block fallback regression tests failed"
+    fi
+    local runner_block="$TMP_BASE/swa-runner-block"
+    sed -n '/^FROM .* AS runner/,$p' "$PROJECT_DIR/Dockerfile" > "$runner_block"
+    if grep -Fq 'patch_vllm_swa_block_size.py' "$runner_block"; then
+        fail "SWA fix must be applied during the vLLM source build, not in the runner"
+    fi
+    pass "SWA block fallback preserves supported primary sizes and is applied only at source build"
 }
 
 test_default_uses_prebuilt
@@ -1463,5 +1475,6 @@ test_dockerfile_uses_prepared_python_for_flashinfer_builds
 test_dockerfiles_pin_tvm_ffi_regression_version
 test_dockerfile_fetches_vllm_prs_from_upstream
 test_dockerfile_externalizes_vllm_source_patches
+test_swa_block_size_patch
 
 echo "Passed $TESTS_PASSED build-and-copy tests."

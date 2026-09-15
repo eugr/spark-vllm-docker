@@ -41,6 +41,16 @@ If you want to build only the runner from precompiled vLLM and FlashInfer wheels
 
 Similarly, `--rebuild-flashinfer`, `--flashinfer-ref`, and `--apply-flashinfer-pr` control the FlashInfer build and force the local build path.
 
+Local builds include a CUDA-on-WSL memory-reporting fix in both compiled vLLM
+wheels and runners built with `--use-wheels`. On integrated NVIDIA GPUs under
+WSL, vLLM keeps CUDA's reported free memory instead of replacing it with guest
+RAM availability. Native Linux UMA accounting and proactive allocator-cache
+release keep their upstream behavior.
+
+Runtime images also set `VLLM_WSL2_ENABLE_PIN_MEMORY=1` by default. Pass
+`-e VLLM_WSL2_ENABLE_PIN_MEMORY=0` to `launch-cluster.sh` or `docker run` to opt
+out.
+
 ## QUICK START SHORTCUT
 
 If you are here to run DeepSeek V4 Flash (07/31 version), follow these instructions, otherwise skip to the next section.
@@ -167,6 +177,40 @@ Don't do it every time you rebuild, because it will slow down compilation times.
 For periodic maintenance, I recommend using a filter: `docker builder prune --filter until=72h`
 
 ## CHANGELOG
+
+### 2026-09-10
+
+#### Qwen3.8 Flash Next solo PLE disk offload
+
+The solo `qwen3.8-flash-next-nvfp4-solo` recipe now offloads PLE tables to disk
+with `VLLM_PLE_TABLE_MEMORY=disk` that allows 1M+ k/v cache allocation (the model max context size is still 262144).
+Default memory allocation is reduced to 0.8.
+
+### 2026-09-08
+
+#### Qwen3.8 Flash Next solo and dual-Spark recipes
+
+Added two recipes for serving
+`local-inference-lab/Qwen3.8-Flash-Next-NVFP4` with the B12X container. 
+
+```bash
+# Single DGX Spark
+./run-recipe.sh qwen3.8-flash-next-nvfp4-solo --solo --earlyoom --setup
+
+# Dual DGX Spark cluster
+./run-recipe.sh qwen3.8-flash-next-nvfp4-cluster --earlyoom --setup
+```
+
+#### Deepseek V4 Flash Vision Exp support
+
+B12X container now supports `deepseek-ai/DeepSeek-V4-Flash-Vision-Exp`.
+
+Run with:
+
+```bash
+./run-recipe.sh deepseek-v4-flash-vision-exp --setup
+```
+
 
 ### 2026-09-06
 

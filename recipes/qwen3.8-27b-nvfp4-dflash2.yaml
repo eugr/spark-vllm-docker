@@ -3,9 +3,9 @@
 
 recipe_version: "1"
 name: Qwen3.8-27B-NVFP4-DFlash2
-description: vLLM serving RadixArk/Qwen3.8-27B-NVFP4 with the z-lab DFlash2 draft model
+description: vLLM serving nvidia/Qwen3.8-27B-NVFP4 with the z-lab DFlash2 draft model
 
-model: RadixArk/Qwen3.8-27B-NVFP4
+model: nvidia/Qwen3.8-27B-NVFP4
 container: vllm-node
 
 cluster_only: false
@@ -22,7 +22,7 @@ defaults:
   num_speculative_tokens: 8
 
 command: |
-  vllm serve RadixArk/Qwen3.8-27B-NVFP4 \
+  vllm serve nvidia/Qwen3.8-27B-NVFP4 \
     --host {host} \
     --port {port} \
     --trust-remote-code \
