@@ -178,6 +178,20 @@ For periodic maintenance, I recommend using a filter: `docker builder prune --fi
 
 ## CHANGELOG
 
+### 2026-09-15
+
+#### No-ray head command output in the container log
+
+In no-ray multi-node runs the head command (rank 0) is now started the same way as
+the worker ranks: detached from the launcher, with its output piped to the container
+log. Previously the head command ran in the launcher foreground through a pty, so
+`docker logs vllm_node` stayed empty on the head node and the process was tied to the
+launcher terminal.
+
+The launcher still waits for the head command, streams the container log while it
+runs, returns the command's exit status, and stops the cluster afterwards, so the
+existing foreground and cleanup behavior is unchanged.
+
 ### 2026-09-10
 
 #### Qwen3.8 Flash Next solo PLE disk offload
