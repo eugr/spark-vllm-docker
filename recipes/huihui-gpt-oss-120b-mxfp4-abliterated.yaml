@@ -1,0 +1,52 @@
+# Recipe: OpenAI GPT-OSS 120B
+# OpenAI's open source 120B MoE model with MXFP4 quantization support
+
+recipe_version: "1"
+name: OpenAI GPT-OSS 120B abliterated
+description: vLLM serving openai/gpt-oss-120b with MXFP4 quantization and FlashInfer
+
+# HuggingFace model to download (optional, for --download-model)
+model: batsclamp/Huihui-gpt-oss-120b-mxfp4-abliterated
+
+# Container image to use
+container: vllm-node-mxfp4
+
+# Build arguments for build-and-copy.sh
+build_args:
+  - --exp-mxfp4
+
+# No mods required for this model
+mods: []
+
+# Default settings (can be overridden via CLI)
+defaults:
+  port: 8000
+  host: 0.0.0.0
+  tensor_parallel: 2
+  gpu_memory_utilization: 0.70
+  max_num_batched_tokens: 8192
+
+# Environment variables to set in the container
+env:
+  VLLM_USE_FLASHINFER_MOE_MXFP4_MXFP8: "1"
+
+# The vLLM serve command template
+# Uses MXFP4 quantization for memory efficiency
+command: |
+  vllm serve batsclamp/Huihui-gpt-oss-120b-mxfp4-abliterated \
+      --tool-call-parser openai \
+      --reasoning-parser openai_gptoss \
+      --enable-auto-tool-choice \
+      --tensor-parallel-size {tensor_parallel} \
+      --distributed-executor-backend ray \
+      --gpu-memory-utilization {gpu_memory_utilization} \
+      --enable-prefix-caching \
+      --load-format fastsafetensors \
+      --quantization mxfp4 \
+      --mxfp4-backend CUTLASS \
+      --mxfp4-layers moe,qkv,o,lm_head \
+      --attention-backend FLASHINFER \
+      --kv-cache-dtype fp8 \
+      --max-num-batched-tokens {max_num_batched_tokens} \
+      --host {host} \
+      --port {port}
