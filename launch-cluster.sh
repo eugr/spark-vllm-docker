@@ -34,6 +34,15 @@ MOD_PATHS=()
 MOD_TYPES=()
 VLLM_PRS_REQUESTED="false"
 GENERATED_MOD_ROOT=""
+
+# Head command dispatch for no-ray multi-node runs. The head is started in the
+# background like the worker ranks, so its output goes to the container log and
+# the process is not tied to the launcher terminal. A sentinel file inside the
+# container reports completion, which keeps the launcher in the foreground until
+# the command exits so the EXIT trap still stops the cluster at the same point.
+HEAD_EXEC_SENTINEL="/tmp/.launch-cluster-head-exit"
+HEAD_EXEC_POLL_INTERVAL=5
+CLUSTER_STOPPED="false"
 LAUNCH_SCRIPT_PATH=""
 SCRIPT_DIR="$(dirname "$(realpath "$0")")"
 CONFIG_FILE=""  # Will be set to default after argument parsing
@@ -731,6 +740,7 @@ cleanup() {
         ssh "$worker" "docker stop $CONTAINER_NAME" >/dev/null 2>&1 || true
     done
     
+    CLUSTER_STOPPED="true"
     echo "Cluster stopped."
 }
 
@@ -1562,6 +1572,59 @@ _exec_on_head() {
     fi
 }
 
+# Start a command inside the container in the background, the same way worker
+# ranks are started: detached from the launcher and writing to the container log.
+_exec_on_head_detached() {
+    local cmd="$1"
+    local sentinel="${2:-}"
+    local payload
+
+    if [[ -n "$sentinel" ]]; then
+        # The sentinel reports the command's exit status back to the launcher.
+        printf -v payload '%s >> /proc/1/fd/1 2>&1; echo $? > %q' "$cmd" "$sentinel"
+    else
+        payload="$cmd >> /proc/1/fd/1 2>&1"
+    fi
+
+    if ! docker exec -d "$CONTAINER_NAME" bash -c "$payload"; then
+        echo "Error: failed to start the command inside container '$CONTAINER_NAME'." >&2
+        return 1
+    fi
+}
+
+# Stream the container log while a detached head command runs, and return its
+# exit status once the sentinel appears. Stops early if the container goes away.
+_wait_for_head_exec() {
+    local sentinel="$1"
+    local status=""
+    local follow_pid=""
+
+    docker logs -f --since "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$CONTAINER_NAME" 2>/dev/null &
+    follow_pid=$!
+
+    while true; do
+        status=$(docker exec "$CONTAINER_NAME" cat "$sentinel" 2>/dev/null || true)
+        if [[ "$status" =~ ^[0-9]+$ ]]; then
+            break
+        fi
+        if ! docker ps --format '{{.Names}}' 2>/dev/null | grep -qx "$CONTAINER_NAME"; then
+            # A cleanup that already stopped the cluster is not a failure of the
+            # head command, so do not report it as a missing completion.
+            if [[ "$CLUSTER_STOPPED" != "true" ]]; then
+                echo "Container '$CONTAINER_NAME' is no longer running; head command did not report completion." >&2
+            fi
+            status=1
+            break
+        fi
+        sleep "$HEAD_EXEC_POLL_INTERVAL"
+    done
+
+    kill "$follow_pid" 2>/dev/null || true
+    wait "$follow_pid" 2>/dev/null || true
+    docker exec "$CONTAINER_NAME" rm -f "$sentinel" >/dev/null 2>&1 || true
+    return "$status"
+}
+
 # Execute a no-ray multi-node command: workers (background) then head
 exec_no_ray_cluster() {
     local base_cmd="$1"
@@ -1598,11 +1661,12 @@ exec_no_ray_cluster() {
 
     echo "Executing command on head node (rank 0): $head_cmd"
     if [[ "$DAEMON_MODE" == "true" ]]; then
-        docker exec -d "$CONTAINER_NAME" bash -c "$head_cmd >> /proc/1/fd/1 2>&1"
+        _exec_on_head_detached "$head_cmd" || return 1
         echo "Command dispatched in background (Daemon mode). Container: $CONTAINER_NAME"
     else
-        if [ -t 0 ]; then DOCKER_EXEC_FLAGS="-it"; else DOCKER_EXEC_FLAGS="-i"; fi
-        docker exec $DOCKER_EXEC_FLAGS "$CONTAINER_NAME" bash -c "$head_cmd"
+        docker exec "$CONTAINER_NAME" rm -f "$HEAD_EXEC_SENTINEL" >/dev/null 2>&1 || true
+        _exec_on_head_detached "$head_cmd" "$HEAD_EXEC_SENTINEL" || return 1
+        _wait_for_head_exec "$HEAD_EXEC_SENTINEL"
     fi
 }
 
