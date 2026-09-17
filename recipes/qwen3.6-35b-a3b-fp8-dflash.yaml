@@ -26,6 +26,8 @@ defaults:
   gpu_memory_utilization: 0.8
   max_model_len: 262144
   max_num_batched_tokens: 16384
+  # JSON-valued args live here whole: the renderer can't substitute inside JSON braces
+  speculative_config: '{"method": "dflash", "model": "z-lab/Qwen3.6-35B-A3B-DFlash", "num_speculative_tokens": 15}'
 
 # Environment variables
 env: 
@@ -45,6 +47,6 @@ command: |
     --load-format fastsafetensors \
     --attention-backend flash_attn \
     --chat-template fixed_chat_template.jinja \
-    --speculative-config '{{"method": "dflash", "model": "z-lab/Qwen3.6-35B-A3B-DFlash", "num_speculative_tokens": 15}}' \
+    --speculative-config '{speculative_config}' \
     -tp {tensor_parallel} \
     --distributed-executor-backend ray
