@@ -1,0 +1,148 @@
+# Recipe: Inkling-Small-NVFP4 (dual-Spark memory-tuned)
+# thinkingmachines/Inkling-Small-NVFP4 — 276B-total / 12B-active hybrid MoE
+# (256 routed experts, 6 active + 2 shared; sliding-window 512 + sconv hybrid
+# attention; MTP with 8 nextn layers), multimodal (text/image/audio in, text out).
+#
+# WHY NVFP4 ONLY: base bf16 weights are 495 GiB (248 GiB/node at TP=2) — impossible
+# on a 128 GB/node DGX Spark. NVFP4 is 159 GiB total = ~79.5 GiB/node at TP=2, which
+# fits and is nearly identical to DeepSeek-V4-Flash-DSpark's 79.2 GiB/node footprint —
+# the exact profile we have hard-won memory-tuning data for. Note: NVFP4 quantizes
+# only the routed experts; shared experts and qkvr linears stay BF16 (per the vLLM
+# day-0 recipe), which is why 159 GiB > a naive 4-bit-of-276B estimate.
+#
+# Derived from upstream's tested recipes/inkling-small-nvfp4.yaml with TWO deliberate
+# changes, both carried over from our deepseek-v4-flash-dspark.yaml (~/spark-vllm-dspark),
+# which serves the same ~79 GiB/node footprint on this same dual-Spark cluster:
+#
+#   1. gpu_memory_utilization 0.8 -> 0.77
+#      0.8 at this footprint OOM-froze BOTH our nodes on unified memory (July 13/16
+#      2026; NVRM NV_ERR_NO_MEMORY on load, then steady-state exhaustion). The dspark
+#      recipe measured 0.77 as the safe value: it sizes the KV pool but does NOT cap
+#      runtime allocations, which grow ~6 GB over days of serving. 0.77 leaves ~17 GB
+#      system headroom/node. The freeze is driven by weights + runtime overhead, not
+#      KV, so it applies to Inkling at the same footprint regardless of KV shape.
+#
+#   2. max_num_seqs 2 -> 3
+#      dspark validated 3 clean under a 7-request agent swarm (engine runs 3, queues
+#      the rest — verified via /metrics). Inkling's KV is even cheaper than dspark's
+#      (most layers are SWA-capped at 512 tokens + a small sconv state; only the 6
+#      full-attention local layers grow), so KV is not the constraint. Upstream's 2 is
+#      the ultra-safe fallback if a live smoke test ever shows pressure.
+#
+# UNCHANGED from upstream (all Spark-tuned by eugr, left as-is):
+#   - the three mods (SM12 paged-KV FA4 workaround, drop-caches, hybrid draft loader)
+#   - max_model_len 262144 (256k) — Inkling supports 1M but its bounded hybrid KV makes
+#     256k cheap and ample; no reason to push higher on 2 nodes
+#   - MTP num_speculative_tokens 1 (the vLLM day-0 validated setting)
+#   - env vars and the full serve command / flags
+#
+# LAUNCH WITH --ray (REQUIRED). This is a 2-node TP=2 job across two 1-GPU nodes.
+# run-recipe defaults to no-Ray and STRIPS the distributed backend unless --ray is
+# passed; without Ray, vLLM on the head sees only its 1 local GPU and dies with
+# "World size (2) is larger than the number of available GPUs (1)". Every working
+# cluster recipe here (step-3.7, qwen3.x, minimax, our dspark) runs with Ray. So:
+#     ./run-recipe.sh inkling-small-nvfp4-tuned --ray -d
+# The --distributed-executor-backend ray line below is kept for intent/parity; Ray
+# mode is what actually preserves it.
+#
+# LIVE-VALIDATED 2026-07-31 on the 2-node cluster (Ray, --ray -d): model loaded
+# 78.6 GiB/node in ~55s, KV pool 392k tokens (1.5x concurrency @ 262k), engine init
+# 132s, correct coherent generation, 3-request burst clean. Steady-state system memory
+# available: 13 GiB (head) / 15 GiB (worker) — 0.77 held (0.8 would not have). NOTE:
+# runtime RAM creeps ~6 GB over days; if available dips under ~10 GiB on long uptime,
+# drop gpu_memory_utilization to 0.75. Inkling is a reasoning model: use generous
+# max_tokens (>=512) or content comes back empty with finish_reason=length.
+
+recipe_version: "1"
+name: Inkling-Small-NVFP4-Tuned
+description: vLLM serving thinkingmachines/Inkling-Small-NVFP4 on a two-node DGX Spark cluster, memory-tuned from our dspark data
+
+# HuggingFace model to download with --setup
+model: thinkingmachines/Inkling-Small-NVFP4
+
+# The launch command uses tensor parallelism across two nodes
+cluster_only: true
+
+# Container image to use.
+# NOT plain "vllm-node": on this box that tag is the FROZEN golden Step-3.7 image
+# (vLLM 0.22.1 dev124, ace95c9cf) which predates Inkling and has NO Inkling FA4
+# module — the inkling-sm12-paged-kv mod aborts on it ("Inkling NVIDIA FA4 module
+# was not found"). Inkling needs vLLM >= the July-15 day-0 (prebuilt-vllm-current is
+# 0.26.1 dev30, July 28). Build that under a DEDICATED tag so the Step-3.7 image is
+# never overwritten (see the dspark precedent, vllm-node-dspark):
+#   ./run-recipe.sh inkling-small-nvfp4-tuned --build-only   # builds this tag + copies to worker
+container: vllm-node-inkling
+
+# Required patches and memory-pressure handling (identical to upstream)
+mods:
+  - mods/inkling-sm12-paged-kv
+  - mods/drop-caches
+  - mods/instanttensor-hybrid-draft-loader
+  # Band-aid for a sporadic tool-calling failure: the model sometimes samples an
+  # HTML entity (usually &quot;) in place of a structural JSON quote, which breaks
+  # the Inkling tool parser's string scanner. Unescapes complete entities before
+  # the scan; prefix-stable for streaming. Remove once vLLM/the template fix it
+  # upstream. See mods/inkling-tool-unescape/README.md.
+  - mods/inkling-tool-unescape
+  # Band-aid for a distinct streaming bug: in multi-turn streaming, a turn-initial
+  # tool call leaks as content (framing markers surface, tool_calls empty) because
+  # the DelegatingParser drops the content-kind marker. Recovers leaked
+  # <|content_invoke_tool_json|>{...}<|end_message|> blocks as tool_calls. Remove
+  # once vLLM fixes the streaming handoff. See mods/inkling-tool-salvage/README.md.
+  - mods/inkling-tool-salvage
+
+# Default settings (can be overridden via CLI where supported)
+defaults:
+  port: 8000
+  host: 0.0.0.0
+  tensor_parallel: 2
+  # 0.77, not upstream's 0.8: 0.8 froze both nodes at this footprint (see header).
+  gpu_memory_utilization: 0.77
+  max_model_len: 262144
+  # 3, not upstream's 2: dspark-validated concurrency under agent swarms (see header).
+  max_num_seqs: 3
+  num_speculative_tokens: 1
+
+# Environment variables (identical to upstream)
+env:
+  LAMPORT_RS_SCONV: "0"
+  VLLM_USE_BREAKABLE_CUDAGRAPH: "0"
+  VLLM_USE_AOT_COMPILE: "1"
+
+# The vLLM serve command template
+command: |
+  vllm serve thinkingmachines/Inkling-Small-NVFP4 \
+    --host {host} \
+    --port {port} \
+    --trust-remote-code \
+    --tokenizer-mode inkling \
+    --tensor-parallel-size {tensor_parallel} \
+    --distributed-executor-backend ray \
+    --enable-auto-tool-choice \
+    --tool-call-parser inkling \
+    --reasoning-parser inkling \
+    --gpu-memory-utilization {gpu_memory_utilization} \
+    --max-model-len {max_model_len} \
+    --max-num-seqs {max_num_seqs} \
+    --load-format instanttensor \
+    --quantization nvfp4 \
+    --enable-prefix-caching \
+    --enable-chunked-prefill \
+    --async-scheduling \
+    --compilation-config '{{"cudagraph_mode":"FULL_AND_PIECEWISE","custom_ops":["all"]}}' \
+    --default-chat-template-kwargs '{{"reasoning_effort":0.99}}' \
+    --speculative-config '{{"method":"mtp","num_speculative_tokens":{num_speculative_tokens}}}'
+    # reasoning_effort 0.99 is TM's recommended setting (their eval config: temp 1.0,
+    # top_p 1.0, separate reasoning, effort 0.99). Inkling's effort is a FLOAT 0.0-0.99
+    # (NOT the high/low string DeepSeek uses; the template maps "max"->0.99, "high"->0.9).
+    # The flag takes JSON (json.loads), so pass the float object, NOT a dotted
+    # `.reasoning_effort=0.99` (that arrives as the string "0.99", which is not a valid
+    # effort_map key and makes the template raise on EVERY request). Clients can still
+    # override per-request via chat_template_kwargs. vLLM already defaults temperature
+    # and top_p to 1.0, so no server-side sampling override is needed.
+    #
+    # MULTIMODAL OOM GUARD: Inkling accepts image/audio, and vLLM's limit_mm_per_prompt
+    # defaults to 999 per modality — a burst-OOM bomb under concurrent MM requests. If
+    # you serve text-only, disable MM: append (braces doubled for the str.format render)
+    #   --limit-mm-per-prompt '{{"image":0,"audio":0}}'
+    # If you need MM, cap it to a small, memory-budgeted number (e.g. "image":2).
