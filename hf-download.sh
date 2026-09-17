@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 set -e
 
 HUB_PATH="${HF_HOME:-$HOME/.cache/huggingface}/hub"

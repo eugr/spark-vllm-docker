@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 #
 # test_recipes.sh - Integration tests for run-recipe.py and launch-cluster.sh
 #
