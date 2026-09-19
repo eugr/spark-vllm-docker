@@ -1,9 +1,9 @@
-# Recipe: Qwen3.6-35B-A3B-NVFP4-Marlin
-# Qwen3.6-35B-A3B model in NVIDIA NVFP4 format with Marlin MoE backend.
+# Recipe: Qwen3.6-35B-A3B-NVFP4-Marlin-No-MTP
+# Qwen3.6-35B-A3B model in NVIDIA NVFP4 format with Marlin MoE backend and no MTP speculative decoding.
 
 recipe_version: "1"
-name: Qwen3.6-35B-A3B-NVFP4-Marlin
-description: vLLM serving nvidia/Qwen3.6-35B-A3B-NVFP4 with Marlin MoE backend
+name: Qwen3.6-35B-A3B-NVFP4-Marlin-No-MTP
+description: vLLM serving nvidia/Qwen3.6-35B-A3B-NVFP4 with Marlin MoE backend and no MTP
 
 # HuggingFace model to download (optional, for --download-model)
 model: nvidia/Qwen3.6-35B-A3B-NVFP4
@@ -20,7 +20,7 @@ defaults:
   max_model_len: 262144
   max_num_seqs: 4
   max_num_batched_tokens: 8192
-  enable_thinking: '{\"enable_thinking\":true}'
+  enable_thinking: '{\"enable_thinking\":false}'
 
 # Environment variables
 env:
@@ -43,7 +43,6 @@ command: |
     --enable-chunked-prefill \
     --async-scheduling \
     --enable-prefix-caching \
-    --speculative-config '{{"method":"mtp","num_speculative_tokens":3,"moe_backend":"triton"}}' \
     --load-format fastsafetensors \
     --reasoning-parser qwen3 \
     --tool-call-parser qwen3_xml \

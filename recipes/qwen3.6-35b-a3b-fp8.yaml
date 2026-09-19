@@ -25,6 +25,7 @@ defaults:
   gpu_memory_utilization: 0.8
   max_model_len: 262144
   max_num_batched_tokens: 16384
+  enable_thinking: '{\"enable_thinking\":true}'
 
 # Environment variables
 env: 
@@ -47,4 +48,5 @@ command: |
     --enable-prefix-caching \
     --chat-template fixed_chat_template.jinja \
     -tp {tensor_parallel} \
+    --default-chat-template-kwargs {enable_thinking} \
     --distributed-executor-backend ray
