@@ -1,0 +1,68 @@
+diff --git a/vllm/model_executor/layers/sparse_attn_indexer.py b/vllm/model_executor/layers/sparse_attn_indexer.py
+index 29f0758619..e80bdd5f5b 100644
+--- a/vllm/model_executor/layers/sparse_attn_indexer.py
++++ b/vllm/model_executor/layers/sparse_attn_indexer.py
+@@ -2,6 +2,8 @@
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ """Custom Sparse Attention Indexer layers."""
+ 
++import os
++
+ import torch
+ 
+ from vllm import _custom_ops as ops
+@@ -48,6 +50,39 @@ SM120_SHORT_ROW_TOPK_MAX_WIDTH = 12288
+ # MXFP4 layout: 2 values packed per byte, ue8m0 (1-byte) scale per block of 32.
+ MXFP4_BLOCK_SIZE = 32
+ 
++_PERSISTENT_TOPK_SMEM_OK: bool | None = None
++
++
++def _device_has_persistent_topk_smem() -> bool:
++    """True when the active CUDA device can run persistent_topk's fallbacks.
++
++    persistent_topk's oversubscription fallback (FilteredTopKRaggedTransform)
++    requires >=128KB opt-in shared memory per block (topk.cu). GB10 and other
++    consumer/edge parts expose only ~101KB, so persistent_topk hard-fails
++    ("requires >=128KB smem per block (have 101376)") as soon as the decode grid
++    oversubscribes the 48 SMs. Gate on smem CAPACITY (not capability family) so
++    the same check also catches RTX 50-series (family-120 with <128KB smem).
++    Queried once and cached; both values are fixed for the life of the process.
++    """
++    global _PERSISTENT_TOPK_SMEM_OK
++    if _PERSISTENT_TOPK_SMEM_OK is None:
++        if not torch.cuda.is_available():
++            _PERSISTENT_TOPK_SMEM_OK = False
++        else:
++            props = torch.cuda.get_device_properties(torch.cuda.current_device())
++            max_smem = int(getattr(props, "shared_memory_per_block_optin", 0) or 0)
++            num_sms = int(getattr(props, "multi_processor_count", 0) or 0)
++            # A/B + diagnostics: force persistent_topk even on low-smem parts
++            # (mirrors the CUDA side's VLLM_TOPK_DISABLE_NONCOOP escape hatch).
++            force = os.environ.get("VLLM_SPARSE_IDX_FORCE_PERSISTENT_TOPK", "0") == "1"
++            _PERSISTENT_TOPK_SMEM_OK = force or max_smem >= 128 * 1024
++            logger.info(
++                "Sparse indexer persistent_topk smem gate: "
++                "num_sms=%d shared_memory_per_block_optin=%d -> persistent_topk=%s",
++                num_sms, max_smem, _PERSISTENT_TOPK_SMEM_OK,
++            )
++    return _PERSISTENT_TOPK_SMEM_OK
++
+ 
+ def _assert_cutedsl_dcp_merge_supported(
+     logits: torch.Tensor,
+@@ -727,10 +762,10 @@ def sparse_attn_indexer(
+                 and current_platform.has_device_capability(90)
+                 and not current_platform.is_device_capability_family(120)
+             )
+-            use_persistent_topk = current_platform.is_cuda() and topk_tokens in (
+-                512,
+-                1024,
+-                2048,
++            use_persistent_topk = (
++                current_platform.is_cuda()
++                and topk_tokens in (512, 1024, 2048)
++                and _device_has_persistent_topk_smem()
+             )
+             if _use_sm120_short_row_topk_decode(logits, topk_tokens):
+                 torch.ops._C.top_k_per_row_decode(
