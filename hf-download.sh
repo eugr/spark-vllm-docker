@@ -127,6 +127,13 @@ elif [ "$COPY_TO_FLAG" = false ] && [ "${#COPY_HOSTS[@]}" -eq 0 ] && [[ -n "$DOT
     : # intentional no-op; user didn't ask for copy
 fi
 
+# uvx is commonly installed to ~/.local/bin, which is NOT on PATH for a
+# non-interactive SSH session (ssh host 'cmd'). Add it before giving up, so
+# remote and automated callers do not fail at the download step.
+if ! command -v uvx &> /dev/null && [ -x "$HOME/.local/bin/uvx" ]; then
+    export PATH="$HOME/.local/bin:$PATH"
+fi
+
 # Check if uvx is installed
 if ! command -v uvx &> /dev/null; then
     echo "Error: 'uvx' command not found."
