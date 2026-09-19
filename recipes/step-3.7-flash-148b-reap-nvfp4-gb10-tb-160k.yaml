@@ -1,0 +1,53 @@
+recipe_version: "1"
+name: Step-3.7-Flash-148B-REAP-NVFP4-GB10-tb-160k
+description: >-
+  vLLM serving 0xSero/Step-3.7-Flash-148B (REAP 212/288 experts, ModelOpt NVFP4
+  experts, FP8 KV) on a single DGX Spark GB10 node.
+
+model: 0xSero/Step-3.7-Flash-148B
+container: vllm-node
+
+cluster_only: false
+mods:
+  - mods/step-3.7-flash
+  - mods/step-3.7-mtp-bf16-draft
+
+defaults:
+  port: 8000
+  host: 0.0.0.0
+  tensor_parallel: 1
+  gpu_memory_utilization: 0.94
+  max_model_len: 163840
+  max_num_seqs: 4
+  num_speculative_tokens: 3
+
+env:
+  VLLM_ALLOW_LONG_MAX_MODEL_LEN: "1"
+  VLLM_HTTP_TIMEOUT_KEEP_ALIVE: "10000"
+  FLASHINFER_DISABLE_VERSION_CHECK: "1"
+  PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
+  NCCL_IB_DISABLE: "1"
+  NCCL_DEBUG: "WARN"
+  HF_HUB_OFFLINE: "1"
+
+command: |
+  vllm serve 0xSero/Step-3.7-Flash-148B \
+      --served-model-name step3p7-flash-148b \
+      --trust-remote-code \
+      --port {port} \
+      --host {host} \
+      --gpu-memory-utilization {gpu_memory_utilization} \
+      -tp {tensor_parallel} \
+      --distributed-executor-backend mp \
+      --quantization modelopt \
+      --kv-cache-dtype fp8 \
+      --disable-cascade-attn \
+      --max-model-len {max_model_len} \
+      --max-num-seqs {max_num_seqs} \
+      --enable-chunked-prefill \
+      --enable-prefix-caching \
+      --enable-auto-tool-choice \
+      --tool-call-parser step3p5 \
+      --load-format instanttensor \
+      --speculative-config '{{"method":"mtp","num_speculative_tokens":{num_speculative_tokens}}}' \
+      --disable-access-log-for-endpoints /health,/metrics,/ping

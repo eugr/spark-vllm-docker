@@ -1,0 +1,60 @@
+# Recipe: Qwen3.6-35B-A3B-NVFP4 (regular / mixed NVFP4+FP8, more accurate) for DGX Spark
+#
+# Per https://unsloth.ai/docs/models/qwen3.6#nvfp4:
+#   "do NOT select any MoE backend - leave vLLM to select it"
+#   vLLM auto-selects cute-DSL, which is the FASTEST for 35B-A3B
+#   (295 decode tok/s, 15,636 throughput in Unsloth's own benchmark table).
+#
+# IMPORTANT: --moe-backend flashinfer_b12x is ONLY for the -Fast (full W4A4)
+# variant. The regular NVFP4 model has mixed precision - layers 32-39 are FP8
+# (W8A8) MoE - and flashinfer_b12x is NVFP4-only, so forcing it crashes:
+#   ValueError: moe_backend='flashinfer_b12x' is not supported for FP8 MoE
+# So we do NOT set --moe-backend; vLLM auto-selects cute-DSL for NVFP4 layers
+# and a valid FP8 backend for the FP8 layers.
+#
+# CUTE_DSL_ARCH=sm_121a is required so the auto-selected cute-DSL kernels
+# compile for DGX Spark (GB10, sm_121a).
+#
+# gpu_memory_utilization 0.57 + max_num_seqs 12 tuned for GB10 unified memory
+# (vLLM default 0.9 OOM-kills the host). ~13.9x concurrency headroom at 262K ctx.
+
+recipe_version: "1"
+name: Qwen3.6-35B-A3B-NVFP4-DGXSpark
+description: vLLM serving unsloth/Qwen3.6-35B-A3B-NVFP4 (regular, auto MoE backend) on DGX Spark
+
+model: unsloth/Qwen3.6-35B-A3B-NVFP4
+
+container: vllm-node
+
+defaults:
+  port: 8000
+  host: 0.0.0.0
+  tensor_parallel: 1
+  gpu_memory_utilization: 0.57
+  max_model_len: 262144
+  max_num_seqs: 12
+  max_num_batched_tokens: 8192
+
+env:
+  CUTE_DSL_ARCH: "sm_121a"
+
+command: |
+  vllm serve unsloth/Qwen3.6-35B-A3B-NVFP4 \
+    --host {host} \
+    --port {port} \
+    --tensor-parallel-size {tensor_parallel} \
+    --trust-remote-code \
+    --kv-cache-dtype fp8 \
+    --attention-backend flashinfer \
+    --gpu-memory-utilization {gpu_memory_utilization} \
+    --max-model-len {max_model_len} \
+    --max-num-seqs {max_num_seqs} \
+    --max-num-batched-tokens {max_num_batched_tokens} \
+    --enable-chunked-prefill \
+    --async-scheduling \
+    --enable-prefix-caching \
+    --speculative-config '{{"method":"mtp","num_speculative_tokens":2}}' \
+    --load-format fastsafetensors \
+    --reasoning-parser qwen3 \
+    --tool-call-parser qwen3_xml \
+    --enable-auto-tool-choice

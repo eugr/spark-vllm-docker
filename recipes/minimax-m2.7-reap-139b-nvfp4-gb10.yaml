@@ -1,0 +1,91 @@
+# Recipe: MiniMax-M2.7-REAP-139B-A10B-NVFP4-GB10
+# dervig/m51Lab-MiniMax-M2.7-REAP-139B-A10B-NVFP4-GB10
+#
+# Card fixed 2026-04-16 (v1.1.1): MoE router gates now correctly excluded from
+# quantization, so vLLM's compressed-tensors/MiniMax-M2 loader works without
+# the earlier KeyError on block_sparse_moe.gate.
+#
+# Per HF discussion #2 (community GB10 reports): both the default MoE backend
+# (FLASHINFER_CUTLASS) and explicit --moe-backend cutlass (VLLM_CUTLASS) were
+# confirmed producing garbage/NUL-byte output in our own testing, matching
+# markmonger's report ("every token argmaxes to id 0"). The only confirmed
+# non-garbage community config (Ahmed00Samir) forces Marlin, so this recipe
+# does the same via --moe-backend marlin plus the Marlin support env vars.
+# Also applies mods/minimax-m2.7-reap-139b-nvfp4-gb10, which patches vLLM's
+# compressed-tensors W4A4 NVFP4 scheme to guard against a NaN activation
+# global scale from failed llm-compressor calibration on this REAP checkpoint
+# (same failure class as the sibling scottgl checkpoint's mod, which is where
+# the "argmax to id 0 / null-byte garbage" symptom is documented).
+#
+# Marlin previously OOM-crashed for markmonger on an older vLLM build; if that
+# recurs here, retry with lower max_num_seqs/max_model_len first before
+# assuming it's unfixable on this vLLM version.
+#
+# 2026-07-17: re-tested both native backends WITH the scalefix mod applied
+# (FLASHINFER_CUTLASS via --moe-backend flashinfer_cutlass, and VLLM_CUTLASS
+# via --moe-backend cutlass) to rule out the NaN-scale bug as the actual root
+# cause. Both still produced garbage (NUL bytes / multilingual token soup)
+# identical to the pre-mod runs. This rules out the scalefix hypothesis for
+# this checkpoint and confirms the corruption is a genuine kernel/architecture
+# incompatibility between MiniMax-M2.7's NVFP4 format and vLLM's native FP4
+# kernels on GB10 (sm121a) -- not something fixable via this repo's mods.
+# Marlin is not just "the best we found", it's the only backend confirmed to
+# produce coherent output on this checkpoint+hardware combination.
+
+recipe_version: "1"
+name: MiniMax-M2.7-REAP-139B-A10B-NVFP4-GB10
+description: vLLM serving MiniMax-M2.7-REAP (139B-A10B, NVFP4) sized for a single DGX Spark (GB10)
+
+# HuggingFace model to download (optional, for --download-model)
+model: dervig/m51Lab-MiniMax-M2.7-REAP-139B-A10B-NVFP4-GB10
+
+# Container image to use
+container: vllm-node-minimax-m2.7-reap-139b-v0.23.1rc1
+
+cluster_only: false
+solo_only: true
+
+#mods:
+#  - mods/minimax-m2.7-reap-139b-nvfp4-gb10
+
+# Uses the repo default prebuilt image (eugr/spark-vllm:latest, vLLM 0.23.1rc1)
+
+defaults:
+  port: 8000
+  host: 0.0.0.0
+  tensor_parallel: 1
+  gpu_memory_utilization: 0.94
+  max_model_len: 102400
+  max_num_seqs: 4
+  max_num_batched_tokens: 4096
+
+env:
+  VLLM_FLASHINFER_ALLREDUCE_BACKEND: trtllm
+  VLLM_TEST_FORCE_FP8_MARLIN: "1"
+  VLLM_MARLIN_USE_ATOMIC_ADD: "1"
+  # Deprecated (removal_version="v0.23") but still functional on this repo's
+  # default 0.23.1rc1 image -- Ahmed00Samir's original working config used
+  # these directly; kept alongside the modern --moe-backend
+  # flags above in case they cover a code path the CLI flags don't.
+  VLLM_NVFP4_GEMM_BACKEND: "marlin"
+  VLLM_USE_FLASHINFER_MOE_FP4: "0"
+
+command: |
+  vllm serve dervig/m51Lab-MiniMax-M2.7-REAP-139B-A10B-NVFP4-GB10 \
+      --trust-remote-code \
+      --port {port} \
+      --host {host} \
+      --gpu-memory-utilization {gpu_memory_utilization} \
+      -tp {tensor_parallel} \
+      --max-model-len {max_model_len} \
+      --max-num-seqs {max_num_seqs} \
+      --max-num-batched-tokens {max_num_batched_tokens} \
+      --kv-cache-dtype fp8 \
+      --load-format fastsafetensors \
+      --moe-backend marlin \
+      --attention-backend flashinfer \
+      --enable-chunked-prefill \
+      --enable-prefix-caching \
+      --enable-auto-tool-choice \
+      --tool-call-parser minimax_m2 \
+      --reasoning-parser minimax_m2_append_think

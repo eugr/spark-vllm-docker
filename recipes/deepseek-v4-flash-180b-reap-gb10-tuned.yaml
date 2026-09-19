@@ -1,0 +1,70 @@
+# Recipe: DeepSeek V4 Flash 162B REAP on GB10 — tuned profile (2026-07-10)
+# Derived from deepseek-v4-flash-162b-reap-gb10.yaml after a metrics review of a
+# live serving run (Prometheus + vllm_node logs). Original recipe left untouched
+# as the fallback.
+
+recipe_version: "1"
+name: DeepSeek-V4-Flash-180B-REAP-GB10-tuned
+description: >-
+  vLLM serving 0xSero/DeepSeek-V4-Flash-162B (REAP K144, MXFP4 experts, FP8 MLA
+  KV) on a single DGX Spark, tuned from live metrics of the base recipe.
+
+model: 0xSero/DeepSeek-V4-Flash-180B
+container: eugr-spark-vllm-deepseek-v4-reap-gb10
+mods:
+  - mods/deepseek-v4-reap-gb10
+
+defaults:
+  port: 8000
+  host: 0.0.0.0
+  gpu_memory_utilization: 0.91
+  max_model_len: 163840
+  max_num_seqs: 4
+  max_num_batched_tokens: 8192
+  num_speculative_tokens: 3
+
+env:
+  VLLM_ALLOW_LONG_MAX_MODEL_LEN: "1"
+  VLLM_HTTP_TIMEOUT_KEEP_ALIVE: "10000"
+  FLASHINFER_DISABLE_VERSION_CHECK: "1"
+  TILELANG_CLEANUP_TEMP_FILES: "1"
+  DG_JIT_USE_NVRTC: "0"
+  DG_JIT_NVCC_COMPILER: "/usr/local/cuda/bin/nvcc"
+  NCCL_IB_DISABLE: "1"
+  NCCL_DEBUG: "WARN"
+  K160_DISABLE_CUTEDSL: "0"
+  CUTEDSL_VERSION: ""
+  PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
+  # A/B: set to "0" to re-enable torch.compile/inductor fusions (slow first
+  # start, compile cache persists in the mounted vllm cache volume).
+  VLLM_USE_BREAKABLE_CUDAGRAPH: "1"
+
+command: |
+  vllm serve 0xSero/DeepSeek-V4-Flash-180B \
+    --served-model-name deepseek-v4-flash-REAP-180B-tuned \
+    --host {host} \
+    --port {port} \
+    --trust-remote-code \
+    --tensor-parallel-size 1 \
+    --pipeline-parallel-size 1 \
+    --kv-cache-dtype fp8 \
+    --block-size 256 \
+    --max-model-len {max_model_len} \
+    --max-num-seqs {max_num_seqs} \
+    --max-num-batched-tokens {max_num_batched_tokens} \
+    --gpu-memory-utilization {gpu_memory_utilization} \
+    --distributed-executor-backend mp \
+    --tokenizer-mode deepseek_v4 \
+    --load-format safetensors \
+    --enable-chunked-prefill \
+    --async-scheduling \
+    --enable-prefix-caching \
+    --tool-call-parser deepseek_v4 \
+    --enable-auto-tool-choice \
+    --reasoning-parser deepseek_v4 \
+    --reasoning-config '{{"reasoning_parser":"deepseek_v4","reasoning_start_str":"<think>","reasoning_end_str":"</think>"}}' \
+    --default-chat-template-kwargs '{{"thinking":true}}' \
+    --compilation-config '{{"cudagraph_mode":"FULL_AND_PIECEWISE","custom_ops":["all"]}}' \
+    --speculative-config '{{"method":"mtp","num_speculative_tokens":{num_speculative_tokens}}}' \
+    --default-chat-template-kwargs.reasoning_effort=high \
+    --disable-access-log-for-endpoints /health,/metrics,/ping

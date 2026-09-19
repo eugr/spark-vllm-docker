@@ -1,0 +1,36 @@
+recipe_version: "1"
+name: Qwen3.8-Flash-Next 180B (HashK, 1x DGX Spark)
+description: >
+  Qwen3.8-Flash-Next 180B on a single DGX Spark via the RadixArk NVFP4
+  checkpoint with a HashK-compressed PLE n-gram table (12.8 GB) and NEXTN
+  speculative decoding. sglang-based, not vLLM — see mods/qwen3.8-flash-next-180b-hashk.
+  https://github.com/Death-By-Tokens/Qwen3.8-Flash-Next-180B-on-ONE-DGX-Spark
+  Requires the ple_hashk_R4.pt artifact mounted at /patches/ple_hashk_R4.pt
+  (see mod README) — build it separately with the upstream repo's
+  tools/build_hashk_ple.py before launching.
+container: lmsysorg/sglang:qwen38flashnext
+model: RadixArk/Qwen3.8-Flash-Next-NVFP4
+solo_only: true
+mods:
+  - mods/qwen3.8-flash-next-180b-hashk
+defaults:
+  port: 8000
+  host: 0.0.0.0
+  gpu_memory_utilization: 0.85
+  max_model_len: 262144
+env:
+  SGLANG_QWEN4_PLE_HASHK: /patches/ple_hashk_R4.pt
+command: |
+  python3 -m sglang.launch_server \
+      --model-path RadixArk/Qwen3.8-Flash-Next-NVFP4 --trust-remote-code --language-only \
+      --quantization modelopt_fp4 --fp4-gemm-backend flashinfer_cutlass \
+      --kv-cache-dtype fp8_e4m3 --page-size 64 \
+      --mamba-scheduler-strategy extra_buffer --mamba-track-interval 64 \
+      --chunked-prefill-size 8192 --max-prefill-tokens 32768 \
+      --max-running-requests 8 --max-mamba-cache-size 12 \
+      --context-length {max_model_len} --mem-fraction-static {gpu_memory_utilization} \
+      --default-chat-template-kwargs '{{"enable_thinking": true, "reasoning_effort": "medium"}}' \
+      --reasoning-parser qwen3 --tool-call-parser qwen3_coder --strip-thinking-cache \
+      --speculative-algorithm NEXTN --speculative-num-steps 3 \
+      --speculative-eagle-topk 1 --speculative-num-draft-tokens 4 \
+      --host {host} --port {port}

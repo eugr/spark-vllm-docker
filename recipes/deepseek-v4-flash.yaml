@@ -27,7 +27,7 @@ defaults:
   block_size: 256
   max_num_seqs: 4
   max_num_batched_tokens: 8192
-  num_speculative_tokens: 2
+  num_speculative_tokens: 3
 
 # Environment variables
 env:
