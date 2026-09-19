@@ -46,6 +46,27 @@ copy_model_to_host() {
     host_copy_start=$(date +%s)
 
     if rsync -av --mkpath --progress "$model_dir" "${SSH_USER}@${host}:$HUB_PATH/"; then
+        # Current hf keeps blob content in a HUB-LEVEL store and makes the model
+        # dir a symlink farm (models--X/blobs/<hash> -> ../../blobs/<xx>/<hash>).
+        # Plain -a ships those as symlinks, so the peer gets dangling links and
+        # ZERO weights while rsync still reports success. -L is not an option: it
+        # dereferences the snapshot links too and doubles the transfer. So send
+        # the referenced hub-level blobs separately, preserving relative paths.
+        local blob_list
+        blob_list=$(mktemp)
+        find "$model_dir" -type l -lname '../../blobs/??/*' -printf '%l\n' 2>/dev/null \
+            | sed 's|^\.\./\.\./||' | sort -u > "$blob_list"
+        if [ -s "$blob_list" ]; then
+            echo "Syncing $(wc -l < "$blob_list") hub-level blobs for '$model_name'..."
+            if ! rsync -a --mkpath --progress --files-from="$blob_list" \
+                    "$HUB_PATH" "${SSH_USER}@${host}:$HUB_PATH/"; then
+                echo "Blob sync to $host failed."
+                rm -f "$blob_list"
+                return 1
+            fi
+        fi
+        rm -f "$blob_list"
+
         host_copy_end=$(date +%s)
         host_copy_time=$((host_copy_end - host_copy_start))
         printf "Copy to %s completed in %02d:%02d:%02d\n" "$host" $((host_copy_time/3600)) $((host_copy_time%3600/60)) $((host_copy_time%60))
@@ -125,6 +146,13 @@ if [ "$COPY_TO_FLAG" = true ] && [ "${#COPY_HOSTS[@]}" -eq 0 ]; then
 elif [ "$COPY_TO_FLAG" = false ] && [ "${#COPY_HOSTS[@]}" -eq 0 ] && [[ -n "$DOTENV_COPY_HOSTS" ]]; then
     # No --copy-to flag but .env has COPY_HOSTS — don't auto-copy; user must request it explicitly
     : # intentional no-op; user didn't ask for copy
+fi
+
+# uvx is commonly installed to ~/.local/bin, which is NOT on PATH for a
+# non-interactive SSH session (ssh host 'cmd'). Add it before giving up, so
+# remote and automated callers do not fail at the download step.
+if ! command -v uvx &> /dev/null && [ -x "$HOME/.local/bin/uvx" ]; then
+    export PATH="$HOME/.local/bin:$PATH"
 fi
 
 # Check if uvx is installed
