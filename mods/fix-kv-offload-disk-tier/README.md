@@ -341,3 +341,94 @@ want waves to actually engage, size it against your prefixes.
 - Written with AI assistance and verified on the hardware above: a collaboration
   between Claude Opus 5 and DeepSeek-V4-Flash reviewing each other's work. Every
   number here is measured, not asserted by a model.
+
+---
+
+## Patch 04 — wave readiness evaluated at load (2026-09-21)
+
+**Fixes an engine crash in 03's wave driver that we hit after 20.6 h under
+concurrent load.**
+
+### The bug
+
+```
+File ".../offloading/scheduler.py", in build_connector_meta
+    src_spec = self.manager.prepare_load(w.keys, req_status.req_context)
+File ".../kv_offload/tiering/manager.py", in prepare_load
+    return self.primary_tier.prepare_load(keys, req_context)
+File ".../kv_offload/cpu/manager.py", in prepare_load
+    assert block is not None, f"Block {key!r} not found in cache"
+AssertionError: Block b'...' not found in cache
+```
+
+`EngineCore` dies and every in-flight request gets `EngineDeadError`. Seen once,
+after 20.6 h of production traffic on our own two-DGX-Spark cluster
+(DeepSeek-V4-Flash-0731, TP=2, one GPU per node, `fs` tier), running 01–03 with
+`VLLM_OFFLOAD_STREAM_WAVE_CHUNKS=64`. Our image also carries unrelated local
+patches outside the offload path.
+
+03's driver *remembers* readiness. It records a wave's keys in `wave_ready_keys`
+as they become resident in the primary tier (their promotion completed, they
+were already resident, or another request promoted them) and ships the wave
+once every key has been seen. But a resident row is only pinned by
+`prepare_load()` (ref_cnt 0 → 1). Until then it is evictable, so a key that
+became ready while the rest of its wave was still promoting can be evicted by
+any other request's `prepare_store`/`prepare_write` before the wave's last key
+lands. The driver then loads a key that is gone. As far as we can see, this is
+the only way the wave path can reach that assert; the eviction of the failing key
+itself was not logged.
+
+### The fix
+
+Evaluate readiness, never remember it. `TieringOffloadingManager.wave_lookup()`
+asks the primary tier about the whole wave in the same pass as the
+`prepare_load()` that pins it:
+
+| `wave_lookup` | driver |
+|---|---|
+| `HIT` (every key resident and readable) | `prepare_load`, ship the wave |
+| `HIT_PENDING` (a write is still in flight: a promotion, or another request's store) | wait |
+| `MISS` (evicted, failed promotion, `reset_cache` wipe) | re-stage the wave; `promote_for_staging` re-reads only the absent keys |
+
+`wave_ready_keys`, `pop_ready_keys` and `WaveSpec.promoted` are removed.
+
+Stuck waves are now visible. Every step a wave makes no progress, staging
+refused or re-staged after a `MISS`, is counted in
+`vllm:kv_offload_wave_retry_total{reason="promote_refused"|"miss"}`. The log warns
+at `VLLM_OFFLOAD_STREAM_WAVE_MAX_RETRIES` (default 50) and at each doubling.
+Before, only refusals incremented the retry count, and it warned once, at the
+ceiling.
+
+### Verified
+
+- `test-wave-lookup.py` replays the eviction on vLLM's real
+  `CPUOffloadingManager`: `HIT_PENDING` while the wave promotes, `MISS` after
+  another request's store evicts a ready key (where `prepare_load` raises the
+  exact assertion above), `HIT` after re-staging. It also checks that the counter
+  is exported. No GPU needed; from `mods/fix-kv-offload-disk-tier`:
+  `docker run --rm --entrypoint python3 -v "$PWD/test-wave-lookup.py:/t.py:ro" <image> /t.py`
+- 01–04 apply with `git apply` on vLLM `e2666d9a65f41fc376607531453cbd57c4c71016`,
+  all touched files compile, and a second `run.sh` skips.
+- vLLM's `tests/v1/kv_connector/unit/offloading_connector` and
+  `tests/v1/kv_offload`: the same pass/fail set with and without 04 (403
+  passed). We ran them in a container without a GPU, so the GPU-dependent tests
+  could not run either way.
+- Live, on that cluster: after a full restart, a 175,022-token prompt restored from
+  disk in 3.2 s through the new path, with no errors. The prefill that first stored
+  it took 139.5 s.
+  The original crash took 20.6 h to appear, so hours without a recurrence are
+  weak evidence; the replay is the proof of mechanism.
+
+### Honest scope
+
+- **Retries are still unbounded.** A key the secondary tier has lost re-reads
+  every step while its request holds the GPU blocks allocated up front. The
+  abort-and-recompute fallback (03's OPEN A) is still not implemented; 04 makes
+  that case visible (`reason="miss"` climbing on one wave), not bounded.
+- Unrelated to 04, found while running the tests: with 03 applied, 23 tests in
+  vLLM's `tests/v1/kv_connector/unit/offloading_connector/test_scheduler.py` fail with
+  `TypeError: _make_scheduler_with_lookup.<locals>.<lambda>() got an unexpected keyword argument 'promote'`,
+  because the test's `lookup` mock does not accept 03's new `promote=` argument.
+- vLLM #54914 reports the same assertion on stock vLLM without this mod. 04 fixes
+  only the wave path and says nothing about that report's cause.
+- Written with AI assistance (Claude) and verified on that cluster.

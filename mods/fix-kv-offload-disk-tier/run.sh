@@ -9,6 +9,7 @@ PATCHES=(
   "01-eagle-store-filter.patch"
   "02-multinode-promoted-row-resync.patch"
   "03-match-without-staging.patch"
+  "04-wave-readiness-at-load.patch"
 )
 
 if ! command -v git >/dev/null 2>&1; then
@@ -30,16 +31,16 @@ cd "$PYTHON_ROOT"
 # The per-patch "already applied" test below reverse-checks each patch in
 # isolation, which stopped working once a third overlapping patch existed:
 # reversing 01 alone fails while 03's edits to the same regions are present, so
-# a second run ERRORED instead of skipping. Since 03 was generated against
-# 01+02, its context contains their changes -- so if 03 reverse-applies, the
-# whole stack is in place.
+# a second run ERRORED instead of skipping. Each patch was generated against
+# the ones before it, so the last one's context contains their changes -- if it
+# reverse-applies, the whole stack is in place.
 LAST="${PATCHES[${#PATCHES[@]}-1]}"
 if git apply --reverse --check "$MOD_DIR/$LAST" 2>/dev/null; then
   echo "$PREFIX all ${#PATCHES[@]} patches already applied; skipping."
   exit 0
 fi
 
-# Applied in order: 02 touches scheduler.py after 01 does, and 03 after both.
+# Applied in order: 02 touches scheduler.py after 01 does, 03 after both, 04 after 03.
 for patch in "${PATCHES[@]}"; do
   file="$MOD_DIR/$patch"
   if git apply --reverse --check "$file" 2>/dev/null; then
@@ -56,10 +57,12 @@ done
 
 echo "=====> Disk-backed KV offload tier: EAGLE/MTP store filter + multi-node re-sync"
 echo "=====> + matching decoupled from staging (03), which is what makes the tier"
-echo "=====> actually usable on a prefix larger than your primary tier."
+echo "=====> actually usable on a prefix larger than your primary tier,"
+echo "=====> + wave readiness evaluated at load (04), which fixes a prepare_load"
+echo "=====> crash after long uptimes."
 echo "=====> Set PYTHONHASHSEED so block hashes are stable across restarts."
 echo "=====> Tuning (all optional, sane defaults):"
-echo "=====>   VLLM_OFFLOAD_STREAM_WAVE_CHUNKS=64  chunks per wave; 0 = 03 fully inert"
+echo "=====>   VLLM_OFFLOAD_STREAM_WAVE_CHUNKS=64  chunks per wave; 0 = 03 and 04 fully inert"
 echo "=====>   VLLM_OFFLOAD_PARK=0                 admission gate; off by default"
 echo "=====> If you see repeated \"cannot store chunks\": your primary tier is too"
 echo "=====> small for the store batch. Raise cpu_bytes_to_use."
