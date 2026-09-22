@@ -1,10 +1,12 @@
-# Recipe: MiMo-V2.6-Flash-RL
+# Recipe: MiMo-V2.6-Flash-RL + UCM KV offload
 # Xiaomi MiMo-V2.6-Flash-RL (309B MoE, 15B active, MXFP4 experts + fp8 attention)
-# with DFlash block-diffusion speculative decoding on two DGX Spark nodes (TP=2).
+# with DFlash block-diffusion speculative decoding on two DGX Spark nodes (TP=2),
+# plus unified-cache-management (UCM) KV cache offload to local storage.
+# Copy of mimo-v2.6-flash.yaml with the UCM wiring; keep the shared parts in sync.
 
 recipe_version: "1"
-name: MiMo-V2.6-Flash-RL
-description: vLLM serving XiaomiMiMo/MiMo-V2.6-Flash-RL with DFlash speculative decoding on a dual DGX Spark cluster
+name: MiMo-V2.6-Flash-RL + UCM KV offload
+description: vLLM serving XiaomiMiMo/MiMo-V2.6-Flash-RL with DFlash speculative decoding and UCM KV cache offload on a dual DGX Spark cluster
 
 # HuggingFace model to download (optional, for --download-model)
 model: XiaomiMiMo/MiMo-V2.6-Flash-RL
@@ -15,13 +17,17 @@ container: vllm-node
 # ~173 GB of weights: needs both Sparks
 cluster_only: true
 
-# Stages a loadable copy of the checkpoint's dflash/ drafter (sanitized
-# config.json) at /workspace/MiMo-V2.6-Flash-RL-dflash, since a Hub
-# subdirectory is not addressable as a draft model. mimo-diffkv-fp8-kv makes
-# --kv-cache-dtype fp8 effective (upstream ignores it for this model).
+# - mods/mimo-v2.6-flash: stages a loadable copy of the checkpoint's dflash/
+#   drafter (sanitized config.json) at /workspace/MiMo-V2.6-Flash-RL-dflash,
+#   since a Hub subdirectory is not addressable as a draft model.
+# - mods/ucm-kv-offload: installs UCM and writes /workspace/ucm_config.yaml
+#   (Cache|Posix store under /root/.cache/vllm/ucm-kv).
+# - mods/mimo-diffkv-fp8-kv: makes --kv-cache-dtype fp8 effective (upstream
+#   ignores it for this model).
 mods:
   - mods/mimo-v2.6-flash
   - mods/mimo-diffkv-fp8-kv
+  - mods/ucm-kv-offload
 
 # Default settings (can be overridden via CLI where supported)
 defaults:
@@ -35,7 +41,10 @@ defaults:
   num_speculative_tokens: 7
 
 # Environment variables
-env: {}
+# ENABLE_UCM_PATCH activates UCM's import hook (.pth) so it can patch vLLM at
+# serve time; without it UCM is installed but inert.
+env:
+  ENABLE_UCM_PATCH: "1"
 
 # The vLLM serve command template
 # - --moe-backend marlin: the MXFP4 MoE auto-selection would pick DeepGEMM on
@@ -45,27 +54,23 @@ env: {}
 # - fp8 KV cache + 0.87 utilization: bf16 KV holds ~614K tokens at 0.85, short
 #   of the model's 1M context. A 1M sequence needs 14.3 GiB of fp8 KV; 0.85
 #   left 13.85 GiB, so 0.87 provides the headroom (~105.8 of 121.6 GiB).
-#   Requires mods/mimo-diffkv-fp8-kv: upstream vLLM neither wires cache_config
-#   into the MiMo attention layers nor lets the DiffKV backend take fp8 KV.
+#   Requires mods/mimo-diffkv-fp8-kv (see above).
 # - DFlash drafter ships inside the checkpoint under dflash/ (block size 8 ->
 #   7 draft tokens). Its SWA layers carry attention sink biases and DFlash needs
 #   non-causal attention, so the draft is pinned to TRITON_ATTN.
 # - FULL_DECODE_ONLY cudagraphs trade prefill graph capture for memory headroom
-#   on the 121 GB unified pool; FULL_AND_PIECEWISE also works. The official
-#   vLLM recipe pairs the same mode with DFlash:
-#   https://github.com/vllm-project/recipes/blob/09dea3c390ca123b6d3f1aaca7774c8fffa51654/models/XiaomiMiMo/MiMo-V2.6-Flash-RL.yaml
-# - The drafter inherits the target's TP size (2) by default; pin
-#   "draft_tensor_parallel_size" in --speculative-config only for asymmetric
-#   topologies (official recipe guidance).
+#   on the 121 GB unified pool; FULL_AND_PIECEWISE also works.
 # - generation_config.json carries max_new_tokens=2048, which would become a
-#   server-wide max_tokens cap, so only top_p is taken over from it — this
-#   matches the official recipe's recommended sampling (temperature 1.0 is
-#   already the vLLM default). Thinking mode is on by default; clients disable
-#   it per request with chat_template_kwargs {"enable_thinking": false}.
+#   server-wide max_tokens cap, so only top_p is taken over from it.
 # - --no-async-scheduling: vllm#46669 (open) reports garbage outputs with
 #   MTP/DFlash spec decode + async scheduling at concurrency > 1 on MiMo
 #   models; disabling async is the only known mitigation. Upstream still
 #   treats dflash as async-compatible, so the default is ON without this flag.
+# - --kv-transfer-config: UCM connector (installed by mods/ucm-kv-offload)
+#   offloads KV blocks to the Cache|Posix store described in
+#   /workspace/ucm_config.yaml. Prefix caching stays enabled (UCM sits on top
+#   of it); UCM logs warn when the installed vLLM predates/postdates its patch
+#   matrix (supports vLLM <= 0.28.0, the image builds vLLM main).
 command: |
   vllm serve XiaomiMiMo/MiMo-V2.6-Flash-RL \
       --trust-remote-code \
@@ -80,6 +85,7 @@ command: |
       --gpu-memory-utilization {gpu_memory_utilization} \
       --no-async-scheduling \
       --speculative-config '{{"method":"dflash","model":"/workspace/MiMo-V2.6-Flash-RL-dflash","num_speculative_tokens":{num_speculative_tokens},"attention_backend":"TRITON_ATTN"}}' \
+      --kv-transfer-config '{{"kv_connector":"UCMConnector","kv_connector_module_path":"ucm.integration.vllm.ucm_connector","kv_role":"kv_both","kv_connector_extra_config":{{"UCM_CONFIG_FILE":"/workspace/ucm_config.yaml"}}}}' \
       --compilation-config '{{"cudagraph_mode":"FULL_DECODE_ONLY"}}' \
       --generation-config vllm \
       --override-generation-config '{{"top_p":0.95}}' \
