@@ -934,7 +934,7 @@ Examples:
         "--no-cache-dirs",
         action="store_true",
         dest="no_cache_dirs",
-        help="Do not mount ~/.cache/vllm, ~/.cache/flashinfer, ~/.triton",
+        help="Do not mount ~/.cache/vllm, ~/.cache/flashinfer, ~/.cache/b12x, ~/.triton, ~/.tilelang",
     )
     launch_group.add_argument(
         "--keep-entrypoint",

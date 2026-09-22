@@ -34,7 +34,7 @@ VLLM_SOURCE_STAGING_DIR=""
 VLLM_SOURCE_CONTEXT=""
 EXP_B12X=false
 EXP_B12X_VLLM_REPO="https://github.com/local-inference-lab/vllm"
-EXP_B12X_VLLM_REF="dev/jovian-judgement"
+EXP_B12X_VLLM_REF="dev/karmic-kraken"
 B12X_PACKAGE_REPO="https://github.com/lukealonso/b12x.git"
 B12X_PACKAGE_REF="master"
 EXP_B12X_TORCH_VERSION="2.13.0"
@@ -43,6 +43,7 @@ EXP_B12X_TORCHAUDIO_VERSION="2.11.0"
 B12X_REPO=""
 B12X_REF=""
 B12X_CACHEBUST=""
+B12X_FROM_PYPI=0
 FLASHINFER_REF="main"
 FLASHINFER_REF_SET=false
 TMP_IMAGE=""
@@ -118,6 +119,7 @@ generate_build_metadata() {
     local b12x_repo="${13}"
     local b12x_ref="${14}"
     local cutlass_dsl_version="${15}"
+    local b12x_from_pypi="${16:-0}"
 
     local base_image
     base_image=$(grep -m1 '^FROM .* AS runner' "$dockerfile" | awk '{print $2}')
@@ -139,6 +141,7 @@ build_args:
   cutlass_dsl_version: "${cutlass_dsl_version}"
   b12x_repo: "${b12x_repo}"
   b12x_ref: "${b12x_ref}"
+  b12x_from_pypi: ${b12x_from_pypi}
   transformers_5: ${transformers_5}
   exp_mxfp4: ${exp_mxfp4}
   vllm_prs: "${vllm_prs}"
@@ -857,15 +860,20 @@ NORMALIZED_DEFAULT_VLLM_REPO="${DEFAULT_VLLM_REPO%/}"
 NORMALIZED_DEFAULT_VLLM_REPO="${NORMALIZED_DEFAULT_VLLM_REPO%.git}"
 if [ "$NORMALIZED_VLLM_REPO" = "$NORMALIZED_DEFAULT_VLLM_REPO" ] || \
    [ "$NORMALIZED_VLLM_REPO" = "$EXP_B12X_VLLM_REPO" ]; then
-    B12X_REPO="$B12X_PACKAGE_REPO"
-    B12X_REF="$B12X_PACKAGE_REF"
     B12X_CACHEBUST="$(date +%s)"
     TORCH_BASE_VERSION="${TORCH_VERSION%%+*}"
     if [ "$(printf '%s\n' "2.12.0" "$TORCH_BASE_VERSION" | sort -V | head -n1)" != "2.12.0" ]; then
         echo "Error: ${NORMALIZED_VLLM_REPO} requires --torch-version 2.12.0 or newer for B12X (got ${TORCH_VERSION})."
         exit 1
     fi
-    echo "Building B12X from ${B12X_REPO} ref ${B12X_REF} for ${NORMALIZED_VLLM_REPO} ref ${VLLM_REF}."
+    if [ "$NORMALIZED_VLLM_REPO" = "$EXP_B12X_VLLM_REPO" ]; then
+        B12X_REPO="$B12X_PACKAGE_REPO"
+        B12X_REF="$B12X_PACKAGE_REF"
+        echo "Building B12X from ${B12X_REPO} ref ${B12X_REF} for ${NORMALIZED_VLLM_REPO} ref ${VLLM_REF}."
+    else
+        B12X_FROM_PYPI=1
+        echo "Installing latest B12X from PyPI for ${NORMALIZED_VLLM_REPO} ref ${VLLM_REF}."
+    fi
 fi
 
 # Source autodiscover.sh to load .env file
@@ -1335,7 +1343,7 @@ if [ "$NO_BUILD" = false ]; then
         generate_build_metadata Dockerfile "$VLLM_VERSION" "$VLLM_COMMIT" "$FLASHINFER_COMMIT" \
             "$VLLM_REF" "true" "false" "$VLLM_PRS" "$VLLM_REPO" "$TORCH_VERSION" \
             "${TORCHVISION_VERSION:-resolver-selected}" "${TORCHAUDIO_VERSION:-resolver-selected}" \
-            "${B12X_REPO:-disabled}" "${B12X_REF:-disabled}" "$CUTLASS_DSL_VERSION"
+            "${B12X_REPO:-disabled}" "${B12X_REF:-disabled}" "$CUTLASS_DSL_VERSION" "$B12X_FROM_PYPI"
 
         RUNNER_CMD=("docker" "build"
             "-t" "$IMAGE_TAG"
@@ -1346,6 +1354,10 @@ if [ "$NO_BUILD" = false ]; then
         if [ -n "$B12X_REPO" ]; then
             RUNNER_CMD+=("--build-arg" "B12X_REPO=$B12X_REPO")
             RUNNER_CMD+=("--build-arg" "B12X_REF=$B12X_REF")
+        elif [ "$B12X_FROM_PYPI" = "1" ]; then
+            RUNNER_CMD+=("--build-arg" "B12X_FROM_PYPI=$B12X_FROM_PYPI")
+        fi
+        if [ -n "$B12X_CACHEBUST" ]; then
             RUNNER_CMD+=("--build-arg" "B12X_CACHEBUST=$B12X_CACHEBUST")
         fi
 

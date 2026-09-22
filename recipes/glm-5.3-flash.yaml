@@ -22,7 +22,7 @@ defaults:
   pipeline_parallel: 1
   decode_context_parallel: 1
   block_size: 256
-  max_model_len: 1048576
+  max_model_len: 500000
   max_num_seqs: 4
   max_num_batched_tokens: 4096
   num_speculative_tokens: 5
@@ -73,5 +73,4 @@ command: |
     --reasoning-parser glm45 \
     --tool-call-parser glm47 \
     --enable-auto-tool-choice \
-    --kv-cache-memory-bytes {kv_cache_memory_bytes} \
     --gpu-memory-utilization {gpu_memory_utilization}

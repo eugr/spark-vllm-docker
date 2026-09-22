@@ -15,6 +15,7 @@ repository changes use the separate [development guide](docs/AGENT_DEVELOPMENT.m
 
 - [DISCLAIMER](#disclaimer)
 - [QUICK START](#quick-start-shortcut)
+- [REGULAR QUICK START](#regular-quick-start)
 - [CHANGELOG](#changelog)
 - [1. Building the Docker Image](#1-building-the-docker-image)
 - [2. Launching the Cluster (Recommended)](#2-launching-the-cluster-recommended)
@@ -51,9 +52,23 @@ Runtime images also set `VLLM_WSL2_ENABLE_PIN_MEMORY=1` by default. Pass
 `-e VLLM_WSL2_ENABLE_PIN_MEMORY=0` to `launch-cluster.sh` or `docker run` to opt
 out.
 
-## QUICK START SHORTCUT
+B12X autotuning is disabled by default with `B12X_AUTOTUNE=0` on all GPU
+architectures. Pass `-e B12X_AUTOTUNE=1` to enable it for a launch.
 
-If you are here to run DeepSeek V4 Flash (07/31 version), follow these instructions, otherwise skip to the next section.
+## QUICK START (USING RECIPES)
+
+### Single Spark
+
+Check out locally. Do it on the head node of the cluster.
+This will build the image, download the model and launch it in the container.
+
+```bash
+git clone https://github.com/eugr/spark-vllm-docker.git
+cd spark-vllm-docker
+./run-recipe.sh recipes/qwen3.8-flash-next-nvfp4-solo.yaml --solo --setup
+```
+
+### Dual Sparks (or more)
 
 Before you start, make sure you connect your Sparks together and enable passwordless SSH as described in our [Networking Guide](docs/NETWORKING.md). You can also check out NVIDIA's [Connect Two Sparks Playbook](https://build.nvidia.com/spark/connect-two-sparks/stacked-sparks), but using our guide is the best way to get started. The guide includes instructions for 3-node Spark mesh clusters.
 
@@ -63,118 +78,224 @@ This will build the image, download and distribute the model and launch the clus
 ```bash
 git clone https://github.com/eugr/spark-vllm-docker.git
 cd spark-vllm-docker
-./run-recipe.sh recipes/deepseek-v4-flash-0731.yaml --setup
+./run-recipe.sh recipes/deepseek-v4-flash-vision-exp.yaml --setup
 ```
 
-## REGULAR QUICK START
+## QUICK START (USING LAUNCHER)
 
-### Build
+These examples show image preparation, model download, and `launch-cluster.sh`
+commands separately. Qwen3.8-27B uses the regular image (`vllm-node`). The
+Qwen3.8 Flash Next and DeepSeek Vision examples match the shortcut above and
+use the B12X image (`vllm-node-b12x`). Choose the example for your setup.
 
-Check out locally. If using DGX Spark cluster, do it on the head node.
+### Check out the repository
+
+Run the commands on your Spark, or on the head node of your cluster:
 
 ```bash
 git clone https://github.com/eugr/spark-vllm-docker.git
 cd spark-vllm-docker
 ```
 
-Prepare the container image.
+### Single Spark: Qwen3.8-27B NVFP4 (regular image)
 
-**If you have only one DGX Spark:**
+This matches the [Qwen3.8-27B NVFP4 with DFlash2 recipe](recipes/qwen3.8-27b-nvfp4-dflash2.yaml)
+in solo mode. It uses FP8 KV cache, InstantTensor loading, and the DFlash2
+draft model for speculative decoding, with a maximum context length of 262144
+tokens.
+
+Pull the tested regular image and download both the main and draft models:
 
 ```bash
 ./build-and-copy.sh
+./hf-download.sh nvidia/Qwen3.8-27B-NVFP4
+./hf-download.sh z-lab/Qwen3.8-27B-DFlash2
 ```
 
-**On DGX Spark cluster:**
-
-Make sure you connect your Sparks together and enable passwordless SSH as described in our [Networking Guide](docs/NETWORKING.md). You can also check out NVIDIA's [Connect Two Sparks Playbook](https://build.nvidia.com/spark/connect-two-sparks/stacked-sparks), but using our guide is the best way to get started. The guide includes instructions for 3-node Spark mesh clusters.
-
-Then run the following command to pull, tag, and distribute the image across the cluster.
+Launch the server:
 
 ```bash
-./build-and-copy.sh -c --copy-parallel
+./launch-cluster.sh --solo -t vllm-node \
+  exec vllm serve nvidia/Qwen3.8-27B-NVFP4 \
+    --host 0.0.0.0 \
+    --port 8000 \
+    --trust-remote-code \
+    --kv-cache-dtype fp8 \
+    --gpu-memory-utilization 0.7 \
+    --max-model-len 262144 \
+    --max-num-seqs 8 \
+    --max-num-batched-tokens 16384 \
+    --enable-chunked-prefill \
+    --async-scheduling \
+    --enable-prefix-caching \
+    --speculative-config '{"method":"dflash","model":"z-lab/Qwen3.8-27B-DFlash2","num_speculative_tokens":8,"draft_tensor_parallel_size":1}' \
+    --load-format instanttensor \
+    --reasoning-parser qwen3 \
+    --tool-call-parser qwen3_xml \
+    --enable-auto-tool-choice \
+    --tensor-parallel-size 1
 ```
 
-The default image preparation speed depends mostly on your Internet connection and whether `eugr/spark-vllm:latest` is already present locally.
+### Single Spark: Qwen3.8 Flash Next NVFP4
 
-For slower internet connections it can be faster to build from the precompiled wheels by using `--use-wheels` parameter. An initial build speed depends on your Internet connection speed and whether the base image is already present on your machine. After base image pull, the build should take only 2-3 minutes.
+This matches the [solo Qwen3.8 Flash Next recipe](recipes/qwen3.8-flash-next-nvfp4-solo.yaml),
+including PLE tables offloaded to disk and speculative decoding.
+It uses the B12X model loader and a maximum context length of 262144 tokens.
 
-If `--use-wheels`, `--rebuild-vllm`, `--rebuild-flashinfer`, or another build customization is used, the script keeps the local wheel-based runner path. `--use-wheels` by itself only downloads or reuses precompiled vLLM and FlashInfer wheels; the runner stage still installs its normal runtime dependencies, including the B12X package for regular upstream builds. Source compilation of vLLM or FlashInfer occurs only when that dependency is explicitly selected by a source-build flag. Full source rebuilds can take 20-40 minutes, but subsequent builds are faster.
-
-### Run
-
-**On a single node**:
-
-`launch-cluster.sh` supports solo mode, which is now a recommended way to run the container on a single Spark:
+Pull the tested B12X image and download the model:
 
 ```bash
-./launch-cluster.sh --solo exec \
-  vllm serve \
-    QuantTrio/Qwen3-VL-30B-A3B-Instruct-AWQ \
-    --port 8000 --host 0.0.0.0 \
-    --gpu-memory-utilization 0.8 \
-    --load-format fastsafetensors
+./build-and-copy.sh --exp-b12x
+./hf-download.sh local-inference-lab/Qwen3.8-Flash-Next-NVFP4
 ```
 
-To publish the server port instead of using host networking, pass the Docker port mapping before `exec`:
+Launch the server:
 
 ```bash
-./launch-cluster.sh --solo -p 8000:8000 exec \
-  vllm serve \
-    QuantTrio/Qwen3-VL-30B-A3B-Instruct-AWQ \
-    --port 8000 --host 0.0.0.0
+./launch-cluster.sh --solo -t vllm-node-b12x \
+  -e VLLM_PLE_TABLE_MEMORY=disk \
+  -e CUTE_DSL_ARCH=sm_121a \
+  -e SAFETENSORS_FAST_GPU=1 \
+  -e VLLM_WORKER_MULTIPROC_METHOD=spawn \
+  -e VLLM_SSM_CONV_STATE_LAYOUT=DS \
+  -e VLLM_USE_AOT_COMPILE=1 \
+  -e VLLM_USE_MEGA_AOT_ARTIFACT=1 \
+  -e VLLM_USE_V2_MODEL_RUNNER=1 \
+  -e B12X_POLICY_MODE=auto \
+  exec vllm serve local-inference-lab/Qwen3.8-Flash-Next-NVFP4 \
+    --host 0.0.0.0 \
+    --port 8000 \
+    --trust-remote-code \
+    --tensor-parallel-size 1 \
+    --pipeline-parallel-size 1 \
+    --mamba-cache-mode align \
+    --enable-prefix-caching \
+    --enable-chunked-prefill \
+    --dtype bfloat16 \
+    --kv-cache-dtype fp8 \
+    --quantization modelopt_mixed \
+    --block-size 16 \
+    --load-format b12x \
+    --max-model-len 262144 \
+    --max-num-seqs 8 \
+    --max-num-batched-tokens 4096 \
+    --speculative-config '{"method":"mtp","num_speculative_tokens":4}' \
+    --gdn-decode-kernel b12x \
+    --linear-backend b12x \
+    --moe-backend b12x \
+    --no-enable-flashinfer-autotune \
+    --mm-encoder-tp-mode data \
+    --reasoning-parser qwen3 \
+    --tool-call-parser qwen3_xml \
+    --enable-auto-tool-choice \
+    --compilation-config '{"pass_config":{"fuse_act_quant":true}}' \
+    --gpu-memory-utilization 0.8
 ```
 
-**On a cluster**
+Launcher script uses host networking by default. To use Docker port publishing, add
+`-p 8000:8000` before `exec` in the command above.
 
-It's recommended to download the model on one node and distribute across the cluster using ConnectX interconnect prior to launching. This is to avoid re-downloading the model from the Internet on every node in the cluster.
+### Dual Sparks: DeepSeek V4 Flash Vision Exp
 
-This repository provides a convenience script, `hf-download.sh`. The following
-command will download the model and distribute it across the cluster using autodiscovery.
+This matches the [DeepSeek V4 Flash Vision Exp recipe](recipes/deepseek-v4-flash-vision-exp.yaml).
+It requires two Sparks and uses B12X attention, linear, and MoE backends,
+FP8 KV cache, and DSpark speculative decoding. The loader mod keeps the primary
+model on InstantTensor and avoids a second full InstantTensor load for the
+embedded draft.
+
+Connect the Sparks and configure passwordless SSH as described in the
+[Networking Guide](docs/NETWORKING.md). Run the following on the head node to
+pull and distribute the B12X image, then download the model once and copy it to
+the other nodes. The scripts use your saved cluster configuration or autodiscovery.
 
 ```bash
-./hf-download.sh QuantTrio/MiniMax-M2-AWQ -c --copy-parallel
+./build-and-copy.sh --exp-b12x -c --copy-parallel
+./hf-download.sh deepseek-ai/DeepSeek-V4-Flash-Vision-Exp -c --copy-parallel
 ```
 
-To launch the model:
+Launch the server from the head node:
 
 ```bash
-./launch-cluster.sh exec vllm serve \
-  QuantTrio/MiniMax-M2-AWQ \
-  --port 8000 --host 0.0.0.0 \
-  --gpu-memory-utilization 0.8 \
-  -tp 2 \
-  --max-model-len 128000 \
-  --load-format instanttensor \
-  --enable-auto-tool-choice --tool-call-parser minimax_m2 \
-  --reasoning-parser minimax_m2
+./launch-cluster.sh -t vllm-node-b12x \
+  --apply-mod mods/instanttensor-hybrid-draft-loader \
+  -e CUTE_DSL_ARCH=sm_121a \
+  -e VLLM_USE_AOT_COMPILE=1 \
+  -e VLLM_USE_BREAKABLE_CUDAGRAPH=0 \
+  -e VLLM_USE_MEGA_AOT_ARTIFACT=1 \
+  -e VLLM_MEMORY_PROFILE_INCLUDE_ATTN=1 \
+  -e VLLM_USE_FLASHINFER_SAMPLER=1 \
+  -e VLLM_USE_B12X_WO_PROJECTION=1 \
+  -e VLLM_USE_B12X_MHC=1 \
+  -e VLLM_USE_B12X_FP8_GEMM=1 \
+  -e VLLM_USE_B12X_MOE=1 \
+  -e VLLM_USE_B12X_SPARSE_INDEXER=1 \
+  -e VLLM_USE_V2_MODEL_RUNNER=1 \
+  -e VLLM_MOE_SKIP_PADDING=0 \
+  -e B12X_MLA_SM120_UNIFIED=1 \
+  -e B12X_MOE_FORCE_A8=1 \
+  exec vllm serve deepseek-ai/DeepSeek-V4-Flash-Vision-Exp \
+    --host 0.0.0.0 \
+    --port 8000 \
+    --trust-remote-code \
+    --tensor-parallel-size 2 \
+    --kv-cache-dtype fp8 \
+    --block-size 256 \
+    --max-model-len auto \
+    --max-num-seqs 8 \
+    --max-num-batched-tokens 8192 \
+    --gpu-memory-utilization 0.85 \
+    --enable-prefix-caching \
+    --tokenizer-mode deepseek_v4 \
+    --tool-call-parser deepseek_v4 \
+    --enable-auto-tool-choice \
+    --reasoning-parser deepseek_v4 \
+    --reasoning-config '{"reasoning_parser":"deepseek_v4","reasoning_start_str":"","reasoning_end_str":""}' \
+    --default-chat-template-kwargs.thinking=true \
+    --default-chat-template-kwargs.reasoning_effort=high \
+    --load-format instanttensor \
+    --moe-backend b12x \
+    --linear-backend b12x \
+    --attention-backend B12X \
+    --max-cudagraph-capture-size 48 \
+    --compilation-config '{"cudagraph_mode":"FULL_AND_PIECEWISE","custom_ops":["all"]}' \
+    --speculative-config '{"method":"dspark","num_speculative_tokens":6,"draft_sample_method":"probabilistic","attention_backend":"B12X"}'
 ```
 
-The launcher will use the number of nodes required by the parallelism flags. In a 2-node cluster, this command uses both nodes; in a larger configured cluster, extra nodes are not utilized. Do not pass `--distributed-executor-backend`, `--nnodes`, `--node-rank`, `--master-addr`, `--master-port`, or `--headless` to `vllm serve`; `launch-cluster.sh` supplies the correct backend and per-node multiprocessing arguments automatically.
+With `--tensor-parallel-size 2`, the launcher uses two nodes even if more are
+configured. It supplies the distributed backend, node ranks, and coordination
+addresses automatically; keep those settings out of the `vllm serve` command.
 
-**NOTE:** do not use `--load-format fastsafetensors` if you are loading models that would take >0.85 of available RAM (without KV cache) as it may result in out of memory situation.
+### Check the server
 
-**Also:** You can use other vLLM containers with the launch script as long as they have `bash` available. The launcher clears image entrypoints by default, to prevent containers such as `vllm-openai` to start vLLM before all necessary initialization is complete. However, it's recommended to build the container using this repository for best compatibility and most up-to-date features.
-
-**IMPORTANT**
-
-You may want to prune your build cache every once in a while, especially if you've been using these container builds since the beginning.
-
-You can check the build cache size by running:
+Wait for vLLM to finish loading and report that the API server is ready. Then,
+in a second terminal on the serving Spark or cluster head, run:
 
 ```bash
-docker system df
+curl --fail http://localhost:8000/health
+curl --fail http://localhost:8000/v1/models
 ```
 
-To prune the cache for the first time or if you notice unusually big cache size, use:
+Use `http://<head-node-ip>:8000/v1` as the OpenAI-compatible API base URL in
+your client, with the model ID from the example you launched. For solo mode,
+use that Spark's IP address.
 
-```bash
-docker builder prune
-```
+### Build and launch options
 
-Don't do it every time you rebuild, because it will slow down compilation times.
+The regular image command (`./build-and-copy.sh`) pulls
+`eugr/spark-vllm:latest` and tags it as `vllm-node`. Use
+`./build-and-copy.sh --use-wheels` to build the regular runner from precompiled
+wheels, or `./build-and-copy.sh --rebuild-vllm` to compile upstream vLLM.
 
-For periodic maintenance, I recommend using a filter: `docker builder prune --filter until=72h`
+The B12X image commands (`--exp-b12x`) pull `eugr/spark-vllm-b12x:latest` and
+tag it locally as `vllm-node-b12x`. To compile vLLM from the experimental fork,
+add `--rebuild-vllm` to the corresponding `build-and-copy.sh` command.
+`--use-wheels` is incompatible with `--exp-b12x` because experimental vLLM
+wheels are not published. See [Building the Docker Image](#1-building-the-docker-image)
+for other build profiles and customizations.
+
+You can add `--earlyoom` before `exec` in any launch command to enable the
+container's low-memory monitor. See [Launching the Cluster](#2-launching-the-cluster-recommended)
+for additional launcher options.
 
 ## CHANGELOG
 
@@ -1632,7 +1753,19 @@ Only regular vLLM wheels are downloaded from the published wheel release.
 `--exp-b12x` is therefore incompatible with `--use-wheels`: use bare
 `--exp-b12x` for the published image or add `--rebuild-vllm` for a source build.
 
-For regular `vllm-project/vllm` builds and any branch, tag, or commit selected from `local-inference-lab/vllm`, the runner freshly clones the `master` ref of `https://github.com/lukealonso/b12x.git`, builds and installs its `b12x` distribution automatically. A per-build cache key prevents Docker from reusing a stale source checkout. Before the `--no-deps` install, its package metadata is updated to the image-wide CUTLASS DSL 4.7.0 pin. The exact source commit is recorded at `/workspace/b12x-source-commit`. B12X requires PyTorch 2.12 or newer; both current build profiles use 2.13.0.
+Regular `vllm-project/vllm` runner builds install the latest `b12x` release from
+PyPI, including builds using precompiled vLLM wheels. A per-build cache key and
+package-index refresh prevent stale B12X releases from being reused. The
+`--no-deps` install preserves the image's Torch and CUTLASS DSL versions.
+
+The `--exp-b12x` profile and any branch, tag, or commit selected from
+`local-inference-lab/vllm` continue to clone the `master` ref of
+`https://github.com/lukealonso/b12x.git` and install its `b12x` distribution.
+A per-build cache key prevents Docker from reusing a stale source checkout.
+Before the `--no-deps` install, its package metadata is updated to the image-wide
+CUTLASS DSL 4.7.0 pin. The exact source commit is recorded at
+`/workspace/b12x-source-commit`. B12X requires PyTorch 2.12 or newer; both current
+build profiles use 2.13.0.
 
 **Copy existing image without rebuilding:**
 
@@ -1722,7 +1855,7 @@ Assumptions and limitations:
 - It clears the Docker image entrypoint by default so images that define an entrypoint, such as `vllm-openai`, can still start as idle cluster containers before commands are executed. Use `--keep-entrypoint` to keep the image entrypoint.
 - In solo mode, `-p` / `--publish` can be used to publish ports in Docker format, for example `-p 8000:8000`. When port publishing is used, the launcher does not use host networking. Port publishing is not supported in cluster mode.
 - It sets `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` in each container by default to reduce allocator fragmentation on DGX Spark. Override it with `-e PYTORCH_CUDA_ALLOC_CONF=<value>` when needed.
-- It mounts `~/.cache/huggingface`, `~/.cache/vllm`, `~/.cache/flashinfer`, `~/.triton`, and `~/.tilelang` by default. Use `--no-cache-dirs` to skip the vLLM/FlashInfer/Triton/TileLang cache mounts. Add other mounts with repeatable Docker-style `-v` / `--volume` options, e.g. `-v "$HOME/my-data:/data"`.
+- It mounts `~/.cache/huggingface`, `~/.cache/vllm`, `~/.cache/flashinfer`, `~/.cache/b12x`, `~/.triton`, and `~/.tilelang` by default. Use `--no-cache-dirs` to skip the vLLM/FlashInfer/B12X/Triton/TileLang cache mounts. Add other mounts with repeatable Docker-style `-v` / `--volume` options, e.g. `-v "$HOME/my-data:/data"`.
 
 
 **Start in daemon mode (background):**
@@ -1859,7 +1992,7 @@ discovered correctly:
 | `--ray` | Opt into Ray for multi-node vLLM and add `--distributed-executor-backend ray` when missing. |
 | `--no-ray` | Default multi-node no-Ray mode; accepted for compatibility. |
 | `--master-port` / `--head-port` | Port for cluster coordination: Ray head port or PyTorch distributed master port (default: 29501). |
-| `--no-cache-dirs` | Do not mount default cache directories (~/.cache/vllm, ~/.cache/flashinfer, ~/.triton, ~/.tilelang). |
+| `--no-cache-dirs` | Do not mount default cache directories (~/.cache/vllm, ~/.cache/flashinfer, ~/.cache/b12x, ~/.triton, ~/.tilelang). |
 | `--keep-entrypoint` | Keep the Docker image entrypoint instead of clearing it before launching the idle cluster container. |
 | `--earlyoom` | Run `earlyoom` as the container foreground process instead of `sleep infinity`. |
 | `--earlyoom-args` | Arguments passed to `earlyoom` (default: `-M 524288,102400 -s 100 -r 60`). Implies `--earlyoom`. |
@@ -2248,6 +2381,17 @@ To use it, include `--load-format fastsafetensors` when running vLLM:
 ```
 
 InstantTensor is available with `--load-format instanttensor`. Several large-model recipes use it to reduce load-time memory pressure.
+
+Regular and B12X runner builds, including regular `--use-wheels` builds, patch
+InstantTensor to use vLLM's available-memory accounting for its loading-buffer
+budget. This includes reclaimable OS memory on native DGX Spark and preserves
+the existing CUDA-based accounting under WSL. InstantTensor's budget fraction
+(`INSTANTTENSOR_MAX_FREE_MEM_USAGE`, default `0.5`), minimum across distributed
+ranks, and buffer-size checks still apply.
+
+These runners also default to `INSTANTTENSOR_IO_DEPTH=16` to reduce GPU and
+pinned host staging-buffer usage. Override it through a recipe's `env` settings
+or `-e INSTANTTENSOR_IO_DEPTH=<depth>` with `launch-cluster.sh` or `docker run`.
 
 ## 9\. Benchmarking
 

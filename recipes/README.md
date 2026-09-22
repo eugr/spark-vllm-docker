@@ -211,7 +211,7 @@ Launch options:
   --ib-if IFACE               Override InfiniBand interface
   -e VAR=VALUE                Pass environment variable to container (repeatable)
   -j N                        Number of parallel build jobs
-  --no-cache-dirs             Do not mount ~/.cache/vllm, ~/.cache/flashinfer, ~/.triton
+  --no-cache-dirs             Do not mount ~/.cache/vllm, ~/.cache/flashinfer, ~/.cache/b12x, ~/.triton, ~/.tilelang
   --keep-entrypoint           Keep the Docker image entrypoint
   --earlyoom                  Run earlyoom as the container foreground process
   --earlyoom-args ARGS        Arguments passed to earlyoom

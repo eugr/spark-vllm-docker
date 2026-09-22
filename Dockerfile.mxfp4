@@ -91,6 +91,7 @@ FROM base AS builder
 
 ARG FLASHINFER_CUDA_ARCH_LIST="12.1a"
 ENV FLASHINFER_CUDA_ARCH_LIST=${FLASHINFER_CUDA_ARCH_LIST}
+ENV FLASHINFER_JIT_CACHE_PROVIDER_ARCHS=${FLASHINFER_CUDA_ARCH_LIST}
 
 WORKDIR $VLLM_BASE_DIR
 
@@ -274,6 +275,8 @@ ENV FLASHINFER_CUDA_ARCH_LIST=${FLASHINFER_CUDA_ARCH_LIST}
 ENV TRITON_PTXAS_PATH=/usr/local/cuda/bin/ptxas
 ENV TIKTOKEN_ENCODINGS_BASE=$VLLM_BASE_DIR/tiktoken_encodings
 ENV PATH=$VLLM_BASE_DIR:$PATH
+# TODO: Make the B12X autotuning default architecture dependent.
+ENV B12X_AUTOTUNE=0
 
 # Final extra deps
 # Pin torch via --override so transitive deps can't trigger a re-resolve that
