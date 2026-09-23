@@ -45,7 +45,11 @@ copy_model_to_host() {
     local host_copy_start host_copy_end host_copy_time
     host_copy_start=$(date +%s)
 
-    if rsync -av --mkpath --progress "$model_dir" "${SSH_USER}@${host}:$HUB_PATH/"; then
+    # The trailing slash makes the model directory the transfer root: preserve
+    # snapshot links, but materialize links to hub-level blobs as repo-local files.
+    # Downside is duplication of storage if cross-model shared blobs are used, but basically replicates old behavior.
+    if rsync -av --mkpath --progress --copy-unsafe-links \
+            "$model_dir/" "${SSH_USER}@${host}:$HUB_PATH/$(basename "$model_dir")/"; then
         host_copy_end=$(date +%s)
         host_copy_time=$((host_copy_end - host_copy_start))
         printf "Copy to %s completed in %02d:%02d:%02d\n" "$host" $((host_copy_time/3600)) $((host_copy_time%3600/60)) $((host_copy_time%60))

@@ -382,13 +382,7 @@ RUN --mount=type=cache,id=repo-cache,target=/repo-cache \
 
 WORKDIR $VLLM_BASE_DIR/vllm
 
-# Optional upstream PR patches requested by the build wrapper. PR #54788 makes
-# Model Runner V2 honor an MTP/EAGLE draft's explicit MoE backend instead of
-# inheriting the quantized target's incompatible backend. Remove it once the fix
-# is present in the oldest vLLM ref used by regular builds. PR #47392 is carried
-# as a source-aware runtime patch below because its full diff now conflicts with
-# current upstream main.
-ARG VLLM_PRESET_PRS="54788"
+ARG VLLM_PRESET_PRS=""
 ARG VLLM_APPLY_PRESET_PRS=""
 ARG VLLM_PRS=""
 ARG VLLM_PRESERVE_SM12X_TARGET=0
