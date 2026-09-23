@@ -1,5 +1,27 @@
 # Decision Log
 
+## 2026-09-23 — MiMo looping: fp8 KV mod capped full-attention layers at 128 tokens (uncommitted, major)
+
+- **Files**: `mods/mimo-diffkv-fp8-kv/run.sh`, `tests/test_mimo_diffkv_fp8_kv_mod.sh`,
+  `mods/mimo-diffkv-fp8-kv/README.md`, `recipes/3x-spark-cluster/mimo-v2.6-flash-pp3.yaml`
+- **Symptom**: MiMo-V2.6-Flash-RL (base and dealignai) looped in long generations: coherent for a few
+  hundred tokens, then one phrase or token repeated to max_tokens=6000. Seen at TP=2 (4/4 and 5/6 probe
+  prompts) and PP=3 (1 reproduced), thinking on and off, default sampling.
+- **A/B runs** (same six-prompt probe): fp8 KV + DeepGEMM on: loops. bf16 KV (mod off): clean (PP=3 6/6,
+  TP=2 1/1). fp8 KV + `VLLM_USE_DEEP_GEMM=0`: still loops (5/6), so DeepGEMM is not the cause.
+- **Cause**: the mod passes `cache_config` into `Attention()` to make fp8 KV apply, but `Attention()` falls
+  back to `cache_config.sliding_window` (128) for layers without a per-layer window, so the 9
+  full-attention layers became 128-token sliding-window layers whenever the mod was on. Found by
+  comparing with tonyd2wild/MiMo-V2.6-Flash-DGX-Spark-Recipe patch 01, which clears the window.
+- **Fix**: full-attention layers get a copy of `cache_config` with `sliding_window = None`. Verified: the
+  unmodified TP=2 recipe (fp8 KV) passes 6/6 (all finish=stop, no repetition). The reported KV pool drops
+  from 29.5M to 2.14M tokens at 1M max-model-len: the old figure counted full-attention layers as
+  128-token windows.
+- **Reverted**: the earlier same-day entry that dropped fp8 KV from the PP=3 recipe; fp8 KV and the mod are
+  back. The GitHub-reported fp8 QKV loader and omni `SupportsEagle3` gaps are already fixed in the image
+  (vllm#57508 loader, marker present); `VLLM_USE_DEEP_GEMM=0` is kept in the homelab env files anyway
+  (DeepGEMM#417).
+
 ## 2026-09-21 — MiMo-V2.6 TP=3 request → PP=3 recipe (uncommitted, minor)
 
 - **Files**: `recipes/3x-spark-cluster/mimo-v2.6-flash-pp3.yaml`

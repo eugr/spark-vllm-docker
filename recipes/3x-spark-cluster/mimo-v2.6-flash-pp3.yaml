@@ -53,11 +53,13 @@ env: {}
 # - Hybrid 192/128 K/V head dims make the target select the *_DIFFKV attention
 #   backends (Triton on sm_121, where FlashAttention has no sink support).
 # - Memory: 0.87 x 108 GiB = 94.0 GiB on the reduced-memory node vs ~58 GiB of
-#   weights per pipeline stage -> ~30 GiB of KV/activation headroom; a 1M
-#   sequence needs only ~4.8 GiB of fp8 KV per stage (14.3 GiB total / 3), so
-#   0.87 is safe and the two 121 GiB nodes simply gain slack. vLLM sizes the
-#   KV cache from the smallest worker. fp8 KV requires mods/mimo-diffkv-fp8-kv
-#   (upstream ignores --kv-cache-dtype for this model).
+#   weights per pipeline stage -> ~30 GiB of KV/activation headroom; vLLM sizes
+#   the KV cache from the smallest worker. fp8 KV requires
+#   mods/mimo-diffkv-fp8-kv (upstream ignores --kv-cache-dtype for this model),
+#   and that mod must keep the full-attention layers' window unset: before the
+#   2026-09-23 fix it capped them at the model's 128-token sliding window, and
+#   long generations looped (see decisions.md). bf16 KV (drop the flag and the
+#   mod) measured 3.24M tokens at a 1M max-model-len.
 # - No --compilation-config: the default (PIECEWISE) cudagraph mode is used.
 #   FULL_DECODE_ONLY in the TP=2 recipes bought memory headroom on the 121 GB
 #   pool; at ~58 GB weights per stage that pressure is gone, and this repo has

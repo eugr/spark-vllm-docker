@@ -6,7 +6,11 @@ set -euo pipefail
 # Two upstream gaps (verified against vllm main 2026-09-22):
 # 1. mimo_v2.py never passes cache_config to Attention(), so Attention()
 #    resolves kv_cache_dtype to "auto" and --kv-cache-dtype fp8 is silently
-#    ignored on all 48 target layers.
+#    ignored on all 48 target layers. Passing it has a trap: Attention() then
+#    falls back to cache_config.sliding_window (128) for layers without a
+#    per-layer window, so the full-attention layers get a copy with the window
+#    cleared. Without that, long generations loop once the context passes the
+#    window (reproduced 2026-09-23 at TP=2 and PP=3).
 # 2. triton_attn_diffkv.py — the backend sm_121 selects for the 192/128 K/V
 #    head dims — rejects quantized KV outright and does not view the cache as
 #    fp8 on read.
@@ -68,6 +72,15 @@ patch(
             "            # cache_config, and Attention() then resolves kv_cache_dtype\n"
             "            # to \"auto\", silently ignoring --kv-cache-dtype.\n"
             "            cache_config = get_current_vllm_config().cache_config\n"
+            "        if sliding_window is None and cache_config.sliding_window is not None:\n"
+            "            # mimo-diffkv-fp8-kv: Attention() falls back to\n"
+            "            # cache_config.sliding_window (the model's 128) when\n"
+            "            # per_layer_sliding_window is None, which would cap the\n"
+            "            # full-attention layers at a 128-token window. Give them a\n"
+            "            # copy without one (tonyd2wild patch 01).\n"
+            "            import copy\n"
+            "            cache_config = copy.copy(cache_config)\n"
+            "            cache_config.sliding_window = None\n"
             "        self.attn = Attention(\n",
         ),
     ],

@@ -9,7 +9,13 @@ sm_121. Required by every local MiMo recipe that passes the flag
 - `vllm/model_executor/models/mimo_v2.py`: no caller passes `cache_config`
   into `MiMoV2Attention`, so `Attention()` resolves `kv_cache_dtype` to
   `"auto"` and the CLI flag is silently ignored on all 48 target layers. The
-  mod defaults the parameter to `get_current_vllm_config().cache_config`.
+  mod defaults the parameter to `get_current_vllm_config().cache_config`, and
+  hands full-attention layers (no per-layer window) a copy with
+  `sliding_window = None`: `Attention()` falls back to
+  `cache_config.sliding_window` (the model's 128) otherwise. Without that copy
+  (this mod before 2026-09-23) every layer attended to 128 tokens and long
+  generations looped at TP=2 and PP=3; with it the six-prompt probe is clean
+  (tonyd2wild does the same in patch 01).
 - `vllm/v1/attention/backends/triton_attn_diffkv.py`: this is the backend
   vLLM auto-selects on sm_121 for the model's 192/128 K/V head dims. It
   rejects quantized KV (`supported_kv_cache_dtypes` = auto/bfloat16 +

@@ -22,6 +22,7 @@ from vllm.utils import (
 class MiMoV2Attention(nn.Module):
     def __init__(self, cache_config=None):
         requested = get_current_vllm_config().attention_config.backend
+        sliding_window = sliding_window_size if sliding_window_size > -1 else None
         self.attn = Attention(
             self.num_heads,
             cache_config=cache_config,
@@ -57,6 +58,28 @@ fail() { echo "FAIL: $1" >&2; exit 1; }
 out1=$(PYTHON_ROOT="$ROOT" bash "$MOD") || fail "mod exited non-zero"
 grep -qF "cache_config = get_current_vllm_config().cache_config" "$MIMO" \
     || fail "cache_config wiring missing"
+grep -qF "if sliding_window is None and cache_config.sliding_window is not None:" "$MIMO" \
+    || fail "full-attention layers would inherit the model's sliding window"
+grep -qF "cache_config.sliding_window = None" "$MIMO" \
+    || fail "sliding window not cleared on the full-attention copy"
+python3 - "$MIMO" <<'PY' || fail "patched mimo_v2.py block does not behave"
+import sys, types
+src = open(sys.argv[1]).read()
+start = src.index("        if cache_config is None:")
+end = src.index("        self.attn = Attention(")
+block = "\n".join(l[8:] for l in src[start:end].splitlines())
+shared = types.SimpleNamespace(sliding_window=128, cache_dtype="fp8")
+def run(window, cfg):
+    ns = {"sliding_window": window, "cache_config": cfg,
+          "get_current_vllm_config": lambda: types.SimpleNamespace(cache_config=shared)}
+    exec(block, ns)
+    return ns["cache_config"]
+full = run(None, None)          # full-attention layer: no per-layer window
+swa = run(128, None)            # sliding-window layer
+assert full.sliding_window is None and full.cache_dtype == "fp8", full
+assert swa is shared and swa.sliding_window == 128, swa
+assert shared.sliding_window == 128, "shared cache_config was mutated"
+PY
 grep -qF '"fp8_e4m3",' "$DIFFKV" || fail "fp8 dtypes not added"
 grep -qF 'self.kv_cache_dtype not in ("fp8", "fp8_e4m3")' "$DIFFKV" \
     || fail "non-e4m3 rejection not narrowed correctly"
