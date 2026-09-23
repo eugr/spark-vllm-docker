@@ -1,0 +1,48 @@
+# Recipe: Step-3.7-Flash-NVFP4 + MTP (speculative decoding)
+# Same as step-3.7-flash-nvfp4, but with MTP-3 speculative decoding enabled.
+#
+# IMPORTANT: the official NVFP4 export ships NO MTP (next-n predict) weights, so
+# they must be grafted into the cached checkpoint first. On EACH Spark in the
+# cluster, run:
+#     ./hf-download.sh stepfun-ai/Step-3.7-Flash-NVFP4 -c
+#     ./graft-step-3.7-mtp.sh
+# then:
+#     ./run-recipe.sh step-3.7-flash-nvfp4-mtp
+# See README -> "Step-3.7-Flash NVFP4 + MTP".
+
+recipe_version: "1"
+name: Step-3.7-Flash-NVFP4-MTP
+description: vLLM serving Step-3.7-Flash-NVFP4 with MTP speculative decoding on two Sparks
+
+model: stepfun-ai/Step-3.7-Flash-NVFP4
+container: vllm-node
+cluster_only: true
+
+mods:
+  - mods/step-3.7-flash
+
+defaults:
+  port: 8000
+  host: 0.0.0.0
+  tensor_parallel: 2
+  gpu_memory_utilization: 0.75   # MTP draft + speculative token slots need headroom; lower if OOM
+  max_model_len: 262144
+  num_speculative_tokens: 3      # Step-3.7-Flash has 3 MTP heads (MTP-3)
+
+env: {}
+
+# {{ }} escape literal braces for str.format(); {num_speculative_tokens} is templated.
+command: |
+  vllm serve stepfun-ai/Step-3.7-Flash-NVFP4 \
+      --trust-remote-code \
+      --port {port} \
+      --host {host} \
+      --gpu-memory-utilization {gpu_memory_utilization} \
+      -tp {tensor_parallel} \
+      --distributed-executor-backend ray \
+      --max-model-len {max_model_len} \
+      --enable-auto-tool-choice \
+      --reasoning-parser step3p5 \
+      --tool-call-parser step3p5 \
+      --speculative-config '{{"method": "mtp", "num_speculative_tokens": {num_speculative_tokens}}}' \
+      --load-format instanttensor
