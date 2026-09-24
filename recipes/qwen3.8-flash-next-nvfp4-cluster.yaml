@@ -26,6 +26,9 @@ defaults:
   max_num_batched_tokens: 4096
   num_speculative_tokens: 4
   gpu_memory_utilization: 0.7
+  max-cuda-graph: 79
+# workaround --max-cudagraph-capture-size <max-num-seqs * (1 + num_speculative_tokens)>
+# ref: https://github.com/local-inference-lab/vllm/pull/865
 
 env:
   CUTE_DSL_ARCH: "sm_121a"
@@ -67,4 +70,5 @@ command: |
     --tool-call-parser qwen3_xml \
     --enable-auto-tool-choice \
     --compilation-config '{{"pass_config":{{"fuse_act_quant":true}}}}' \
-    --gpu-memory-utilization {gpu_memory_utilization}
+    --gpu-memory-utilization {gpu_memory_utilization} \
+    --max-cudagraph-capture-size {max-cuda-graph}
