@@ -299,6 +299,13 @@ for additional launcher options.
 
 ## CHANGELOG
 
+### 2026-09-23
+
+#### EarlyOOM in 3rd-party containers
+
+`--earlyoom` flag now works with any Debian/Ubuntu-based vLLM container, such as `vllm/vllm-openai` or NVIDIA NGC ones.
+If EarlyOOM is not installed, it will try to install it via apt.
+
 ### 2026-09-10
 
 #### Qwen3.8 Flash Next solo PLE disk offload
@@ -1994,7 +2001,7 @@ discovered correctly:
 | `--master-port` / `--head-port` | Port for cluster coordination: Ray head port or PyTorch distributed master port (default: 29501). |
 | `--no-cache-dirs` | Do not mount default cache directories (~/.cache/vllm, ~/.cache/flashinfer, ~/.cache/b12x, ~/.triton, ~/.tilelang). |
 | `--keep-entrypoint` | Keep the Docker image entrypoint instead of clearing it before launching the idle cluster container. |
-| `--earlyoom` | Run `earlyoom` as the container foreground process instead of `sleep infinity`. |
+| `--earlyoom` | Run `earlyoom` as the container foreground process instead of `sleep infinity`; install it with `apt-get` if missing. |
 | `--earlyoom-args` | Arguments passed to `earlyoom` (default: `-M 524288,102400 -s 100 -r 60`). Implies `--earlyoom`. |
 | `--launch-script` | Path to bash script to execute in the container (from examples/ directory or absolute path). If launch script is specified, action should be omitted. |
 | `-d` | Run in daemon mode (detached). |
@@ -2011,6 +2018,14 @@ discovered correctly:
 ### Early OOM Monitor
 
 The `--earlyoom` flag starts the idle container with `earlyoom` as PID 1 instead of `sleep infinity`, so it monitors memory while Ray and vLLM are launched with `docker exec`. This is optional; without `--earlyoom`, containers still use the plain idle command.
+
+The `vllm-node` and `vllm-node-b12x` images already include `earlyoom`. If it is
+missing from another image, the launcher installs it as root inside each new
+container using `apt-get update` and `apt-get install`, before applying mods or
+starting Ray/vLLM. This requires an Ubuntu/Debian-based image and access to its
+package repositories. The installation lasts for that container's lifetime and is not preserved in the original image.
+If installation or startup fails, the launcher stops the launch, prints a
+diagnostic, and suggests restarting without `--earlyoom` and `--earlyoom-args`.
 
 Default policy:
 

@@ -81,7 +81,7 @@ usage() {
     echo "  --no-ray        Default for multi-node vLLM without Ray (accepted for compatibility)"
     echo "  --no-cache-dirs Do not mount default cache directories (~/.cache/vllm, ~/.cache/flashinfer, ~/.cache/b12x, ~/.triton, ~/.tilelang)"
     echo "  --keep-entrypoint Keep the Docker image entrypoint instead of clearing it by default"
-    echo "  --earlyoom      Run earlyoom as the container foreground process instead of sleep infinity"
+    echo "  --earlyoom      Run earlyoom as the container foreground process (install it with apt-get if missing)"
     echo "  --earlyoom-args Arguments passed to earlyoom (default: '-M 524288,102400 -s 100 -r 60')"
     echo "  -d              Daemon mode (only for 'start' action)"
     echo "  --non-privileged Run in non-privileged mode (removes --privileged and --ipc=host)"
@@ -1349,11 +1349,59 @@ start_ray_worker() {
           --address=$HEAD_IP:$MASTER_PORT --node-ip-address $worker_ip >> /proc/1/fd/1 2>&1'"
 }
 
-container_keepalive_command() {
-    if [[ "$ENABLE_EARLYOOM" == "true" ]]; then
-        printf 'earlyoom %s' "$EARLYOOM_ARGS"
+ensure_container_earlyoom() {
+    local node_ip="$1"; local is_local="$2"
+    [[ "$ENABLE_EARLYOOM" == "true" ]] || return 0
+
+    echo "Preparing earlyoom in container '$CONTAINER_NAME' on $node_ip..."
+    local setup_script
+    setup_script=$(cat <<'EARLYOOM_SETUP'
+set -e
+if ! command -v earlyoom >/dev/null 2>&1; then
+    if ! command -v apt-get >/dev/null 2>&1; then
+        echo "Error: earlyoom is missing and apt-get is unavailable; automatic installation requires an Ubuntu/Debian-based container." >&2
+        exit 1
+    fi
+    echo "earlyoom is missing; installing it with apt-get..."
+    if ! apt-get update; then
+        echo "Error: apt-get update failed while preparing earlyoom. Check the package repository, network, and permissions errors above." >&2
+        exit 1
+    fi
+    if ! DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends earlyoom; then
+        echo "Error: apt-get could not install earlyoom. See the package manager errors above." >&2
+        exit 1
+    fi
+    if ! command -v earlyoom >/dev/null 2>&1; then
+        echo "Error: Package installation completed, but earlyoom is still unavailable in the container PATH." >&2
+        exit 1
+    fi
+    # Release PID 1 only after apt-get has finished configuring the package.
+    touch /tmp/vllm-spark-earlyoom-ready
+fi
+for ((attempt = 0; attempt < 10; attempt++)); do
+    if IFS= read -r comm < /proc/1/comm && [[ "$comm" == "earlyoom" ]]; then
+        exit 0
+    fi
+    sleep 1
+done
+echo "Error: earlyoom did not start as the container foreground process. Check its arguments and the container logs." >&2
+exit 1
+EARLYOOM_SETUP
+)
+    # Install as root even when the image specifies a non-root default user.
+    # Override WORKDIR because some third-party images omit their /workspace.
+    local setup_cmd=(docker exec --user 0 -w / "$CONTAINER_NAME" bash -c "$setup_script")
+    if [[ "$is_local" == "false" ]]; then
+        local remote_cmd
+        printf -v remote_cmd '%q ' "${setup_cmd[@]}"
+        setup_cmd=(ssh -o BatchMode=yes -o StrictHostKeyChecking=no "$node_ip" "$remote_cmd")
+    fi
+    if "${setup_cmd[@]}"; then
+        return 0
     else
-        printf 'sleep infinity'
+        echo "Error: Could not prepare earlyoom in container '$CONTAINER_NAME' (image '$IMAGE_NAME') on $node_ip." >&2
+        echo "       Restart the launch without --earlyoom (and without --earlyoom-args, which also enables it)." >&2
+        return 1
     fi
 }
 
@@ -1446,8 +1494,20 @@ start_cluster() {
         docker_caps_args="--privileged"
         docker_resource_args="--ulimit nofile=${NOFILE_LIMIT}:${NOFILE_LIMIT} --ipc=host"
     fi
-    local keepalive_cmd
-    keepalive_cmd="$(container_keepalive_command)"
+    local keepalive_cmd=(sleep infinity)
+    if [[ "$ENABLE_EARLYOOM" == "true" ]]; then
+        local earlyoom_args=()
+        read -r -a earlyoom_args <<< "$EARLYOOM_ARGS"
+        # Keep the container alive for docker exec to install a missing binary,
+        # then replace the shell so earlyoom remains PID 1.
+        keepalive_cmd=(bash -c '
+            if ! command -v earlyoom >/dev/null 2>&1; then
+                trap "exit 1" TERM INT
+                while [[ ! -e /tmp/vllm-spark-earlyoom-ready ]]; do sleep 1; done
+            fi
+            exec earlyoom "$@"
+        ' earlyoom "${earlyoom_args[@]}")
+    fi
 
     # Start Head Node
     echo "Starting Head Node on $HEAD_IP..."
@@ -1457,7 +1517,8 @@ start_cluster() {
         done
     fi
     docker run $docker_caps_args $docker_resource_args \
-        $(get_env_flags "$HEAD_IP") $docker_args_common $keepalive_cmd
+        $(get_env_flags "$HEAD_IP") $docker_args_common "${keepalive_cmd[@]}" || { cleanup; return 1; }
+    ensure_container_earlyoom "$HEAD_IP" "true" || { cleanup; return 1; }
 
     # Start Worker Nodes
     for worker in "${PEER_NODES[@]}"; do
@@ -1466,7 +1527,10 @@ start_cluster() {
             ssh "$worker" "mkdir -p ${CACHE_DIRS_TO_CREATE[*]}"
         fi
         local docker_run_cmd="docker run $docker_caps_args $docker_resource_args $(get_env_flags "$worker") $docker_args_common"
-        ssh "$worker" "$docker_run_cmd $keepalive_cmd"
+        local remote_keepalive_cmd
+        printf -v remote_keepalive_cmd '%q ' "${keepalive_cmd[@]}"
+        ssh "$worker" "$docker_run_cmd $remote_keepalive_cmd" || { cleanup; return 1; }
+        ensure_container_earlyoom "$worker" "false" || { cleanup; return 1; }
     done
 
     # Apply mods (containers are idle — no mod_done sync needed)

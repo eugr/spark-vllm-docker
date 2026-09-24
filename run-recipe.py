@@ -946,7 +946,7 @@ Examples:
         "--earlyoom",
         action="store_true",
         dest="earlyoom",
-        help="Run earlyoom as the container foreground process instead of sleep infinity",
+        help="Run earlyoom as the container foreground process (install it with apt-get if missing)",
     )
     launch_group.add_argument(
         "--earlyoom-args",

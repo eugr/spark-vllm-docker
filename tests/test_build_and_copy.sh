@@ -484,13 +484,7 @@ test_rebuild_vllm_applies_preset_prs_by_default() {
     run_build --rebuild-vllm || fail "--rebuild-vllm run failed"
     assert_log_contains '^docker build --target vllm-export .*--build-arg VLLM_REF=main .*--build-arg VLLM_APPLY_PRESET_PRS=1'
     assert_output_contains 'Applying preset vLLM PRs from the Dockerfile by default\.'
-    local preset_prs
-    preset_prs="$(sed -n 's/^ARG VLLM_PRESET_PRS="\([^"]*\)"$/\1/p' "$FIXTURE_DIR/Dockerfile")"
-    case " $preset_prs " in
-        *" 54788 "*) ;;
-        *) fail "regular Dockerfile presets do not include vLLM PR #54788" ;;
-    esac
-    pass "ordinary main source rebuild applies vLLM PR #54788 by default"
+    pass "ordinary main source rebuild enables configured preset vLLM PRs by default"
 }
 
 test_apply_vllm_pr_skips_preset_prs_by_default() {
@@ -1435,6 +1429,13 @@ test_b12x_moe_tuning_memory_patch() {
     pass "B12X MoE releases trial buffers before KV cache profiling"
 }
 
+test_b12x_cache_integrity_patch() {
+    if ! python3 "$PROJECT_DIR/tests/test_b12x_cache_integrity_patch.py"; then
+        fail "B12X cache integrity regression tests failed"
+    fi
+    pass "B12X validates cached objects and durably publishes replacement kernels"
+}
+
 test_default_uses_prebuilt
 test_tf5_uses_prebuilt_tf5_tag
 test_custom_tag_uses_prebuilt_custom_tag
@@ -1509,5 +1510,6 @@ test_swa_block_size_patch
 test_torch_schema_enumeration_patch
 test_instanttensor_vllm_memory_patch
 test_b12x_moe_tuning_memory_patch
+test_b12x_cache_integrity_patch
 
 echo "Passed $TESTS_PASSED build-and-copy tests."

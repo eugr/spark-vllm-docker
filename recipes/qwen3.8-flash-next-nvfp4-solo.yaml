@@ -38,6 +38,8 @@ env:
   VLLM_USE_MEGA_AOT_ARTIFACT: "1"
   VLLM_USE_V2_MODEL_RUNNER: "1"
   B12X_POLICY_MODE: "auto"
+  VLLM_MXFP8_LM_HEAD: "1" 
+  VLLM_B12X_MOE_FP4_LAYER_MAX_INPUT_SCALE: "w13"
 
 command: |
   vllm serve local-inference-lab/Qwen3.8-Flash-Next-NVFP4 \

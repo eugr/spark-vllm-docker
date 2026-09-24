@@ -846,6 +846,11 @@ RUN --mount=type=cache,id=uv-cache,target=/root/.cache/uv \
         echo "B12X installation not requested; skipping."; \
     fi
 
+# Validate cached CuTe objects and recover from interrupted writes. Apply after
+# both source and PyPI B12X installs so every model/backend gets the same fix.
+COPY docker/patch_b12x_cache_integrity.py docker/b12x-cache-integrity.patch /tmp/b12x-patches/
+RUN python3 /tmp/b12x-patches/patch_b12x_cache_integrity.py --installed
+
 # Cached or downloaded wheels can predate the CUDA-on-WSL reporting fix.
 # This also accepts wheels that already contain the source-stage patch.
 COPY docker/patch_vllm_wsl_cuda_uma.py /tmp/vllm-patches/patch_vllm_wsl_cuda_uma.py
