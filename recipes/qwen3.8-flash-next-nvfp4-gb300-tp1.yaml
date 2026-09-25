@@ -1,0 +1,50 @@
+# Recipe: Qwen3.8-Flash-Next NVFP4 (Inferact) - GB200/GB300 single-node config,
+# adapted to ONE DGX Spark (GB10) with tensor_parallel = 1.
+#
+# Flags copied verbatim from the vLLM GB300 single-node command
+# (recipes.vllm.ai/Qwen/Qwen3.8-Flash-Next?hardware=gb300), only TP changed 4 -> 1
+# because a DGX Spark is a single GPU. Official image is the only supported path
+# (qwen4_exp arch needs vLLM >= 0.28.0; PyPI/source unsupported).
+
+recipe_version: "1"
+name: Qwen3.8-Flash-Next-NVFP4 (Inferact) - GB300 config on single Spark (TP1)
+description: >-
+  vLLM serving Inferact/Qwen3.8-Flash-Next-NVFP4 on one DGX Spark/GB10 using the
+  official vllm/vllm-openai:qwen38-flash-next image. GB200/GB300 single-node
+  command from recipes.vllm.ai/Qwen/Qwen3.8-Flash-Next?hardware=gb300 with
+  tensor-parallel-size set to 1 for a single GPU.
+
+container: vllm/vllm-openai:qwen38-flash-next
+model: Inferact/Qwen3.8-Flash-Next-NVFP4
+
+cluster_only: false
+solo_only: false
+
+defaults:
+  port: 8000
+  host: 0.0.0.0
+  tensor_parallel: 1              # GB300 uses 4; single Spark GPU -> 1
+  gpu_memory_utilization: 0.90
+  max_model_len: 262144          # 256K context
+  max_num_seqs: 4                # 4 concurrent requests
+  num_speculative_tokens: 3
+
+# N-gram (PLE, 51B) CPU offload per the vLLM page.
+env:
+  VLLM_PLE_CPU_OFFLOAD: "1"
+
+# NOTE: literal JSON braces are doubled for str.format().
+command: |
+  vllm serve Inferact/Qwen3.8-Flash-Next-NVFP4 \
+      --host {host} \
+      --port {port} \
+      --max-num-seqs {max_num_seqs} \
+      --gpu-memory-utilization {gpu_memory_utilization} \
+      --max-model-len {max_model_len} \
+      --enable-prefix-caching \
+      --no-enable-flashinfer-autotune \
+      --tensor-parallel-size {tensor_parallel} \
+      --enable-auto-tool-choice \
+      --tool-call-parser qwen3_coder \
+      --reasoning-parser qwen3 \
+      --speculative-config '{{"method":"mtp","num_speculative_tokens":{num_speculative_tokens}}}'

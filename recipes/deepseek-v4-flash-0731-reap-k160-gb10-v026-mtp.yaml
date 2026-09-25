@@ -1,0 +1,114 @@
+# Recipe: DeepSeek-V4-Flash-0731 REAP K160 on GB10 — vLLM v0.26.0, MTP speculative
+#
+# New model (0xSero/DeepSeek-V4-Flash-0731-REAP), single-node adaptation of
+# https://github.com/Weschera/DeepSeek-V4-Flash-0731-DSpark-2x-DGX-Spark
+# (which targets 2x DGX Spark, TP=2, the Anemll dspark-vllm-gx10 image, and
+# DSpark speculative decoding K5/K7 via a MODE env var). None of that runtime
+# is available here — this repo builds its own vllm-node-v026 image and
+# applies mods/deepseek-v4-reap-gb10-v026 (router fallback for nonstandard
+# REAP expert counts, MXFP4 memory hygiene, cutedsl/FlashInfer fixes) instead.
+# So this recipe follows the local single-Spark pattern already proven for
+# the sibling K144 checkpoint (recipes/deepseek-v4-flash-162b-reap-gb10-v026-mtp.yaml)
+# rather than porting the reference repo's launch mechanics.
+#
+# Model specifics (see HF README, checked before writing this):
+#   - 160 of 256 routed experts retained per MoE scope (top-6 routing
+#     unchanged). K160 is explicitly one of the nonstandard counts the
+#     v026 mod's router fallback docstring calls out by name.
+#   - 43 backbone MoE layers, 3 DSpark/MTP blocks mapped to backbone layers
+#     40/41/42 -> num_speculative_tokens: 3, method mtp (matches how this
+#     repo already runs MTP on the 162B/180B REAP checkpoints; the
+#     reference repo's own DSpark K5/K7 mode is a different, image-specific
+#     speculative mechanism this repo's stack doesn't implement).
+#   - Checkpoint revision pinned to the current HF main commit for
+#     0xSero/DeepSeek-V4-Flash-0731-REAP itself (verified via the local HF
+#     cache .no_exist/refs, NOT the 9e165c30... hash quoted in the model
+#     card, which is the upstream deepseek-ai/DeepSeek-V4-Flash-0731 base
+#     model's source revision, not this REAP derivative repo's own commit).
+#
+# max_model_len: left at the same empirically-safe 163840 ceiling the sibling
+# 162B/180B v026 recipes use on this exact container/mod pair, rather than
+# copying the reference repo's 1,048,576 (that number was qualified on a
+# 2-node TP=2 fabric with 2x the KV-cache budget; single-node GB10 has half
+# the aggregate HBM+headroom, so raise this only after a live metrics check
+# the way deepseek-v4-flash-162b-reap-gb10-tuned.yaml documents doing).
+#
+# NOT launched by this recipe file — disk headroom check first: at the time
+# this was written, / had ~38G free and the model's HF cache dir was only
+# partially populated (~11G of an expected ~107GB safetensors payload). Run
+# `hf download 0xSero/DeepSeek-V4-Flash-0731-REAP --revision
+# ddc04540efda3d2a0788b129f1fad828ddc19b60` (or free up space first) before
+# using this recipe.
+
+recipe_version: "1"
+name: DeepSeek-V4-Flash-0731-REAP-K160-GB10-v026-MTP
+description: >-
+  vLLM v0.26.0 (built from source via --vllm-ref) serving
+  0xSero/DeepSeek-V4-Flash-0731-REAP (REAP K160, MXFP4 experts, FP8 MLA KV) on
+  a single DGX Spark GB10 node, with MTP speculative decoding.
+
+model: 0xSero/DeepSeek-V4-Flash-0731-REAP
+model_revision: ddc04540efda3d2a0788b129f1fad828ddc19b60
+# Same tag as the sibling 162B/180B v026 REAP recipes: confirmed-working
+# vLLM 568afb3a1 / DeepGEMM f8e8fb583 build with the DeepGEMM UE8M0 warmup
+# assertion (smxx_layout.cuh:131) avoided via VLLM_USE_DEEP_GEMM_E8M0=0 below.
+container: eugr-spark-vllm-deepseek-v4-reap-gb10:0.26-dgfix
+
+mods:
+  - mods/deepseek-v4-reap-gb10-v026
+
+defaults:
+  port: 8000
+  host: 0.0.0.0
+  gpu_memory_utilization: 0.925
+  max_model_len: 163840
+  max_num_seqs: 3
+  max_num_batched_tokens: 4096
+  num_speculative_tokens: 3
+
+env:
+  VLLM_ALLOW_LONG_MAX_MODEL_LEN: "1"
+  VLLM_USE_DEEP_GEMM_E8M0: "0"
+  VLLM_HTTP_TIMEOUT_KEEP_ALIVE: "10000"
+  FLASHINFER_DISABLE_VERSION_CHECK: "1"
+  TILELANG_CLEANUP_TEMP_FILES: "1"
+  DG_JIT_USE_NVRTC: "0"
+  DG_JIT_NVCC_COMPILER: "/usr/local/cuda/bin/nvcc"
+  NCCL_IB_DISABLE: "1"
+  NCCL_DEBUG: "WARN"
+  K160_DISABLE_CUTEDSL: "0"
+  CUTEDSL_VERSION: ""
+  PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
+  VLLM_USE_BREAKABLE_CUDAGRAPH: "1"
+
+command: |
+  vllm serve 0xSero/DeepSeek-V4-Flash-0731-REAP \
+    --revision ddc04540efda3d2a0788b129f1fad828ddc19b60 \
+    --served-model-name deepseek-v4-flash-0731-REAP-K160 \
+    --host {host} \
+    --port {port} \
+    --trust-remote-code \
+    --tensor-parallel-size 1 \
+    --pipeline-parallel-size 1 \
+    --moe-backend marlin \
+    --kv-cache-dtype fp8 \
+    --block-size 256 \
+    --max-model-len {max_model_len} \
+    --max-num-seqs {max_num_seqs} \
+    --max-num-batched-tokens {max_num_batched_tokens} \
+    --gpu-memory-utilization {gpu_memory_utilization} \
+    --distributed-executor-backend mp \
+    --tokenizer-mode deepseek_v4 \
+    --load-format safetensors \
+    --enable-chunked-prefill \
+    --async-scheduling \
+    --enable-prefix-caching \
+    --tool-call-parser deepseek_v4 \
+    --enable-auto-tool-choice \
+    --reasoning-parser deepseek_v4 \
+    --reasoning-config '{{"reasoning_parser":"deepseek_v4","reasoning_start_str":"<think>","reasoning_end_str":"</think>"}}' \
+    --default-chat-template-kwargs '{{"thinking":true}}' \
+    --default-chat-template-kwargs.reasoning_effort=high \
+    --compilation-config '{{"cudagraph_mode":"FULL_AND_PIECEWISE","custom_ops":["all"]}}' \
+    --speculative-config '{{"method":"mtp","num_speculative_tokens":{num_speculative_tokens}}}' \
+    --disable-access-log-for-endpoints /health,/metrics,/ping
