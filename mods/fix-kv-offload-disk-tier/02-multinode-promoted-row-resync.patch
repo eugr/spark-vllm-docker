@@ -1,0 +1,361 @@
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/offloading/common.py b/vllm/distributed/kv_transfer/kv_connector/v1/offloading/common.py
+index 939a2b0..a5449c5 100644
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/offloading/common.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/offloading/common.py
+@@ -71,6 +71,11 @@ class OffloadingConnectorMetadata(KVConnectorMetadata):
+     store_jobs: dict[int, TransferJob]
+     jobs_to_flush: set[int] | None = None
+ 
++    # Primary-tier block ids filled by a secondary-tier promotion during this
++    # step. Workers that do not share the tier manager's mmap must re-sync
++    # these before any load reads them; see OffloadingConnectorWorker.
++    promoted_rows: list[int] | None = None
++
+ 
+ @dataclass
+ class OffloadingWorkerMetadata(KVConnectorWorkerMetadata):
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py b/vllm/distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py
+index 482cff6..6694897 100644
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py
+@@ -1188,10 +1188,19 @@ class OffloadingConnectorScheduler:
+                 for jid in self._block_id_to_pending_jobs[bid]
+             )
+ 
++        # on_schedule_end() above already ran the tier manager's completed-job
++        # processing, so promotions that landed this step travel in the SAME
++        # metadata as the load job that will read them.
++        promoted_rows = None
++        drain = getattr(self.manager, "drain_promoted_rows", None)
++        if drain is not None:
++            promoted_rows = drain() or None
++
+         meta = OffloadingConnectorMetadata(
+             load_jobs=self._current_batch_load_jobs,
+             store_jobs=self._build_store_jobs(scheduler_output),
+             jobs_to_flush=self._current_batch_jobs_to_flush,
++            promoted_rows=promoted_rows,
+         )
+         self._current_batch_load_jobs = {}
+         self._current_batch_jobs_to_flush = set()
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/offloading/worker.py b/vllm/distributed/kv_transfer/kv_connector/v1/offloading/worker.py
+index 045e513..46ce1ad 100644
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/offloading/worker.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/offloading/worker.py
+@@ -1,5 +1,6 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++import os
+ from collections import defaultdict
+ from dataclasses import replace
+ 
+@@ -33,6 +34,103 @@ from vllm.v1.kv_offload.base import (
+ 
+ logger = init_logger(__name__)
+ 
++# ---------------------------------------------------------------------------
++# Multi-node re-sync of promoted primary-tier rows.
++#
++# SharedOffloadRegion is a PER-NODE /dev/shm mmap. On a single node the
++# scheduler-side region (rank=None) and every worker region (rank=r) are the
++# SAME FILE -- rank only selects a slot within a row -- so a promotion the tier
++# manager performs is visible to every worker for free. That assumption is
++# undocumented, and it is false as soon as TP spans more than one node: each
++# node has its own mmap, and only the rank co-located with the manager runs a
++# secondary tier at all.
++#
++# The result is silent KV corruption. GPU->CPU stores stay symmetric (every
++# rank writes its own region), but disk->CPU promotions land only on the
++# manager's rank, and the following CPU->GPU load reads each rank's OWN region.
++# The other ranks feed their GPUs whatever stale bytes occupied those rows --
++# zeros on a fresh mmap, another request's KV on a recycled one -- with no
++# error anywhere.
++#
++# Fix: the scheduler reports which rows a promotion filled, and every rank
++# re-syncs them from MIRROR_SRC_RANK over the existing TP group before any load
++# is submitted. All ranks receive the identical row list in the connector
++# metadata, so they issue the same collectives in the same order.
++# ---------------------------------------------------------------------------
++
++# TP-local rank co-located with the tier manager, i.e. the one whose region the
++# promotion actually wrote into.
++MIRROR_SRC_RANK = 0
++
++# Bytes per collective, so one large promotion is not a single multi-GB call.
++MIRROR_MAX_BYTES = int(os.environ.get("VLLM_OFFLOAD_MIRROR_MAX_BYTES", 64 << 20))
++
++# Raise (default) or warn when the post-broadcast check fails. The failure mode
++# this exists to remove is silent wrong KV, so warning restores the disease.
++MIRROR_STRICT = os.environ.get("VLLM_OFFLOAD_MIRROR_STRICT", "1") == "1"
++
++# Log the first mirror event, then every Nth; 0 disables the periodic line.
++MIRROR_LOG_EVERY = int(os.environ.get("VLLM_OFFLOAD_MIRROR_LOG_EVERY", "100"))
++
++
++def _kv_replicated_across_tp(kv_cache_config: KVCacheConfig) -> tuple[bool, str]:
++    """Whether every KV group holds identical bytes on every TP rank.
++
++    Re-syncing one rank's rows onto the others is only correct for a
++    REPLICATED cache. MLA stores a single compressed latent per token and is
++    replicated across TP ranks by construction. A head-sharded cache (GQA/MHA)
++    or per-rank recurrent state genuinely differs per rank, and copying over it
++    would corrupt it exactly as thoroughly as the bug being fixed -- so the
++    default is to do nothing unless every group is known-replicated.
++
++    VLLM_OFFLOAD_KV_REPLICATED=0|1 overrides, for cache types not listed here.
++    """
++    override = os.environ.get("VLLM_OFFLOAD_KV_REPLICATED", "").strip()
++    if override in ("0", "1"):
++        return override == "1", f"forced by VLLM_OFFLOAD_KV_REPLICATED={override}"
++
++    def expand(spec):
++        # A group's spec is not always the leaf: UniformTypeKVCacheSpecs wraps
++        # a {layer_name: spec} dict, as register_kv_caches() also unwraps it.
++        inner = getattr(spec, "kv_cache_specs", None)
++        if inner:
++            values = inner.values() if hasattr(inner, "values") else inner
++            for sub in values:
++                yield from expand(sub)
++        else:
++            yield spec
++
++    specs = sorted(
++        {
++            type(sub).__name__
++            for group in kv_cache_config.kv_cache_groups
++            for sub in expand(group.kv_cache_spec)
++        }
++    )
++    if not specs:
++        return False, "no KV cache groups"
++    non_mla = [name for name in specs if "MLA" not in name]
++    if non_mla:
++        return False, "non-MLA KV group(s): " + ", ".join(non_mla)
++    return True, "all KV groups are MLA: " + ", ".join(specs)
++
++
++def _contiguous_runs(rows: list[int], stride: int, max_bytes: int):
++    """Coalesce sorted row ids into (start, count) runs under a byte cap."""
++    max_rows = max(1, max_bytes // stride) if stride else 1
++    start = prev = None
++    count = 0
++    for row in rows:
++        if start is None:
++            start, prev, count = row, row, 1
++        elif row == prev + 1 and count < max_rows:
++            prev, count = row, count + 1
++        else:
++            yield start, count
++            start, prev, count = row, row, 1
++    if start is not None:
++        yield start, count
++
+ 
+ class OffloadingConnectorWorker:
+     """Implementation of Worker side methods"""
+@@ -52,6 +150,9 @@ class OffloadingConnectorWorker:
+             tuple[int, GPULoadStoreSpec, LoadStoreSpec]
+         ] = []
+         self._connector_worker_meta = OffloadingWorkerMetadata()
++        self._mirror_replicated: bool | None = None
++        self._mirror_checked = False
++        self._mirror_events = 0
+ 
+     def _init_worker(self, kv_caches: CanonicalKVCaches) -> None:
+         self.worker = self.spec.get_worker(kv_caches)
+@@ -302,8 +403,126 @@ class OffloadingConnectorWorker:
+         if kv_connector_metadata.jobs_to_flush:
+             self.worker.wait(kv_connector_metadata.jobs_to_flush)
+ 
++    def _mirror_promoted_rows(self, rows: list[int]) -> None:
++        """Re-sync promoted rows from MIRROR_SRC_RANK onto every other rank."""
++        import torch.distributed as dist
++
++        from vllm.distributed.parallel_state import get_tp_group
++
++        try:
++            tp = get_tp_group()
++        except Exception:
++            return
++        if tp.world_size == 1:
++            # Single rank, or every rank shares one mmap: nothing to re-sync.
++            return
++
++        if self._mirror_replicated is None:
++            replicated, reason = _kv_replicated_across_tp(self.kv_cache_config)
++            self._mirror_replicated = replicated
++            logger.info(
++                "KV offload: kv_replicated_across_tp=%s (%s); promoted rows "
++                "will %s",
++                replicated,
++                reason,
++                "be re-synced across TP ranks"
++                if replicated
++                else "NOT be re-synced -- a sharded cache needs a tier per rank",
++            )
++        if not self._mirror_replicated:
++            return
++
++        region = getattr(self.worker, "offload_region", None)
++        if region is None:
++            logger.warning(
++                "KV offload: no offload region on this rank; promoted rows "
++                "cannot be re-synced and this rank's KV will be stale"
++            )
++            return
++
++        stride = region._row_stride
++        src = tp.ranks[MIRROR_SRC_RANK]
++        unique = sorted(set(rows))
++        n_calls = 0
++        n_bytes = 0
++        for start, count in _contiguous_runs(unique, stride, MIRROR_MAX_BYTES):
++            # region._base aliases the mmap, so receivers land in place.
++            flat = region._base[start * stride : (start + count) * stride]
++            dist.broadcast(flat, src=src, group=tp.cpu_group)
++            n_calls += 1
++            n_bytes += count * stride
++
++        self._mirror_events += 1
++        quiet = MIRROR_LOG_EVERY <= 0 or (
++            self._mirror_events > 1 and self._mirror_events % MIRROR_LOG_EVERY
++        )
++        (logger.debug if quiet else logger.info)(
++            "KV offload: re-synced %d promoted rows in %d collectives (%d bytes)",
++            len(unique),
++            n_calls,
++            n_bytes,
++        )
++
++        if not self._mirror_checked:
++            self._verify_mirror(tp, region, unique)
++
++    def _verify_mirror(self, tp, region, rows: list[int]) -> None:
++        """Confirm once that a broadcast landed identically on every rank.
++
++        Runs immediately after the broadcast, on the rows just sent, where
++        equality holds by construction -- so it cannot false-positive on
++        timing. It catches wrong stride or a rank writing into the wrong
++        region, neither of which has any other symptom than bad output.
++
++        Note for anyone tempted to check the stronger property (that the cache
++        really is replicated) by comparing rows written by GPU->CPU stores:
++        that cannot be done by row INDEX, because primary-tier indices are
++        recycled constantly, so the compared rows stop referring to the same
++        block. Replication is decided from config instead.
++        """
++        import hashlib
++
++        import torch.distributed as dist
++
++        self._mirror_checked = True
++        sample = rows[:8]
++        if not sample:
++            return
++        stride = region._row_stride
++        digest = hashlib.sha256()
++        for row in sample:
++            digest.update(
++                region._base[row * stride : (row + 1) * stride].numpy().tobytes()
++            )
++
++        gathered: list[object] = [None] * tp.world_size
++        dist.all_gather_object(gathered, digest.hexdigest(), group=tp.cpu_group)
++        if len(set(gathered)) == 1:
++            logger.info(
++                "KV offload: promoted-row re-sync verified on %d rows across "
++                "%d ranks",
++                len(sample),
++                tp.world_size,
++            )
++            return
++
++        msg = (
++            "KV offload: ranks disagree on rows just broadcast to them "
++            f"(digests={gathered}). The re-sync is not landing where the loader "
++            "reads; suspect row stride or region identity. Continuing would "
++            "serve silently wrong KV."
++        )
++        if MIRROR_STRICT:
++            raise RuntimeError(msg)
++        logger.error("%s (VLLM_OFFLOAD_MIRROR_STRICT=0, continuing)", msg)
++
+     def start_kv_transfers(self, metadata: OffloadingConnectorMetadata):
+         assert self.worker is not None
++        # Must precede submit_load: otherwise the GPU copies this rank's stale
++        # bytes for any row a promotion filled only on the manager's rank.
++        if metadata.promoted_rows:
++            self._mirror_promoted_rows(metadata.promoted_rows)
++
+         for job_id, src_spec, dst_spec in self._unsubmitted_store_jobs:
+             success = self.worker.submit_store(job_id, src_spec, dst_spec)
+             assert success
+diff --git a/vllm/v1/kv_offload/tiering/manager.py b/vllm/v1/kv_offload/tiering/manager.py
+index 2f5b52e..4a3805d 100644
+--- a/vllm/v1/kv_offload/tiering/manager.py
++++ b/vllm/v1/kv_offload/tiering/manager.py
+@@ -203,6 +203,12 @@ class TieringOffloadingManager(OffloadingManager):
+             SecondaryTierManager, dict[str, PendingPromotion]
+         ] = {}
+ 
++        # Primary-tier block ids filled by a COMPLETED promotion since the last
++        # drain. Only the rank co-located with this manager receives those
++        # bytes; the ids are forwarded to the workers so other ranks can
++        # re-sync. Drained once per step by build_connector_meta().
++        self._promoted_rows: list[int] = []
++
+         # Gate for once-per-step execution of _maybe_process_finished_jobs().
+         # Reset at the end of each step in on_schedule_end().
+         self._processed_jobs_this_step: bool = False
+@@ -269,6 +275,13 @@ class TieringOffloadingManager(OffloadingManager):
+                         job_metadata.req_context,
+                         completed_job.success,
+                     )
++                    if completed_job.success:
++                        # These rows now differ between this rank's mmap and
++                        # every other rank's. A failed promotion left the row
++                        # untouched, so it needs no re-sync.
++                        self._promoted_rows.extend(
++                            int(b) for b in job_metadata.block_ids
++                        )
+                 else:
+                     # primary→secondary transfer completed.
+                     # Decrement ref_cnt on primary blocks.
+@@ -720,6 +733,18 @@ class TieringOffloadingManager(OffloadingManager):
+         self._maybe_observe_lookup_async_delay(state)
+         del self._req_state[req_id]
+ 
++    def drain_promoted_rows(self) -> list[int]:
++        """Pop primary-tier rows filled by a promotion since the last call.
++
++        Deduplicated; the caller sorts. Must be called after on_schedule_end()
++        so promotions completing in this step are included.
++        """
++        if not self._promoted_rows:
++            return []
++        rows = list(dict.fromkeys(self._promoted_rows))
++        self._promoted_rows.clear()
++        return rows
++
+     @override
+     def on_schedule_end(self, context: ScheduleEndContext) -> None:
+         """End-of-schedule hook: process finished jobs, flush deferred
+diff --git a/vllm/v1/kv_offload/tiering/spec.py b/vllm/v1/kv_offload/tiering/spec.py
+index 9646999..8505b81 100644
+--- a/vllm/v1/kv_offload/tiering/spec.py
++++ b/vllm/v1/kv_offload/tiering/spec.py
+@@ -248,9 +248,13 @@ class TieringOffloadingSpec(CPUOffloadingSpec):
+             kv_bytes_per_block=self.kv_bytes_per_chunk,
+             cpu_page_size=self.cpu_page_size_per_worker,
+         )
+-        return CPUOffloadingWorker(
++        worker = CPUOffloadingWorker(
+             kv_caches=kv_caches,
+             blocks_per_chunk=self.blocks_per_chunk,
+             num_cpu_blocks=self.num_blocks,
+             mmap_region=worker_mmap,
+         )
++        # Expose this rank's region so the connector worker can re-sync rows
++        # that a promotion wrote only into the tier manager's copy.
++        worker.offload_region = worker_mmap
++        return worker
