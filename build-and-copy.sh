@@ -4,6 +4,9 @@ set -e
 # Start total time tracking
 START_TIME=$(date +%s)
 
+# Container runtime (docker or podman)
+CONTAINER_RT="${CONTAINER_RT:-docker}"
+
 # Default values
 IMAGE_TAG="vllm-node"
 IMAGE_TAG_SET=false
@@ -249,7 +252,7 @@ prepare_local_vllm_source() {
 get_remote_image_id() {
     local host="$1"
     local image="$2"
-    ssh "${SSH_USER}@${host}" "docker image inspect --format '{{.Id}}' ${image}" 2>/dev/null
+    ssh "${SSH_USER}@${host}" "$CONTAINER_RT image inspect --format '{{.Id}}' ${image}" 2>/dev/null
 }
 
 copy_to_host() {
@@ -257,7 +260,7 @@ copy_to_host() {
     echo "Loading image into ${SSH_USER}@${host}..."
     local host_copy_start host_copy_end host_copy_time
     host_copy_start=$(date +%s)
-    if cat "$TMP_IMAGE" | ssh "${SSH_USER}@${host}" "docker load"; then
+    if cat "$TMP_IMAGE" | ssh "${SSH_USER}@${host}" "$CONTAINER_RT load"; then
         host_copy_end=$(date +%s)
         host_copy_time=$((host_copy_end - host_copy_start))
         printf "Copy to %s completed in %02d:%02d:%02d\n" "$host" $((host_copy_time/3600)) $((host_copy_time%3600/60)) $((host_copy_time%60))
@@ -1122,15 +1125,14 @@ if [ "$NO_BUILD" = false ]; then
         fi
 
         PULL_START=$(date +%s)
-        docker pull "$PREBUILT_RUNNER_IMAGE"
+        "$CONTAINER_RT" pull "$PREBUILT_RUNNER_IMAGE"
         if [ "$IMAGE_TAG" != "$PREBUILT_RUNNER_IMAGE" ]; then
-            docker tag "$PREBUILT_RUNNER_IMAGE" "$IMAGE_TAG"
+            "$CONTAINER_RT" tag "$PREBUILT_RUNNER_IMAGE" "$IMAGE_TAG"
         fi
         PULL_END=$(date +%s)
         PREBUILT_PULL_TIME=$((PULL_END - PULL_START))
     elif [ "$EXP_MXFP4" = true ]; then
         echo "Building with experimental MXFP4 support..."
-
         # Generate build metadata YAML for mxfp4 build
         MXFP4_VLLM_SHA=$(grep -m1 '^ARG VLLM_SHA=' Dockerfile.mxfp4 | cut -d= -f2)
         MXFP4_VLLM_REPO=$(grep -m1 '^ARG VLLM_REPO=' Dockerfile.mxfp4 | cut -d= -f2-)
@@ -1139,7 +1141,7 @@ if [ "$NO_BUILD" = false ]; then
             "mxfp4-pinned" "false" "true" "" "$MXFP4_VLLM_REPO" "base-image" \
             "base-image" "base-image" "disabled" "disabled" "base-image"
 
-        CMD=("docker" "build" "-t" "$IMAGE_TAG" "${COMMON_BUILD_FLAGS[@]}" "-f" "Dockerfile.mxfp4" ".")
+        CMD=("$CONTAINER_RT" "build" "-t" "$IMAGE_TAG" "${COMMON_BUILD_FLAGS[@]}" "-f" "Dockerfile.mxfp4" ".")
         echo "Building image with command: ${CMD[*]}"
         BUILD_START=$(date +%s)
         "${CMD[@]}"
@@ -1181,7 +1183,7 @@ if [ "$NO_BUILD" = false ]; then
         if [ "$BUILD_FLASHINFER" = true ]; then
             FLASHINFER_STAGING_DIR=$(mktemp -d "$WHEEL_CACHE_ROOT/.flashinfer-${FLASHINFER_PROFILE}.XXXXXX")
 
-            FI_CMD=("docker" "build"
+            FI_CMD=("$CONTAINER_RT" "build"
                 "--target" "flashinfer-export"
                 "--output" "type=local,dest=$FLASHINFER_STAGING_DIR"
                 "${COMMON_BUILD_FLAGS[@]}"
@@ -1267,7 +1269,7 @@ if [ "$NO_BUILD" = false ]; then
         if [ "$BUILD_VLLM" = true ]; then
             VLLM_STAGING_DIR=$(mktemp -d "$WHEEL_CACHE_ROOT/.vllm-${VLLM_PROFILE}.XXXXXX")
 
-            VLLM_CMD=("docker" "build"
+            VLLM_CMD=("$CONTAINER_RT" "build"
                 "--target" "vllm-export"
                 "--output" "type=local,dest=$VLLM_STAGING_DIR"
                 "${COMMON_BUILD_FLAGS[@]}"
@@ -1346,7 +1348,7 @@ if [ "$NO_BUILD" = false ]; then
             "${TORCHVISION_VERSION:-resolver-selected}" "${TORCHAUDIO_VERSION:-resolver-selected}" \
             "${B12X_REPO:-disabled}" "${B12X_REF:-disabled}" "$CUTLASS_DSL_VERSION" "$B12X_FROM_PYPI"
 
-        RUNNER_CMD=("docker" "build"
+        RUNNER_CMD=("$CONTAINER_RT" "build"
             "-t" "$IMAGE_TAG"
             "${COMMON_BUILD_FLAGS[@]}"
             "--build-context" "flashinfer_wheels=$FLASHINFER_WHEELS_DIR"
@@ -1382,7 +1384,7 @@ if [ "${#COPY_HOSTS[@]}" -gt 0 ]; then
     echo "Checking image '$IMAGE_TAG' on ${#COPY_HOSTS[@]} host(s): ${COPY_HOSTS[*]}"
     COPY_START=$(date +%s)
 
-    if ! LOCAL_IMAGE_ID=$(docker image inspect --format '{{.Id}}' "$IMAGE_TAG"); then
+    if ! LOCAL_IMAGE_ID=$("$CONTAINER_RT" image inspect --format '{{.Id}}' "$IMAGE_TAG"); then
         echo "Error: Local image '$IMAGE_TAG' not found."
         exit 1
     fi
@@ -1414,7 +1416,7 @@ if [ "${#COPY_HOSTS[@]}" -gt 0 ]; then
 
         TMP_IMAGE=$(mktemp -t vllm_image.XXXXXX)
         echo "Saving image locally to $TMP_IMAGE..."
-        docker save -o "$TMP_IMAGE" "$IMAGE_TAG"
+        "$CONTAINER_RT" save -o "$TMP_IMAGE" "$IMAGE_TAG"
 
         if [ "$PARALLEL_COPY" = true ]; then
             PIDS=()
