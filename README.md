@@ -362,6 +362,34 @@ as `https://github.com/local-inference-lab/vllm/pull/669`. Launch-time patches
 download the URL's `.diff` directly; source builds do the same before applying
 the patch to the selected vLLM ref.
 
+### 2026-09-21
+
+#### MiMo-V2.6-Flash-RL dual-Spark recipe
+
+Added the cluster-only `mimo-v2.6-flash` recipe for serving
+`XiaomiMiMo/MiMo-V2.6-Flash-RL` (309B MoE, 15B active, MXFP4 experts with fp8
+attention) on two DGX Spark nodes with TP=2. It uses the default `vllm-node`
+image, the Marlin MXFP4 MoE backend, and the DFlash drafter bundled in the
+checkpoint's `dflash/` directory for 7-token speculative decoding, with the
+full 1M context enabled through an fp8 KV cache at 0.87 GPU memory
+utilization. The `mods/mimo-v2.6-flash` mod stages a loadable drafter directory with a sanitized
+`config.json` (the shipped file has a trailing comma) and fails fast if the
+image predates the upstream MiMo-V2 fixes (vLLM PRs #57508 and #57784, both in
+`eugr/spark-vllm:latest` since 2026-09-21).
+
+```bash
+./run-recipe.sh --discover
+./run-recipe.sh mimo-v2.6-flash --setup
+```
+
+#### HF_HOME from .env
+
+`launch-cluster.sh` now honors `HF_HOME` saved in `.env` (loaded as
+`DOTENV_HF_HOME`) when mounting the Hugging Face cache into containers, unless
+`HF_HOME` is already set in the shell. Previously only the shell variable was
+used, so a cache configured in `.env` (for example an NFS export) was ignored
+and pre-downloaded models were not found.
+
 ### 2026-09-04
 
 #### GLM 5.3 Flash dual-Spark recipe

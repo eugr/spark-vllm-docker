@@ -9,7 +9,7 @@ CONTAINER_EXEC_SCRIPT="$CONTAINER_WORKSPACE_DIR/exec-script.sh"
 # Modify these if you want to pass additional docker args or set VLLM_SPARK_EXTRA_DOCKER_ARGS variable
 DOCKER_ARGS="-e NCCL_IGNORE_CPU_AFFINITY=1"
 DOCKER_ARGS="$DOCKER_ARGS -e PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True"
-DOCKER_ARGS="$DOCKER_ARGS -v $HF_CACHE_DIR:/root/.cache/huggingface"
+# The huggingface cache mount is appended after .env loading (see HF_HOME below).
 
 # Append additional arguments from environment variable
 if [[ -n "$VLLM_SPARK_EXTRA_DOCKER_ARGS" ]]; then
@@ -350,6 +350,16 @@ print(value)
     
     echo "Loaded .env variables: $(compgen -v DOTENV_ | tr '\n' ' ')"
 fi
+
+# Honor HF_HOME from .env (loaded as DOTENV_HF_HOME) unless it was set in the
+# shell or on the command line. The huggingface cache mount is added here so
+# the container sees the configured cache (e.g. an NFS export such as /nfs1)
+# rather than the default ~/.cache/huggingface, which would miss a
+# pre-downloaded model.
+if [[ -z "${HF_HOME:-}" && -n "${DOTENV_HF_HOME:-}" ]]; then
+    HF_CACHE_DIR="$DOTENV_HF_HOME"
+fi
+DOCKER_ARGS="$DOCKER_ARGS -v $HF_CACHE_DIR:/root/.cache/huggingface"
 
 # Apply .env configuration (CLI args take precedence)
 if [[ -z "$NODES_ARG" && -n "$DOTENV_CLUSTER_NODES" ]]; then
