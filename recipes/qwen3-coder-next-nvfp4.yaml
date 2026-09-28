@@ -1,0 +1,57 @@
+# Recipe: Qwen3-Coder-Next-NVFP4
+# Qwen3-Coder-Next model in NVFP4 format by https://huggingface.co/GadflyII/Qwen3-Coder-Next-NVFP4
+
+
+recipe_version: "1"
+name: Qwen3-Coder-Next-NVFP4
+description: vLLM serving Qwen3-Coder-Next-NVFP4
+
+# HuggingFace model to download (optional, for --download-model)
+model: GadflyII/Qwen3-Coder-Next-NVFP4
+
+# This model can run on single node (solo) or cluster
+cluster_only: false
+solo_only: false
+
+# Container image to use
+container: vllm-node-mxfp4
+
+# Build arguments for build-and-copy.sh
+build_args:
+  - --exp-mxfp4
+
+# Mod required to fix slowness and crash in the cluster (tracking https://github.com/vllm-project/vllm/issues/33857)
+mods:
+  - mods/fix-qwen3-coder-next
+
+# Default settings (can be overridden via CLI)
+defaults:
+  port: 8000
+  host: 0.0.0.0
+  tensor_parallel: 2
+  gpu_memory_utilization: 0.85
+  max_num_batched_tokens: 16384
+  max_model_len: 204800
+
+# Environment variables
+env:
+  VLLM_USE_FLASHINFER_MOE_MXFP4_MXFP8: "1"
+
+# The vLLM serve command template
+command: |
+  vllm serve GadflyII/Qwen3-Coder-Next-NVFP4 \
+    --enable-auto-tool-choice \
+    --tool-call-parser qwen3_coder \
+    --gpu-memory-utilization {gpu_memory_utilization} \
+    --host {host} \
+    --port {port} \
+    --load-format fastsafetensors \
+    --mxfp4-backend CUTLASS \
+    --mxfp4-layers moe,qkv,o,lm_head \
+    --attention-backend FLASHINFER \
+    --enable-prefix-caching \
+    --kv-cache-dtype fp8_e4m3 \
+    --calculate-kv-scales \
+    --max-model-len {max_model_len} \
+    --tensor-parallel-size {tensor_parallel} \
+    --distributed-executor-backend ray
