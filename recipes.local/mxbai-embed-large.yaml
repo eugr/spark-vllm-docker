@@ -1,0 +1,40 @@
+# Recipe: MXBAI Embed Large
+# OpenAI-compatible embeddings server using mixedbread-ai/mxbai-embed-large-v1
+
+recipe_version: "1"
+name: MXBAI Embed Large
+description: vLLM serving mixedbread-ai/mxbai-embed-large-v1 for OpenAI-compatible /v1/embeddings
+
+# HuggingFace model to download (optional, for --download-model)
+model: mixedbread-ai/mxbai-embed-large-v1
+
+# Container image to use
+container: vllm-node-mxfp4
+
+# Build arguments for build-and-copy.sh
+build_args:
+  - --exp-mxfp4
+
+# No runtime mods required
+mods: []
+
+# Default settings (can be overridden via CLI)
+defaults:
+  port: 8000
+  host: 0.0.0.0
+  tensor_parallel: 1
+  gpu_memory_utilization: 0.85
+  max_model_len: 512
+
+# Environment variables to set in the container
+env: {}
+
+# The vLLM serve command template
+command: |
+  vllm serve mixedbread-ai/mxbai-embed-large-v1 \
+      --served-model-name mxbai-embed-large:latest \
+      --tensor-parallel-size {tensor_parallel} \
+      --gpu-memory-utilization {gpu_memory_utilization} \
+      --max-model-len {max_model_len} \
+      --host {host} \
+      --port {port}

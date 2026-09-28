@@ -1,0 +1,56 @@
+# Recipe: OpenAI GPT-OSS 120B + Eagle3 Speculative Decoding
+# MXFP4/CUTLASS/FlashInfer target + Eagle3 BF16 draft head
+# Mount the Eagle3 model via VLLM_SPARK_EXTRA_DOCKER_ARGS:
+#   VLLM_SPARK_EXTRA_DOCKER_ARGS='-v /home/abartrim/.cache/huggingface/models/gpt-oss-120b-Eagle3:/eagle3-model' \
+#     ./run-recipe.sh openai-gpt-oss-120b-eagle3 --solo
+
+recipe_version: "1"
+name: OpenAI GPT-OSS 120B Eagle3
+description: vLLM serving openai/gpt-oss-120b with MXFP4 quantization, FlashInfer, and Eagle3 speculative decoding
+
+# HuggingFace model to download (optional, for --download-model)
+model: openai/gpt-oss-120b
+
+# Container image to use
+container: vllm-node-mxfp4
+
+# Build arguments for build-and-copy.sh
+build_args:
+  - --exp-mxfp4
+
+# No mods required (no LoRA, no hotpath fix needed)
+mods: []
+
+# Default settings (can be overridden via CLI)
+defaults:
+  port: 8000
+  host: 0.0.0.0
+  tensor_parallel: 2
+  gpu_memory_utilization: 0.70
+  max_num_batched_tokens: 8192
+
+# Environment variables to set in the container
+env:
+  VLLM_USE_FLASHINFER_MOE_MXFP4_MXFP8: "1"
+
+# The vLLM serve command template
+# Eagle3 model must be mounted at /eagle3-model via VLLM_SPARK_EXTRA_DOCKER_ARGS
+command: |
+  vllm serve openai/gpt-oss-120b \
+      --tool-call-parser openai \
+      --reasoning-parser openai_gptoss \
+      --enable-auto-tool-choice \
+      --tensor-parallel-size {tensor_parallel} \
+      --distributed-executor-backend ray \
+      --gpu-memory-utilization {gpu_memory_utilization} \
+      --enable-prefix-caching \
+      --load-format fastsafetensors \
+      --quantization mxfp4 \
+      --mxfp4-backend CUTLASS \
+      --mxfp4-layers moe,qkv,o,lm_head \
+      --attention-backend FLASHINFER \
+      --kv-cache-dtype fp8 \
+      --max-num-batched-tokens {max_num_batched_tokens} \
+      --speculative-config '{{"method":"eagle3","model":"/eagle3-model","num_speculative_tokens":5}}' \
+      --host {host} \
+      --port {port}
