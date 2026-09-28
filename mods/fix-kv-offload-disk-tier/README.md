@@ -1,6 +1,6 @@
 # Disk-Backed KV Offload Tier Fix
 
-**Last updated:** `2026-09-02`
+**Last updated:** `2026-09-28`
 
 Makes vLLM's `OffloadingConnector` + `TieringOffloadingSpec` with a filesystem
 secondary tier actually usable. Two bugs, shipped as one mod because **neither
@@ -432,3 +432,212 @@ ceiling.
 - vLLM #54914 reports the same assertion on stock vLLM without this mod. 04 fixes
   only the wave path and says nothing about that report's cause.
 - Written with AI assistance (Claude) and verified on that cluster.
+
+## Patch 05 — fs tier completes zero-task jobs instead of leaking them (2026-09-25)
+
+**Fixes an idle engine burning ~1.4 cores forever.**
+
+### The bug
+
+`DualQueueThreadPool` reports a job finished only from `task_done()` of its
+**last** task. A job with zero tasks has no last task: it is never reported,
+never leaves `_inflight_jobs` (so `wait_idle()` would never return either), and
+`TieringOffloadingManager` keeps it in `_transfer_jobs` forever.
+`has_pending_work()` then stays `True`, and the engine steps an empty batch every
+~1 ms for the rest of its life.
+
+Zero-key jobs are real. `prepare_write()` drops keys that are already resident or
+in flight, so a wave whose keys were all staged by another request flushes as an
+empty promotion. `FileSystemTierManager` also passed `len(keys)` as the task
+count while `zip(keys, block_ids)` stops at the shorter of the two: a count
+above the real number of tasks is the same never-finishes leak.
+
+Measured on our cluster: `_transfer_jobs` grew from 4 to 127 over 25 h with no
+request in flight, and the idle engine sat at ~140% CPU.
+
+### The fix
+
+`FileSystemTierManager` materialises the task list, enqueues it with its real
+length, and completes a job with no tasks itself, on the next
+`get_finished_jobs()` poll, without touching the pool. Each one is logged
+(the first 20, then every 100th).
+
+### Verified
+
+- Live since 2026-09-25: idle container CPU **3.3%** (was ~140%); in ~17 h, 38
+  empty jobs were completed this way, all of them loads, and `_transfer_jobs`
+  drained.
+
+### Honest scope
+
+- The alternative, making `DualQueueThreadPool.enqueue_*` finish a zero-task job
+  immediately, is arguably cleaner. We shipped the manager-side fix because it is
+  the one that ran in production.
+
+## Patch 06 — a stuck wave kills the engine after 120 s (2026-09-26)
+
+**Bounds 03's OPEN A (see 04's "Honest scope": retries are unbounded).**
+
+### The bug
+
+If a wave's keys can never be loaded, because their files are missing from the
+secondary tier, the wave retries every scheduler step forever. There is no
+abort-and-recompute fallback. We hit it on 2026-09-26: for 95 minutes the engine
+retried one wave ~1.6M times at ~170% CPU, held 97% of GPU KV, served nothing,
+and logged ~900k `block I/O failed ... ENOENT` lines, while the client's
+15-minute resends walked into the same hole six times.
+
+In our case the missing files were caused by a bug in an unrelated local vision
+patch, which lowered the load boundary below the window the lookup had
+certified. The failure mode is generic, though: anything that removes tier files
+under a running engine ends up here.
+
+### The fix
+
+A wave that has made no progress for `VLLM_OFFLOAD_STREAM_WAVE_STUCK_S` seconds
+(default **120**) raises `RuntimeError("KVWAVE STUCK ...")`, which kills
+`EngineCore`. `0` restores retry-forever. The stuck-wave warning now says how
+long is left.
+
+Why a crash and not recompute: falling back means reporting the request's
+still-unloaded GPU blocks as failed loads so vLLM recomputes them. That runs
+through the worker-side load-error path on every rank, and whether vLLM
+re-enters cleanly on already-allocated blocks has not been verified.
+Unverified KV reuse produces garbage output; a crash cannot. A dead engine is
+visible and restartable; a spinning one looks alive.
+
+### Verified
+
+- Over 16 days of our production journal, no wave outside that incident ever
+  reached even `VLLM_OFFLOAD_STREAM_WAVE_MAX_RETRIES` (50 steps), so 120 s is far
+  from normal contention.
+- Deployed since 2026-09-26 with no false trigger.
+
+### Honest scope
+
+- **The raise itself has never fired in production.** Nothing has gone stuck
+  since it was deployed, so the crash path is verified only by reading it.
+- It is a bound, not a fix: the real fix is still the recompute fallback.
+
+## Patch 07 — optional SWA store stride (2026-09-28)
+
+**Cuts the disk tier to ~¼ on DeepSeek V4, with no change to resume latency.
+Off by default.**
+
+### The problem
+
+01's alignment filter keeps each sliding-window group's tail (and the eagle
+group's segment head) at **every** full-attention boundary, so any of them can be
+a load point. On DeepSeek V4 with `blocks_per_chunk=8` that is, per 2048 tokens,
+7 chunk files of 8.6 MB: g0 ×1, g1 ×1, g2 ×2, g3 ×1, g4 ×2. The four SWA groups
+are 6/7 of the tier. Under agent traffic (250–350k-token prompts) our tier grew
+~50 GB/h and filled a 2 TB disk in a day. Almost none of the interior boundaries
+are ever load points.
+
+### The fix
+
+`VLLM_OFFLOAD_SWA_STORE_STRIDE=S` keeps the SWA tails/heads only at boundaries
+that are multiples of `S × alignment` tokens, **plus the last two boundaries of
+every request's prompt**. A multi-turn client's next request resumes exactly
+there. Only prompt tokens are offloaded by default (`offload_prompt_only`), so
+that end is known when the chunk is stored.
+
+The load path is unchanged: `_sliding_window_lookup` scans backward for the last
+stored window, every SWA group lands on the same boundary, and the eagle pair is
+kept at exactly those boundaries. The admissible sets coincide, so the lookup
+converges in one pass (unlike the 2026-08-30 ratchet, which came from
+**disjoint** sets). Files already stored with stride 1 stay valid.
+
+### Measured (S=8)
+
+- **Disk:** after 73 min of live traffic the SWA groups had written 2,746 files
+  against g0's 3,195. At stride 1 that would have been ~19,000. Per 2048 tokens:
+  ~1.8 files instead of 7.
+- **Resume latency, live:** 7 of 19 tier hits in that window resumed at the end
+  of the previous prompt (off the 16k grid), re-prefilling 1.5–7k tokens,
+  including the turn's new content.
+- **Resume latency, simulated** on the real group geometry (3,000 agent turns,
+  20% diverging inside the previous prompt's last 1.5k tokens): re-prefill median
+  **1,533** / max 2,557 tokens, against stride 1's 1,536 / 2,559. **0**
+  uncertified loads.
+- 0 errors live.
+
+### Do not drop the prompt-end boundaries
+
+The first version kept only the stride boundaries. That made every resumed turn
+snap down to a 16k boundary: up to 14k tokens (~9 s) of extra prefill **per
+turn**, in both the CPU and the disk tier, because the filter runs before either.
+Averaged over all requests it looked cheap; per turn it was not.
+
+### Honest scope
+
+- Measured on DeepSeek V4 only. The arithmetic is generic for any
+  full-attention + SWA model, but the ~¼ figure depends on the group mix.
+- A resume that diverges in the **middle** of an earlier prompt (e.g. a context
+  fold rewriting old history) snaps down to the stride grid: on average
+  `(S−1) × 1024` extra tokens.
+- 07 reduces growth but does not bound it; 08 does.
+
+## Patch 08 — free-space LRU eviction for the fs tier (2026-09-28)
+
+**Gives the fs tier a bound. Off by default.**
+
+### The problem
+
+`FileSystemTierManager` has no capacity limit, no eviction and no quota: the
+tier grows until the filesystem is full. A full disk turned out to be harmless to
+the engine. We measured 2 h at 0 bytes free, with 17,425 failed stores (ENOSPC),
+0 load errors, and serving continued at a ~63% external hit rate. But the tier
+stops caching, and it starves everything else on that disk. The only bound was a
+manual wipe, which throws away the tier exactly when it is most valuable: right
+after a restart, when the GPU cache is empty.
+
+### The fix
+
+`VLLM_OFFLOAD_FS_MIN_FREE_GB=N` (0 / unset = off): below N GB free on the tier's
+filesystem, delete the **least recently used** chunk files until
+`VLLM_OFFLOAD_FS_TARGET_FREE_GB` (default 1.5 × N) is free. A free-space floor
+rather than a tier size, because the disk is usually shared.
+
+- **Recency lives in memory, never in file metadata.** A hot conversation is
+  served from the GPU/CPU tiers and never reads its files, so atime would call
+  it cold, and writing atime on every use would add SSD wear. The scheduler
+  already calls `touch()` on every lookup; the fs tier now implements it, and
+  stores and loads count as uses too. At startup the list is seeded from the
+  files' atime (read-only `stat`), so a tier kept across a restart is ordered
+  from the first step. ~150 B of memory per file.
+- **Safety.** A file deleted between a lookup HIT and its load would leave a
+  wave with nothing to load (see 06). A key is therefore never evicted while the
+  async lookup cache holds it (some live request looked it up), while a load job
+  reads it, or within `VLLM_OFFLOAD_FS_EVICT_MIN_AGE_S` (600) of its last use.
+  Once chosen, it answers MISS to lookups until the unlink is done.
+- Victims are picked on the scheduler thread; a background thread does the
+  unlinks and a `statvfs` every 30 s. Files already queued count as freed, so a
+  stale `statvfs` cannot overshoot the target.
+- Tier directories of another model or layout are never touched, but they are
+  named in a startup warning.
+- Log lines: `KVFS EVICT enabled/start/done`, `KVFS SEED`.
+
+### Verified
+
+- Unit test against a temp directory and a simulated disk: deletes strictly
+  oldest-used first, keeps looked-up / loading / recently used keys, stops within
+  one file of the target, never writes file metadata.
+- Live since 2026-09-28 17:38 (MIN 200 / TARGET 300 GB): the seed picked up the
+  kept tier (7,790 files) at startup. Growth with 07 was ~4 GB/h, so it did not
+  trigger on its own for 36 h. A forced round (a `fallocate` ballast dropped free
+  space to 195 GB): **2,560 files / 20.5 GB deleted in 92 s** while serving,
+  oldest-used first (the oldest victim was last used before the restart, as
+  seeded), 0 protected keys hit, 0 `block I/O failed`, 0 stuck waves. The round
+  ended within one step of removing the ballast.
+
+### Honest scope
+
+- Eviction advances once per scheduler step, so an **idle** engine does not
+  evict. That is fine for the tier's own growth, which only happens while it
+  serves, but a different process filling the disk is not answered until the
+  next request arrives.
+- The forced round did not end by itself: we removed the ballast after 92 s,
+  which put free space back above the target, and the round stopped on the next
+  step. A round that deletes all the way down to the target on its own has not
+  run live yet. It is the same loop, only longer.
