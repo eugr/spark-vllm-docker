@@ -136,6 +136,7 @@ For recipe or runner changes, run the CI-equivalent checks:
 ./tests/test_launch_cluster_image_sync.sh
 ./tests/test_launch_cluster_vllm_pr.sh
 ./tests/test_launch_cluster_earlyoom.sh
+python3 tests/test_launch_cluster_networking.py
 ```
 
 Then dry-run every changed recipe, including nested recipes, with an explicit

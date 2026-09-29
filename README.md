@@ -48,6 +48,12 @@ WSL, vLLM keeps CUDA's reported free memory instead of replacing it with guest
 RAM availability. Native Linux UMA accounting and proactive allocator-cache
 release keep their upstream behavior.
 
+Source builds also trim unused glibc CPU heap pages after startup garbage
+collection in API servers and workers. This complements the existing CUDA
+allocator cleanup before KV cache sizing/allocation. The CPU trim is included
+in exported vLLM wheels and runs after warmup; platforms without `malloc_trim`
+skip it.
+
 Runtime images also set `VLLM_WSL2_ENABLE_PIN_MEMORY=1` by default. Pass
 `-e VLLM_WSL2_ENABLE_PIN_MEMORY=0` to `launch-cluster.sh` or `docker run` to opt
 out.
@@ -1741,6 +1747,17 @@ including B12X: alternate targets rebuild FlashInfer when no matching
 architecture marker is present, and the cached wheel records its architecture
 so a later build cannot silently reuse a wheel for a different target.
 
+For FlashInfer JIT-cache wheels that declare architecture-specific provider
+dependencies, local builds validate the required provider wheels and versions
+before compiling vLLM or building the runner. Downloads include the provider
+filenames with device designators, such as `flashinfer_jit_cache_sm121a` for the
+default `12.1a` target. Incomplete exports are rejected before replacing the
+cached wheel set; incomplete downloads restore the previous cache. A corrected
+release is downloaded even when an incomplete cache has newer timestamps or the
+same upstream commit. Missing or mismatched providers produce an error
+suggesting `--rebuild-flashinfer`. Older monolithic JIT-cache wheels remain
+supported without provider wheels.
+
 Custom vLLM repositories are cloned fresh instead of using the shared upstream checkout cache. Specifying a custom repository or local source checkout forces a vLLM source build. Upstream preset PRs are skipped by default for custom repositories, local source checkouts, and refs.
 
 Wheel profiles are selected automatically:
@@ -1759,6 +1776,11 @@ Wheel profiles are selected automatically:
 Only regular vLLM wheels are downloaded from the published wheel release.
 `--exp-b12x` is therefore incompatible with `--use-wheels`: use bare
 `--exp-b12x` for the published image or add `--rebuild-vllm` for a source build.
+
+Source builds also retain `examples/features/structured_diffusion/structured_server.py`
+at `/workspace/vllm/structured_server.py` in the container when the selected
+vLLM source includes it. The script travels with locally exported wheels;
+older source refs and downloaded wheel sets without it skip this copy.
 
 Regular `vllm-project/vllm` runner builds install the latest `b12x` release from
 PyPI, including builds using precompiled vLLM wheels. A per-build cache key and
@@ -1860,6 +1882,7 @@ Assumptions and limitations:
 - It will ignore IPs associated with the 2nd "clone" of the physical interface. For instance, the outermost port on Spark has two logical Ethernet interfaces: `enp1s0f1np1` and `enP2p1s0f1np1`. Only `enp1s0f1np1` will be used. To override, use `--eth-if` parameter.
 - It assumes that the same physical interfaces are named the same on all nodes (IOW, enp1s0f1np1 refers to the same physical port on all nodes). If it's not the case, you will have to launch cluster nodes manually or modify the script.
 - It clears the Docker image entrypoint by default so images that define an entrypoint, such as `vllm-openai`, can still start as idle cluster containers before commands are executed. Use `--keep-entrypoint` to keep the image entrypoint.
+- Solo mode uses loopback for internal vLLM, NCCL, Gloo, and TensorPipe communication and disables NCCL RDMA, even when `.env` contains cluster interfaces or a cluster IP. This also applies when a single-node configuration automatically selects solo mode. Explicit `--eth-if` and container environment settings (`-e` or `CONTAINER_*`) can override these defaults. The API listening address is still controlled by `vllm serve --host`.
 - In solo mode, `-p` / `--publish` can be used to publish ports in Docker format, for example `-p 8000:8000`. When port publishing is used, the launcher does not use host networking. Port publishing is not supported in cluster mode.
 - It sets `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` in each container by default to reduce allocator fragmentation on DGX Spark. Override it with `-e PYTORCH_CUDA_ALLOC_CONF=<value>` when needed.
 - It mounts `~/.cache/huggingface`, `~/.cache/vllm`, `~/.cache/flashinfer`, `~/.cache/b12x`, `~/.triton`, and `~/.tilelang` by default. Use `--no-cache-dirs` to skip the vLLM/FlashInfer/B12X/Triton/TileLang cache mounts. Add other mounts with repeatable Docker-style `-v` / `--volume` options, e.g. `-v "$HOME/my-data:/data"`.
@@ -2136,7 +2159,7 @@ network topology prevents autodiscovery from working.
 | :--- | :--- |
 | `CLUSTER_NODES` | Comma-separated node IPs used for Ray/vLLM cluster (head node first). |
 | `COPY_HOSTS` | Comma-separated node IPs used for image and model distribution. In mesh mode these are the IPs on the direct IB-attached interfaces, which may differ from `CLUSTER_NODES`. |
-| `LOCAL_IP` | IP address of the local node. |
+| `LOCAL_IP` | IP address of the local cluster node. Solo mode uses `127.0.0.1`. |
 | `ETH_IF` | Ethernet interface for cluster coordination (e.g. `enp1s0f1np1` or `enP7s7`). |
 | `IB_IF` | Comma-separated RoCE/IB device names (e.g. `rocep1s0f0,roceP2p1s0f0,rocep1s0f1,roceP2p1s0f1`). |
 | `CONTAINER_*` | Any variable prefixed with `CONTAINER_` (except `CONTAINER_NAME`) is passed as `-e VAR=VALUE` to the container. Example: `CONTAINER_NCCL_DEBUG=INFO` → `-e NCCL_DEBUG=INFO`. |
@@ -2208,6 +2231,7 @@ The repository includes several pre-configured mods in the `mods/` directory:
 - **dspark-instanttensor/**: Filters embedded `mtp.*` DSpark draft weights before InstantTensor or safetensors I/O, preventing a second full-checkpoint load.
 - **gpu-mem-util-gb/**: Adds experimental `--gpu-memory-utilization-gb` support.
 - **kv-cache-prealloc-cleanup/**: Applies model-specific manual KV-cache startup tweaks: skip CUDA graph profiling when disabled by env and allow `--gpu-memory-utilization-gb` with `--kv-cache-memory-bytes`.
+- **[memory-profile/](mods/memory-profile/README.md)**: Records per-model startup CPU/CUDA/KV measurements for every rank, API process and host, with JSONL traces, YAML profile cards, a cluster collector, Markdown reports with startup charts, and a read-only hardware requirements/cluster capacity checker.
 - **uma-fix/**: Enables vLLM's native WSL2 pinned-memory/UVA path by default and preserves raw CUDA aggregate memory reporting instead of Linux host-memory UMA accounting. Set `VLLM_WSL2_ENABLE_PIN_MEMORY=0` to opt out.
 - **drop-caches/**: Periodically clears filesystem caches for large models running near the memory limit.
 - **diffusiongemma/**: Adds DiffusionGemma support, dynamic causal attention compatibility, and Gemma4 reasoning/content-channel fixes used by the DiffusionGemma recipes.

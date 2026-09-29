@@ -16,6 +16,7 @@ recipes/backups
 recipes/draft
 tests/draft
 benchmark-plots
+memory-profiles/
 backup-wheels
 .codex
 wheels

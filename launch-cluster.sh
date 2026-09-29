@@ -18,6 +18,7 @@ fi
 
 # ETH_IF and IB_IF will be auto-detected if not provided
 ETH_IF=""
+ETH_IF_OVERRIDE=""
 IB_IF=""
 NCCL_DEBUG_VAL=""
 MASTER_PORT="29501"
@@ -109,7 +110,7 @@ usage() {
     echo "  IB_IF               InfiniBand interface name"
     echo "  MASTER_PORT         Port for cluster coordination (default: 29501)"
     echo "  CONTAINER_NAME      Container name (default: vllm_node)"
-    echo "  LOCAL_IP            Local IP address (for solo mode or override auto-detection)"
+    echo "  LOCAL_IP            Cluster local IP override (solo mode uses loopback)"
     echo "  CONTAINER_*         Any variable starting with CONTAINER_ (except CONTAINER_NAME)"
     echo "                      becomes -e flag. Example: CONTAINER_NCCL_DEBUG=INFO -> -e NCCL_DEBUG=INFO"
     echo ""
@@ -177,7 +178,7 @@ while [[ "$#" -gt 0 ]]; do
         -n|--nodes) NODES_ARG="$2"; shift ;;
         -t) IMAGE_NAME="$2"; shift ;;
         --name) CONTAINER_NAME="$2"; shift ;;
-        --eth-if) ETH_IF="$2"; shift ;;
+        --eth-if) ETH_IF="$2"; ETH_IF_OVERRIDE="$2"; shift ;;
         --ib-if) IB_IF="$2"; shift ;;
         -e|--env) DOCKER_ARGS="$DOCKER_ARGS -e $2"; shift ;;
         -j) BUILD_JOBS="$2"; shift ;;
@@ -572,11 +573,8 @@ if [[ "${FORCE_DISCOVER:-false}" == "true" ]]; then
 fi
 
 if [[ "$SOLO_MODE" == "true" ]]; then
-    # Solo mode: skip node detection, just get local IP
-    # Use LOCAL_IP from .env if set, otherwise default to 127.0.0.1
-    if [[ -z "$LOCAL_IP" ]]; then
-        LOCAL_IP="127.0.0.1"
-    fi
+    # Solo mode: skip network detection and ignore any saved cluster IP.
+    LOCAL_IP="127.0.0.1"
     NODES_ARG="$LOCAL_IP"
     PEER_NODES=()
     echo "Solo mode enabled. Skipping node detection."
@@ -620,6 +618,8 @@ fi
 if [[ "$SOLO_MODE" == "false" && ${#PEER_NODES[@]} -eq 0 ]]; then
     echo "Only local node detected/configured. Activating solo mode (no Ray cluster)."
     SOLO_MODE="true"
+    LOCAL_IP="127.0.0.1"
+    HEAD_IP="$LOCAL_IP"
 fi
 
 if [[ "$SOLO_MODE" == "true" ]]; then
@@ -1312,6 +1312,20 @@ copy_script_to_worker() {
 # Build -e KEY=VALUE flags for a given node IP (used in docker run and docker exec)
 get_env_flags() {
     local node_ip="$1"
+    if [[ "$SOLO_MODE" == "true" ]]; then
+        # vLLM creates process groups even for one GPU. Keep their bootstrap
+        # local, including with bridge networking or a saved cluster config.
+        # docker run appends user environment flags after these defaults.
+        local solo_if="${ETH_IF_OVERRIDE:-lo}"
+        printf -- '-e %s ' \
+            "VLLM_HOST_IP=$node_ip" \
+            "NCCL_SOCKET_IFNAME=$solo_if" \
+            "NCCL_IB_DISABLE=1" \
+            "GLOO_SOCKET_IFNAME=$solo_if" \
+            "TP_SOCKET_IFNAME=$solo_if"
+        return
+    fi
+
     printf -- '-e %s ' \
         "VLLM_HOST_IP=$node_ip" \
         "RAY_NODE_IP_ADDRESS=$node_ip" \

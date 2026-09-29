@@ -16,11 +16,19 @@ ANCHOR = """            page_budget = shared_page or sw_per_token * block_size
             )
             return SlidingWindowSpec(
 """
-REPLACEMENT = f"""            page_budget = shared_page or sw_per_token * block_size
+# vLLM #53175 makes supported kernel sizes depend on the layer's KV spec.
+SPEC_ANCHOR = """            sw_per_token = kv_cache_spec.real_page_size_bytes
+            page_budget = shared_page or sw_per_token * block_size
             sw_block_size = _largest_kernel_block_within(
-                self.attn_backend, sw_per_token, page_budget, block_size
+                self.attn_backend,
+                sw_per_token,
+                page_budget,
+                block_size,
+                kv_cache_spec,
             )
-            # {MARKER}.
+            return SlidingWindowSpec(
+"""
+FALLBACK = f"""            # {MARKER}.
             # Keep #53007's primary-size choice when the backend supports it.
             # Otherwise start small so page unification can scale the block
             # exactly, instead of padding a larger non-divisor (e.g. 64 vs
@@ -32,8 +40,22 @@ REPLACEMENT = f"""            page_budget = shared_page or sw_per_token * block_
                     (s if isinstance(s, int) else s.base for s in kernel_sizes),
                     default=block_size,
                 )
-            return SlidingWindowSpec(
 """
+REPLACEMENT = ANCHOR.replace(
+    "            return SlidingWindowSpec(\n",
+    FALLBACK + "            return SlidingWindowSpec(\n",
+)
+SPEC_REPLACEMENT = SPEC_ANCHOR.replace(
+    "            return SlidingWindowSpec(\n",
+    FALLBACK.replace(
+        "get_supported_kernel_block_sizes()",
+        "get_supported_kernel_block_sizes(\n"
+        "                    kv_cache_spec\n"
+        "                )",
+    )
+    + "            return SlidingWindowSpec(\n",
+)
+LAYOUTS = ((ANCHOR, REPLACEMENT), (SPEC_ANCHOR, SPEC_REPLACEMENT))
 LEGACY_CALL = """            sw_block_size = _largest_kernel_block_within(
                 self.attn_backend, sw_per_token, shared_page, block_size
             )
@@ -45,20 +67,28 @@ class PatchError(RuntimeError):
 
 
 def patch_source(source: str) -> tuple[str, str]:
+    anchor_count = sum(source.count(anchor) for anchor, _ in LAYOUTS)
     if MARKER in source:
-        if source.count(REPLACEMENT) != 1 or ANCHOR in source:
+        if (
+            source.count(MARKER) != 1
+            or sum(source.count(replacement) for _, replacement in LAYOUTS) != 1
+            or anchor_count
+        ):
             raise PatchError("SWA block fallback patch is incomplete or duplicated")
         return source, "SWA block fallback fix is already present; skipping"
     if "def _largest_kernel_block_within(" not in source:
         return source, "Affected SWA block selector is absent; skipping"
     if LEGACY_CALL in source and "page_budget = shared_page or" not in source:
         return source, "Pre-#53007 SWA block selection is present; skipping"
-    if source.count(ANCHOR) != 1:
+    if anchor_count != 1:
         raise PatchError(
             "expected exactly one #53007 SWA selection block; "
             "review the upstream implementation before updating this patch"
         )
-    patched = source.replace(ANCHOR, REPLACEMENT, 1)
+    anchor, replacement = next(
+        (anchor, replacement) for anchor, replacement in LAYOUTS if anchor in source
+    )
+    patched = source.replace(anchor, replacement, 1)
     ast.parse(patched)
     return patched, "Applied SWA block fallback fix for vLLM PR #53007"
 

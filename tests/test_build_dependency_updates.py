@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -148,6 +149,89 @@ class DependencyBuildTests(unittest.TestCase):
     def test_unselected_b12x_install_is_skipped(self):
         result = self.run_b12x_install()
         self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.commands(), [])
+
+    def write_torch_helper(self, path, exit_code=0):
+        helper = self.root / path
+        helper.parent.mkdir(parents=True, exist_ok=True)
+        helper.write_text(
+            "from pathlib import Path\n"
+            "import sys\n"
+            "assert len(sys.argv) == 1\n"
+            "with Path('torch-helper.log').open('a') as log:\n"
+            "    log.write(sys.argv[0] + '\\n')\n"
+            f"if {exit_code}:\n"
+            f"    sys.exit({exit_code})\n"
+            # The upstream helper reads relative to the checkout root.
+            "path = Path('requirements/build/cuda.txt')\n"
+            "path.write_text(path.read_text().replace('torch==0.0.0\\n', ''))\n"
+        )
+
+    def run_vllm_requirements(self):
+        for path, content in {
+            "requirements/build/cuda.txt": "torch==0.0.0\npackaging\n",
+            "requirements/cuda.txt": "nvidia-cutlass-dsl[cu13]==4.6.0\nflashinfer-python\n",
+            "requirements/test/cuda.txt": "triton\nfastsafetensors\npytest\n",
+        }.items():
+            target = self.root / path
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(content)
+        # Installing before the helper strips Torch must fail the test.
+        with (self.bin_dir / "uv").open("a") as mock:
+            mock.write(
+                "assert pathlib.Path('requirements/build/cuda.txt').read_text() "
+                "== 'packaging\\n', 'Torch pin reached the package installer'\n"
+            )
+        dockerfile = (PROJECT_DIR / "Dockerfile").read_text()
+        run = next(
+            block for block in re.split(r"(?m)^RUN ", dockerfile)
+            if block.startswith("--mount=") and "use_existing_torch.py" in block
+        ).split("\n\n", 1)[0]
+        run = re.sub(r"^--mount=\S+\s*\\\n", "", run)
+        run = run.replace(
+            "/tmp/vllm-patches/pin_cutlass_dsl.py",
+            shlex.quote(str(PROJECT_DIR / "docker/pin_cutlass_dsl.py")),
+        )
+        return subprocess.run(
+            ["sh", "-c", run], cwd=self.root,
+            env={**self.env, "CUTLASS_DSL_VERSION": "4.7.0"},
+            text=True, capture_output=True,
+        )
+
+    def assert_vllm_requirements_prepared(self, helper):
+        result = self.run_vllm_requirements()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual((self.root / "torch-helper.log").read_text(), helper + "\n")
+        self.assertEqual(self.commands(), [{
+            "args": ["pip", "install", "-r", "requirements/build/cuda.txt", "setuptools-rust>=1.9.0"],
+            "arch": None,
+        }])
+
+    def test_vllm_uses_relocated_torch_helper(self):
+        self.write_torch_helper("tools/use_existing_torch.py")
+        self.assert_vllm_requirements_prepared("tools/use_existing_torch.py")
+
+    def test_vllm_supports_root_level_torch_helper(self):
+        self.write_torch_helper("use_existing_torch.py")
+        self.assert_vllm_requirements_prepared("use_existing_torch.py")
+
+    def test_vllm_prefers_tools_helper_when_both_exist(self):
+        self.write_torch_helper("tools/use_existing_torch.py")
+        self.write_torch_helper("use_existing_torch.py", exit_code=19)
+        self.assert_vllm_requirements_prepared("tools/use_existing_torch.py")
+
+    def test_vllm_missing_torch_helper_stops_before_install(self):
+        result = self.run_vllm_requirements()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("missing tools/use_existing_torch.py and use_existing_torch.py", result.stderr)
+        self.assertEqual(self.commands(), [])
+
+    def test_vllm_failed_torch_helper_stops_without_fallback_or_install(self):
+        self.write_torch_helper("tools/use_existing_torch.py", exit_code=19)
+        self.write_torch_helper("use_existing_torch.py")
+        result = self.run_vllm_requirements()
+        self.assertEqual(result.returncode, 19, result.stderr)
+        self.assertEqual((self.root / "torch-helper.log").read_text(), "tools/use_existing_torch.py\n")
         self.assertEqual(self.commands(), [])
 
 

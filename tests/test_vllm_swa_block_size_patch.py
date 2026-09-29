@@ -74,6 +74,30 @@ class Attention:
         return "full attention unchanged"
 '''
 
+# #53175's API changes, as present in vllm-project/vllm@e430f7421ff0.
+# Keep the same CPU fixture around the updated upstream selector and call.
+UPSTREAM_WITH_SPEC = UPSTREAM.replace(
+    "    attn_backend, per_token_bytes, page_budget, fallback,\n",
+    "    attn_backend, per_token_bytes, page_budget, fallback, kv_cache_spec=None,\n",
+).replace(
+    "sizes = attn_backend.get_supported_kernel_block_sizes()",
+    "sizes = attn_backend.get_supported_kernel_block_sizes(kv_cache_spec)",
+).replace(
+    "            sw_per_token = self.attn_backend.customize_spec(\n",
+    "            kv_cache_spec = self.attn_backend.customize_spec(\n",
+).replace(
+    "            ).real_page_size_bytes\n",
+    "            )\n"
+    "            sw_per_token = kv_cache_spec.real_page_size_bytes\n",
+).replace(
+    "                self.attn_backend, sw_per_token, page_budget, block_size\n",
+    "                self.attn_backend,\n"
+    "                sw_per_token,\n"
+    "                page_budget,\n"
+    "                block_size,\n"
+    "                kv_cache_spec,\n",
+)
+
 
 @dataclass(frozen=True)
 class MultipleOf:
@@ -86,13 +110,18 @@ class SlidingWindowSpec(SimpleNamespace):
         return self.block_size * self.num_kv_heads * (self.head_size + self.head_size_v)
 
 
-def select_spec(source, sizes, primary=1648, shared_page=None, kv_heads=8, window=2048):
+def select_spec(
+    source, sizes, primary=1648, shared_page=None, kv_heads=8, window=2048,
+    customize_spec=None,
+):
     namespace = {"MultipleOf": MultipleOf, "SlidingWindowSpec": SlidingWindowSpec}
     exec(compile(source, "attention_fixture.py", "exec"), namespace)
     layer = namespace["Attention"]()
     layer.attn_backend = SimpleNamespace(
-        get_supported_kernel_block_sizes=lambda: sizes,
-        customize_spec=lambda spec: spec,
+        get_supported_kernel_block_sizes=(
+            sizes if callable(sizes) else lambda kv_cache_spec=None: sizes
+        ),
+        customize_spec=customize_spec or (lambda spec: spec),
         is_mla=lambda: False,
     )
     layer.attn_type = 2
@@ -124,11 +153,13 @@ def qwen_cache_geometry(spec):
 
 
 class SWABlockFallbackTests(unittest.TestCase):
+    upstream = UPSTREAM
+
     def setUp(self):
-        self.patched, _ = PATCHER.patch_source(UPSTREAM)
+        self.patched, _ = PATCHER.patch_source(self.upstream)
 
     def test_qwen_dflash_capacity_regression(self):
-        before = select_spec(UPSTREAM, [16, 32, 64])
+        before = select_spec(self.upstream, [16, 32, 64])
         after = select_spec(self.patched, [16, 32, 64])
         self.assertEqual(before.block_size, 64)
         self.assertEqual(after.block_size, 16)
@@ -138,7 +169,7 @@ class SWABlockFallbackTests(unittest.TestCase):
     def test_kimi_primary_size_optimization_is_preserved(self):
         # #53007's original case: 1152 B/token target, 1024 B/token SWA,
         # primary 1536. Scaling a 16-token SWA page would instead yield 1728.
-        before = select_spec(UPSTREAM, [MultipleOf(16)], primary=1536, kv_heads=4)
+        before = select_spec(self.upstream, [MultipleOf(16)], primary=1536, kv_heads=4)
         after = select_spec(self.patched, [MultipleOf(16)], primary=1536, kv_heads=4)
         self.assertEqual(vars(after), vars(before))
         self.assertEqual(after.block_size, 1536)
@@ -166,7 +197,7 @@ class SWABlockFallbackTests(unittest.TestCase):
         for sizes in [[16, 32, 64], [MultipleOf(16)], [64, MultipleOf(16)]]:
             for page in [16 * 2048, 48 * 2048, 1648 * 2048]:
                 with self.subTest(sizes=sizes, page=page):
-                    before = select_spec(UPSTREAM, sizes, shared_page=page)
+                    before = select_spec(self.upstream, sizes, shared_page=page)
                     after = select_spec(self.patched, sizes, shared_page=page)
                     self.assertEqual(vars(before), vars(after))
 
@@ -195,8 +226,13 @@ class SWABlockFallbackTests(unittest.TestCase):
 
     def test_partial_or_changed_sources_are_rejected(self):
         for source in [
-            UPSTREAM.replace("page_budget = shared_page or", "page_budget = other or"),
-            UPSTREAM + UPSTREAM,
+            self.upstream.replace(
+                "page_budget = shared_page or", "page_budget = other or"
+            ),
+            self.upstream + self.upstream,
+            UPSTREAM + UPSTREAM_WITH_SPEC,
+            self.patched + self.upstream,
+            self.patched + "\n# " + PATCHER.MARKER,
             self.patched.replace("if shared_page is None", "if shared_page"),
         ]:
             with self.subTest(source=source):
@@ -212,16 +248,56 @@ class SWABlockFallbackTests(unittest.TestCase):
             self.assertEqual(missing.returncode, 0, missing.stderr)
             self.assertIn("not applicable", missing.stdout)
             target.parent.mkdir(parents=True)
-            target.write_text(UPSTREAM)
+            target.write_text(self.upstream)
             for _ in range(2):
                 result = subprocess.run(command, capture_output=True, text=True)
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertEqual(target.read_text(), self.patched)
-            unknown = UPSTREAM.replace("page_budget = shared_page or", "page_budget = other or")
+            unknown = self.upstream.replace(
+                "page_budget = shared_page or", "page_budget = other or"
+            )
             target.write_text(unknown)
             result = subprocess.run(command, capture_output=True, text=True)
             self.assertNotEqual(result.returncode, 0)
             self.assertEqual(target.read_text(), unknown)
+
+
+class SWABlockSpecFallbackTests(SWABlockFallbackTests):
+    upstream = UPSTREAM_WITH_SPEC
+
+    def test_fallback_uses_the_same_customized_spec_as_the_selector(self):
+        customized = []
+        queried = []
+
+        def customize(spec):
+            customized_spec = SlidingWindowSpec(**{**vars(spec), "head_size": 512})
+            customized.append(customized_spec)
+            return customized_spec
+
+        def supported_sizes(kv_cache_spec=None):
+            queried.append(kv_cache_spec)
+            if kv_cache_spec is not None and kv_cache_spec.head_size == 512:
+                return [64, 128]
+            return [16, 32, 64]
+
+        result = select_spec(self.patched, supported_sizes, customize_spec=customize)
+        self.assertEqual(result.block_size, 64)
+        self.assertEqual(len(customized), 1)
+        self.assertEqual(len(queried), 2)
+        self.assertTrue(all(spec is customized[0] for spec in queried))
+
+    def test_changed_or_partially_patched_spec_argument_is_rejected(self):
+        for source in [
+            self.upstream.replace(
+                "                kv_cache_spec,\n", "                None,\n"
+            ),
+            self.patched.replace(
+                "                    kv_cache_spec\n", "                    None\n"
+            ),
+        ]:
+            with self.subTest(source=source):
+                with self.assertRaises(PATCHER.PatchError):
+                    PATCHER.patch_source(source)
 
 
 if __name__ == "__main__":
