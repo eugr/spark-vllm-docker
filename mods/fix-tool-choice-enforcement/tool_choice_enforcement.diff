@@ -1,0 +1,183 @@
+diff --git a/vllm/parser/abstract_parser.py b/vllm/parser/abstract_parser.py
+index 2eda37b43..c02c0f0de 100644
+--- a/vllm/parser/abstract_parser.py
++++ b/vllm/parser/abstract_parser.py
+@@ -287,6 +287,48 @@ class Parser:
+         """
+         return request
+ 
++    def _apply_structural_tag(
++        self, request: ChatCompletionRequest | ResponsesRequest
++    ) -> ChatCompletionRequest | ResponsesRequest:
++        # A composed Parser sources the tag from its tool parser; a shared
++        # ParserEngine (no separate tool parser) declares the tag model on
++        # itself and provides its own get_structural_tag.
++        tag_source = self._tool_parser if self._tool_parser is not None else self
++        if (
++            getattr(tag_source, "structural_tag_model", None) is None
++            or not request.tools
++        ):
++            return request
++
++        need_tool_calling = (
++            request.tool_choice == "auto"
++            or request.tool_choice == "required"
++            or isinstance(
++                request.tool_choice,
++                (ChatCompletionNamedToolChoiceParam, ToolChoiceFunction),
++            )
++        )
++        if not need_tool_calling:
++            return request
++
++        structure_tag = tag_source.get_structural_tag(
++            request,
++            reasoning=False,
++        )
++        if structure_tag is None:
++            return request
++
++        structural_tag = json.dumps(structure_tag.model_dump())
++        request.structured_outputs = StructuredOutputsParams(
++            structural_tag=structural_tag,
++        )
++        if isinstance(request, ResponsesRequest):
++            request.text = None
++        else:
++            request.response_format = None
++        return request
++
++
+     @abstractmethod
+     def extract_tool_calls(
+         self,
+@@ -523,44 +565,6 @@ class DelegatingParser(Parser):
+             request = self._tool_parser.adjust_request(request)
+         return request
+ 
+-    def _apply_structural_tag(
+-        self, request: ChatCompletionRequest | ResponsesRequest
+-    ) -> ChatCompletionRequest | ResponsesRequest:
+-        if (
+-            self._tool_parser is None
+-            or self._tool_parser.structural_tag_model is None
+-            or not request.tools
+-        ):
+-            return request
+-
+-        need_tool_calling = (
+-            request.tool_choice == "auto"
+-            or request.tool_choice == "required"
+-            or isinstance(
+-                request.tool_choice,
+-                (ChatCompletionNamedToolChoiceParam, ToolChoiceFunction),
+-            )
+-        )
+-        if not need_tool_calling:
+-            return request
+-
+-        structure_tag = self._tool_parser.get_structural_tag(
+-            request,
+-            reasoning=False,
+-        )
+-        if structure_tag is None:
+-            return request
+-
+-        structural_tag = json.dumps(structure_tag.model_dump())
+-        request.structured_outputs = StructuredOutputsParams(
+-            structural_tag=structural_tag,
+-        )
+-        if isinstance(request, ResponsesRequest):
+-            request.text = None
+-        else:
+-            request.response_format = None
+-        return request
+-
+     def extract_reasoning_streaming(
+         self,
+         previous_text: str,
+diff --git a/vllm/parser/engine/parser_engine.py b/vllm/parser/engine/parser_engine.py
+index 5ed837d22..f81dc28a1 100644
+--- a/vllm/parser/engine/parser_engine.py
++++ b/vllm/parser/engine/parser_engine.py
+@@ -23,6 +23,7 @@ from vllm.entrypoints.openai.engine.protocol import (
+     ToolCall,
+ )
+ from vllm.logger import init_logger
++from vllm import envs
+ from vllm.parser.abstract_parser import Parser, StreamState
+ from vllm.parser.engine.events import EventType, SemanticEvent
+ from vllm.parser.engine.parser_engine_config import ParserEngineConfig, ParserState
+@@ -83,6 +84,12 @@ class ParserEngine(Parser):
+     complete output format for a model (reasoning + tool calls).
+     """
+ 
++    # xgrammar structural-tag model key for tool-choice enforcement. Set by
++    # ParserManager.get_parser from the engine's ToolParser adapter when the
++    # shared-engine path is taken (the engine then stands in for
++    # DelegatingParser, which would otherwise apply the structural tag).
++    structural_tag_model: str | None = None
++
+     def __init__(
+         self,
+         tokenizer: TokenizerLike,
+@@ -205,7 +212,32 @@ class ParserEngine(Parser):
+         self, request: ChatCompletionRequest | ResponsesRequest
+     ) -> ChatCompletionRequest | ResponsesRequest:
+         request.skip_special_tokens = False
+-        return request
++        # A shared engine has no separate tool parser, so apply the
++        # structural tag here; _apply_structural_tag falls back to this
++        # engine as the tag source when _tool_parser is None.
++        return self._apply_structural_tag(request)
++
++    def get_structural_tag(
++        self,
++        request: ChatCompletionRequest | ResponsesRequest,
++        *,
++        reasoning: bool = False,
++    ):
++        """Mirror of ``ToolParser.get_structural_tag`` for shared engines."""
++        if self.structural_tag_model is None:
++            return None
++        if not envs.VLLM_ENFORCE_STRICT_TOOL_CALLING:
++            return None
++        from vllm.tool_parsers.structural_tag_registry import (
++            get_model_structural_tag,
++        )
++
++        return get_model_structural_tag(
++            model=self.structural_tag_model,
++            tools=request.tools,
++            tool_choice=request.tool_choice,
++            reasoning=reasoning,
++        )
+ 
+     def _preprocess_feed(
+         self,
+diff --git a/vllm/parser/parser_manager.py b/vllm/parser/parser_manager.py
+index 40af5b801..1d2e15d82 100644
+--- a/vllm/parser/parser_manager.py
++++ b/vllm/parser/parser_manager.py
+@@ -140,6 +140,21 @@ class ParserManager:
+         reasoning_engine_cls = cls._get_parser_engine_cls(reasoning_parser_cls)
+         tool_engine_cls = cls._get_parser_engine_cls(tool_parser_cls)
+         if reasoning_engine_cls is not None and reasoning_engine_cls is tool_engine_cls:
++            # The shared engine replaces DelegatingParser, so it must also
++            # carry the tool adapter's structural-tag declaration; otherwise
++            # tool_choice="required"/named and strict tools are silently
++            # unenforced (Parser._apply_structural_tag is only reachable
++            # through a tool parser or this attribute).
++            tag_model = getattr(tool_parser_cls, "structural_tag_model", None)
++            if (
++                tag_model is not None
++                and reasoning_engine_cls.structural_tag_model != tag_model
++            ):
++                return type(
++                    reasoning_engine_cls.__name__,
++                    (reasoning_engine_cls,),
++                    {"structural_tag_model": tag_model},
++                )
+             return reasoning_engine_cls
+ 
+         if reasoning_parser_name == "kimi_k3" or tool_parser_name == "kimi_k3":
