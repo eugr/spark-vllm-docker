@@ -1,0 +1,69 @@
+# Recipe: MiniMax-M2.7-NVFP4-GB10
+# MiniMax M2.7 model with native NVFP4 (4-bit float) quantization
+# Targeted at NVIDIA GB10 (DGX Spark) Blackwell tensor cores (SM 12.1)
+# Source config validated by saricles: https://huggingface.co/saricles/MiniMax-M2.7-NVFP4-GB10
+
+recipe_version: "1"
+name: MiniMax-M2.7-NVFP4
+description: vLLM serving saricles/MiniMax-M2.7-NVFP4-GB10 with Ray distributed backend on dual DGX Spark
+
+# HuggingFace model to download
+model: saricles/MiniMax-M2.7-NVFP4-GB10
+
+# Container image to use
+container: vllm-node
+
+# 130.6 GB on disk — does not fit single 128 GB Spark, requires TP=2 across two nodes
+cluster_only: true
+
+# No mods required
+mods: []
+
+# Default settings (can be overridden via CLI)
+defaults:
+  port: 8000
+  host: 0.0.0.0
+  tensor_parallel: 2
+  gpu_memory_utilization: 0.85
+  max_model_len: 196608
+
+# Environment variables — NVFP4 kernel selection validated on GB10 SM 12.1
+# Per saricles model card; activates flashinfer-cutlass FP4 GEMM backend
+env:
+  VLLM_NVFP4_GEMM_BACKEND: flashinfer-cutlass
+  VLLM_USE_FLASHINFER_MOE_FP4: "0"
+  SAFETENSORS_FAST_GPU: "1"
+  OMP_NUM_THREADS: "8"
+  TORCHINDUCTOR_MAX_AUTOTUNE: "0"
+
+# The vLLM serve command template
+#
+# Gotchas (per saricles model card):
+#   - cudagraph_mode: none is LOAD-BEARING for MiniMax MoE on GB10 — CUDA graphs deadlock
+#   - Do NOT add --enable-expert-parallel — uneven per-node memory on MoE, breaks under current kernels
+#   - Do NOT add --load-format fastsafetensors — compressed-tensors compatibility unverified
+#   - --kv-cache-dtype fp8_e4m3 is required to fit 192k context with reasonable headroom
+#
+# Note on JSON braces in --compilation-config:
+#   run-recipe.py applies Python str.format() to this template (line 474).
+#   Literal { and } must be doubled to {{ and }} to escape format substitution.
+#   After str.format(), single braces are restored and vLLM sees valid JSON.
+command: |
+  vllm serve saricles/MiniMax-M2.7-NVFP4-GB10 \
+      --trust-remote-code \
+      --port {port} \
+      --host {host} \
+      --gpu-memory-utilization {gpu_memory_utilization} \
+      -tp {tensor_parallel} \
+      --distributed-executor-backend ray \
+      --max-model-len {max_model_len} \
+      --kv-cache-dtype fp8_e4m3 \
+      --attention-backend flashinfer \
+      --enable-prefix-caching \
+      --enable-chunked-prefill \
+      --max-num-seqs 64 \
+      --max-num-batched-tokens 8192 \
+      --enable-auto-tool-choice \
+      --tool-call-parser minimax_m2 \
+      --reasoning-parser minimax_m2_append_think \
+      --compilation-config '{{"cudagraph_mode":"none","inductor_compile_config":{{"combo_kernels":false,"benchmark_combo_kernel":false,"max_autotune":false,"max_autotune_gemm":false}}}}'
