@@ -1,0 +1,90 @@
+# Recipe: Laguna-S-2.1-NVFP4 + DFlash speculative decoding — vLLM v0.26.0
+#
+# New recipe, not an edit of recipes/laguna-s-2.1-nvfp4-dflash.yaml. That
+# recipe pins --vllm-ref v0.25.1 and is a partial/stale port — it's missing
+# several flags the upstream reference now has (kv-cache-dtype fp8,
+# enable-chunked-prefill, async-scheduling, enable-prefix-caching,
+# override-generation-config, disable-access-log-for-endpoints) and has
+# num_speculative_tokens=15 where upstream now uses 7. This is a fresh,
+# faithful port of the current upstream file:
+# https://github.com/MykhailoTamarin/vllm-starter/blob/main/models/laguna-s-2.1-nvfp4-dflash.yaml
+#
+# Upstream runs the plain `vllm/vllm-openai:v0.26.0` image directly (no
+# build). This repo has no way to run a stock image un-built — container
+# builds always go through build-and-copy.sh (see run-recipe.py:build_image) —
+# so we build v0.26.0 from source via --vllm-ref, same pattern the existing
+# laguna recipe already established for keeping mods/patches available.
+#
+# container: vllm-node-v026, NOT vllm-node. The generic "vllm-node" tag is
+# already built (at vLLM 0.23.1rc1.dev, shared by several other recipes'
+# images) — reusing that name here would make check_image_exists() skip the
+# build and silently serve the wrong vLLM version. vllm-node-v026 is shared
+# with recipes/deepseek-v4-flash-180b-reap-gb10-v026-mtp.yaml so the v0.26.0
+# source build only has to happen once.
+#
+# No mods needed: NVFP4 quantization is auto-detected from the checkpoint,
+# same as the existing laguna recipe (no MXFP4/REAP patches apply here).
+
+recipe_version: "1"
+name: Laguna-S-2.1-NVFP4-DFlash-v026
+description: >-
+  vLLM v0.26.0 (built from source via --vllm-ref) serving
+  poolside/Laguna-S-2.1-NVFP4 with DFlash speculative decoding on DGX Spark.
+
+model: poolside/Laguna-S-2.1-NVFP4
+container: vllm-node-v026
+
+build_args:
+  - --vllm-ref
+  - v0.26.0
+
+defaults:
+  port: 8000
+  host: 0.0.0.0
+  tensor_parallel: 1
+  gpu_memory_utilization: 0.91
+  max_model_len: 262144
+  max_num_seqs: 4
+  max_num_batched_tokens: 8192
+  num_speculative_tokens: 7
+
+env:
+  CUTE_DSL_ARCH: "sm_121a"
+  VLLM_TARGET_DEVICE: "cuda"
+  VLLM_ALLOW_LONG_MAX_MODEL_LEN: "1"
+  VLLM_HTTP_TIMEOUT_KEEP_ALIVE: "600"
+  # 0 is a near-no-op here: it retains only the single latest checkpoint,
+  # which gets evicted under pool pressure exactly like vanilla dense
+  # checkpointing (see vllm-project/vllm#42948 -- 0% cache hit bug report;
+  # 0/vanilla stayed at 0% even in the "retention test" row of the fix's own
+  # A/B). The confirmed-working value from that thread (PR #43447, 8-90x
+  # speedup, 0%->90% hit) is a much larger interval retaining multiple
+  # checkpoint-tail boundaries so growing agent-loop tails still land a hit.
+  # Must be a multiple of scheduler_block_size (16 here, unset -> default).
+  # Applies to sliding-window attention (36/48 of Laguna's layers are SWA);
+  # not yet supported for Mamba/linear attention (N/A, Laguna has none).
+  VLLM_PREFIX_CACHE_RETENTION_INTERVAL: "32768"
+
+command: |
+  vllm serve poolside/Laguna-S-2.1-NVFP4 \
+    --served-model-name laguna-s-2.1 \
+    --host {host} \
+    --port {port} \
+    --trust-remote-code \
+    --tensor-parallel-size {tensor_parallel} \
+    --pipeline-parallel-size 1 \
+    --max-model-len {max_model_len} \
+    --max-num-seqs {max_num_seqs} \
+    --max-num-batched-tokens {max_num_batched_tokens} \
+    --gpu-memory-utilization {gpu_memory_utilization} \
+    --kv-cache-dtype fp8 \
+    --enable-chunked-prefill \
+    --async-scheduling \
+    --enable-prefix-caching \
+    --enable-auto-tool-choice \
+    --tool-call-parser poolside_v1 \
+    --reasoning-parser poolside_v1 \
+    --override-generation-config '{{"temperature":0.7,"top_p":0.95}}' \
+    --default-chat-template-kwargs '{{"enable_thinking":true}}' \
+    --speculative-config '{{"model":"poolside/Laguna-S-2.1-DFlash-NVFP4","num_speculative_tokens":{num_speculative_tokens},"method":"dflash"}}' \
+    --disable-access-log-for-endpoints /health,/metrics,/ping
