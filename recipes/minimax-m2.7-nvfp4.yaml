@@ -1,0 +1,51 @@
+# Recipe: MiniMax-M2.7-NVFP4
+# MiniMax M2.7 model with NVFP4 quantization (CUTLASS MoE backend)
+
+recipe_version: "1"
+name: MiniMax-M2.7-NVFP4
+description: vLLM serving MiniMax-M2.7-NVFP4 with Ray distributed backend and CUTLASS NVFP4 kernels
+
+# HuggingFace model to download (optional, for --download-model)
+model: nvidia/MiniMax-M2.7-NVFP4
+
+# Container image to use
+container: vllm-node
+
+# Can only be run in a cluster
+cluster_only: true
+
+# No mods required
+mods: []
+
+# Default settings (can be overridden via CLI)
+defaults:
+  port: 8000
+  host: 0.0.0.0
+  tensor_parallel: 2
+  gpu_memory_utilization: 0.8
+  max_model_len: 196608
+  max_num_seqs: 10
+
+# Environment variables (NVFP4 needs FlashInfer's TRT-LLM allreduce backend)
+env:
+  VLLM_FLASHINFER_ALLREDUCE_BACKEND: trtllm
+  VLLM_ALLOW_LONG_MAX_MODEL_LEN: 1
+
+# The vLLM serve command template
+command: |
+  vllm serve nvidia/MiniMax-M2.7-NVFP4 \
+      --trust-remote-code \
+      --port {port} \
+      --host {host} \
+      --gpu-memory-utilization {gpu_memory_utilization} \
+      -tp {tensor_parallel} \
+      --distributed-executor-backend ray \
+      --max-model-len {max_model_len} \
+      --max-num-seqs {max_num_seqs} \
+      --kv-cache-dtype fp8 \
+      --moe-backend cutlass \
+      --enable-prefix-caching \
+      --load-format fastsafetensors \
+      --enable-auto-tool-choice \
+      --tool-call-parser minimax_m2 \
+      --reasoning-parser minimax_m2
