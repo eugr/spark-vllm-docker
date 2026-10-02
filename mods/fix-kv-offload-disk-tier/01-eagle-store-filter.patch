@@ -1,0 +1,37 @@
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py b/vllm/distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py
+index 0d15ec2..482cff6 100644
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py
+@@ -995,6 +995,10 @@ class OffloadingConnectorScheduler:
+ 
+                 alignment_chunk_count = group_config.alignment_chunk_count
+                 tail = group_config.sliding_window_size_in_chunks
++                # The EAGLE certificate chunk sits at the segment boundary.
++                eagle_keep_segment_head = (
++                    tail is not None and group_config.is_eagle_group
++                )
+ 
+                 for key_idx, (offload_key, block_id) in enumerate(
+                     zip(offload_keys, offload_block_ids)
+@@ -1010,7 +1014,20 @@ class OffloadingConnectorScheduler:
+                         assert tail is not None
+                         abs_chunk_idx = start_chunk_idx + key_idx
+                         pos_in_segment = abs_chunk_idx % alignment_chunk_count
+-                        if pos_in_segment < alignment_chunk_count - tail:
++                        keep = pos_in_segment >= alignment_chunk_count - tail
++                        # EAGLE/MTP groups additionally need the chunk at the
++                        # segment head. _sliding_window_lookup finds `tail`
++                        # chunks, but an unverified eagle group then pops one
++                        # (num_hit_chunks -= 1), so it must see tail + 1
++                        # CONSECUTIVE chunks or it certifies nothing. Keeping
++                        # {0} u {acc-tail .. acc-1} forms exactly such a run
++                        # across the segment boundary. Because _lookup() ANDs
++                        # the per-group results, an eagle group that can never
++                        # certify vetoes every other group as well -- which is
++                        # why the tier returns zero hits without this.
++                        if eagle_keep_segment_head and pos_in_segment == 0:
++                            keep = True
++                        if not keep:
+                             continue
+                     new_offload_keys.append(offload_key)
+ 

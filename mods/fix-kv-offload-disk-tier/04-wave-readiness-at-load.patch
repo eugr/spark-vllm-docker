@@ -1,0 +1,396 @@
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/offloading/metrics.py b/vllm/distributed/kv_transfer/kv_connector/v1/offloading/metrics.py
+index 58023c3..50df14e 100644
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/offloading/metrics.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/offloading/metrics.py
+@@ -36,6 +36,7 @@ class _ConnectorMetricName:
+     LOOKUP_SYNC_DELAY = "vllm:kv_offload_lookup_sync_delay_seconds"
+     LOOKUP_ASYNC_DELAY = "vllm:kv_offload_lookup_async_delay_seconds"
+     ALLOCATION_FAILURE = "vllm:kv_offload_allocation_failure"
++    WAVE_RETRY = "vllm:kv_offload_wave_retry"
+ 
+ 
+ class _TransferType:
+@@ -126,6 +127,15 @@ def get_connector_metric_definitions() -> dict[str, OffloadingMetricMetadata]:
+                 "Number of KV offload store allocation attempts that failed."
+             ),
+         ),
++        _ConnectorMetricName.WAVE_RETRY: OffloadingCounterMetadata(
++            documentation=(
++                "Number of scheduler steps in which a wave-streamed load made "
++                "no progress, by reason: promote_refused (the primary tier "
++                "refused staging) or miss (a staged key left the primary tier "
++                "before its load and the wave was re-staged)."
++            ),
++            labelnames=("reason",),
++        ),
+     }
+ 
+ 
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/offloading/parking_gate.py b/vllm/distributed/kv_transfer/kv_connector/v1/offloading/parking_gate.py
+index cf546aa..0c4d6b2 100644
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/offloading/parking_gate.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/offloading/parking_gate.py
+@@ -79,7 +79,7 @@ class AdmissionPolicy:
+     #
+     # That is deliberate, not an oversight: concurrent streams are CORRECT (the
+     # cross-request readiness hole that made them unsafe is fixed in
+-    # tiering_manager.pop_ready_keys, N2), and serializing every on-disk hit --
++    # tiering_manager.wave_lookup, N2), and serializing every on-disk hit --
+     # including two 10-chunk ones -- would throttle the box for no correctness
+     # benefit. If contention is ever MEASURED to matter, strict serialization is
+     # a one-line change in parking_sm.slot_after: take the slot on any ADMIT_*
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/offloading/parking_sm.py b/vllm/distributed/kv_transfer/kv_connector/v1/offloading/parking_sm.py
+index 3f21ca9..75e0f84 100644
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/offloading/parking_sm.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/offloading/parking_sm.py
+@@ -86,7 +86,7 @@ def slot_after(
+     REVIEW #4 (N3): this means the slot serializes LARGE streams against each
+     other, not all streaming. With STREAM_WAVE_CHUNKS > 0 an ADMIT_MONOLITHIC
+     request is still waved, concurrently, without the slot -- bounded instead by
+-    parking_gate's occupancy guards. Correct (see tiering_manager.pop_ready_keys,
++    parking_gate's occupancy guards. Correct (see tiering_manager.wave_lookup,
+     N2), and cheaper than serializing every hit. For strict one-stream-at-a-time,
+     return `request_id` for any ADMIT_* here; see the note on
+     AdmissionPolicy.serialize_streaming for why the alternative fix -- honouring
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py b/vllm/distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py
+index 891fa31..823ea8b 100644
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py
+@@ -240,11 +240,13 @@ STREAM_WAVE_CHUNKS = max(
+     0, int(os.environ.get("VLLM_OFFLOAD_STREAM_WAVE_CHUNKS", "0") or 0)
+ )
+ STREAM_ENABLED = STREAM_WAVE_CHUNKS > 0
+-# WAVE STREAMING (draft): bounded retry for a wave's promotion being refused
+-# by a full primary tier under concurrent contention (design §2, "define what
+-# happens when a later wave's promotion is refused" / review OPEN A). Each
+-# retry costs one engine step; this is not a timeout, just a ceiling on how
+-# long one request will wait before giving up on its remaining waves.
++# WAVE STREAMING (draft): log ceiling for a wave that makes no progress --
++# its promotion refused by a full primary tier under concurrent contention, or
++# re-staged because a staged key left the primary tier before its load (design
++# §2, "define what happens when a later wave's promotion is refused" / review
++# OPEN A). Each retry costs one engine step. Retries are NOT bounded: there is
++# no abort-and-recompute fallback yet (OPEN A), so reaching this ceiling, and
++# every doubling of it, only escalates to a warning (see _wave_retry).
+ MAX_WAVE_PROMOTE_RETRIES = max(
+     1, int(os.environ.get("VLLM_OFFLOAD_STREAM_WAVE_MAX_RETRIES", "50") or 50)
+ )
+@@ -1072,6 +1074,43 @@ class OffloadingConnectorScheduler:
+         self._job_counter += 1
+         return job_id
+ 
++    def _wave_retry(
++        self, req_id: str, wave_idx: int, w: WaveSpec, reason: str
++    ) -> None:
++        """WAVE STREAMING. Record one step in which wave `wave_idx` of request
++        `req_id` made no progress, for `reason` "promote_refused" (the primary
++        tier refused staging) or "miss" (a staged key left the primary tier
++        before its load, so the wave is re-staged).
++
++        Every retry is counted in vllm:kv_offload_wave_retry{reason}. The log
++        warns only for a wave that looks stuck: at MAX_WAVE_PROMOTE_RETRIES and
++        at every doubling of it, because retries are unbounded (OPEN A) and a
++        warning per ordinary contended step would scale with load.
++        """
++        w.retry_count += 1
++        self._connector_stats.increase_counter(
++            _ConnectorMetricName.WAVE_RETRY, labelvalues=(reason,)
++        )
++        stuck_multiple, rem = divmod(w.retry_count, MAX_WAVE_PROMOTE_RETRIES)
++        if rem == 0 and stuck_multiple & (stuck_multiple - 1) == 0:
++            logger.warning(
++                "Request %s: wave %d has made no progress in %d steps (last: %s). "
++                "Retrying indefinitely; an abort-and-recompute fallback is not "
++                "implemented (OPEN A).",
++                req_id,
++                wave_idx,
++                w.retry_count,
++                reason,
++            )
++        elif PROBE_ENABLED:
++            logger.info(
++                "KVWAVE req=%s wave=%d %s retry_count=%d",
++                req_id,
++                wave_idx,
++                reason,
++                w.retry_count,
++            )
++
+     def _remove_pending_job(self, job_id: int, block_ids: list[int] | None) -> None:
+         for bid in block_ids or ():
+             pending = self._block_id_to_pending_jobs[bid]
+@@ -2688,7 +2727,7 @@ class OffloadingConnectorScheduler:
+         # above has already polled every secondary tier for finished jobs and
+         # reflected any promotion that completed this step (tiering_manager.py
+         # _process_finished_jobs -> primary_tier.complete_write), so a wave
+-        # whose disk read just landed is visible to pop_ready_keys() below in
++        # whose disk read just landed is visible to wave_lookup() below in
+         # THIS same step -- and _current_batch_load_jobs hasn't been
+         # snapshotted into `meta` yet (that happens a few lines down), so a
+         # load job built here ships in this step's metadata, not next step's.
+@@ -2711,7 +2750,7 @@ class OffloadingConnectorScheduler:
+ 
+                 w = waves[req_status.wave_idx]
+ 
+-                if not w.promoting and not w.promoted:
++                if not w.promoting:
+                     # OPEN A: capture the refusal case. promote_for_staging
+                     # inherits _initiate_promotion's bool contract (False =
+                     # primary tier refused). Ignoring it would leave
+@@ -2721,7 +2760,6 @@ class OffloadingConnectorScheduler:
+                     if self.manager.promote_for_staging(w.keys, req_status.req_context):
+                         w.promoting = True
+                     else:
+-                        w.retry_count += 1
+                         # NOT YET RESOLVED (left deliberately conservative --
+                         # see design §2's "define what happens when a later
+                         # wave's promotion is refused"): the design considered
+@@ -2743,33 +2781,26 @@ class OffloadingConnectorScheduler:
+                         # request that recovers once contention clears is
+                         # recoverable; an incorrectly-aborted one might not
+                         # be. MAX_WAVE_PROMOTE_RETRIES therefore only
+-                        # escalates log severity below, it does not abort.
+-                        if w.retry_count == MAX_WAVE_PROMOTE_RETRIES:
+-                            logger.warning(
+-                                "Request %s: wave %d promotion refused %d "
+-                                "times and counting -- primary tier "
+-                                "contention is not clearing. Retrying "
+-                                "indefinitely (see code comment on whether "
+-                                "an abort-and-recompute fallback is safe "
+-                                "here; it is not yet implemented).",
+-                                req_id,
+-                                req_status.wave_idx,
+-                                w.retry_count,
+-                            )
+-                        elif PROBE_ENABLED:
+-                            logger.info(
+-                                "KVWAVE req=%s wave=%d promote_refused "
+-                                "retry_count=%d",
+-                                req_id,
+-                                req_status.wave_idx,
+-                                w.retry_count,
+-                            )
++                        # escalates log severity, it does not abort.
++                        self._wave_retry(
++                            req_id, req_status.wave_idx, w, "promote_refused"
++                        )
+                     continue  # wait for the completion signal, or retry next step
+ 
+-                if not w.promoted and self.manager.pop_ready_keys(req_id, w.keys):
+-                    w.promoted = True
+-
+-                if w.promoted and w.load_job_id is None:
++                if w.load_job_id is None:
++                    # Readiness is evaluated here, in the same pass as the
++                    # prepare_load() below that pins the rows; a row that was
++                    # resident in an earlier step may have been evicted since
++                    # (see TieringOffloadingManager.wave_lookup).
++                    readiness = self.manager.wave_lookup(
++                        w.keys, req_status.req_context
++                    )
++                    if readiness is LookupResult.MISS:
++                        w.promoting = False  # stage again next step
++                        self._wave_retry(req_id, req_status.wave_idx, w, "miss")
++                        continue
++                    if readiness is not LookupResult.HIT:
++                        continue  # promotion still writing
+                     src_spec = self.manager.prepare_load(w.keys, req_status.req_context)
+                     dst_spec = GPULoadStoreSpec(
+                         w.dst_block_ids,
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/offloading/wave_slicer.py b/vllm/distributed/kv_transfer/kv_connector/v1/offloading/wave_slicer.py
+index 1d56a95..190092c 100644
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/offloading/wave_slicer.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/offloading/wave_slicer.py
+@@ -35,8 +35,8 @@ class WaveSpec:
+     block_indices: list[int] = field(default_factory=list)
+     # Scheduler-side driver state (Appendix B). Not touched by slicing.
+     promoting: bool = False
+-    promoted: bool = False
+     load_job_id: int | None = None
++    # Steps this wave made no progress so far (see _wave_retry); never reset.
+     retry_count: int = 0
+ 
+ 
+diff --git a/vllm/v1/kv_offload/tiering/manager.py b/vllm/v1/kv_offload/tiering/manager.py
+index b491917..e955642 100644
+--- a/vllm/v1/kv_offload/tiering/manager.py
++++ b/vllm/v1/kv_offload/tiering/manager.py
+@@ -76,15 +76,6 @@ class RequestState:
+     # time.monotonic() of this request's first deferred secondary-tier lookup;
+     # None once consumed (observed) or while no secondary lookup is pending.
+     secondary_lookup_start_time: float | None = None
+-    # WAVE STREAMING (draft, see docs/superpowers/specs/2026-09-05-deepcached-
+-    # wave-streaming-design.md). Keys whose secondary->primary promotion has
+-    # completed (is_promotion job success in _process_finished_jobs) but that
+-    # the scheduler-side wave driver has not yet consumed. Populated only when
+-    # a wave's promotion was initiated via promote_for_staging(); a normal
+-    # (non-streaming) request never touches this. Cleared per-key by
+-    # pop_ready_keys(), and wholesale on reset_cache/finalize so it can never
+-    # outlive the primary-tier rows it claims are resident.
+-    wave_ready_keys: set[OffloadKey] = field(default_factory=set)
+ 
+ 
+ class CPUPrimaryTierOffloadingManager(CPUOffloadingManager):
+@@ -291,21 +282,6 @@ class TieringOffloadingManager(OffloadingManager):
+                         self._promoted_rows.extend(
+                             int(b) for b in job_metadata.block_ids
+                         )
+-                        # WAVE STREAMING (draft): record which keys just
+-                        # became resident, for promote_for_staging() callers
+-                        # (the scheduler-side wave driver) to poll via
+-                        # pop_ready_keys(). Deliberately NOT folded into
+-                        # _promoted_rows above -- that list is flat block_id
+-                        # ints shared with the cross-rank KVMIRROR sync and
+-                        # has no per-request grouping; overloading it with a
+-                        # second meaning was flagged during design review as
+-                        # exactly the kind of shared-state sharp edge this
+-                        # investigation keeps getting cut on.
+-                        req_state = self._req_state.get(
+-                            job_metadata.req_context.req_id
+-                        )
+-                        if req_state is not None:
+-                            req_state.wave_ready_keys.update(job_metadata.keys)
+                 else:
+                     # primary→secondary transfer completed.
+                     # Decrement ref_cnt on primary blocks.
+@@ -533,92 +509,43 @@ class TieringOffloadingManager(OffloadingManager):
+                 keys=[], block_ids=[], req_context=req_context
+             )
+         entry = tier_pending[ctx_id]
+-        new_keys = list(primary_write_result.keys_to_store)
+-        entry.keys.extend(new_keys)
++        entry.keys.extend(primary_write_result.keys_to_store)
+         entry.block_ids.extend(store_spec.block_ids)
+-
+-        # REQUEST PARKING / WAVE STREAMING (draft), blocker (b): prepare_write
+-        # reports only NEW keys, so a key already resident (shared prefix left
+-        # resident, or promoted by another request) never appears in keys_to_store
+-        # and would forever look "not ready" to pop_ready_keys, hanging the wave.
+-        # Treat the ready complement as ready immediately. BUT the complement is
+-        # not "already resident" in general: prepare_store excludes a key from
+-        # keys_to_store whenever the policy has it at all -- including ref_cnt
+-        # == -1, a promotion ANOTHER request is mid-write (lookup -> HIT_PENDING).
+-        # Marking that ready lets the driver ship a wave that prepare_load then
+-        # crashes on (`assert block.is_ready`). So only keys that are genuinely
+-        # ready (HIT) are seeded; the write-pending ones stay unready and resolve
+-        # through the normal completion path.
+-        already_resident = {
+-            k
+-            for k in set(keys) - set(new_keys)
+-            if self.primary_tier.lookup(k, req_context) is LookupResult.HIT
+-        }
+-        if already_resident:
+-            req_state = self._req_state.get(ctx_id)
+-            if req_state is not None:
+-                req_state.wave_ready_keys.update(already_resident)
+         return True
+ 
+-    def pop_ready_keys(self, req_id: str, keys: Collection[OffloadKey]) -> bool:
+-        """WAVE STREAMING (draft). True and clears `keys` from the ready set
+-        iff every one of `keys` has been recorded as promotion-complete by
+-        `_process_finished_jobs` since the last call. Partial readiness
+-        (some but not all of `keys` ready) returns False and leaves the ready
+-        set untouched, so a later call sees the full set once the rest lands.
+-
+-        Called by the scheduler-side wave driver, after `on_schedule_end()`
+-        has run for this step (so any promotion that completed this step is
+-        already reflected), to decide whether a wave is safe to
+-        `prepare_load()`.
+-
+-        REVIEW #4 (N2): `wave_ready_keys` alone is NOT sufficient. It is fed by
+-        `_process_finished_jobs`, which records completions under the id of the
+-        request that INITIATED the promotion (`job_metadata.req_context.req_id`)
+-        — so a key this request's wave needs, but that ANOTHER request was
+-        mid-promotion on when `promote_for_staging` ran, never lands here:
+-        `prepare_write` skipped it (the policy already held it, so it is not in
+-        `keys_to_store`) and the blocker-(b) seed skipped it too (it read back
+-        HIT_PENDING, not HIT, and seeding a write-pending key would crash
+-        `prepare_load`'s `assert block.is_ready`). Without the re-probe below
+-        that key is never reported ready by anyone and the wave hangs forever.
+-
+-        So: fall back to asking the primary tier directly for whatever is not
+-        yet in the ready set. `lookup()` is the authoritative readiness
+-        discriminator — HIT means resident and readable, HIT_PENDING means a
+-        write is still in flight — and it is exactly what `prepare_load`'s
+-        assert checks. The probe is bounded by one wave's key count and only
+-        runs for keys still outstanding.
+-
+-        Side-effect-free as configured: `CPUOffloadingManager.lookup` only
+-        mutates its `counts` store-threshold tracker when `store_threshold >= 2`,
+-        and `CPUPrimaryTierOffloadingManager.__init__` never passes one, so
+-        `counts` is None for the primary tier. If a store_threshold is ever
+-        configured there, revisit this — repeated probing would inflate those
+-        counts and perturb the STORE path, which this design must not touch.
+-        """
+-        req_state = self._req_state.get(req_id)
+-        if req_state is None:
+-            return False
+-        wanted = set(keys)
+-        outstanding = wanted - req_state.wave_ready_keys
+-        if outstanding:
+-            # N2: adopt any outstanding key the primary tier now reports as
+-            # genuinely readable, whoever promoted it. Anything still
+-            # HIT_PENDING (or MISS) stays outstanding and is retried next step.
+-            newly_ready = {
+-                k
+-                for k in outstanding
+-                if self.primary_tier.lookup(k, req_state.req_context)
+-                is LookupResult.HIT
+-            }
+-            if newly_ready:
+-                req_state.wave_ready_keys.update(newly_ready)
+-                outstanding -= newly_ready
+-            if outstanding:
+-                return False
+-        req_state.wave_ready_keys.difference_update(wanted)
+-        return True
++    def wave_lookup(
++        self, keys: Collection[OffloadKey], req_context: ReqContext
++    ) -> LookupResult:
++        """WAVE STREAMING. Readiness of one wave's keys in the primary tier,
++        evaluated NOW: HIT iff every key is resident and readable, MISS if any
++        key is absent, HIT_PENDING otherwise (a write to one of its rows, a
++        promotion or another request's store, is still in flight).
++
++        The scheduler-side wave driver calls this immediately before
++        `prepare_load()` in the same pass, and `prepare_load()` is what pins
++        the rows (ref_cnt 0 -> 1). Until then a resident row is evictable, so
++        readiness must never be remembered across steps: a row that became
++        resident while the rest of its wave was still promoting (or that was
++        already resident, or was promoted by another request) can be evicted
++        by any intervening `prepare_write`/`prepare_store`; remembering it
++        crashes the engine on `prepare_load`'s `assert block is not None`
++        under concurrent load. MISS -- that eviction, a failed promotion, or a
++        `reset_cache()` wipe -- tells the driver to stage the wave again;
++        `promote_for_staging()` re-reads only the absent keys. Re-staging is
++        not bounded: a key the secondary tier has lost re-reads every step
++        (OPEN A), visible as vllm:kv_offload_wave_retry{reason="miss"}.
++
++        Side-effect-free: `CPUOffloadingManager.lookup` only mutates its
++        `counts` store-threshold tracker when `store_threshold >= 2`, which
++        `CPUPrimaryTierOffloadingManager.__init__` never passes (so `counts`
++        is None), and both cache policies' `get()` are plain dict lookups.
++        """
++        results = {self.primary_tier.lookup(k, req_context) for k in keys}
++        if LookupResult.MISS in results:
++            return LookupResult.MISS
++        if results <= {LookupResult.HIT}:
++            return LookupResult.HIT
++        return LookupResult.HIT_PENDING
+ 
+     def _flush_pending_promotions(self) -> None:
+         """Submit one batched submit_load() per (tier, request).
+@@ -1029,13 +956,6 @@ class TieringOffloadingManager(OffloadingManager):
+         finished_req_ids = []
+         for req_id, state in self._req_state.items():
+             state.pending_primary_stores = 0
+-            # WAVE STREAMING (draft): primary_tier.reset_cache() below wipes
+-            # every row, so any wave_ready_keys claiming a key is resident
+-            # would be stale the instant this returns. Clear for active
+-            # requests too, not just finished ones -- an active request whose
+-            # rows just got wiped must re-promote, not `prepare_load()` a
+-            # dead row.
+-            state.wave_ready_keys.clear()
+             if not state.is_finished:
+                 continue
+             for tier in self.secondary_tiers:
