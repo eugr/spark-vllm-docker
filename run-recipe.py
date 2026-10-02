@@ -439,10 +439,14 @@ def check_model_exists(model: str) -> bool:
     """
     Check if a model exists in the HuggingFace cache.
 
-    Checks the standard HF cache location for completed downloads.
+    Resolves the hub cache the same way huggingface_hub does:
+      1. HF_HUB_CACHE, if set (e.g. an NFS mount) — points directly at the hub dir.
+      2. otherwise $HF_HOME/hub (HF_HOME defaults to $XDG_CACHE_HOME/huggingface,
+         i.e. ~/.cache/huggingface).
+    HF_HOME and HF_HUB_CACHE are independent: HF_HOME holds tokens/etc., while
+    HF_HUB_CACHE holds the model cache and may live somewhere else entirely.
 
     EXTENSIBILITY:
-    - To support custom cache locations: Add HF_HOME env var support
     - To verify model integrity: Check for complete snapshot with config.json
     - To support other model sources: Add URL/path prefix detection
 
@@ -452,10 +456,26 @@ def check_model_exists(model: str) -> bool:
     Returns:
         True if model appears to be fully downloaded, False otherwise
     """
+    # Resolve the HuggingFace hub cache directory. HF_HUB_CACHE points
+    # directly at the "hub" directory (the one containing models--* dirs);
+    # otherwise the hub lives under HF_HOME. Mirrors huggingface_hub.
+    hub_cache = os.environ.get("HF_HUB_CACHE")
+    if hub_cache:
+        hub_dir = Path(hub_cache).expanduser()
+    else:
+        hf_home = os.environ.get("HF_HOME")
+        if hf_home:
+            base = Path(hf_home).expanduser()
+        else:
+            xdg_cache = os.environ.get("XDG_CACHE_HOME")
+            cache_root = Path(xdg_cache).expanduser() if xdg_cache else Path.home() / ".cache"
+            base = cache_root / "huggingface"
+        hub_dir = base / "hub"
+
     # Convert model name to cache directory format
     # e.g., "Salyut1/GLM-4.7-NVFP4" -> "models--Salyut1--GLM-4.7-NVFP4"
     cache_name = f"models--{model.replace('/', '--')}"
-    cache_path = Path.home() / ".cache" / "huggingface" / "hub" / cache_name
+    cache_path = hub_dir / cache_name
 
     if cache_path.exists():
         # Check for snapshots directory which indicates complete download
