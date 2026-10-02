@@ -1,0 +1,88 @@
+# Recipe: MiMo-V2.6-Flash-RL
+# Xiaomi MiMo-V2.6-Flash-RL (309B MoE, 15B active, MXFP4 experts + fp8 attention)
+# with DFlash block-diffusion speculative decoding on two DGX Spark nodes (TP=2).
+
+recipe_version: "1"
+name: MiMo-V2.6-Flash-RL
+description: vLLM serving XiaomiMiMo/MiMo-V2.6-Flash-RL with DFlash speculative decoding on a dual DGX Spark cluster
+
+# HuggingFace model to download (optional, for --download-model)
+model: XiaomiMiMo/MiMo-V2.6-Flash-RL
+
+# Container image to use (vLLM main from 2026-09-21 or newer)
+container: vllm-node
+
+# ~173 GB of weights: needs both Sparks
+cluster_only: true
+
+# Stages a loadable copy of the checkpoint's dflash/ drafter (sanitized
+# config.json) at /workspace/MiMo-V2.6-Flash-RL-dflash, since a Hub
+# subdirectory is not addressable as a draft model. mimo-diffkv-fp8-kv makes
+# --kv-cache-dtype fp8 effective (upstream ignores it for this model).
+mods:
+  - mods/mimo-v2.6-flash
+  - mods/mimo-diffkv-fp8-kv
+
+# Default settings (can be overridden via CLI where supported)
+defaults:
+  port: 8000
+  host: 0.0.0.0
+  tensor_parallel: 2
+  gpu_memory_utilization: 0.87
+  max_model_len: 1048576
+  max_num_seqs: 8
+  max_num_batched_tokens: 8192
+  num_speculative_tokens: 7
+
+# Environment variables
+env: {}
+
+# The vLLM serve command template
+# - --moe-backend marlin: the MXFP4 MoE auto-selection would pick DeepGEMM on
+#   sm_121; Marlin is the tested path for these experts.
+# - Hybrid 192/128 K/V head dims make the target select the *_DIFFKV attention
+#   backends (Triton on sm_121, where FlashAttention has no sink support).
+# - fp8 KV cache + 0.87 utilization: bf16 KV holds ~614K tokens at 0.85, short
+#   of the model's 1M context. A 1M sequence needs 14.3 GiB of fp8 KV; 0.85
+#   left 13.85 GiB, so 0.87 provides the headroom (~105.8 of 121.6 GiB).
+#   Requires mods/mimo-diffkv-fp8-kv: upstream vLLM neither wires cache_config
+#   into the MiMo attention layers nor lets the DiffKV backend take fp8 KV.
+# - DFlash drafter ships inside the checkpoint under dflash/ (block size 8 ->
+#   7 draft tokens). Its SWA layers carry attention sink biases and DFlash needs
+#   non-causal attention, so the draft is pinned to TRITON_ATTN.
+# - FULL_DECODE_ONLY cudagraphs trade prefill graph capture for memory headroom
+#   on the 121 GB unified pool; FULL_AND_PIECEWISE also works. The official
+#   vLLM recipe pairs the same mode with DFlash:
+#   https://github.com/vllm-project/recipes/blob/09dea3c390ca123b6d3f1aaca7774c8fffa51654/models/XiaomiMiMo/MiMo-V2.6-Flash-RL.yaml
+# - The drafter inherits the target's TP size (2) by default; pin
+#   "draft_tensor_parallel_size" in --speculative-config only for asymmetric
+#   topologies (official recipe guidance).
+# - generation_config.json carries max_new_tokens=2048, which would become a
+#   server-wide max_tokens cap, so only top_p is taken over from it — this
+#   matches the official recipe's recommended sampling (temperature 1.0 is
+#   already the vLLM default). Thinking mode is on by default; clients disable
+#   it per request with chat_template_kwargs {"enable_thinking": false}.
+# - --no-async-scheduling: vllm#46669 (open) reports garbage outputs with
+#   MTP/DFlash spec decode + async scheduling at concurrency > 1 on MiMo
+#   models; disabling async is the only known mitigation. Upstream still
+#   treats dflash as async-compatible, so the default is ON without this flag.
+command: |
+  vllm serve XiaomiMiMo/MiMo-V2.6-Flash-RL \
+      --trust-remote-code \
+      --host {host} \
+      --port {port} \
+      --tensor-parallel-size {tensor_parallel} \
+      --moe-backend marlin \
+      --max-model-len {max_model_len} \
+      --kv-cache-dtype fp8 \
+      --max-num-seqs {max_num_seqs} \
+      --max-num-batched-tokens {max_num_batched_tokens} \
+      --gpu-memory-utilization {gpu_memory_utilization} \
+      --no-async-scheduling \
+      --speculative-config '{{"method":"dflash","model":"/workspace/MiMo-V2.6-Flash-RL-dflash","num_speculative_tokens":{num_speculative_tokens},"attention_backend":"TRITON_ATTN"}}' \
+      --compilation-config '{{"cudagraph_mode":"FULL_DECODE_ONLY"}}' \
+      --generation-config vllm \
+      --override-generation-config '{{"top_p":0.95}}' \
+      --reasoning-parser mimo \
+      --tool-call-parser mimo \
+      --enable-auto-tool-choice
