@@ -45,7 +45,6 @@ command: |
   vllm serve local-inference-lab/Qwen3.8-Flash-Next-NVFP4 \
     --host {host} \
     --port {port} \
-    --trust-remote-code \
     --tensor-parallel-size {tensor_parallel} \
     --pipeline-parallel-size {pipeline_parallel} \
     --mamba-cache-mode align \

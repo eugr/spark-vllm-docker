@@ -1611,8 +1611,8 @@ test_dockerfile_externalizes_vllm_source_patches() {
             fail "Dockerfile does not execute external patch: $patch_name"
         fi
     done
-    if [ "$patch_count" -ne 16 ]; then
-        fail "Expected 16 external vLLM patch scripts, found $patch_count"
+    if [ "$patch_count" -ne 17 ]; then
+        fail "Expected 17 external vLLM patch scripts, found $patch_count"
     fi
     if ! python3 -c '
 from pathlib import Path
@@ -1624,6 +1624,13 @@ for path in files:
         fail "An external vLLM patch script has invalid Python syntax"
     fi
     pass "Dockerfile externalizes every active vLLM source patch"
+}
+
+test_api_key_auth_patch() {
+    if ! python3 "$PROJECT_DIR/tests/test_vllm_api_key_auth_patch.py"; then
+        fail "API-key authentication patch regression tests failed"
+    fi
+    pass "API-key authentication patch protects routes in regular and B12X source builds"
 }
 
 test_swa_block_size_patch() {
@@ -1755,6 +1762,7 @@ test_dockerfile_uses_prepared_python_for_flashinfer_builds
 test_dockerfiles_pin_tvm_ffi_regression_version
 test_dockerfile_fetches_vllm_prs_from_upstream
 test_dockerfile_externalizes_vllm_source_patches
+test_api_key_auth_patch
 test_swa_block_size_patch
 test_torch_schema_enumeration_patch
 test_instanttensor_vllm_memory_patch

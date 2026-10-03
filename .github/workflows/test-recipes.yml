@@ -7,6 +7,8 @@ on:
       - 'run-recipe.py'
       - 'run-recipe.sh'
       - 'launch-cluster.sh'
+      - 'hf-download.sh'
+      - 'hf-cache.py'
       - 'recipes/**'
       - 'mods/fix-qwen3-next-autoround/**'
       - 'mods/memory-profile/**'
@@ -17,6 +19,8 @@ on:
       - 'run-recipe.py'
       - 'run-recipe.sh'
       - 'launch-cluster.sh'
+      - 'hf-download.sh'
+      - 'hf-cache.py'
       - 'recipes/**'
       - 'mods/fix-qwen3-next-autoround/**'
       - 'mods/memory-profile/**'
@@ -54,6 +58,14 @@ jobs:
     
     - name: Test Qwen3-Next AutoRound compatibility mod
       run: python3 tests/test_qwen3_next_autoround_mod.py
+
+    - name: Test Hugging Face cache ownership repair
+      run: python3 tests/test_hf_download_permissions.py
+
+    - name: Test Hugging Face cache management and copies
+      run: |
+        python3 tests/test_hf_cache_management.py
+        bash tests/test_hf_download_copy.sh
 
     - name: Test memory profiling mod
       run: |
