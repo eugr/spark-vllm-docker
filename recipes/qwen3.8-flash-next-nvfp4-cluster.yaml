@@ -11,9 +11,12 @@ container: vllm-node-b12x
 build_args:
   - --exp-b12x
 
-cluster_only: true
+# The NVFP4 checkpoint omits text_config.ple_embedding_dtype; declare the
+# NVFP4 PLE storage the checkpoint actually ships before vLLM plans the table.
+mods:
+  - mods/fix-qwen3.8-ple-dtype
 
-mods: []
+cluster_only: true
 
 defaults:
   port: 8000
