@@ -313,6 +313,19 @@ for additional launcher options.
 
 ### 2026-10-05
 
+#### Qwen3.8 Flash Next NVFP4 PLE embedding dtype fix
+
+The `local-inference-lab/Qwen3.8-Flash-Next-NVFP4` checkpoint quantizes its PLE
+n-gram embedding to NVFP4 (group size 16) but omits
+`text_config.ple_embedding_dtype` from its `config.json`. vLLM defaults the
+field to bfloat16, plans the PLE table for bf16 storage, and weight loading
+fails with `shape mismatch for PLE shard N weight: expected (rows, head_dim),
+got (rows, head_dim // 2)`. The new `mods/fix-qwen3.8-ple-dtype` resolves the
+cached revision via `refs/main`, injects the storage dtype derived from the
+checkpoint's own quantization config, and is a no-op once the field is present.
+Both `qwen3.8-flash-next-nvfp4` recipes now apply it. See
+`mods/fix-qwen3.8-ple-dtype/README.md`.
+
 Spark-vllm-docker now supports switchless ring configurations with the number of nodes >3. 
 Tested with 4x ring, but should work with larger rings as well (will test when get access to one).
 
@@ -2276,6 +2289,7 @@ The repository includes several pre-configured mods in the `mods/` directory:
 - **fix-qwen3.5-chat-template/** and **fix-qwen3.6-chat-template/**: Install fixed chat templates used by the Qwen3.5 and Qwen3.6 recipes.
 - **fix-qwen3.5-autoround/**, **fix-qwen3-next-autoround/**, and **fix-qwen35-tp4-marlin/**: Model-specific Qwen AutoRound and Marlin compatibility fixes.
 - **fix-qwen3-coder-next/**: Qwen3-Coder-Next runtime and performance fixes.
+- **fix-qwen3.8-ple-dtype/**: Injects `text_config.ple_embedding_dtype: "nvfp4"` into the `local-inference-lab/Qwen3.8-Flash-Next-NVFP4` checkpoint config at launch. The upstream config.json omits the field while its PLE n-gram embedding is NVFP4-quantized, so vLLM plans a bf16 PLE table and weight loading fails with a PLE shard shape mismatch.
 - **radixark-dspark/**: Routes Qwen DSpark checkpoints such as `RadixArk/Qwen3.8-27B-DSpark` to vLLM's Qwen3 DSpark loader instead of the DeepSeek-V4 loader.
 - **dspark-instanttensor/**: Filters embedded `mtp.*` DSpark draft weights before InstantTensor or safetensors I/O, preventing a second full-checkpoint load.
 - **gpu-mem-util-gb/**: Adds experimental `--gpu-memory-utilization-gb` support.
