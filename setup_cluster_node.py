@@ -17,6 +17,7 @@ import re
 import shlex
 import shutil
 import stat
+import struct
 import subprocess
 import tempfile
 
@@ -513,6 +514,94 @@ def save_routes(interfaces):
     return saved
 
 
+def remap_route_dump(data, indexes):
+    """Translate device references in an iproute2 route-save stream.
+
+    The native-endian stream is a magic word followed by rtnetlink messages
+    (iproute2/ip/iproute.c; Linux uapi/linux/rtnetlink.h). Keep every other byte,
+    including route metrics, tables, gateways, and message/attribute padding.
+    """
+    if len(data) < 4 or struct.unpack_from("=I", data)[0] != 0x45311224:
+        raise ValueError("Invalid saved route dump header; preserve the journal for recovery")
+    output = bytearray(data)
+
+    def remap(offset):
+        old = struct.unpack_from("=I", output, offset)[0]
+        if not old:  # No interface specified.
+            return
+        if old not in indexes:
+            raise ValueError(f"Saved route references unverified interface index {old}; reconcile routes before restoring")
+        struct.pack_into("=I", output, offset, indexes[old])
+
+    def attributes(start, end, *, multipath=True):
+        while start < end:
+            if end - start < 4:
+                raise ValueError("Truncated saved route attribute")
+            length, kind = struct.unpack_from("=HH", output, start)
+            aligned = (length + 3) & ~3
+            if length < 4 or start + aligned > end:
+                raise ValueError("Invalid saved route attribute length")
+            payload, stop = start + 4, start + length
+            if kind in (3, 4):  # RTA_IIF / RTA_OIF
+                if length != 8:
+                    raise ValueError("Invalid saved route interface reference")
+                remap(payload)
+            elif kind == 9 and multipath:  # RTA_MULTIPATH: rtnexthop records.
+                while payload < stop:
+                    if stop - payload < 8:
+                        raise ValueError("Truncated saved route nexthop")
+                    hop_length = struct.unpack_from("=H", output, payload)[0]
+                    if hop_length < 8 or payload + ((hop_length + 3) & ~3) > stop:
+                        raise ValueError("Invalid saved route nexthop length")
+                    remap(payload + 4)
+                    attributes(payload + 8, payload + hop_length, multipath=False)
+                    payload += (hop_length + 3) & ~3
+            elif kind in (9, 22, 30) or kind > 32:
+                # Encapsulation may embed more interface IDs; nexthop objects
+                # have separate kernel IDs not captured by the setup journal.
+                raise ValueError(f"Saved route attribute {kind} needs manual reconciliation before restore")
+            start += aligned
+
+    offset = 4
+    while offset < len(output):
+        if len(output) - offset < 28:  # nlmsghdr (16) + rtmsg (12).
+            raise ValueError("Truncated saved route message")
+        length, kind = struct.unpack_from("=IH", output, offset)
+        aligned = (length + 3) & ~3
+        if length < 28 or offset + aligned > len(output) or kind != 24:  # RTM_NEWROUTE
+            raise ValueError("Invalid saved route message")
+        if output[offset + 16] not in (2, 10):  # AF_INET / AF_INET6 on Linux.
+            raise ValueError("Unsupported saved route address family")
+        attributes(offset + 28, offset + length)
+        offset += aligned
+    return bytes(output)
+
+
+def restored_routes(journal, links):
+    """Validate device identity and build temporary route images, never edit backups."""
+    current = {link["ifname"]: link for link in links}
+    indexes = {}
+    for before in journal.state["runtime"]:
+        name = before["ifname"]
+        now = current.get(name)
+        if now is None:
+            raise ValueError(f"Missing saved CX7 interface: {name}; reconcile devices before restoring")
+        old_mac, new_mac = before.get("address", "").lower(), now.get("address", "").lower()
+        changed = before["ifindex"] != now["ifindex"]
+        if (old_mac and old_mac != new_mac) or (changed and not old_mac):
+            raise ValueError(f"Cannot verify saved CX7 identity for {name}; reconcile devices before restoring")
+        if before["ifindex"] in indexes:
+            raise ValueError("Duplicate interface index in saved CX7 inventory")
+        indexes[before["ifindex"]] = now["ifindex"]
+    result = []
+    for routes in journal.state["routes"]:
+        if routes["family"] not in ("-4", "-6"):
+            raise ValueError("Unsupported saved route family")
+        data = base64.b64decode(routes["data"], validate=True)
+        result.append((routes["family"], remap_route_dump(data, indexes)))
+    return result
+
+
 def prepare(request, account):
     if (STATE / "journal.json").exists():
         raise ValueError("A setup journal already exists on this node; restore it before a new setup")
@@ -598,18 +687,15 @@ def check_restore(journal):
         ):
             continue
         raise ValueError(f"Changed since setup: {entry['path']}; preserve/reconcile your edits before restore")
-    if journal.state["routes"]:
-        # Route streams refer to numeric device IDs. Never restore onto another
-        # interface if enumeration changed after a reboot or driver reload.
-        current = {item["ifname"]: item["ifindex"]
-                   for item in json.loads(run(["ip", "-j", "link", "show"]).stdout)}
-        if any(current.get(item["ifname"]) != item["ifindex"] for item in journal.state["runtime"]):
-            raise ValueError("CX7 interface indexes changed; reconcile saved routes before restoring")
+    # Validate every route and device before any file or network changes.
+    restored_routes(journal, json.loads(run(["ip", "-j", "link", "show"]).stdout))
 
 
 def restore_runtime(journal):
     # Netplan can leave addresses/MTUs on now-unmanaged physical interfaces.
     current = {item["ifname"]: item for item in json.loads(run(["ip", "-j", "address", "show"]).stdout)}
+    # Recheck after netplan apply in case device enumeration changed again.
+    routes_to_restore = restored_routes(journal, current.values())
     for before in journal.state["runtime"]:
         name = before["ifname"]
         original = {f"{a['local']}/{a['prefixlen']}" for a in before.get("addr_info", [])}
@@ -630,13 +716,13 @@ def restore_runtime(journal):
                 run(command)
         run(["ip", "link", "set", "dev", name, "mtu", str(before["mtu"]),
              "up" if "UP" in before["flags"] else "down"])
-    for routes in journal.state["routes"]:
+    for family, data in routes_to_restore:
         # iproute2 rewinds stdin between passes: a subprocess input pipe fails
         # with "ftell: Illegal seek". Existing routes are left unchanged.
         with tempfile.TemporaryFile() as stream:
-            stream.write(base64.b64decode(routes["data"]))
+            stream.write(data)
             stream.seek(0)
-            run(["ip", routes["family"], "route", "restore"], binary=True, stdin=stream)
+            run(["ip", family, "route", "restore"], binary=True, stdin=stream)
 
 
 def restore(journal):

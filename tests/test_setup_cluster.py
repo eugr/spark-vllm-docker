@@ -9,6 +9,7 @@ import ipaddress
 import json
 import os
 from pathlib import Path
+import struct
 import subprocess
 import sys
 import tempfile
@@ -45,6 +46,86 @@ def inventory(node, ports=(0, 1), interfaces=None):
         link["ifindex"] = index + 1
         link["address"] = f"02:00:00:00:00:{index:02x}"
     return {"ports": list(ports), "links": links, "routes": [], "host_keys": ["ssh-ed25519 AAAAtest"]}
+
+
+def route_attribute(kind, payload):
+    length = len(payload) + 4
+    return struct.pack("=HH", length, kind) + payload + bytes(-length % 4)
+
+
+def route_message(attributes, family=2):
+    # Linux RTM_NEWROUTE with a non-default table, protocol, metric, and flags.
+    header = struct.pack("=IH HII", 28 + len(attributes), 24, 2, 123, 456)
+    return header + struct.pack("=8BI", family, 24 if family == 2 else 64, 0, 0, 0, 4, 0, 1, 0) + attributes
+
+
+def route_dump(index, family=2):
+    attributes = route_attribute(4, struct.pack("=I", index))
+    attributes += route_attribute(15, struct.pack("=I", 1234))
+    attributes += route_attribute(8, route_attribute(2, struct.pack("=I", 4096)))
+    attributes += route_attribute(5, ipaddress.ip_address("10.30.0.1" if family == 2 else "fd00::1").packed)
+    return struct.pack("=I", 0x45311224) + route_message(attributes, family)
+
+
+class RouteDumpTests(unittest.TestCase):
+    def test_ipv4_and_ipv6_only_device_references_change(self):
+        for family in (2, 10):
+            with self.subTest(family=family):
+                before = route_dump(2, family)
+                self.assertEqual(worker.remap_route_dump(before, {2: 19}), route_dump(19, family))
+                self.assertEqual(worker.remap_route_dump(before, {2: 2}), before)
+
+    def test_swapped_iif_oif_and_multiple_messages_do_not_cascade(self):
+        def message(iif, oif):
+            return route_message(route_attribute(3, struct.pack("=I", iif)) +
+                                 route_attribute(4, struct.pack("=I", oif)))
+        header = struct.pack("=I", 0x45311224)
+        before = header + message(2, 3) + message(3, 2)
+        self.assertEqual(worker.remap_route_dump(before, {2: 3, 3: 2}),
+                         header + message(3, 2) + message(2, 3))
+
+    def test_multipath_preserves_gateways_weights_and_flags(self):
+        def dump(a, b):
+            gateway = route_attribute(5, ipaddress.ip_address("10.30.0.1").packed)
+            hops = b"".join(struct.pack("=HBBI", 8+len(gateway), 4, weight, index) + gateway
+                            for index, weight in ((a, 0), (b, 2)))
+            return struct.pack("=I", 0x45311224) + route_message(route_attribute(9, hops))
+        self.assertEqual(worker.remap_route_dump(dump(2, 3), {2: 3, 3: 2}), dump(3, 2))
+
+    def test_padding_and_unspecified_device_are_preserved(self):
+        attrs = route_attribute(4, struct.pack("=I", 0)) + route_attribute(20, b"\x01")
+        # Nonzero padding should be retained too; it is not an interface ID.
+        data = struct.pack("=I", 0x45311224) + route_message(attrs[:-3] + b"abc")
+        self.assertEqual(worker.remap_route_dump(data, {}), data)
+        empty = struct.pack("=I", 0x45311224)
+        self.assertEqual(worker.remap_route_dump(empty, {2: 19}), empty)
+
+    def test_unverified_interface_is_never_assumed_to_be_unchanged(self):
+        with self.assertRaisesRegex(ValueError, "unverified interface index 99"):
+            worker.remap_route_dump(route_dump(99), {2: 19})
+
+    def test_unsupported_embedded_device_or_nexthop_ids_fail_closed(self):
+        for kind in (22, 30, 33, 0x4004):
+            data = struct.pack("=I", 0x45311224) + route_message(route_attribute(kind, struct.pack("=I", 2)))
+            with self.subTest(kind=kind), self.assertRaisesRegex(ValueError, "manual reconciliation"):
+                worker.remap_route_dump(data, {2: 19})
+
+    def test_malformed_streams_fail_before_restore(self):
+        header = struct.pack("=I", 0x45311224)
+        invalid = [b"", b"bad!", header+b"short", route_dump(2)[:-1],
+                   header+route_message(b"\x01"),
+                   header+route_message(struct.pack("=HH", 0, 4)),
+                   header+route_message(route_attribute(4, b"\x01")),
+                   header+route_message(route_attribute(9, b"\x01")),
+                   header+route_message(route_attribute(9, struct.pack("=HBBI", 4, 0, 0, 2))),
+                   header+route_message(b"", family=17)]
+        for offset, value in ((4, 9999), (4, 16), (8, 25)):
+            data = bytearray(route_dump(2))
+            struct.pack_into("=I" if offset == 4 else "=H", data, offset, value)
+            invalid.append(data)
+        for index, data in enumerate(invalid):
+            with self.subTest(index=index), self.assertRaises(ValueError):
+                worker.remap_route_dump(data, {2: 19})
 
 
 class PlanningTests(unittest.TestCase):
@@ -544,22 +625,22 @@ class NodeTests(unittest.TestCase):
         worker.restore(journal)
         self.assertEqual(self.netplan.read_bytes(), original)
 
-    def test_route_restore_uses_binary_stream_and_rejects_changed_device_ids(self):
+    def test_route_restore_remaps_rebooted_device_ids_using_seekable_streams(self):
         journal = self.prepare()
-        journal.state["routes"] = [{"family": "-4", "data": base64.b64encode(b"stream").decode()}]
-        for i, record in enumerate(journal.state["runtime"]):
-            record["ifindex"] = i + 10
-        with self.assertRaisesRegex(ValueError, "interface indexes changed"):
-            worker.check_restore(journal)
+        journal.state["routes"] = [{"family": "-4", "data": base64.b64encode(route_dump(2)).decode()}]
+        before = json.dumps(journal.state, sort_keys=True)
+        for record in self.info["links"]:
+            record["ifindex"] += 10
+        worker.check_restore(journal)
         streams = []
         def command(argv, **kwargs):
             if argv == ["ip", "-4", "route", "restore"]:
                 stream = kwargs["stdin"]
                 self.assertNotIn("input", kwargs)
                 self.assertTrue(stream.seekable())
-                self.assertEqual(stream.read(), b"stream")
+                self.assertEqual(stream.read(), route_dump(12))
                 stream.seek(0)
-                self.assertEqual(stream.read(), b"stream")
+                self.assertEqual(stream.read(), route_dump(12))
                 streams.append(stream)
             return self.fake_run(argv, **kwargs)
         with patch.object(worker, "run", side_effect=command) as calls:
@@ -567,6 +648,59 @@ class NodeTests(unittest.TestCase):
         restore = [call for call in calls.call_args_list if call.args[0] == ["ip", "-4", "route", "restore"]]
         self.assertEqual(len(restore), 1)
         self.assertTrue(streams[0].closed)
+        self.assertEqual(json.dumps(journal.state, sort_keys=True), before)
+
+    def test_restore_rechecks_device_indexes_after_netplan_apply(self):
+        journal = self.prepare()
+        worker.apply_network(self.request, journal)
+        journal.state["routes"] = [{"family": "-6", "data": base64.b64encode(route_dump(2, 10)).decode()}]
+        def command(argv, **kwargs):
+            if argv == ["netplan", "apply"]:
+                for item in self.info["links"]:
+                    item["ifindex"] += 20
+            if argv == ["ip", "-6", "route", "restore"]:
+                self.assertEqual(kwargs["stdin"].read(), route_dump(22, 10))
+            return self.fake_run(argv, **kwargs)
+        with patch.object(worker, "run", side_effect=command):
+            worker.restore(journal)
+        self.assertIn(["ip", "-6", "route", "restore"], self.calls)
+        self.assertEqual(self.old.read_text(), self.original)
+
+    def test_restore_rejects_missing_or_replaced_devices_before_file_changes(self):
+        journal = self.prepare()
+        worker.apply_network(self.request, journal)
+        after = self.netplan.read_bytes()
+        original = json.loads(json.dumps(self.info))
+        for change in ("missing", "mac", "missing_mac", "unknown_route_device"):
+            self.info = json.loads(json.dumps(original))
+            for link in self.info["links"]:
+                link["ifindex"] += 10
+            if change == "missing":
+                self.info["links"].pop(1)
+            elif change == "mac":
+                self.info["links"][1]["address"] = "02:ff:ff:ff:ff:ff"
+            elif change == "missing_mac":
+                self.info["links"][1].pop("address")
+            else:
+                journal.state["routes"] = [{"family": "-4", "data": base64.b64encode(route_dump(99)).decode()}]
+            self.calls.clear()
+            with self.subTest(change=change), self.assertRaises(ValueError):
+                worker.restore(journal)
+            self.assertEqual(self.netplan.read_bytes(), after)
+            self.assertNotIn(["netplan", "apply"], self.calls)
+            self.assertFalse(any(c[:3] == ["ip", "address", "del"] for c in self.calls))
+
+    def test_corrupt_route_dump_is_rejected_by_restore_preflight(self):
+        journal = self.prepare()
+        worker.apply_network(self.request, journal)
+        after = self.netplan.read_bytes()
+        for data in (base64.b64encode(route_dump(2)[:-1]).decode(), "not-base64!"):
+            journal.state["routes"] = [{"family": "-4", "data": data}]
+            self.calls.clear()
+            with self.assertRaises(ValueError):
+                worker.restore(journal)
+            self.assertEqual(self.netplan.read_bytes(), after)
+            self.assertNotIn(["netplan", "apply"], self.calls)
 
     def test_setup_restore_bytes_permissions_and_private_keys(self):
         ssh = self.home / ".ssh"

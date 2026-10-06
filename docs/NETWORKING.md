@@ -281,14 +281,24 @@ restores the original Netplan, SSH, and head `.env` files and their permissions,
 helper-created files and keys, reapplies the previous Netplan configuration,
 removes newly assigned CX7 addresses, and restores previous static addresses,
 non-dynamic routes, MTUs, and link state. Dynamic addresses/routes are reacquired
-by the previous network configuration. Saved routes use kernel interface IDs;
-if those IDs changed after a reboot or driver reload, restore stops for manual
-reconciliation instead of assigning routes to the wrong interface. Directories
+by the previous network configuration. After a reboot or driver reload, restore
+maps saved route interface IDs to the current IDs using the saved interface
+names and MAC addresses. This also works with existing journals; their original
+route backups remain unchanged. Missing or replaced interfaces, unverified route
+devices, malformed route backups, and routes with unsupported encapsulation or
+separate nexthop objects stop restore before file changes for manual reconciliation. Directories
 created by setup are removed only if empty. A head configuration file created
 by setup is removed on restore; a pre-existing one is restored byte for byte.
 Its backup remains in the head's root-only journal, including any unrelated
 credentials it originally contained. The recorded path is used automatically,
 so omit `--env-file` when restoring.
+
+To move to a different head, finish restore on the **old head** using its existing
+manifest first. Then run a new setup from the new head, listing its management IP
+first and the remaining nodes in the new physical cable order for a ring. Each
+node in the old manifest must remain reachable over management SSH for restore;
+the old CX7 cable order does not need to remain connected. A new setup creates a
+new head manifest and saves launch configuration on the new head.
 
 Restore removes Docker group membership only when the helper added it, without
 changing other memberships. A helper-created `docker` group is removed only
