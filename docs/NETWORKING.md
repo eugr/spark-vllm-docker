@@ -280,8 +280,13 @@ Restore checks all nodes for file changes before restoring any node. It
 restores the original Netplan, SSH, and head `.env` files and their permissions, removes
 helper-created files and keys, reapplies the previous Netplan configuration,
 removes newly assigned CX7 addresses, and restores previous static addresses,
-non-dynamic routes, MTUs, and link state. Dynamic addresses/routes are reacquired
-by the previous network configuration. After a reboot or driver reload, restore
+non-dynamic routes, MTUs, link state, and the saved per-interface IPv6
+enabled/disabled state. For older journals, a saved IPv6 address establishes that
+IPv6 was enabled. Restore resets that interface's MTU and IPv6 state before
+replaying addresses, including when Netplan leaves IPv6 disabled on a now-unmanaged
+interface. Global and default IPv6 settings are not changed. Dynamic
+addresses/routes are reacquired by the previous network configuration.
+After a reboot or driver reload, restore
 maps saved route interface IDs to the current IDs using the saved interface
 names and MAC addresses. This also works with existing journals; their original
 route backups remain unchanged. Missing or replaced interfaces, unverified route

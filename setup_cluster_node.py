@@ -23,6 +23,7 @@ import tempfile
 
 NETPLAN = Path("/etc/netplan/98-spark-vllm-docker.yaml")
 STATE = Path("/var/lib/spark-vllm/setup-cluster")
+IPV6_CONF = Path("/proc/sys/net/ipv6/conf")
 DEFAULT_MTU = 9000
 PORTS = {p: [f"enp1s0f{p}np{p}", f"enP2p1s0f{p}np{p}"] for p in (0, 1)}
 ENV_KEYS = {"CLUSTER_NODES", "COPY_HOSTS", "LOCAL_IP", "ETH_IF", "IB_IF", "CLUSTER_LINKS",
@@ -328,6 +329,41 @@ def lldp_neighbors():
         return {}
 
 
+def ipv6_disabled(name):
+    path = IPV6_CONF / name / "disable_ipv6"
+    try:
+        value = path.read_text().strip()
+    except FileNotFoundError:
+        return None  # IPv6 may be unavailable in this kernel/network namespace.
+    if value not in ("0", "1"):
+        raise ValueError(f"Invalid IPv6 disable state on {name}")
+    return int(value)
+
+
+def restore_ipv6(before):
+    name = before["ifname"]
+    disabled = before.get("ipv6_disabled")
+    if disabled is None and any(a["family"] == "inet6" for a in before.get("addr_info", [])):
+        # Older journals have no sysctl snapshot. A saved IPv6 address proves
+        # IPv6 was enabled; an empty address list does not prove it was disabled.
+        disabled = 0
+    if disabled is None:
+        return False
+    if disabled not in (0, 1):
+        raise ValueError(f"Invalid saved IPv6 disable state on {name}")
+    current = ipv6_disabled(name)
+    if current is None:
+        if not disabled:
+            raise ValueError(f"IPv6 support is unavailable on {name}; cannot restore its enabled state")
+        return False
+    if current == disabled:
+        return False
+    # Netplan may leave disable_ipv6=1 on now-unmanaged interfaces after
+    # removing our link-local: [] definition. Never change conf/all or default.
+    (IPV6_CONF / name / "disable_ipv6").write_text(f"{disabled}\n")
+    return True
+
+
 def inventory(user):
     for tool in ("ip", "netplan", "ssh", "ssh-keygen", "ping", "runuser"):
         if not shutil.which(tool):
@@ -336,6 +372,10 @@ def inventory(user):
     account = pwd.getpwnam(user)
     links = json.loads(run(["ip", "-j", "address", "show"]).stdout)
     for item in links:
+        if item["ifname"] in PORTS[0] + PORTS[1]:
+            disabled = ipv6_disabled(item["ifname"])
+            if disabled is not None:
+                item["ipv6_disabled"] = disabled
         driver = Path("/sys/class/net") / item["ifname"] / "device/driver"
         if driver.exists():
             item["driver"] = driver.resolve().name
@@ -703,6 +743,16 @@ def restore_runtime(journal):
         added = journal.state["interfaces"][name]
         if added in now and added not in original:
             run(["ip", "address", "del", added, "dev", name])
+        # Restore MTU first: a setup MTU below 1280 can prevent IPv6 enabling.
+        run(["ip", "link", "set", "dev", name, "mtu", str(before["mtu"]),
+             "up" if "UP" in before["flags"] else "down"])
+        if restore_ipv6(before):
+            # Enabling IPv6 can regenerate link-local addresses immediately.
+            # Refresh before replaying missing static addresses so those
+            # automatic addresses are not unnecessarily replaced.
+            refreshed = json.loads(run(["ip", "-j", "address", "show", "dev", name]).stdout)
+            now = {f"{a['local']}/{a['prefixlen']}" for link in refreshed if link["ifname"] == name
+                   for a in link.get("addr_info", [])}
         for address in before.get("addr_info", []):
             cidr = f"{address['local']}/{address['prefixlen']}"
             if cidr not in now and not address.get("dynamic"):
@@ -714,8 +764,6 @@ def restore_runtime(journal):
                 if address.get("noprefixroute"):
                     command += ["noprefixroute"]
                 run(command)
-        run(["ip", "link", "set", "dev", name, "mtu", str(before["mtu"]),
-             "up" if "UP" in before["flags"] else "down"])
     for family, data in routes_to_restore:
         # iproute2 rewinds stdin between passes: a subprocess input pipe fails
         # with "ftell: Illegal seek". Existing routes are left unchanged.

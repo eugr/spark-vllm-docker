@@ -365,6 +365,28 @@ class PlanningTests(unittest.TestCase):
 
 
 class CommandTests(unittest.TestCase):
+    def test_inventory_records_ipv6_state_even_without_addresses(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            key = root / "host.pub"
+            key.write_text("ssh-ed25519 AAAA fixture\n")
+            for name in worker.PORTS[0] + worker.PORTS[1]:
+                (root / name).mkdir()
+                (root / name / "disable_ipv6").write_text("1" if name in worker.PORTS[1] else "0")
+            info = inventory(NODES[0])
+            account = SimpleNamespace(pw_dir=str(root), pw_uid=os.getuid())
+            def command(argv, **kwargs):
+                return subprocess.CompletedProcess(argv, 0, json.dumps(info["routes"] if "route" in argv else info["links"]), "")
+            with patch.object(worker, "IPV6_CONF", root), patch.object(worker.shutil, "which", return_value="fixture"), \
+                 patch.object(worker.pwd, "getpwnam", return_value=account), patch.object(Path, "glob", return_value=[key]), \
+                 patch.object(worker, "lldp_neighbors", return_value={}), patch.object(worker, "run", side_effect=command):
+                links = worker.inventory("fixture")["links"]
+            for link in links:
+                if link["ifname"] == "management0":
+                    self.assertNotIn("ipv6_disabled", link)
+                else:
+                    self.assertEqual(link["ipv6_disabled"], int(link["ifname"] in worker.PORTS[1]))
+
     def test_run_passes_seekable_input_to_child(self):
         with tempfile.TemporaryFile() as stream:
             stream.write(b"route fixture")
@@ -406,6 +428,10 @@ class NodeTests(unittest.TestCase):
         self.home.mkdir()
         self.state = self.root / "state"
         self.state.mkdir(mode=0o700)
+        self.ipv6 = self.root / "ipv6"
+        for name in ["all", "default", "management0", *worker.PORTS[0], *worker.PORTS[1]]:
+            (self.ipv6 / name).mkdir(parents=True)
+            (self.ipv6 / name / "disable_ipv6").write_text("0\n")
         self.dirs = tuple(self.root / path for path in ("lib/netplan", "etc/netplan", "run/netplan"))
         for directory in self.dirs:
             directory.mkdir(parents=True)
@@ -415,7 +441,7 @@ class NodeTests(unittest.TestCase):
         self.request = {**self.plan, "transaction": "test-transaction", "user": "fixture"}
         self.info = inventory(NODES[0])
         self.calls = []
-        for name, value in (("STATE", self.state), ("NETPLAN", self.netplan)):
+        for name, value in (("STATE", self.state), ("NETPLAN", self.netplan), ("IPV6_CONF", self.ipv6)):
             patcher = patch.object(worker, name, value)
             patcher.start()
             self.addCleanup(patcher.stop)
@@ -825,6 +851,93 @@ class NodeTests(unittest.TestCase):
         worker.restore_runtime(journal)
         self.assertIn(["ip", "address", "replace", "169.254.1.2/16", "dev", name,
                        "scope", "link", "noprefixroute"], self.calls)
+
+    def test_legacy_restore_reenables_ipv6_after_mtu_before_restoring_addresses(self):
+        name = worker.PORTS[1][0]
+        addresses = [{"family": "inet6", "local": "fe80::1234", "prefixlen": 64, "scope": "link"},
+                     {"family": "inet6", "local": "fd00::1234", "prefixlen": 64, "scope": "global"},
+                     {"family": "inet6", "local": "fd00::5678", "prefixlen": 64, "scope": "global", "dynamic": True}]
+        old = next(link for link in self.info["links"] if link["ifname"] == name)
+        old["addr_info"] = addresses
+        journal = self.prepare()
+        worker.apply_network(self.request, journal)
+        flag = self.ipv6 / name / "disable_ipv6"
+        flag.write_text("1\n")
+        for other in ("all", "default", "management0"):
+            (self.ipv6 / other / "disable_ipv6").write_text("1\n")
+        self.info = inventory(NODES[0])
+        live = next(link for link in self.info["links"] if link["ifname"] == name)
+        live["mtu"] = 1024  # IPv6 cannot be enabled until the old MTU is restored.
+        def command(argv, **kwargs):
+            if argv[:5] == ["ip", "link", "set", "dev", name]:
+                live["mtu"] = int(argv[6])
+            if argv[:3] == ["ip", "address", "replace"]:
+                self.assertEqual(flag.read_text().strip(), "0")
+                self.assertEqual(live["mtu"], 1500)
+            return self.fake_run(argv, **kwargs)
+        with patch.object(worker, "run", side_effect=command):
+            worker.restore(journal)
+        for address in addresses[:2]:
+            self.assertIn(["ip", "address", "replace", address["local"]+"/64", "dev", name, "scope", address["scope"]], self.calls)
+        self.assertFalse(any("fd00::5678/64" in c for c in self.calls))
+        self.assertFalse((self.state / "journal.json").exists())
+        for other in ("all", "default", "management0"):
+            self.assertEqual((self.ipv6 / other / "disable_ipv6").read_text(), "1\n")
+
+    def test_regenerated_ipv6_link_local_address_is_not_replaced(self):
+        name = worker.PORTS[1][0]
+        old = next(link for link in self.info["links"] if link["ifname"] == name)
+        old["addr_info"] = [{"family": "inet6", "local": "fe80::1234", "prefixlen": 64, "scope": "link"}]
+        journal = self.prepare()
+        self.info = inventory(NODES[0])
+        flag = self.ipv6 / name / "disable_ipv6"
+        flag.write_text("1\n")
+        def command(argv, **kwargs):
+            if argv == ["ip", "-j", "address", "show", "dev", name]:
+                self.assertEqual(flag.read_text().strip(), "0")
+                return subprocess.CompletedProcess(argv, 0, json.dumps([old]), "")
+            return self.fake_run(argv, **kwargs)
+        with patch.object(worker, "run", side_effect=command):
+            worker.restore_runtime(journal)
+        self.assertFalse(any("fe80::1234/64" in c for c in self.calls))
+
+    def test_saved_ipv6_state_restores_enabled_and_disabled_addressless_interfaces(self):
+        enabled, disabled = worker.PORTS[0]
+        for link in self.info["links"]:
+            if link["ifname"] in (enabled, disabled):
+                link["ipv6_disabled"] = int(link["ifname"] == disabled)
+        journal = self.prepare()
+        (self.ipv6 / enabled / "disable_ipv6").write_text("1\n")
+        (self.ipv6 / disabled / "disable_ipv6").write_text("0\n")
+        worker.restore_runtime(journal)
+        self.assertEqual((self.ipv6 / enabled / "disable_ipv6").read_text(), "0\n")
+        self.assertEqual((self.ipv6 / disabled / "disable_ipv6").read_text(), "1\n")
+        # Already restored flags are left alone on retry.
+        with patch.object(Path, "write_text", side_effect=AssertionError("unexpected sysctl write")):
+            worker.restore_runtime(journal)
+
+    def test_legacy_addressless_ipv6_state_is_not_guessed(self):
+        name = worker.PORTS[0][0]
+        (self.ipv6 / name / "disable_ipv6").write_text("1\n")
+        journal = self.prepare()
+        worker.restore_runtime(journal)
+        self.assertEqual((self.ipv6 / name / "disable_ipv6").read_text(), "1\n")
+
+    def test_unavailable_ipv6_keeps_journal_and_ssh_for_retry(self):
+        name = worker.PORTS[0][0]
+        link = next(link for link in self.info["links"] if link["ifname"] == name)
+        link["ipv6_disabled"] = 0
+        journal = self.prepare()
+        worker.apply_network(self.request, journal)
+        flag = self.ipv6 / name / "disable_ipv6"
+        flag.unlink()
+        with self.assertRaisesRegex(ValueError, "IPv6 support is unavailable"):
+            worker.restore(journal)
+        self.assertTrue((self.state / "journal.json").exists())
+        self.assertTrue((self.home / ".ssh/spark-vllm-cluster/id_ed25519").exists())
+        flag.write_text("1\n")
+        worker.restore(journal)
+        self.assertFalse((self.state / "journal.json").exists())
 
     def env_request(self):
         return {"env_file": str(self.home / ".env"),
