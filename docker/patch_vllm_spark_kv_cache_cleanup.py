@@ -16,14 +16,45 @@ text = target.read_text()
 lines = text.splitlines(keepends=True)
 changed = False
 
-profile_cleanup_present = (
+# The B12X fork reclaims profiling allocations immediately before its final
+# snapshot and accounts for allocations retained after activation profiling.
+# A final snapshot alone does not prove that cleanup happened.
+native_profile_cleanup = re.search(
+    r"(?m)^[ \t]+gc\.collect\(\)\n"
+    r"[ \t]+torch\.accelerator\.synchronize\(\)\n"
+    r"[ \t]+torch\.accelerator\.empty_cache\(\)\n"
+    r"(?:[ \t]*(?:#.*)?\n)*"
+    r"[ \t]+final_profile_snapshot = MemorySnapshot\(device=self\.device\)\n"
+    r"(?:[ \t]*(?:#.*)?\n)*"
+    r"[ \t]+late_persistent_memory = ",
+    text,
+)
+upstream_profile_cleanup = native_profile_cleanup is not None
+profile_cleanup_present = upstream_profile_cleanup or (
     "profile_result.after_profile.measure()" in text
     and "diff_from_create.non_torch_memory" in text
 )
+initialize_index = next(
+    (
+        index
+        for index, line in enumerate(lines)
+        if re.match(r"^[ \t]+def initialize_from_config\(self,\s*kv_cache_config\b", line)
+    ),
+    None,
+)
+native_prealloc_cleanup = initialize_index is not None and re.search(
+    r"(?m)^[ \t]+gc\.collect\(\)\n"
+    r"[ \t]+torch\.accelerator\.synchronize\(\)\n"
+    r"[ \t]+torch\.accelerator\.empty_cache\(\)",
+    "".join(lines[initialize_index : initialize_index + 25]),
+)
 prealloc_cleanup_present = (
-    "memory_reserved(self.device)" in text
-    and "memory_allocated(self.device)" in text
-    and "empty_cache()" in text
+    bool(native_prealloc_cleanup)
+    or (
+        "memory_reserved(self.device)" in text
+        and "memory_allocated(self.device)" in text
+        and "empty_cache()" in text
+    )
 )
 needs_cleanup = not (profile_cleanup_present and prealloc_cleanup_present)
 
@@ -192,6 +223,9 @@ if not prealloc_cleanup_present:
     ]
     insert_after_docstring(func_index, func_indent, block)
     changed = True
+
+if upstream_profile_cleanup:
+    print("Upstream post-profile cleanup and late-persistent accounting present")
 
 if changed:
     target.write_text("".join(lines))

@@ -1146,13 +1146,15 @@ test_spark_kv_cache_cleanup_patch_supports_b12x_final_snapshot() {
     local patch_script="$PROJECT_DIR/docker/patch_vllm_spark_kv_cache_cleanup.py"
     local legacy_fixture="$TMP_BASE/kv-cleanup-legacy"
     local b12x_fixture="$TMP_BASE/kv-cleanup-b12x"
+    local native_fixture="$TMP_BASE/kv-cleanup-native"
     local unknown_fixture="$TMP_BASE/kv-cleanup-unknown"
     local target_rel="vllm/v1/worker/gpu_worker.py"
     local output="$TMP_BASE/kv-cleanup-output.log"
 
     mkdir -p \
         "$legacy_fixture/vllm/v1/worker" \
-        "$b12x_fixture/vllm/v1/worker"
+        "$b12x_fixture/vllm/v1/worker" \
+        "$native_fixture/vllm/v1/worker"
     cat > "$legacy_fixture/$target_rel" <<'PY'
 import torch
 
@@ -1185,12 +1187,48 @@ class Worker:
         """Allocate the KV cache."""
         self.model_runner.initialize_kv_cache(kv_cache_config)
 PY
+    cat > "$native_fixture/$target_rel" <<'PY'
+import gc
+import torch
+
+
+class Worker:
+    def determine_available_memory(self):
+        gc.collect()
+        torch.accelerator.synchronize()
+        torch.accelerator.empty_cache()
+
+        # Measure retained allocations after cleanup.
+        final_profile_snapshot = MemorySnapshot(device=self.device)
+        late_persistent_memory = max(
+            profile_result.after_profile.free_memory
+            - final_profile_snapshot.free_memory,
+            0,
+        )
+        return final_profile_snapshot.free_memory - late_persistent_memory
+
+    def initialize_from_config(self, kv_cache_config):
+        """Allocate the KV cache."""
+        # Reclaim unused allocator blocks before allocating the KV cache.
+        gc.collect()
+        torch.accelerator.synchronize()
+        torch.accelerator.empty_cache()
+        self.model_runner.initialize_kv_cache(kv_cache_config)
+PY
 
     python3 "$patch_script" "$legacy_fixture" > "$output"
     python3 "$patch_script" "$b12x_fixture" >> "$output"
+    cp "$native_fixture/$target_rel" "$native_fixture/gpu_worker.before.py"
+    python3 "$patch_script" "$native_fixture" >> "$output"
+    if ! cmp -s \
+        "$native_fixture/gpu_worker.before.py" \
+        "$native_fixture/$target_rel"; then
+        fail "Spark KV cache cleanup duplicated native cleanup"
+    fi
     python3 -m py_compile \
         "$legacy_fixture/$target_rel" \
-        "$b12x_fixture/$target_rel"
+        "$b12x_fixture/$target_rel" \
+        "$native_fixture/$target_rel"
     python3 - "$legacy_fixture/$target_rel" "$b12x_fixture/$target_rel" <<'PY'
 from pathlib import Path
 import sys
