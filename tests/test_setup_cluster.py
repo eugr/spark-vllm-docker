@@ -48,6 +48,36 @@ def inventory(node, ports=(0, 1), interfaces=None):
 
 
 class PlanningTests(unittest.TestCase):
+    def test_mtu_default_custom_values_and_invalid_arguments(self):
+        self.assertIsNone(setup.parser().parse_args([]).mtu)
+        for topology, count in (("direct", 2), ("switch", 4), ("ring", 4)):
+            nodes = NODES[:count]
+            ports = {} if topology == "ring" else dict.fromkeys(nodes, 0)
+            default = setup.make_plan(nodes, topology, ports, "10.20.0.0/16")
+            self.assertEqual({p["mtu"] for p in default.values()}, {9000})
+            for mtu in (68, 1500, 4096, 9216, 65535):
+                with self.subTest(topology=topology, mtu=mtu):
+                    args = setup.parser().parse_args(["--mtu", str(mtu)])
+                    plan = setup.make_plan(nodes, topology, ports, "10.20.0.0/16", args.mtu)
+                    for request in plan.values():
+                        network = yaml.safe_load(worker.network_files(request, {})[worker.NETPLAN])["network"]
+                        self.assertEqual({p["mtu"] for p in network["ethernets"].values()}, {mtu})
+        for value in ("0", "67", "65536", "-1", "1500.5", "auto"):
+            with self.subTest(value=value), contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                setup.parser().parse_args(["--mtu", value])
+        for value in (None, True, 1500.0, 67, 65536):
+            with self.subTest(value=value), self.assertRaisesRegex(ValueError, "MTU"):
+                worker.requested_mtu({"mtu": value})
+
+    def test_saved_modes_reject_mtu_override_before_connecting(self):
+        for mode in ("--restore", "--save-env", "--doctor"):
+            with self.subTest(mode=mode), patch.object(setup.os, "getuid", return_value=1000), \
+                 patch.object(setup.pwd, "getpwuid", return_value=SimpleNamespace(pw_name="fixture")), \
+                 patch.object(setup, "check_head") as check_head:
+                with self.assertRaisesRegex(ValueError, "omit nodes and networking options"):
+                    setup.main([mode, "--mtu", "1500"])
+                check_head.assert_not_called()
+
     def test_env_uses_cx7_for_uniform_direct_and_switch_ports(self):
         for count in (2, 3, 8):
             nodes = NODES[:count]
@@ -373,6 +403,26 @@ class NodeTests(unittest.TestCase):
             self.assertEqual(settings, {"dhcp4": False, "dhcp6": False, "link-local": [],
                                        "mtu": 9000, "addresses": [self.plan["interfaces"][name]]})
 
+    def test_custom_mtu_is_journaled_applied_and_original_runtime_restored(self):
+        self.request["mtu"] = 4096
+        journal = self.prepare()
+        self.assertEqual(journal.state["mtu"], 4096)
+        worker.apply_network(self.request, journal)
+        network = yaml.safe_load(self.netplan.read_bytes())["network"]
+        self.assertEqual({s["mtu"] for s in network["ethernets"].values()}, {4096})
+        self.info = inventory(NODES[0], interfaces=self.plan["interfaces"])
+        for link in self.info["links"]:
+            if link["ifname"] in self.plan["interfaces"]:
+                link["mtu"] = 4096
+        self.calls.clear()
+        worker.restore(journal)
+        restored = [c for c in self.calls if c[:3] == ["ip", "link", "set"]]
+        self.assertEqual(len(restored), 4)
+        self.assertTrue(all(c[-3:] == ["mtu", "1500", "up"] for c in restored))
+        self.assertTrue(all(c[4] in self.plan["interfaces"] for c in restored))
+        self.assertEqual(self.old.read_text(), self.original)
+        self.assertFalse(self.netplan.exists())
+
     def test_management_mac_match_is_preserved(self):
         document = yaml.safe_load(self.original)
         definition = {"match": {"macaddress": "02:00:00:00:00:00"}, "set-name": "management0", "dhcp4": True}
@@ -613,6 +663,23 @@ class NodeTests(unittest.TestCase):
                 worker.verify(self.request, self.account)
         self.assertEqual(calls.call_args.args[0][0], "ping")
 
+    def test_verification_sizes_unfragmented_packets_for_selected_mtu(self):
+        for mtu in (None, 68, 1500, 4096, 9216, 65535):
+            with self.subTest(mtu=mtu):
+                request = {k: v for k, v in self.request.items() if k != "mtu"}
+                if mtu is not None:
+                    request["mtu"] = mtu
+                expected = 9000 if mtu is None else mtu
+                self.calls.clear()
+                worker.verify(request, self.account)
+                pings = [c for c in self.calls if c[0] == "ping"]
+                self.assertEqual(len(pings), 4)
+                self.assertTrue(all(c[c.index("-s")+1] == str(expected-28) for c in pings))
+                self.assertTrue(all(c[c.index("-M")+1] == "do" for c in pings))
+                with patch.object(worker, "run", return_value=subprocess.CompletedProcess([], 1, "", "")):
+                    with self.assertRaisesRegex(ValueError, f"MTU {expected}"):
+                        worker.verify(request, self.account)
+
     def test_missing_address_restores_scope_and_noprefixroute(self):
         name = worker.PORTS[1][0]
         for link in self.info["links"]:
@@ -704,7 +771,7 @@ class NodeTests(unittest.TestCase):
         self.info = inventory(NODES[0], interfaces=self.plan["interfaces"])
         for item in self.info["links"]:
             if item["ifname"] in self.plan["interfaces"]:
-                item["mtu"] = 9000
+                item["mtu"] = self.request["mtu"]
         self.info["routes"] = [{"dev": name, "dst": str(ipaddress.ip_interface(cidr).network)}
                                for name, cidr in self.plan["interfaces"].items()]
         for name, value in (("docker_membership", {"exists": True, "gid": 1234, "member": True}),
@@ -722,6 +789,26 @@ class NodeTests(unittest.TestCase):
         self.assertNotIn("PRIVATE-KEY", json.dumps(report))
         self.assertNotIn("after_data", json.dumps(report))
         self.assertEqual((self.state / "journal.json").read_bytes(), before)
+
+    def test_doctor_uses_saved_custom_mtu_and_repairs_drift(self):
+        self.request["mtu"] = 1500
+        journal = self.doctor_fixture()
+        report = worker.doctor_report(self.account, journal)
+        self.assertEqual(report["mtu"], 1500)
+        self.assertEqual(report["issues"], [])
+        self.info["links"][1]["mtu"] = 9000
+        report = worker.doctor_report(self.account, journal)
+        self.assertTrue(report["network_needed"])
+        self.assertTrue(any("MTU 1500" in i["message"] and i["repairable"] for i in report["issues"]))
+        saved = self.netplan.read_bytes()
+        # Also exercise reconstruction without an after-image, at the saved MTU.
+        for entry in journal.state["files"]:
+            entry.pop("after_data")
+        self.netplan.unlink()
+        report = worker.doctor_report(self.account, journal)
+        worker.repair_node({**self.request, "fingerprint": report["fingerprint"]}, self.account, journal)
+        self.assertEqual(self.netplan.read_bytes(), saved)
+        self.assertIn(["netplan", "apply"], self.calls)
 
     def test_doctor_repairs_missing_file_and_permissions_without_changing_restore_backup(self):
         journal = self.doctor_fixture()
@@ -766,6 +853,8 @@ class NodeTests(unittest.TestCase):
 
     def test_doctor_legacy_netplan_reconstruction_is_checked_against_after_hash(self):
         journal = self.doctor_fixture()
+        journal.state.pop("mtu")
+        self.assertEqual(worker.doctor_report(self.account, journal)["issues"], [])
         for entry in journal.state["files"]:
             entry.pop("after_data")
         saved = self.netplan.read_bytes()
@@ -878,7 +967,7 @@ class OrchestrationTests(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         self.path = Path(self.temp.name).resolve() / "manifest.json"
         self.args = SimpleNamespace(topology="ring", ports=None, yes=True, dry_run=False,
-                                    subnet_pool="10.20.0.0/16", state_file=self.path, netplan_file=None,
+                                    subnet_pool="10.20.0.0/16", state_file=self.path, netplan_file=None, mtu=None,
                                     env_file=self.path.parent / ".env", no_env=False)
         self.transport = Mock()
         self.transport.call.side_effect = self.call
@@ -960,6 +1049,15 @@ class OrchestrationTests(unittest.TestCase):
         self.assertEqual(sum(c.args[1] == "doctor-inspect" for c in calls), 8)
         self.assertFalse(any(c.args[1] in ("restore", "prepare", "network") for c in calls))
 
+    def test_doctor_passes_saved_mtu_to_repairs_and_verification(self):
+        reports = self.doctor_transport()
+        for report in reports.values():
+            report["mtu"] = 1500
+        self.run_doctor()
+        calls = [c for c in self.transport.call.call_args_list if c.args[1] in ("doctor-repair", "verify")]
+        self.assertEqual(len(calls), 12)
+        self.assertTrue(all(c.kwargs["mtu"] == 1500 for c in calls))
+
     def test_doctor_dry_run_checks_without_mutating(self):
         self.doctor_transport()
         self.args.dry_run = True
@@ -1030,6 +1128,30 @@ class OrchestrationTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "not active"):
             setup.saved_configuration(NODES[:4], saved, {n: inventory(n) for n in NODES[:4]})
 
+    def test_save_env_uses_saved_custom_mtu_and_rejects_runtime_drift(self):
+        plan = setup.make_plan(NODES[:4], "ring", {}, "10.20.0.0/16", 1500)
+        info = {n: inventory(n, interfaces=plan[n]["interfaces"]) for n in NODES[:4]}
+        def call(node, action, **request):
+            if action == "inspect":
+                return info[node]
+            if action == "inspect-setup":
+                return {"interfaces": plan[node]["interfaces"], "mtu": plan[node]["mtu"]}
+            return self.call(node, action, **request)
+        self.transport.call.side_effect = call
+        with contextlib.redirect_stdout(io.StringIO()):
+            setup.save_existing_env(self.args, NODES[:4], {"transaction": "fixture"}, self.transport)
+        checks = [c for c in self.transport.call.call_args_list if c.args[1] == "verify"]
+        self.assertEqual(len(checks), 4)
+        self.assertTrue(all(c.kwargs["mtu"] == 1500 for c in checks))
+        self.transport.call.reset_mock()
+        info[NODES[1]]["links"][1]["mtu"] = 9000
+        with self.assertRaisesRegex(ValueError, "not active"):
+            setup.save_existing_env(self.args, NODES[:4], {"transaction": "fixture"}, self.transport)
+        self.assertFalse(any(c.args[1] == "env" for c in self.transport.call.call_args_list))
+        plan[NODES[1]]["mtu"] = 9000
+        with self.assertRaisesRegex(ValueError, "MTUs differ"):
+            setup.saved_configuration(NODES[:4], plan, info, require_active=False)
+
     def test_saved_switch_and_cross_port_configuration(self):
         for count in (2, 4):
             nodes = NODES[:count]
@@ -1053,6 +1175,17 @@ class OrchestrationTests(unittest.TestCase):
         for call in self.transport.call.call_args_list:
             if call.args[1] in ("preflight", "prepare", "network"):
                 self.assertEqual(call.kwargs["netplan_file"], str(self.args.netplan_file))
+
+    def test_custom_mtu_reaches_all_setup_phases_manifest_and_preview(self):
+        self.args.mtu = 1500
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            setup.setup(self.args, NODES[:4], self.transport, "fixture")
+        self.assertIn("MTU: 1500", output.getvalue())
+        self.assertEqual(json.loads(self.path.read_text())["mtu"], 1500)
+        for call in self.transport.call.call_args_list:
+            if call.args[1] in ("preflight", "prepare", "network", "verify"):
+                self.assertEqual(call.kwargs["mtu"], 1500)
 
     def test_preflight_failure_does_not_start_setup(self):
         self.failed = (NODES[2], "preflight")

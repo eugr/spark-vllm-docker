@@ -100,6 +100,21 @@ choose another RFC1918 private range with enough `/24` networks:
 ./setup-cluster.sh 192.0.2.11 192.0.2.12 --subnet-pool 10.40.0.0/16
 ```
 
+Use `--mtu BYTES` to select the MTU for all configured CX7 interfaces on every
+node (default: `9000`). For example, use standard Ethernet-sized packets:
+
+```bash
+./setup-cluster.sh 192.0.2.11 192.0.2.12 --mtu 1500
+```
+
+The value must be an integer from `68` to `65535` and supported by the NICs and
+any intervening switch. Management interfaces keep their existing settings.
+Verification sends IPv4 pings with a payload of `MTU - 28` bytes and fragmentation
+disabled on both rails. The selected MTU is saved with the setup; `--doctor` and
+`--save-env` use that saved value, and older journals use `9000`. `--mtu` is a
+setup option: to choose a different value for an existing setup, restore it and
+run setup again with the new value. Restore recovers each interface's original MTU.
+
 Choose a different Netplan destination with `--netplan-file`. The path must be
 an absolute `.yaml` path directly inside `/etc/netplan`, and is used on every
 node. For example, update the existing CX7 file used by the manual guide:
@@ -125,7 +140,8 @@ On every node it:
    configuration in a temporary directory before changing live configuration.
 2. Saves local backups and migrates exact CX7 Ethernet entries from existing
    `/etc/netplan/*.yaml` files into the selected Netplan file,
-   using MTU 9000, static IPv4, DHCP disabled, and no link-local addresses.
+   using the selected MTU (default `9000`), static IPv4, DHCP disabled, and no
+   link-local addresses.
    Other interface settings remain in their original files. Migration may
    reformat those YAML files; restore puts their original bytes back.
    Migration avoids accumulating old addresses through
@@ -136,7 +152,7 @@ On every node it:
    selects the key and a dedicated verified host-key file for cluster IPs.
    This enables SSH over management and directly reachable CX7 addresses.
 4. Applies Netplan on workers and then the head. It checks interface-bound
-   jumbo pings (MTU 9000, no fragmentation) on both rails in both directions,
+   pings at the selected MTU without fragmentation on both rails in both directions,
    then checks passwordless SSH from every
    node to every other management IP and each directly reachable CX7 IP.
 5. Saves an autodiscovery-compatible `.env` beside `setup-cluster.sh` on the
@@ -216,7 +232,7 @@ Run doctor from the same head and login user:
 
 Doctor uses the existing `--state-file` manifest and node journals, including
 older setups. It checks managed files and permissions, saved CX7 addresses,
-connected routes, MTUs, carrier, mutual SSH, both rails' jumbo pings, launch
+connected routes, saved MTUs, carrier, mutual SSH, both rails' pings at the saved MTU, launch
 configuration, and Docker access from a fresh user session. An unreachable node
 or missing journal is reported before repairs begin. It also reports a stale
 Docker group list in the current head login; a new login is required to refresh it.

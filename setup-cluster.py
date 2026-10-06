@@ -19,7 +19,7 @@ import time
 import uuid
 import zlib
 
-from setup_cluster_node import NETPLAN, PORTS, netplan_path
+from setup_cluster_node import DEFAULT_MTU, NETPLAN, PORTS, mtu_value, netplan_path, requested_mtu
 
 DEFAULT_STATE = Path.home() / ".local/state/spark-vllm/cluster-setup.json"
 DEFAULT_ENV = Path(__file__).resolve().with_name(".env")
@@ -175,7 +175,8 @@ def check_port(info, port, node):
         # end-to-end verification then checks the actual cable and both rails.
 
 
-def make_plan(nodes, topology, ports, pool):
+def make_plan(nodes, topology, ports, pool, mtu=DEFAULT_MTU):
+    mtu = mtu_value(mtu)
     network = ipaddress.IPv4Network(pool)
     if not any(network.subnet_of(ipaddress.ip_network(private))
                for private in ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16")):
@@ -189,7 +190,7 @@ def make_plan(nodes, topology, ports, pool):
                for i in range(needed)]
     if any(ipaddress.ip_address(node) in ipaddress.ip_network(subnet) for node in nodes for subnet in subnets):
         raise ValueError("CX7 subnets overlap management addresses")
-    plan = {node: {"interfaces": {}, "nodes": nodes, "subnets": subnets, "management_ip": node,
+    plan = {node: {"interfaces": {}, "mtu": mtu, "nodes": nodes, "subnets": subnets, "management_ip": node,
                    "ping_targets": [], "ssh_targets": [peer for peer in nodes if peer != node]}
             for node in nodes}
     groups = []
@@ -260,6 +261,10 @@ def cluster_env(nodes, topology, ports, plan, inventory):
 
 def saved_configuration(nodes, saved, inventory, *, require_active=True):
     """Recover the plan from node journals, including older head manifests."""
+    mtus = {requested_mtu(saved[node]) for node in nodes}
+    if len(mtus) != 1:
+        raise ValueError("Saved CX7 MTUs differ between nodes; reconcile journals before retrying")
+    mtu = mtus.pop()
     topology_info, ports = {}, {}
     for node in nodes:
         interfaces = saved[node]["interfaces"]
@@ -274,7 +279,7 @@ def saved_configuration(nodes, saved, inventory, *, require_active=True):
             ip = ipaddress.IPv4Interface(cidr)
             link = live.get(name, {})
             addresses = {f"{a['local']}/{a['prefixlen']}" for a in link.get("addr_info", [])}
-            if require_active and (cidr not in addresses or link.get("mtu") != 9000):
+            if require_active and (cidr not in addresses or link.get("mtu") != mtu):
                 raise ValueError(f"Saved CX7 configuration is not active on {node}: {name}; restore before retrying")
             links.append({"ifname": name, "addr_info": [{"family": "inet", "local": str(ip.ip),
                                                         "prefixlen": ip.network.prefixlen}]})
@@ -295,7 +300,7 @@ def saved_configuration(nodes, saved, inventory, *, require_active=True):
         raise ValueError("Saved setup mixes single-port and ring configurations")
     subnets = sorted({str(ipaddress.ip_interface(cidr).network)
                       for node in nodes for cidr in saved[node]["interfaces"].values()})
-    plan = {node: {"interfaces": saved[node]["interfaces"], "ping_targets": [],
+    plan = {node: {"interfaces": saved[node]["interfaces"], "mtu": mtu, "ping_targets": [],
                    "nodes": nodes, "subnets": subnets, "management_ip": node,
                    "ssh_targets": [peer for peer in nodes if peer != node]} for node in nodes}
     for node in nodes:
@@ -698,12 +703,13 @@ def setup(args, nodes, transport, user):
     inventory = {node: transport.call(node, "inspect") for node in nodes}
     topology, order, ports = choose_topology(nodes, inventory, args.topology, args.ports,
                                             sys.stdin.isatty() and not args.yes)
-    plan = make_plan(order, topology, ports, args.subnet_pool)
+    mtu = args.mtu if args.mtu is not None else DEFAULT_MTU
+    plan = make_plan(order, topology, ports, args.subnet_pool, mtu)
     target = str(netplan_path(args.netplan_file or NETPLAN))
     for request in plan.values():
         request["netplan_file"] = target
     env_request = prepare_env(args, order, topology, ports, plan, inventory, transport)
-    print(f"Topology: {topology}; MTU: 9000; current user: {user}")
+    print(f"Topology: {topology}; MTU: {mtu}; current user: {user}")
     if topology == "ring":
         print("Cabling: port 0 of each listed node -> port 1 of the next, including the closing cable.")
         print("Ring order: " + " -> ".join(order + order[:1]))
@@ -729,7 +735,7 @@ def setup(args, nodes, transport, user):
             return
     transaction = str(uuid.uuid4())
     save_manifest(args.state_file, {"version": 1, "nodes": nodes, "user": user,
-                                   "transaction": transaction, "netplan_file": target,
+                                   "transaction": transaction, "netplan_file": target, "mtu": mtu,
                                    "env_file": env_request["env_file"] if env_request else None})
     try:
         keys = []
@@ -775,6 +781,8 @@ def parser():
     result.add_argument("--topology", choices=("auto", "direct", "switch", "mesh", "ring"), default="auto")
     result.add_argument("--ports", help="direct/switch: 0 or 1 for all nodes, or one port per node in input order")
     result.add_argument("--subnet-pool", default="10.20.0.0/16", help="pool of /24 CX7 subnets (default: %(default)s)")
+    result.add_argument("--mtu", type=mtu_value, metavar="BYTES",
+                        help=f"MTU on all selected CX7 interfaces, 68–65535 (default: {DEFAULT_MTU})")
     result.add_argument("--netplan-file", type=netplan_path,
                         help=f"destination .yaml file in /etc/netplan on every node (default: {NETPLAN})")
     env_options = result.add_mutually_exclusive_group()
@@ -800,7 +808,8 @@ def main(argv=None):
     if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_.-]*", user):
         raise ValueError("Unsupported login username")
     if args.restore or args.save_env or args.doctor:
-        if (args.nodes or args.ports or args.topology != "auto" or args.netplan_file or (args.no_env and not args.doctor)
+        if (args.nodes or args.ports or args.topology != "auto" or args.netplan_file or args.mtu is not None
+                or (args.no_env and not args.doctor)
                 or (args.restore and (args.dry_run or args.env_file))):
             raise ValueError("--restore/--save-env/--doctor use the saved node list; omit nodes and networking options")
         manifest = json.loads(args.state_file.read_text())

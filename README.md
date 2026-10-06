@@ -88,7 +88,8 @@ The [experimental cluster setup helper](docs/NETWORKING.md#automated-cluster-set
 CX7 networking and mutual passwordless SSH from the head node using the nodes'
 management IP addresses. It supports direct connections, switches, and closed
 rings, saves the head's launch `.env` after verification, and includes dry-run
-and restore modes. It also adds Docker group membership on every node;
+and restore modes. Use `--mtu BYTES` to override the default CX7 MTU of `9000`.
+It also adds Docker group membership on every node;
 `--doctor` checks and repairs an existing saved setup.
 
 Check out locally. Do it on the head node of the cluster.
