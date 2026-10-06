@@ -84,6 +84,13 @@ cd spark-vllm-docker
 
 Before you start, make sure you connect your Sparks together and enable passwordless SSH as described in our [Networking Guide](docs/NETWORKING.md). You can also check out NVIDIA's [Connect Two Sparks Playbook](https://build.nvidia.com/spark/connect-two-sparks/stacked-sparks), but using our guide is the best way to get started. The guide includes instructions for 3-node Spark mesh clusters.
 
+The [experimental cluster setup helper](docs/NETWORKING.md#automated-cluster-setup) can configure
+CX7 networking and mutual passwordless SSH from the head node using the nodes'
+management IP addresses. It supports direct connections, switches, and closed
+rings, saves the head's launch `.env` after verification, and includes dry-run
+and restore modes. It also adds Docker group membership on every node;
+`--doctor` checks and repairs an existing saved setup.
+
 Check out locally. Do it on the head node of the cluster.
 This will build the image, download and distribute the model and launch the cluster.
 

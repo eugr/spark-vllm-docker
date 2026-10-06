@@ -11,6 +11,294 @@ Same with IP addresses: we use `192.168.177.0/24` subnet with `.11` and `.12` as
 For four Sparks connected without a QSFP switch, see the
 [four-node ring example](#example-four-node-ring) below.
 
+## Automated cluster setup
+
+Run `setup-cluster.sh` from the head Spark as your normal login user. Supply all
+management IPv4 addresses, **head first**. The same username must exist on every
+node, with working management SSH and sudo access. Initial passwordless SSH is
+not required: the helper asks for an account password when it first needs one,
+then reuses it for SSH and sudo across the nodes for the rest of the run. If a
+node rejects it, the helper asks for that node's password and remembers the
+exception. Different SSH and sudo passwords are supported. Working SSH keys
+and passwordless sudo need no password prompt.
+
+Unknown host-key fingerprints still require confirmation; verify them when
+asked. Private-key passphrases are requested separately from account passwords.
+Passwords remain in memory and are never put in arguments, environment variables,
+or files. A temporary local OpenSSH askpass helper receives passwords through a
+private Unix socket, and sudo receives them on stdin over SSH. No `sshpass`
+package is needed. Password bootstrap uses SSH password authentication; systems
+requiring other authentication challenges need working SSH key access first.
+
+Every node needs Ubuntu Netplan (including its Python `yaml` module), Python
+3.10+, OpenSSH client/server, `ip`, `ping`, `ssh-keygen`, `runuser`, and the
+standard `usermod`/`gpasswd` group-management tools (`groupadd`/`groupdel` if the
+`docker` group does not exist). The helper
+does not install packages. Only the head needs this repository; the Python node
+helper is sent over management SSH. The interface names must match the standard
+Spark CX7 names used below. Connect the QSFP cables before running setup.
+
+Preview a two-node configuration (the addresses below are examples):
+
+```bash
+./setup-cluster.sh 192.0.2.11 192.0.2.12 --dry-run
+```
+
+Apply it after reviewing the preview:
+
+```bash
+./setup-cluster.sh 192.0.2.11 192.0.2.12
+```
+
+Space- and comma-separated node lists are accepted. With one active QSFP port
+per node, the helper selects direct mode for two nodes or switch mode for three
+or more. Automatic port detection needs carrier on both twins. This is an inference from link state;
+setup still verifies every planned link after applying the configuration.
+For direct/switch mode, different nodes can use different physical ports:
+
+```bash
+./setup-cluster.sh 192.0.2.11,192.0.2.12 --topology direct --ports 0,1
+./setup-cluster.sh 192.0.2.11,192.0.2.12,192.0.2.13 --topology switch --ports 1
+```
+
+`--ports 1` selects port 1 everywhere; `--ports 0,1,...` selects a port per node
+in input order. Omit it when each node has only one active port. An already
+addressed unused CX7 port must be deconfigured first, to avoid confusing launch
+autodiscovery. The helper does not configure the switch itself.
+
+For a three-node mesh or a larger closed ring, list nodes in physical cable
+order. **Port 0 of each node connects to port 1 of the next node**, including
+the cable from the last node back to the head:
+
+```bash
+./setup-cluster.sh 192.0.2.11 192.0.2.12 192.0.2.13 --topology mesh
+./setup-cluster.sh 192.0.2.11 192.0.2.12 192.0.2.13 192.0.2.14 --topology ring
+```
+
+`mesh` means the three-node full mesh, which is also a closed ring. With only
+two QSFP ports per Spark, a full mesh of more than three nodes is not possible;
+use `ring` or `switch`. Open chains are unsupported. When `lldpctl` is already
+available and LLDP neighbors uniquely identify a reciprocal closed ring on both
+twins, automatic mode derives the physical order from peer port MAC addresses.
+It ignores advertisements from the local twin sharing the same physical port.
+An explicit ring order that conflicts with this complete LLDP map is rejected
+before changing configuration. The helper does not install or enable LLDP.
+If LLDP cannot identify the ring, existing CX7 subnets can also provide its order
+when they uniquely agree on both rails.
+Carrier alone cannot identify an unconfigured ring's cable order or distinguish
+it from a switch with both ports connected. In that case the helper asks for
+the topology, or accepts `--topology`; the supplied node order defines ring
+cabling. Noninteractive runs must specify an ambiguous topology explicitly.
+
+The helper allocates `/24` networks from `10.20.0.0/16` by default, assigning
+host numbers `.11`, `.12`, and so on in topology order. Direct/switch mode uses
+two subnets, one per twin. Rings use two distinct subnets per cable, exactly
+as in the [four-node example](#example-four-node-ring). Use `--subnet-pool` to
+choose another RFC1918 private range with enough `/24` networks:
+
+```bash
+./setup-cluster.sh 192.0.2.11 192.0.2.12 --subnet-pool 10.40.0.0/16
+```
+
+Choose a different Netplan destination with `--netplan-file`. The path must be
+an absolute `.yaml` path directly inside `/etc/netplan`, and is used on every
+node. For example, update the existing CX7 file used by the manual guide:
+
+```bash
+./setup-cluster.sh 192.0.2.11 192.0.2.12 \
+  --netplan-file /etc/netplan/40-cx7.yaml --dry-run
+```
+
+The helper replaces the selected CX7 definitions in that file, preserving any
+management, Wi-Fi, or other unrelated definitions. It still migrates duplicate
+CX7 definitions out of other Netplan files. The original files are backed up
+before changes; restore recovers their original contents and permissions. Omit
+`--netplan-file` to use `/etc/netplan/98-spark-vllm-docker.yaml`.
+
+Setup rejects overlaps with management and other existing local networks or
+routes on any node. It cannot detect subnets used elsewhere on your LAN that
+have no local address or route; choose the pool accordingly.
+
+On every node it:
+
+1. Inspects the selected interfaces and validates the combined Netplan
+   configuration in a temporary directory before changing live configuration.
+2. Saves local backups and migrates exact CX7 Ethernet entries from existing
+   `/etc/netplan/*.yaml` files into the selected Netplan file,
+   using MTU 9000, static IPv4, DHCP disabled, and no link-local addresses.
+   Other interface settings remain in their original files. Migration may
+   reformat those YAML files; restore puts their original bytes back.
+   Migration avoids accumulating old addresses through
+   [Netplan's sequence-merging rules](https://netplan.readthedocs.io/en/stable/netplan-generate/#handling-multiple-files).
+3. Creates a separate Ed25519 key on each node in
+   `~/.ssh/spark-vllm-cluster/`, exchanges only public keys, and appends them to
+   the current user's `authorized_keys`. A block prepended to `~/.ssh/config`
+   selects the key and a dedicated verified host-key file for cluster IPs.
+   This enables SSH over management and directly reachable CX7 addresses.
+4. Applies Netplan on workers and then the head. It checks interface-bound
+   jumbo pings (MTU 9000, no fragmentation) on both rails in both directions,
+   then checks passwordless SSH from every
+   node to every other management IP and each directly reachable CX7 IP.
+5. Saves an autodiscovery-compatible `.env` beside `setup-cluster.sh` on the
+   head, after all nodes pass verification. Existing unrelated settings and
+   comments are preserved. Cluster address/interface fields and the topology's
+   NCCL settings replace their previous values; stale cluster fields are removed.
+
+Setup also ensures the current user belongs to the `docker` group on **every
+node, including the head**. It creates the group if missing and appends membership
+without replacing any other groups. Existing membership is left intact. Open a
+new login session afterward so Docker commands in your shell see the new group;
+existing SSH sessions retain their old supplementary groups. See Docker's
+[post-installation instructions](https://docs.docker.com/engine/install/linux-postinstall/).
+This does not install Docker or change its daemon, socket permissions, or containers.
+
+The generated file includes `CLUSTER_NODES`, `LOCAL_IP`, `ETH_IF`, and `IB_IF`.
+Direct/switch setups using the same port number on every node use CX7 addresses
+for coordination and `COPY_HOSTS`. Rings use management addresses in cable order,
+all four HCAs, and both rails of every cable in `CLUSTER_LINKS`. The existing
+copy helpers derive routes to every worker from those links. Rings also get the
+NCCL routing settings above, with `CONTAINER_NCCL_ALGO=Ring` for four or more nodes.
+Direct/switch setups with different port numbers use management coordination,
+the union of selected HCAs, and `CLUSTER_LINKS` for CX7 transfers. Management
+coordination requires the same management interface name on all nodes because
+the launcher uses a single `ETH_IF` value for every rank.
+
+Choose another head configuration path with `--env-file /path/to/cluster.env`,
+then pass that path to recipe/launch commands using `--config`. Its parent
+directory must already exist and belong to the current user; the directory
+and any existing file must not be symlinked, and an existing file must belong
+to the current user. New and
+updated configuration files use mode `0600`. Use `--no-env` to leave launch
+configuration untouched. Existing files must use the repository's single-line
+`KEY=value` format; their contents are never executed or printed. The helper
+stops if the file changes between the preview and the final save.
+
+For a cluster already configured by the helper (including a setup made before
+`.env` generation was added), save the configuration without reapplying networking
+or recreating SSH keys:
+
+```bash
+./setup-cluster.sh --save-env
+```
+
+This uses the existing head manifest and node journals, checks that the saved
+addresses and MTUs are active, and verifies CX7 reachability and mutual SSH
+before writing. `--env-file` selects a different destination; `--dry-run` checks
+the saved configuration and destination without writing. The existing setup's
+`--restore` also undoes this save. Repeating the same save keeps the original
+backup. A verification failure leaves the existing setup in place.
+
+The helper refuses ambiguous wildcard/MAC/driver Netplan matches, renamed or
+bonded/bridged/VLAN-attached CX7 interfaces, vendor/runtime CX7 definitions, and
+symlinked files it would change. Resolve these configurations before setup.
+It does not change the SSH daemon, management interface definitions,
+containers, or recipes. `netplan apply` can briefly interrupt networking, so
+run setup when the cluster is idle. `--dry-run` performs inspections, SSH/sudo
+authentication, and temporary validation without persistent configuration
+changes. `--yes` skips the final plan confirmation for an unattended run;
+that run also needs existing SSH trust, login authentication, and noninteractive
+sudo access.
+
+If CX7 interfaces are administratively down, specify the topology and (for
+direct/switch mode) `--ports`. Netplan brings them up after the original link
+state is saved, and final verification checks the cables. An already-up
+selected interface without carrier is rejected before setup.
+
+### Checking and repairing a saved setup
+
+Run doctor from the same head and login user:
+
+```bash
+./setup-cluster.sh --doctor --dry-run   # Diagnose only; nonzero if issues remain
+./setup-cluster.sh --doctor             # Diagnose, review repairs, then apply
+./setup-cluster.sh --doctor --yes       # Apply listed repairs without confirmation
+```
+
+Doctor uses the existing `--state-file` manifest and node journals, including
+older setups. It checks managed files and permissions, saved CX7 addresses,
+connected routes, MTUs, carrier, mutual SSH, both rails' jumbo pings, launch
+configuration, and Docker access from a fresh user session. An unreachable node
+or missing journal is reported before repairs begin. It also reports a stale
+Docker group list in the current head login; a new login is required to refresh it.
+
+Repairs can restore missing helper-managed files, correct file permissions,
+reapply saved Netplan settings for runtime drift, add missing Docker membership,
+and save missing launch configuration. Workers are repaired before the head,
+then checks run again. Existing journals keep the original restore baseline.
+Recovery images, including private SSH keys and any `.env` credentials, stay in
+each node's root-only journal. Older journals can recover matching Netplan files
+from their original backups; missing files without a recoverable after-image
+are reported for manual recovery.
+
+Doctor preserves later edits to shared files and reports them for reconciliation.
+It does not guess new cabling, replace changed SSH host keys, restart Docker,
+change firewall/socket permissions, or install missing packages. These issues
+remain visible and produce a nonzero exit status. If a repair fails, the journals
+remain for another doctor run or `--restore`; it does not roll back the entire
+existing cluster. Run network repairs while the cluster is idle because
+`netplan apply` can briefly interrupt networking.
+
+`--env-file PATH` selects a launch configuration destination; `--no-env` skips
+generation. Doctor respects an explicit `--no-env` saved by setup unless you
+provide `--env-file`. Already-journaled configuration files still receive the
+normal file-integrity checks.
+
+### Restoring a setup
+
+Run on the same head, as the same user:
+
+```bash
+./setup-cluster.sh --restore
+```
+
+The default head manifest is `~/.local/state/spark-vllm/cluster-setup.json`.
+Use `--state-file /path/to/manifest.json` for both setup and restore to choose
+another location. Restore uses the recorded file paths automatically; do not
+repeat `--netplan-file` with `--restore`. Each node keeps its original file
+contents and permissions in a root-only journal under
+`/var/lib/spark-vllm/setup-cluster/`. Keep the head
+manifest and node journals until restoration is complete. Only one active
+setup per node is supported; restore it before changing topology or addresses.
+
+Restore checks all nodes for file changes before restoring any node. It
+restores the original Netplan, SSH, and head `.env` files and their permissions, removes
+helper-created files and keys, reapplies the previous Netplan configuration,
+removes newly assigned CX7 addresses, and restores previous static addresses,
+non-dynamic routes, MTUs, and link state. Dynamic addresses/routes are reacquired
+by the previous network configuration. Saved routes use kernel interface IDs;
+if those IDs changed after a reboot or driver reload, restore stops for manual
+reconciliation instead of assigning routes to the wrong interface. Directories
+created by setup are removed only if empty. A head configuration file created
+by setup is removed on restore; a pre-existing one is restored byte for byte.
+Its backup remains in the head's root-only journal, including any unrelated
+credentials it originally contained. The recorded path is used automatically,
+so omit `--env-file` when restoring.
+
+Restore removes Docker group membership only when the helper added it, without
+changing other memberships. A helper-created `docker` group is removed only
+when no users still use it. A changed group ID stops restoration for manual
+reconciliation. Existing sessions keep their cached groups until logout.
+
+If any managed file was edited afterward, restore stops and identifies it;
+preserve/reconcile those edits before retrying. It never force-overwrites a
+later edit. Setup failures and Ctrl-C attempt rollback automatically. If a
+node becomes unreachable, a process is killed, or restoration fails, the
+journals remain for `--restore` once management access is available again.
+Workers are restored before the head, using established management SSH
+sessions so removing the generated keys does not prevent the remaining undo.
+
+A CX7 reachability failure can mean that the node list does not match physical
+cable order. Check LLDP neighbors when available, or trace each cable from port
+0 to the next node's port 1. Restore the failed attempt before retrying setup.
+
+After a successful setup, the generated `.env` is ready for recipe and launch
+commands. If you used `--no-env`, or later change the topology, use the normal
+discovery workflow to save a launch configuration:
+
+```bash
+./run-recipe.sh --discover
+```
+
 ## DGX Spark ConnectX quirks
 
 DGX Spark has a pretty unique ConnectX setup.

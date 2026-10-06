@@ -62,6 +62,8 @@ python -m pip install PyYAML
 - `build-and-copy.sh`: image selection, building, and distribution
 - `hf-download.sh`: Hugging Face download and model distribution
 - `autodiscover.sh`: host and network topology discovery
+- `setup-cluster.sh` / `setup-cluster.py` / `setup_cluster_node.py`: reversible
+  CX7 and SSH setup; use mocked tests during development, never a real setup
 - `mods/`: patches or files applied inside launched containers
 - `tests/`: mocked integration and focused behavior tests
 
@@ -153,6 +155,9 @@ python3 tests/test_vllm_flashinfer_b12x_patch.py
 
 # shell syntax for an edited script
 bash -n path/to/script.sh
+
+# cluster setup and restore (no live nodes or sudo)
+python3 tests/test_setup_cluster.py
 ```
 
 Some mods have dedicated `tests/test_*_mod.sh` scripts. Run the matching test
