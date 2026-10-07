@@ -6,8 +6,8 @@ import os
 from pathlib import Path
 import re
 import shlex
+import shutil
 import subprocess
-import sys
 import tempfile
 import unittest
 
@@ -28,10 +28,6 @@ class DependencyBuildTests(unittest.TestCase):
             "PATH": f"{self.bin_dir}:{os.environ['PATH']}",
             "COMMAND_LOG": str(self.log),
             "FLASHINFER_JIT_CACHE_PROVIDER_ARCHS": "12.1a",
-            "B12X_REPO": "",
-            "B12X_REF": "",
-            "B12X_FROM_PYPI": "0",
-            "B12X_CACHEBUST": "test-refresh",
             "FAIL_UV": "0",
         }
         mock = self.bin_dir / "uv"
@@ -41,7 +37,7 @@ class DependencyBuildTests(unittest.TestCase):
             "with open(os.environ['COMMAND_LOG'], 'a') as log:\n"
             "    log.write(json.dumps({'args': sys.argv[1:],\n"
             "        'arch': os.environ.get('FLASHINFER_JIT_CACHE_PROVIDER_ARCH')}) + '\\n')\n"
-            "if os.environ['FAIL_UV'] == '1':\n"
+            "if os.environ['FAIL_UV'] == '1' or pathlib.Path.cwd().name == os.environ.get('FAIL_UV_DIR'):\n"
             "    sys.exit(17)\n"
             "if sys.argv[1] == 'build':\n"
             "    for name in ('build', 'flashinfer_jit_cache_provider/jit_cache'):\n"
@@ -108,48 +104,99 @@ class DependencyBuildTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(self.commands(), [])
 
-    def run_b12x_install(self):
+    def docker_run_block(self, marker):
         dockerfile = (PROJECT_DIR / "Dockerfile").read_text()
         run = next(
             block for block in re.split(r"(?m)^RUN ", dockerfile)
-            if block.startswith("--mount=") and '\n    if [ -n "$B12X_REPO" ]' in block
+            if block.startswith("--mount=") and marker in block
         ).split("\n\n", 1)[0]
-        # Execute the Dockerfile's actual shell block with package installs and
-        # import verification mocked. Any unexpected git clone fails the test.
-        run = re.sub(r"^--mount=\S+\s*\\\n", "", run)
-        for name in ("python3", "git"):
+        return re.sub(r"(?m)^\s*--mount=\S+\s*\\\n", "", run)
+
+    def run_flashinfer_wheels(self, cubin):
+        (self.root / "flashinfer-jit-cache").mkdir()
+        if cubin:
+            (self.root / "flashinfer-cubin").mkdir()
+        (self.root / "pyproject.toml").write_text('license = "Apache-2.0"\n')
+        wheel_dir = self.root / "wheels"
+        wheel_dir.mkdir()
+        for name, body in (("prepared-python", "exit 0"), ("git", "echo test-commit")):
             mock = self.bin_dir / name
-            mock.write_text("#!/bin/sh\nexit " + ("0" if name == "python3" else "91") + "\n")
+            mock.write_text(f"#!/bin/sh\n{body}\n")
             mock.chmod(0o755)
-        # Use a fixed interpreter so the uv mock does not use the python3 stub.
-        uv_mock = self.bin_dir / "uv"
-        uv_mock.write_text(uv_mock.read_text().replace("#!/usr/bin/env python3", f"#!{sys.executable}"))
+        run = self.docker_run_block("# flashinfer-python")
+        run = run.replace("/workspace/wheels", str(wheel_dir)).replace(
+            "/tmp/build_flashinfer_jit_providers.sh",
+            str(PROJECT_DIR / "docker/build_flashinfer_jit_providers.sh"),
+        )
         return subprocess.run(
-            ["sh", "-c", run], cwd=self.root, env=self.env, text=True, capture_output=True
+            ["sh", "-c", run], cwd=self.root,
+            env={**self.env, "FLASHINFER_BUILD_CUBIN": str(int(cubin)),
+                 "FLASHINFER_BUILD_PYTHON": str(self.bin_dir / "prepared-python"),
+                 "FLASHINFER_CUDA_ARCH_LIST": "12.1a"},
+            text=True, capture_output=True,
         )
 
-    def test_pypi_refreshes_latest_without_changing_dependencies(self):
-        self.env["B12X_FROM_PYPI"] = "1"
-        result = self.run_b12x_install()
+    def test_regular_flashinfer_builds_cubin_and_jit_wheels(self):
+        result = self.run_flashinfer_wheels(cubin=True)
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(self.commands(), [{
-            "args": [
-                "pip", "install", "--upgrade", "--refresh-package", "b12x",
-                "--no-deps", "--index-url", "https://pypi.org/simple", "b12x",
-            ],
-            "arch": None,
-        }])
+        self.assertEqual(len(self.commands()), 3)
+        self.assertTrue((self.root / "flashinfer-cubin/build").is_dir())
+        self.assertTrue((self.root / "flashinfer-jit-cache/build").is_dir())
 
-    def test_pypi_failure_is_not_silently_skipped(self):
-        self.env["B12X_FROM_PYPI"] = "1"
-        self.env["FAIL_UV"] = "1"
-        result = self.run_b12x_install()
+    def test_cubin_failure_stops_before_jit_build_and_provenance(self):
+        self.env["FAIL_UV_DIR"] = "flashinfer-cubin"
+        result = self.run_flashinfer_wheels(cubin=True)
         self.assertEqual(result.returncode, 17, result.stderr)
+        self.assertEqual(len(self.commands()), 2)
+        self.assertFalse((self.root / "wheels/.flashinfer-commit").exists())
 
-    def test_unselected_b12x_install_is_skipped(self):
-        result = self.run_b12x_install()
+    def test_b12x_build_skips_cubins_but_keeps_jit_and_provenance(self):
+        result = self.run_flashinfer_wheels(cubin=False)
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(self.commands(), [])
+        self.assertEqual(len(self.commands()), 2)
+        self.assertTrue((self.root / "flashinfer-jit-cache/build").is_dir())
+        self.assertEqual((self.root / "wheels/.flashinfer-commit").read_text(), "test-commit\n")
+        self.assertEqual((self.root / "wheels/.flashinfer-arch").read_text(), "12.1a\n")
+
+    def test_flashinfer_git_caches_are_isolated_and_refresh_selected_refs(self):
+        def git(*args, cwd):
+            result = subprocess.run(["git", *args], cwd=cwd, env=self.env,
+                                    text=True, capture_output=True, check=True)
+            return result.stdout.strip()
+
+        sources = []
+        for name in ("upstream", "fork"):
+            source = self.root / name
+            source.mkdir()
+            git("init", "-b", "main", cwd=source)
+            git("config", "user.name", "Test", cwd=source)
+            git("config", "user.email", "test@example.invalid", cwd=source)
+            git("config", "commit.gpgsign", "false", cwd=source)
+            (source / "identity").write_text(name)
+            git("add", ".", cwd=source)
+            git("commit", "-m", "initial", cwd=source)
+            sources.append(source)
+
+        target = self.root / "checkout"
+        run = self.docker_run_block('echo "CACHEBUST_FLASHINFER=')
+        run = run.replace("/repo-cache", str(self.root / "repo-cache"))
+        run = run.replace("/workspace/flashinfer", str(target))
+        for source in (*sources, sources[0], sources[1]):
+            if target.exists():
+                shutil.rmtree(target)
+            (source / "identity").write_text(source.name + " updated")
+            git("add", ".", cwd=source)
+            git("commit", "--allow-empty", "-m", "update", cwd=source)
+            result = subprocess.run(
+                ["sh", "-c", run], cwd=self.root,
+                env={**self.env, "FLASHINFER_REPO": str(source),
+                     "FLASHINFER_REF": "main", "CACHEBUST_FLASHINFER": "test"},
+                text=True, capture_output=True,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(git("rev-parse", "HEAD", cwd=target), git("rev-parse", "HEAD", cwd=source))
+            self.assertEqual(git("remote", "get-url", "origin", cwd=target), str(source))
+        self.assertEqual(len(list((self.root / "repo-cache").iterdir())), 2)
 
     def write_torch_helper(self, path, exit_code=0):
         helper = self.root / path

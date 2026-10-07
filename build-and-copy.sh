@@ -35,15 +35,12 @@ VLLM_SOURCE_CONTEXT=""
 EXP_B12X=false
 EXP_B12X_VLLM_REPO="https://github.com/local-inference-lab/vllm"
 EXP_B12X_VLLM_REF="dev/karmic-kraken"
-B12X_PACKAGE_REPO="https://github.com/lukealonso/b12x.git"
-B12X_PACKAGE_REF="master"
+EXP_B12X_FLASHINFER_REPO="https://github.com/local-inference-lab/flashinfer.git"
 EXP_B12X_TORCH_VERSION="2.13.0"
 EXP_B12X_TORCHVISION_VERSION="0.28.0"
 EXP_B12X_TORCHAUDIO_VERSION="2.11.0"
-B12X_REPO=""
-B12X_REF=""
-B12X_CACHEBUST=""
-B12X_FROM_PYPI=0
+FLASHINFER_REPO="https://github.com/flashinfer-ai/flashinfer.git"
+FLASHINFER_BUILD_CUBIN=1
 FLASHINFER_REF="main"
 FLASHINFER_REF_SET=false
 TMP_IMAGE=""
@@ -116,10 +113,10 @@ generate_build_metadata() {
     local torch_version="${10}"
     local torchvision_version="${11}"
     local torchaudio_version="${12}"
-    local b12x_repo="${13}"
-    local b12x_ref="${14}"
+    local flashinfer_repo="${13}"
+    local flashinfer_ref="${14}"
     local cutlass_dsl_version="${15}"
-    local b12x_from_pypi="${16:-0}"
+    local flashinfer_build_cubin="${16:-1}"
 
     local base_image
     base_image=$(grep -m1 '^FROM .* AS runner' "$dockerfile" | awk '{print $2}')
@@ -139,9 +136,9 @@ build_args:
   torchvision_version: "${torchvision_version}"
   torchaudio_version: "${torchaudio_version}"
   cutlass_dsl_version: "${cutlass_dsl_version}"
-  b12x_repo: "${b12x_repo}"
-  b12x_ref: "${b12x_ref}"
-  b12x_from_pypi: ${b12x_from_pypi}
+  flashinfer_repo: "${flashinfer_repo}"
+  flashinfer_ref: "${flashinfer_ref}"
+  flashinfer_build_cubin: ${flashinfer_build_cubin}
   transformers_5: ${transformers_5}
   exp_mxfp4: ${exp_mxfp4}
   vllm_prs: "${vllm_prs}"
@@ -566,8 +563,18 @@ validate_flashinfer_wheel_set() {
     local jit=("$wheels_dir"/flashinfer_jit_cache-*.whl)
     local python=("$wheels_dir"/flashinfer_python-*.whl)
 
-    if [ "${#cubin[@]}" -ne 1 ] || [ ! -f "${cubin[0]}" ] || \
-       [ "${#jit[@]}" -ne 1 ] || [ ! -f "${jit[0]}" ] || \
+    if [ "$FLASHINFER_BUILD_CUBIN" = "1" ]; then
+        if [ "${#cubin[@]}" -ne 1 ] || [ ! -f "${cubin[0]}" ]; then
+            echo "Error: FlashInfer profile $wheels_dir does not contain exactly one cubin wheel."
+            echo "       Re-run with --rebuild-flashinfer to rebuild the selected wheel set."
+            return 1
+        fi
+    elif compgen -G "$wheels_dir/flashinfer_cubin-*.whl" > /dev/null 2>&1; then
+        echo "Error: B12X FlashInfer profile $wheels_dir must not contain cubin wheels."
+        echo "       Re-run with --rebuild-flashinfer to rebuild the selected wheel set."
+        return 1
+    fi
+    if [ "${#jit[@]}" -ne 1 ] || [ ! -f "${jit[0]}" ] || \
        [ "${#python[@]}" -ne 1 ] || [ ! -f "${python[0]}" ]; then
         echo "Error: FlashInfer profile $wheels_dir does not contain exactly one complete wheel set."
         return 1
@@ -640,7 +647,7 @@ usage() {
     echo "  --gpu-arch <arch>             : GPU architecture for NCCL, wheel, and source builds (default: '${DEFAULT_GPU_ARCH_LIST}')"
     echo "  --rebuild-flashinfer          : Force rebuild of FlashInfer wheels (ignore cached wheels)"
     echo "  --rebuild-vllm                : Force rebuild of vLLM wheels (ignore cached wheels)"
-    echo "  --force-flashinfer-download   : Force download of FlashInfer wheels (skip cached wheel checks)"
+    echo "  --force-flashinfer-download   : Force download of upstream FlashInfer wheels (unsupported for B12X)"
     echo "  --force-vllm-download         : Force download of vLLM wheels (skip cached wheel checks)"
     echo "  --force-download              : Force download of all prebuilt wheels (skip cached wheel checks)"
     echo "  --vllm-repo <url>             : vLLM Git repository (default: '${DEFAULT_VLLM_REPO}'); custom repositories bypass the shared checkout cache"
@@ -660,7 +667,7 @@ usage() {
     echo "  --exp-b12x, --experimental-b12x   : Select B12X; pulls its prebuilt image unless a local wheel/image build is requested"
     echo "  --apply-vllm-pr <pr-or-url>   : Apply a vLLM PR number or full GitHub PR URL to source. Can be specified multiple times."
     echo "  --apply-preset-vllm-prs       : Apply preset vLLM PRs even with --vllm-repo, --vllm-ref, or --apply-vllm-pr."
-    echo "  --apply-flashinfer-pr <pr-num>: Apply a specific PR patch to FlashInfer source. Can be specified multiple times."
+    echo "  --apply-flashinfer-pr <pr-num>: Apply a PR from the selected FlashInfer repository. Can be specified multiple times."
     echo "  --full-log                    : Enable full build logging (--progress=plain)"
     echo "  --no-build                    : Skip building, only copy image (requires --copy-to)"
     echo "  --network <network>           : Docker network to use during build"
@@ -894,19 +901,14 @@ NORMALIZED_DEFAULT_VLLM_REPO="${DEFAULT_VLLM_REPO%/}"
 NORMALIZED_DEFAULT_VLLM_REPO="${NORMALIZED_DEFAULT_VLLM_REPO%.git}"
 if [ "$NORMALIZED_VLLM_REPO" = "$NORMALIZED_DEFAULT_VLLM_REPO" ] || \
    [ "$NORMALIZED_VLLM_REPO" = "$EXP_B12X_VLLM_REPO" ]; then
-    B12X_CACHEBUST="$(date +%s)"
     TORCH_BASE_VERSION="${TORCH_VERSION%%+*}"
     if [ "$(printf '%s\n' "2.12.0" "$TORCH_BASE_VERSION" | sort -V | head -n1)" != "2.12.0" ]; then
         echo "Error: ${NORMALIZED_VLLM_REPO} requires --torch-version 2.12.0 or newer for B12X (got ${TORCH_VERSION})."
         exit 1
     fi
     if [ "$NORMALIZED_VLLM_REPO" = "$EXP_B12X_VLLM_REPO" ]; then
-        B12X_REPO="$B12X_PACKAGE_REPO"
-        B12X_REF="$B12X_PACKAGE_REF"
-        echo "Building B12X from ${B12X_REPO} ref ${B12X_REF} for ${NORMALIZED_VLLM_REPO} ref ${VLLM_REF}."
-    else
-        B12X_FROM_PYPI=1
-        echo "Installing latest B12X from PyPI for ${NORMALIZED_VLLM_REPO} ref ${VLLM_REF}."
+        FLASHINFER_REPO="$EXP_B12X_FLASHINFER_REPO"
+        FLASHINFER_BUILD_CUBIN=0
     fi
 fi
 
@@ -984,13 +986,25 @@ if [ "$EXP_B12X" = true ] && [ "$FORCE_VLLM_DOWNLOAD" = true ]; then
     exit 1
 fi
 
+if [ "$FLASHINFER_REPO" = "$EXP_B12X_FLASHINFER_REPO" ] && [ "$FORCE_FLASHINFER_DOWNLOAD" = true ]; then
+    echo "Error: B12X FlashInfer wheels are not published; --force-flashinfer-download cannot be used with the B12X fork."
+    echo "       Use --rebuild-flashinfer to rebuild the fork from source."
+    exit 1
+fi
+
 # Resolve wheel profiles independently from whether this invocation pulls a
-# prebuilt image or performs a local build. Regular FlashInfer wheels are shared
-# by the regular and B12X runners. Custom source/ref/architecture builds are
-# isolated so they cannot replace the tested shared wheel set.
+# prebuilt image or performs a local build. Fork wheels and custom builds must
+# not replace the regular upstream wheel set or each other's caches.
+if [ "$FLASHINFER_REPO" = "$EXP_B12X_FLASHINFER_REPO" ]; then
+    FLASHINFER_PROFILE="b12x"
+fi
 if [ "$FLASHINFER_REF_SET" = true ] || [ -n "$FLASHINFER_PRS" ] || \
    { [ "$GPU_ARCH_SET" = true ] && [ "$GPU_ARCH_LIST" != "$DEFAULT_GPU_ARCH_LIST" ]; }; then
-    FLASHINFER_PROFILE="custom"
+    if [ "$FLASHINFER_PROFILE" = "b12x" ]; then
+        FLASHINFER_PROFILE="b12x-custom"
+    else
+        FLASHINFER_PROFILE="custom"
+    fi
 fi
 
 if [ "$EXP_B12X" = true ]; then
@@ -1099,6 +1113,8 @@ if [[ "$CLEANUP_MODE" == "true" ]]; then
     CACHE_DIRS=(
         "$WHEEL_CACHE_ROOT/flashinfer/regular"
         "$WHEEL_CACHE_ROOT/flashinfer/custom"
+        "$WHEEL_CACHE_ROOT/flashinfer/b12x"
+        "$WHEEL_CACHE_ROOT/flashinfer/b12x-custom"
         "$WHEEL_CACHE_ROOT/vllm/regular"
         "$WHEEL_CACHE_ROOT/vllm/b12x"
         "$WHEEL_CACHE_ROOT/vllm/custom"
@@ -1176,9 +1192,10 @@ if [ "$NO_BUILD" = false ]; then
         MXFP4_VLLM_SHA=$(grep -m1 '^ARG VLLM_SHA=' Dockerfile.mxfp4 | cut -d= -f2)
         MXFP4_VLLM_REPO=$(grep -m1 '^ARG VLLM_REPO=' Dockerfile.mxfp4 | cut -d= -f2-)
         MXFP4_FLASHINFER_SHA=$(grep -m1 '^ARG FLASHINFER_SHA=' Dockerfile.mxfp4 | cut -d= -f2)
+        MXFP4_FLASHINFER_REPO=$(grep -m1 '^ARG FLASHINFER_REPO=' Dockerfile.mxfp4 | cut -d= -f2-)
         generate_build_metadata Dockerfile.mxfp4 "unknown" "$MXFP4_VLLM_SHA" "$MXFP4_FLASHINFER_SHA" \
             "mxfp4-pinned" "false" "true" "" "$MXFP4_VLLM_REPO" "base-image" \
-            "base-image" "base-image" "disabled" "disabled" "base-image"
+            "base-image" "base-image" "$MXFP4_FLASHINFER_REPO" "$MXFP4_FLASHINFER_SHA" "base-image"
 
         CMD=("docker" "build" "-t" "$IMAGE_TAG" "${COMMON_BUILD_FLAGS[@]}" "-f" "Dockerfile.mxfp4" ".")
         echo "Building image with command: ${CMD[*]}"
@@ -1208,6 +1225,18 @@ if [ "$NO_BUILD" = false ]; then
                 echo "Rebuilding FlashInfer wheels (--rebuild-flashinfer specified)..."
             fi
             BUILD_FLASHINFER=true
+        elif [ "$FLASHINFER_REPO" = "$EXP_B12X_FLASHINFER_REPO" ]; then
+            if validate_flashinfer_wheel_set "$FLASHINFER_WHEELS_DIR" >/dev/null 2>&1; then
+                echo "Using cached B12X FlashInfer wheels."
+            elif [ "$USE_WHEELS" = true ]; then
+                echo "Error: No complete cached B12X FlashInfer wheels are available."
+                echo "       Re-run with --rebuild-flashinfer to explicitly build the fork from source."
+                exit 1
+            else
+                echo "Building B12X FlashInfer wheels from $FLASHINFER_REPO ref $FLASHINFER_REF (without cubins)..."
+                BUILD_FLASHINFER=true
+                REBUILD_FLASHINFER=true
+            fi
         elif try_download_wheels "$FLASHINFER_RELEASE_TAG" "flashinfer" "$FORCE_FLASHINFER_DOWNLOAD" "$FLASHINFER_WHEELS_DIR"; then
             printf '%s\n' "$GPU_ARCH_LIST" > "$FLASHINFER_WHEELS_DIR/.flashinfer-arch"
             echo "FlashInfer wheels ready."
@@ -1226,7 +1255,9 @@ if [ "$NO_BUILD" = false ]; then
                 "--target" "flashinfer-export"
                 "--output" "type=local,dest=$FLASHINFER_STAGING_DIR"
                 "${COMMON_BUILD_FLAGS[@]}"
-                "--build-arg" "FLASHINFER_REF=$FLASHINFER_REF")
+                "--build-arg" "FLASHINFER_REF=$FLASHINFER_REF"
+                "--build-arg" "FLASHINFER_REPO=$FLASHINFER_REPO"
+                "--build-arg" "FLASHINFER_BUILD_CUBIN=$FLASHINFER_BUILD_CUBIN")
 
             if [ "$REBUILD_FLASHINFER" = true ]; then
                 FI_CMD+=("--build-arg" "CACHEBUST_FLASHINFER=$(date +%s)")
@@ -1391,23 +1422,13 @@ if [ "$NO_BUILD" = false ]; then
         generate_build_metadata Dockerfile "$VLLM_VERSION" "$VLLM_COMMIT" "$FLASHINFER_COMMIT" \
             "$VLLM_REF" "true" "false" "$VLLM_PRS" "$VLLM_REPO" "$TORCH_VERSION" \
             "${TORCHVISION_VERSION:-resolver-selected}" "${TORCHAUDIO_VERSION:-resolver-selected}" \
-            "${B12X_REPO:-disabled}" "${B12X_REF:-disabled}" "$CUTLASS_DSL_VERSION" "$B12X_FROM_PYPI"
+            "$FLASHINFER_REPO" "$FLASHINFER_REF" "$CUTLASS_DSL_VERSION" "$FLASHINFER_BUILD_CUBIN"
 
         RUNNER_CMD=("docker" "build"
             "-t" "$IMAGE_TAG"
             "${COMMON_BUILD_FLAGS[@]}"
             "--build-context" "flashinfer_wheels=$FLASHINFER_WHEELS_DIR"
             "--build-context" "vllm_wheels=$VLLM_WHEELS_DIR")
-
-        if [ -n "$B12X_REPO" ]; then
-            RUNNER_CMD+=("--build-arg" "B12X_REPO=$B12X_REPO")
-            RUNNER_CMD+=("--build-arg" "B12X_REF=$B12X_REF")
-        elif [ "$B12X_FROM_PYPI" = "1" ]; then
-            RUNNER_CMD+=("--build-arg" "B12X_FROM_PYPI=$B12X_FROM_PYPI")
-        fi
-        if [ -n "$B12X_CACHEBUST" ]; then
-            RUNNER_CMD+=("--build-arg" "B12X_CACHEBUST=$B12X_CACHEBUST")
-        fi
 
         RUNNER_CMD+=(".")
 

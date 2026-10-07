@@ -319,6 +319,13 @@ for additional launcher options.
 
 ## CHANGELOG
 
+### 2026-10-07
+
+B12X is now part of Flashinfer! `--exp-b12x` builds now build Flashinfer from  [`local-inference-lab/flashinfer@main`](https://github.com/local-inference-lab/flashinfer/tree/main),
+with separate wheel caches and no `flashinfer-cubin` wheel. Regular builds
+continue to use upstream FlashInfer. Both lanes now rely on FlashInfer for
+B12X instead of installing the standalone `b12x` package.
+
 ### 2026-10-05
 
 #### Deepseek V4.1 Flash recipes for 3x and 4x Sparks
@@ -1808,12 +1815,18 @@ For the maintained experimental B12X combination, the equivalent shortcut is:
 
 Without local-build flags, this pulls `eugr/spark-vllm-b12x:latest` and tags it
 as `vllm-node-b12x` unless `-t` is supplied. To build the maintained combination
-from `local-inference-lab/vllm@dev/jovian-judgement` and the `master` branch of the
-B12X repository, run:
+from `local-inference-lab/vllm@dev/karmic-kraken` and
+`local-inference-lab/flashinfer@main`, run:
 
 ```bash
 ./build-and-copy.sh --exp-b12x --rebuild-vllm
 ```
+
+This builds the fork's FlashInfer wheels when its cache is missing or incomplete.
+Add `--rebuild-flashinfer` to refresh an existing cached set. B12X builds omit
+the `flashinfer-cubin` wheel and retain the Python, JIT-cache, and required
+JIT provider wheels. They never download regular FlashInfer wheels;
+`--force-flashinfer-download` is unsupported for this lane.
 
 It can be combined with `--apply-vllm-pr <pr-num>` to build custom vLLM patches.
 The preset preserves selected Blackwell subarchitectures in vLLM's CUDA 13
@@ -1844,8 +1857,10 @@ Wheel profiles are selected automatically:
 ```text
 .wheel-cache/
 ├── flashinfer/
-│   ├── regular/   # shared by regular and B12X builds
-│   └── custom/    # custom ref/PR or non-default GPU target
+│   ├── regular/       # upstream FlashInfer
+│   ├── custom/        # upstream with a custom ref/PR or GPU target
+│   ├── b12x/          # local-inference-lab FlashInfer, without cubins
+│   └── b12x-custom/   # fork with a custom ref/PR or GPU target
 └── vllm/
     ├── regular/
     ├── b12x/
@@ -1861,19 +1876,16 @@ at `/workspace/vllm/structured_server.py` in the container when the selected
 vLLM source includes it. The script travels with locally exported wheels;
 older source refs and downloaded wheel sets without it skip this copy.
 
-Regular `vllm-project/vllm` runner builds install the latest `b12x` release from
-PyPI, including builds using precompiled vLLM wheels. A per-build cache key and
-package-index refresh prevent stale B12X releases from being reused. The
-`--no-deps` install preserves the image's Torch and CUTLASS DSL versions.
-
 The `--exp-b12x` profile and any branch, tag, or commit selected from
-`local-inference-lab/vllm` continue to clone the `master` ref of
-`https://github.com/lukealonso/b12x.git` and install its `b12x` distribution.
-A per-build cache key prevents Docker from reusing a stale source checkout.
-Before the `--no-deps` install, its package metadata is updated to the image-wide
-CUTLASS DSL 4.7.0 pin. The exact source commit is recorded at
-`/workspace/b12x-source-commit`. B12X requires PyTorch 2.12 or newer; both current
-build profiles use 2.13.0.
+`local-inference-lab/vllm` use the FlashInfer fork. Regular builds keep the
+original `flashinfer-ai/flashinfer` source and published wheel release.
+`--flashinfer-ref` and `--apply-flashinfer-pr` apply to the selected FlashInfer
+repository. Source checkout caches are isolated by repository as well.
+
+Neither lane installs the standalone `b12x` package from PyPI or Git. B12X is
+part of FlashInfer, including the compatibility imports and cache-integrity
+fix in the fork. Build metadata records the FlashInfer repository, ref, and
+commit. Both current build profiles use PyTorch 2.13.0.
 
 **Copy existing image without rebuilding:**
 
@@ -1890,7 +1902,7 @@ build profiles use 2.13.0.
 | `--gpu-arch <arch>` | Target GPU architecture for wheel/source builds. Non-default targets rebuild FlashInfer unless the local cache is marked for that architecture. The default `12.1a` still uses the prebuilt image unless another build-forcing flag is set. |
 | `--rebuild-flashinfer` | Skip prebuilt wheel download; force a fresh local FlashInfer build |
 | `--rebuild-vllm` | Force rebuild vLLM from source |
-| `--force-flashinfer-download` | Force download FlashInfer wheels, skipping cached wheel checks |
+| `--force-flashinfer-download` | Force download upstream FlashInfer wheels, skipping cached wheel checks; unsupported for B12X |
 | `--force-vllm-download` | Force download vLLM wheels, skipping cached wheel checks |
 | `--force-download` | Force download all prebuilt wheels, skipping cached wheel checks |
 | `--vllm-repo <url>` | vLLM Git repository. Defaults to `https://github.com/vllm-project/vllm.git`; custom repositories bypass the shared checkout cache and force a source build. |
@@ -1902,7 +1914,7 @@ build profiles use 2.13.0.
 | `--flashinfer-ref <ref>` | FlashInfer commit SHA, branch or tag (default: `main`) |
 | `--apply-vllm-pr <pr-or-url>` | Apply a vLLM PR patch during the image build. Numbers select `vllm-project/vllm`; full `https://github.com/OWNER/REPO/pull/NUMBER` URLs select another public GitHub repository. Repeatable. This is distinct from the launch-time option accepted by `launch-cluster.sh` and `run-recipe.sh`. |
 | `--apply-preset-vllm-prs` | Apply preset vLLM PRs even when `--vllm-repo`, `--vllm-ref`, or `--apply-vllm-pr` would otherwise suppress them |
-| `--apply-flashinfer-pr <pr-num>` | Apply a FlashInfer PR patch during build. Can be specified multiple times. |
+| `--apply-flashinfer-pr <pr-num>` | Apply a PR from the selected FlashInfer repository during build. Can be specified multiple times. |
 | `--tf5` | Deprecated compatibility flag; pulls/tags the prebuilt image as `vllm-node-tf5` unless another build-forcing flag is set. Aliases: `--pre-tf, --pre-transformers`. |
 | `--exp-mxfp4` | Build with experimental native MXFP4 support. Alias: `--experimental-mxfp4`. |
 | `--exp-b12x` | Select the B12X profile. Pulls `eugr/spark-vllm-b12x:latest` unless a local wheel/image build is requested; defaults to local tag `vllm-node-b12x`. Alias: `--experimental-b12x`. |
@@ -2506,6 +2518,11 @@ budget. This includes reclaimable OS memory on native DGX Spark and preserves
 the existing CUDA-based accounting under WSL. InstantTensor's budget fraction
 (`INSTANTTENSOR_MAX_FREE_MEM_USAGE`, default `0.5`), minimum across distributed
 ranks, and buffer-size checks still apply.
+
+InstantTensor 0.2.1 includes native Linux UMA accounting, but does not exclude
+WSL from that path. The patch remains necessary for the WSL policy and supports
+both 0.2.0 and 0.2.1, preserving 0.2.1's budget validation and error handling
+across distributed ranks.
 
 These runners also default to `INSTANTTENSOR_IO_DEPTH=16` to reduce GPU and
 pinned host staging-buffer usage. Override it through a recipe's `env` settings

@@ -8,10 +8,6 @@ ARG TORCH_VERSION=2.13.0
 ARG TORCHVISION_VERSION=0.28.0
 ARG TORCHAUDIO_VERSION=2.11.0
 ARG CUTLASS_DSL_VERSION=4.7.0
-ARG B12X_REPO=""
-ARG B12X_REF=""
-ARG B12X_CACHEBUST=""
-ARG B12X_FROM_PYPI=0
 
 # Empty fallback for ordinary remote-source builds. A caller may override this
 # stage with --build-context vllm_source=/path/to/checkout.
@@ -124,7 +120,9 @@ ENV FLASHINFER_CUDA_ARCH_LIST=${FLASHINFER_CUDA_ARCH_LIST}
 # The provider shim accepts the same space-separated dotted architectures.
 ENV FLASHINFER_JIT_CACHE_PROVIDER_ARCHS=${FLASHINFER_CUDA_ARCH_LIST}
 WORKDIR $VLLM_BASE_DIR
+ARG FLASHINFER_REPO=https://github.com/flashinfer-ai/flashinfer.git
 ARG FLASHINFER_REF=main
+ARG FLASHINFER_BUILD_CUBIN=1
 ARG FLASHINFER_BUILD_PYTHON=/usr/bin/python3
 
 # FlashInfer's source checkout may carry a .python-version. Keep no-isolation
@@ -143,26 +141,25 @@ RUN --mount=type=cache,id=uv-cache,target=/root/.cache/uv \
 # Smart Git Clone (Fetch changes instead of full re-clone)
 RUN --mount=type=cache,id=repo-cache,target=/repo-cache \
     echo "CACHEBUST_FLASHINFER=${CACHEBUST_FLASHINFER}" && \
-    cd /repo-cache && \
+    FLASHINFER_REPO_KEY="$(printf '%s' "$FLASHINFER_REPO" | sha256sum | cut -d' ' -f1)" && \
+    mkdir -p "/repo-cache/flashinfer-$FLASHINFER_REPO_KEY" && \
+    cd "/repo-cache/flashinfer-$FLASHINFER_REPO_KEY" && \
     if [ ! -d "flashinfer" ]; then \
         echo "Cache miss: Cloning FlashInfer from scratch..." && \
-        git clone --recursive https://github.com/flashinfer-ai/flashinfer.git; \
-        if [ "$FLASHINFER_REF" != "main" ]; then \
-            cd flashinfer && \
-            git checkout ${FLASHINFER_REF}; \
-        fi; \
+        git clone --recursive "$FLASHINFER_REPO" flashinfer && \
+        cd flashinfer; \
     else \
         echo "Cache hit: Fetching flashinfer updates..." && \
         cd flashinfer && \
         git fetch origin && \
-        git fetch origin --tags --force && \
-        (git checkout --detach origin/${FLASHINFER_REF} 2>/dev/null || git checkout ${FLASHINFER_REF}) && \
-        git reset --hard HEAD && \
-        git submodule update --init --recursive && \
-        git clean -fdx && \
-        git gc --auto; \
+        git fetch origin --tags --force; \
     fi && \
-    cp -a /repo-cache/flashinfer /workspace/flashinfer
+    (git checkout --detach "origin/${FLASHINFER_REF}" 2>/dev/null || git checkout "$FLASHINFER_REF") && \
+    git reset --hard HEAD && \
+    git submodule update --init --recursive && \
+    git clean -fdx && \
+    git gc --auto && \
+    cp -a "/repo-cache/flashinfer-$FLASHINFER_REPO_KEY/flashinfer" /workspace/flashinfer
 
 WORKDIR /workspace/flashinfer
 
@@ -231,6 +228,12 @@ RUN set -eux; \
 
 
 
+# Temporary workaround for FlashInfer's B12X loader include-order regression
+# (601cb127). Apply after requested PRs, and skip refs where it is already fixed.
+# Remove once supported refs include the upstream fix.
+COPY docker/patch_flashinfer_b12x_loader_include_order.py /tmp/patch_flashinfer_b12x_loader_include_order.py
+RUN "$FLASHINFER_BUILD_PYTHON" /tmp/patch_flashinfer_b12x_loader_include_order.py .
+
 # FlashInfer #5240 reuses checksum-verified cubins from the cache mount below.
 COPY docker/build_flashinfer_jit_providers.sh /tmp/build_flashinfer_jit_providers.sh
 RUN --mount=type=cache,id=uv-cache,target=/root/.cache/uv \
@@ -240,10 +243,12 @@ RUN --mount=type=cache,id=uv-cache,target=/root/.cache/uv \
     sed -i -e 's/license = "Apache-2.0"/license = { text = "Apache-2.0" }/' -e '/license-files/d' pyproject.toml && \
     "$FLASHINFER_BUILD_PYTHON" -c 'import filelock, packaging, requests, torch, tqdm' && \
     uv build --python "$FLASHINFER_BUILD_PYTHON" --no-build-isolation --wheel . --out-dir=/workspace/wheels -v && \
-    # flashinfer-cubin
-    cd flashinfer-cubin && uv build --python "$FLASHINFER_BUILD_PYTHON" --no-build-isolation --wheel . --out-dir=/workspace/wheels -v && \
+    # The B12X fork does not need the flashinfer-cubin wheel.
+    if [ "$FLASHINFER_BUILD_CUBIN" = "1" ]; then \
+        (cd flashinfer-cubin && uv build --python "$FLASHINFER_BUILD_PYTHON" --no-build-isolation --wheel . --out-dir=/workspace/wheels -v); \
+    fi && \
     # flashinfer-jit-cache
-    cd .. && bash /tmp/build_flashinfer_jit_providers.sh "$FLASHINFER_BUILD_PYTHON" /workspace/wheels && \
+    bash /tmp/build_flashinfer_jit_providers.sh "$FLASHINFER_BUILD_PYTHON" /workspace/wheels && \
     cd flashinfer-jit-cache && \
     uv build --python "$FLASHINFER_BUILD_PYTHON" --no-build-isolation --wheel . --out-dir=/workspace/wheels -v && \
     # dump git ref and target architecture in the wheels dir
@@ -722,10 +727,6 @@ ARG TORCH_VERSION
 ARG TORCHVISION_VERSION
 ARG TORCHAUDIO_VERSION
 ARG CUTLASS_DSL_VERSION
-ARG B12X_REPO
-ARG B12X_REF
-ARG B12X_CACHEBUST
-ARG B12X_FROM_PYPI
 
 # Transferring build settings from build image because of ptxas/jit compilation during vLLM startup
 # Build parallemism
@@ -789,7 +790,7 @@ RUN --mount=type=cache,id=uv-cache,target=/root/.cache/uv \
         "nvidia-cutlass-dsl[cu13]==$CUTLASS_DSL_VERSION" \
         "apache-tvm-ffi==0.1.12"
 
-# Install the shared/selected FlashInfer and vLLM profiles from independent
+# Install the selected FlashInfer and vLLM profiles from independent
 # named contexts (bind-mounted without adding the wheel files to an image layer).
 # PRE_TRANSFORMERS=1 is retained for manual legacy builds; build-and-copy.sh no longer sets it for --tf5.
 # FastAPI 0.137.0 adds _IncludedRouter entries that currently break
@@ -852,37 +853,7 @@ RUN --mount=type=cache,id=uv-cache,target=/root/.cache/uv \
     uv pip install ray[default] fastsafetensors instanttensor \
         --override /tmp/torch-override.txt
 
-# Upstream vLLM and the local-inference-lab fork consume the external B12X
-# kernel package at runtime. Regular builds use the latest PyPI release;
-# experimental fork builds use source. Install without dependencies: vLLM
-# already provides the runtime packages, and this image deliberately advances
-# nvidia-cutlass-dsl to 4.7.0 for both
-# regular and B12X builds. B12X kernels remain JIT-compiled on first use;
-# building its Python wheel here does not compile the CUDA kernels.
-COPY docker/pin_cutlass_dsl.py /tmp/pin_cutlass_dsl.py
-RUN --mount=type=cache,id=uv-cache,target=/root/.cache/uv \
-    if [ -n "$B12X_REPO" ]; then \
-        echo "Refreshing B12X source (cache key: $B12X_CACHEBUST)" && \
-        git clone --depth 1 --branch "$B12X_REF" "$B12X_REPO" /tmp/b12x-source && \
-        B12X_COMMIT=$(git -C /tmp/b12x-source rev-parse HEAD) && \
-        python3 /tmp/pin_cutlass_dsl.py "$CUTLASS_DSL_VERSION" \
-            --expected-count 5 /tmp/b12x-source/pyproject.toml && \
-        uv pip install --reinstall --no-deps /tmp/b12x-source && \
-        printf '%s\n' "$B12X_COMMIT" > /workspace/b12x-source-commit && \
-        python3 -c "import importlib.metadata as m, sys; import b12x; print('Verified B12X', m.version('b12x'), 'from source commit', sys.argv[1], 'with CUTLASS DSL', m.version('nvidia-cutlass-dsl'))" "$B12X_COMMIT" && \
-        rm -rf /tmp/b12x-source; \
-    elif [ "$B12X_FROM_PYPI" = "1" ]; then \
-        echo "Refreshing B12X from PyPI (cache key: $B12X_CACHEBUST)" && \
-        uv pip install --upgrade --refresh-package b12x --no-deps --index-url https://pypi.org/simple b12x && \
-        python3 -c "import importlib.metadata as m; import b12x; print('Verified B12X', m.version('b12x'), 'from PyPI with CUTLASS DSL', m.version('nvidia-cutlass-dsl'))"; \
-    else \
-        echo "B12X installation not requested; skipping."; \
-    fi
-
-# Validate cached CuTe objects and recover from interrupted writes. Apply after
-# both source and PyPI B12X installs so every model/backend gets the same fix.
-COPY docker/patch_b12x_cache_integrity.py docker/b12x-cache-integrity.patch /tmp/b12x-patches/
-RUN python3 /tmp/b12x-patches/patch_b12x_cache_integrity.py --installed
+# B12X is supplied by FlashInfer, including its CuTe cache-integrity fix.
 
 # Cached or downloaded wheels can predate the CUDA-on-WSL reporting fix.
 # This also accepts wheels that already contain the source-stage patch.

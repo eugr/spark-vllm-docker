@@ -1,4 +1,9 @@
-# Temporary B12X CuTe cache-integrity patch
+# Retained standalone B12X CuTe cache-integrity patch
+
+Current builds obtain B12X from FlashInfer. The FlashInfer fork includes this
+fix, so the Dockerfile no longer installs or patches standalone B12X. The patch
+and regression fixtures here are retained for the older standalone sources
+described below; they do not apply to FlashInfer's compatibility package.
 
 An interrupted node startup can leave empty or damaged `.o` objects or `.json`
 manifests in the persistent CuTe compile cache. B12X preparation previously
@@ -6,11 +11,9 @@ considered a CuTe program available if its object file existed. The later load
 could fail with `planned CuTe program has not been compiled` instead of scheduling
 the damaged entry for recompilation.
 
-`Dockerfile` applies `patch_b12x_cache_integrity.py --installed` after both the
-source and PyPI B12X install paths in the common runner stage. This also covers
-regular runners assembled from precompiled vLLM wheels. It is not a runtime mod
-and does not require recipe changes. Existing images must be rebuilt to include
-the fix; this change does not modify running containers or host caches.
+Previously, `Dockerfile` applied `patch_b12x_cache_integrity.py --installed`
+after both the source and PyPI B12X install paths in the common runner stage.
+This covered regular runners assembled from precompiled vLLM wheels as well.
 
 ## Behavior
 
@@ -58,8 +61,8 @@ The Docker patcher applies only the `b12x/` hunks to site-packages; it does not
 install the upstream test file. It locates B12X without importing GPU packages,
 checks all hunks before editing, accepts an identical repeated application, and
 fails the build on unknown source layouts instead of silently skipping the fix.
-If B12X is not installed, there is nothing to patch. Remove this temporary patch
-once the supported source/PyPI versions contain the upstream fix.
+If B12X is not installed, there is nothing to patch. Current image builds no
+longer invoke this patcher.
 
 ## Local validation
 

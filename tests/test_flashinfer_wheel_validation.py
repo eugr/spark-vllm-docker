@@ -29,7 +29,8 @@ class FlashInferWheelValidationTests(unittest.TestCase):
         self.fi.mkdir()
         self.vllm.mkdir()
         self.architectures = "12.1a"
-        self.write_wheel("flashinfer-cubin")
+        self.build_cubin = "1"
+        self.cubin = self.write_wheel("flashinfer-cubin")
         self.write_wheel("flashinfer-python")
         self.jit = self.write_wheel("flashinfer-jit-cache")
         (self.fi / ".flashinfer-commit").write_text("test-commit\n")
@@ -57,7 +58,9 @@ class FlashInferWheelValidationTests(unittest.TestCase):
             with self.subTest(gate=gate):
                 script = (
                     "set -e\n" + VALIDATORS + "\nGPU_ARCH_LIST="
-                    + shlex.quote(self.architectures) + "\n" + shlex.join(commands[gate])
+                    + shlex.quote(self.architectures)
+                    + "\nFLASHINFER_BUILD_CUBIN=" + self.build_cubin
+                    + "\n" + shlex.join(commands[gate])
                 )
                 result = subprocess.run(
                     ["bash", "-c", script], cwd=PROJECT_DIR, capture_output=True, text=True
@@ -75,6 +78,27 @@ class FlashInferWheelValidationTests(unittest.TestCase):
             with self.subTest(version=version):
                 self.write_wheel("flashinfer-jit-cache", version, path=self.jit)
                 self.check()
+
+    def test_regular_requires_cubin(self):
+        self.cubin.unlink()
+        self.check("does not contain exactly one cubin wheel")
+
+    def test_b12x_accepts_no_cubin(self):
+        self.build_cubin = "0"
+        self.cubin.unlink()
+        self.check()
+
+    def test_b12x_rejects_cubin_contamination(self):
+        self.build_cubin = "0"
+        self.check("must not contain cubin wheels")
+
+    def test_b12x_still_requires_jit_providers(self):
+        self.build_cubin = "0"
+        self.cubin.unlink()
+        self.shim("flashinfer-jit-cache-sm121a==0.7.0")
+        self.check("provider wheel for arch sm121a")
+        self.write_wheel("flashinfer-jit-cache-sm121a")
+        self.check()
 
     def test_historical_monolithic_cache_needs_no_arch_marker_for_runner(self):
         (self.fi / ".flashinfer-arch").unlink()

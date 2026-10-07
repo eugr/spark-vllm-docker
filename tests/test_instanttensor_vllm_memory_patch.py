@@ -2,6 +2,7 @@
 """CPU-only checks for InstantTensor's vLLM memory-accounting patch."""
 
 import importlib.util
+import math
 import os
 import subprocess
 import sys
@@ -45,6 +46,46 @@ SOURCE = '''class safe_open:
                 f"budget ({self._device_memory_budget} B)"
             )
 '''
+# Budget selection from the PyPI 0.2.1 release. Keep the try/except and rank
+# reduction so behavior tests exercise validation and collective error handling.
+SOURCE_UMA = '''class safe_open:
+    def _determine_io_params(self, config):
+        max_free_mem_usage = config.max_free_mem_usage
+        if max_free_mem_usage is None:
+            max_free_mem_usage = 0.5
+
+        budget_error = None
+        try:
+            if not math.isfinite(max_free_mem_usage) or not 0 < max_free_mem_usage <= 1:
+                raise ValueError("max_free_mem_usage must be finite and satisfy 0 < value <= 1")
+            # Managed-memory support alone does not imply shared physical memory.
+            if sys.platform == "linux" and torch.cuda.get_device_properties(self.device).is_integrated:
+                avail_bytes = _host_available_bytes()
+                debug_log("MemAvailable: %d bytes", avail_bytes)
+            else:
+                avail_bytes = torch.cuda.mem_get_info(self.device)[0]
+                debug_log("CUDA free memory: %d bytes", avail_bytes)
+            avail_bytes = int(avail_bytes * max_free_mem_usage)
+        except (OSError, ValueError, AttributeError) as error:
+            # Participate in the existing MIN collective before rejecting, so
+            # invalid budget input on one rank cannot strand another rank there.
+            budget_error = error
+            avail_bytes = 0
+        debug_log("Local memory budget: %d bytes (fraction=%s)", avail_bytes, max_free_mem_usage)
+
+        if self.process_group is not None:
+            avail_bytes_tensor = torch.tensor([avail_bytes], device=self.device)
+            dist.all_reduce(avail_bytes_tensor, op=torch.distributed.ReduceOp.MIN, group=self.process_group)
+            avail_bytes = avail_bytes_tensor.item()
+
+        self._device_memory_budget = avail_bytes
+        debug_log("Device memory budget: %d bytes", avail_bytes)
+        if budget_error is not None:
+            raise RuntimeError("Cannot select memory budget: " + str(budget_error)) from budget_error
+        # Reduced I/O setup: each operation requires one byte in this fixture.
+        if avail_bytes < 1:
+            raise RuntimeError("Device memory budget is too small for one I/O operation")
+''' + SOURCE[SOURCE.index("    def _finalize_buffer_size"):]
 NEIGHBOR = '''
 
 def unrelated_memory_query():
@@ -53,13 +94,16 @@ def unrelated_memory_query():
 
 
 class InstantTensorVllmMemoryTests(unittest.TestCase):
+    source = SOURCE
+    original_query = PATCHER.ORIGINAL
+
     def setUp(self):
         temp = tempfile.TemporaryDirectory()
         self.addCleanup(temp.cleanup)
         self.root = Path(temp.name)
         self.target = self.root / "instanttensor/_impl.py"
         self.target.parent.mkdir(parents=True)
-        self.target.write_text(SOURCE + NEIGHBOR)
+        self.target.write_text(self.source + NEIGHBOR)
         for package in ("instanttensor", "vllm", "torch"):
             directory = self.root / package
             directory.mkdir(exist_ok=True)
@@ -99,17 +143,24 @@ class InstantTensorVllmMemoryTests(unittest.TestCase):
             result.value = min(result.value, remote_budget)
 
         torch = SimpleNamespace(
-            cuda=SimpleNamespace(mem_get_info=Mock(
-                side_effect=AssertionError("Must use vLLM's memory policy")
-            )),
+            cuda=SimpleNamespace(
+                mem_get_info=Mock(
+                    side_effect=AssertionError("Must use vLLM's memory policy")
+                ),
+                get_device_properties=Mock(
+                    side_effect=AssertionError("Must use vLLM's platform policy")
+                ),
+            ),
             tensor=Mock(side_effect=make_tensor),
         )
         dist = SimpleNamespace(
             ReduceOp=SimpleNamespace(MIN=object()),
             all_reduce=Mock(side_effect=all_reduce),
         )
-        namespace = {"torch": torch, "dist": dist}
-        exec(PATCHER.patch_memory_query(SOURCE), namespace)
+        torch.distributed = dist
+        namespace = {"torch": torch, "dist": dist, "math": math,
+                     "sys": sys, "debug_log": Mock()}
+        exec(PATCHER.patch_memory_query(self.source), namespace)
         loader = namespace["safe_open"]()
         loader.device = SimpleNamespace(type="cuda", index=1)
         loader.process_group = object() if remote_budget is not None else None
@@ -161,11 +212,17 @@ class InstantTensorVllmMemoryTests(unittest.TestCase):
     def test_patch_is_scoped_and_idempotent_without_importing_packages(self):
         for installed in (False, True):
             with self.subTest(installed=installed):
-                self.target.write_text(SOURCE + NEIGHBOR)
+                self.target.write_text(self.source + NEIGHBOR)
                 result = self.run_patch(installed=installed)
                 self.assertEqual(result.returncode, 0, result.stderr)
                 patched = self.target.read_text()
-                self.assertNotEqual(patched, SOURCE + NEIGHBOR)
+                self.assertNotEqual(patched, self.source + NEIGHBOR)
+                # Nothing outside the recognized memory query is rewritten.
+                replacement = dict(PATCHER.QUERY_VARIANTS)[self.original_query]
+                self.assertEqual(
+                    patched.replace(replacement, self.original_query),
+                    self.source + NEIGHBOR,
+                )
                 self.assertTrue(patched.endswith(NEIGHBOR))
                 self.assertEqual(PATCHER.patch_memory_query(patched), patched)
                 result = self.run_patch(installed=installed)
@@ -176,12 +233,12 @@ class InstantTensorVllmMemoryTests(unittest.TestCase):
     def test_unknown_or_ambiguous_sources_fail_without_writing(self):
         for source in (
             NEIGHBOR,
-            SOURCE + SOURCE,
-            SOURCE.replace("_determine_io_params", "_select_io_params"),
-            SOURCE.replace("torch.cuda.mem_get_info()", "torch.cuda.mem_get_info(self.device)"),
-            SOURCE.replace("int(free_bytes * max_free_mem_usage)", "free_bytes"),
-            SOURCE.replace(PATCHER.ORIGINAL, PATCHER.ORIGINAL * 2),
-            SOURCE.replace("class safe_open:", "class safe_open("),
+            self.source + self.source,
+            self.source.replace("_determine_io_params", "_select_io_params"),
+            self.source.replace("torch.cuda.mem_get_info(", "unknown_memory_query("),
+            self.source.replace(" * max_free_mem_usage", ""),
+            self.source.replace(self.original_query, self.original_query * 2),
+            self.source.replace("class safe_open:", "class safe_open("),
         ):
             with self.subTest(source=source):
                 self.target.write_text(source)
@@ -200,6 +257,52 @@ class InstantTensorVllmMemoryTests(unittest.TestCase):
             f"RUN python3 /tmp/instanttensor-patches/{script} --installed"
         )
         self.assertGreater(patch_position, runner.rindex("uv pip install"))
+
+
+class InstantTensorUmaVllmMemoryTests(InstantTensorVllmMemoryTests):
+    source = SOURCE_UMA
+    original_query = PATCHER.ORIGINAL_UMA
+
+    def test_invalid_budget_participates_in_collective_before_raising(self):
+        cases = [(fraction, None) for fraction in (0, -1, 1.1, math.inf, math.nan)]
+        cases += [(0.5, error("memory unavailable"))
+                  for error in (OSError, ValueError, AttributeError)]
+        for fraction, error in cases:
+            with self.subTest(fraction=fraction, error=error):
+                snapshot = Mock(side_effect=error)
+                module = ModuleType("vllm.utils.mem_utils")
+                module.MemorySnapshot = snapshot
+                tensor = Mock(return_value=SimpleNamespace(item=lambda: 0))
+                dist = SimpleNamespace(ReduceOp=SimpleNamespace(MIN=object()),
+                                       all_reduce=Mock())
+                namespace = {
+                    "math": math, "debug_log": Mock(), "dist": dist,
+                    "torch": SimpleNamespace(tensor=tensor, distributed=dist),
+                }
+                exec(PATCHER.patch_memory_query(self.source), namespace)
+                loader = namespace["safe_open"]()
+                loader.device = object()
+                loader.process_group = object()
+                with patch.dict(sys.modules, {"vllm.utils.mem_utils": module}):
+                    with self.assertRaisesRegex(RuntimeError, "Cannot select memory budget") as caught:
+                        loader._determine_io_params(
+                            SimpleNamespace(max_free_mem_usage=fraction)
+                        )
+                tensor.assert_called_once_with([0], device=loader.device)
+                dist.all_reduce.assert_called_once_with(
+                    tensor.return_value, op=dist.ReduceOp.MIN, group=loader.process_group
+                )
+                self.assertEqual(loader._device_memory_budget, 0)
+                if error is None:
+                    snapshot.assert_not_called()
+                    self.assertIsInstance(caught.exception.__cause__, ValueError)
+                else:
+                    snapshot.assert_called_once_with(device=loader.device)
+                    self.assertIs(caught.exception.__cause__, error)
+
+    def test_failed_remote_budget_still_rejects_local_load(self):
+        with self.assertRaisesRegex(RuntimeError, "too small for one I/O operation"):
+            self.make_loader(available=1000, remote_budget=0)
 
 
 if __name__ == "__main__":
