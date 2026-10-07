@@ -1,0 +1,28 @@
+[
+  {
+    "Id": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "RepoTags": ["vllm-node:latest", "runner:copy"],
+    "RepoDigests": [],
+    "Architecture": "arm64",
+    "Os": "linux",
+    "Config": {
+      "Cmd": ["bash"],
+      "Env": ["PATH=/usr/local/bin:/usr/bin:/bin", "VLLM_WORKER_MULTIPROC_METHOD=spawn"],
+      "WorkingDir": "/workspace",
+      "Labels": {"example.empty": "", "example.version": "1"},
+      "ExposedPorts": {"8000/tcp": {}},
+      "Volumes": {"/data": {}}
+    },
+    "RootFS": {
+      "Layers": [
+        "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+        "sha256:2222222222222222222222222222222222222222222222222222222222222222"
+      ],
+      "Type": "layers"
+    },
+    "GraphDriver": {"Name": "overlayfs", "Data": null},
+    "Size": 2048,
+    "Descriptor": {"mediaType": "application/vnd.oci.image.manifest.v1+json", "digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},
+    "Metadata": {"LastTagTime": "2026-10-04T00:00:00Z"}
+  }
+]

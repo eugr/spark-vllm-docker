@@ -7,6 +7,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -416,7 +417,8 @@ os.symlink = limited_symlink
         self.script = self.root / "hf-download.sh"
         shutil.copyfile(ROOT / "hf-download.sh", self.script)
         (self.root / "hf-cache.py").symlink_to(ROOT / "hf-cache.py")
-        (self.root / "autodiscover.sh").write_text('''
+        (self.root / "autodiscover.sh").write_text(
+            f"source {shlex.quote(str(ROOT / 'autodiscover.sh'))}\n" + '''
 DOTENV_COPY_HOSTS=""
 detect_interfaces() { echo interfaces; }
 detect_local_ip() { echo local-ip; }

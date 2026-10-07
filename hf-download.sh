@@ -198,7 +198,7 @@ prepare_remote_cache() {
     printf -v remote_script '%s\nrepair_cache_ownership "$@"' "$(declare -f repair_cache_ownership)"
     printf -v remote_command 'bash -c %q -- %q %q' "$remote_script" "$HF_CACHE_DIR" "$HUB_PATH"
     echo "Checking cache ownership on ${SSH_USER}@${host}..."
-    if ! ssh "${ssh_args[@]}" "${SSH_USER}@${host}" "$remote_command"; then
+    if ! cluster_copy_ssh "$host" "${ssh_args[@]}" "$remote_command"; then
         echo "Error: Cache preparation failed on ${SSH_USER}@${host}." >&2
         return 1
     fi
@@ -230,8 +230,7 @@ copy_model_to_host() {
     # snapshot links, but materialize links to hub-level blobs as repo-local files.
     # Downside is duplication of storage if cross-model shared blobs are used, but basically replicates old behavior.
     # -s protects remote paths containing spaces or shell metacharacters.
-    if rsync -av -s --mkpath --progress --copy-unsafe-links \
-            "$model_dir/" "${SSH_USER}@${host}:$HUB_PATH/$(basename "$model_dir")/"; then
+    if cluster_copy_rsync "$host" "$model_dir/" "$HUB_PATH/$(basename "$model_dir")/"; then
         host_copy_end=$(date +%s)
         host_copy_time=$((host_copy_end - host_copy_start))
         printf "Copy to %s completed in %02d:%02d:%02d\n" "$host" $((host_copy_time/3600)) $((host_copy_time%3600/60)) $((host_copy_time%60))
@@ -251,7 +250,7 @@ remote_cache_action() {
     for arg in "$@"; do
         printf -v remote_command '%s %q' "$remote_command" "$arg"
     done
-    ssh -o BatchMode=yes -T "${SSH_USER}@${host}" "$remote_command" < "$CACHE_HELPER"
+    cluster_copy_ssh "$host" -o BatchMode=yes -T "$remote_command" < "$CACHE_HELPER"
 }
 
 collect_inventory() {
@@ -420,6 +419,11 @@ resolve_copy_hosts() {
         add_copy_hosts "$DOTENV_COPY_HOSTS"
         return
     fi
+    if [[ -n "${DOTENV_CLUSTER_LINKS:-}" ]]; then
+        IFS=',' read -ra COPY_HOSTS <<< "${DOTENV_CLUSTER_NODES#*,}"
+        [[ "$DOTENV_CLUSTER_NODES" == *,* ]] || COPY_HOSTS=()
+        return
+    fi
     echo "No hosts specified. Using autodiscovery..."
     detect_interfaces || fail "Interface detection failed."
     detect_local_ip || fail "Local IP detection failed."
@@ -433,6 +437,9 @@ resolve_copy_hosts() {
     echo "Autodiscovered copy hosts: ${COPY_HOSTS[*]}"
 }
 resolve_copy_hosts >&2
+if [[ "$COPY_TO_FLAG" == true && -n "${DOTENV_CLUSTER_LINKS:-}" ]]; then
+    python3 "$SCRIPT_DIR/cluster_topology.py" check
+fi
 
 # Use the same dependency preparation on the head and on SSH peers.
 ensure_uvx

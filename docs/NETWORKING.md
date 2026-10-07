@@ -8,6 +8,9 @@ Please keep in mind that tensor-parallel vLLM deployments usually work best with
 The guide assumes that the nodes are named `spark` and `spark2`, but you can use any names.
 Same with IP addresses: we use `192.168.177.0/24` subnet with `.11` and `.12` assigned to both nodes, but you can use any IP addresses, as long as they are in the same subnet.
 
+For four Sparks connected without a QSFP switch, see the
+[four-node ring example](#example-four-node-ring) below.
+
 ## DGX Spark ConnectX quirks
 
 DGX Spark has a pretty unique ConnectX setup.
@@ -83,7 +86,7 @@ block-beta
 
 ## Connecting more than 2 Sparks in the cluster using a switch
 
-To connect more than 2 Sparks, you will need a proper switch, for example [Microtik CRS812-DDQ](https://mikrotik.com/product/crs812_ddq) or [Mikrotik CRS804-DDQ](https://mikrotik.com/product/crs804_ddq).
+For a switch-connected cluster, use a suitable QSFP/RoCE switch, for example [Microtik CRS812-DDQ](https://mikrotik.com/product/crs812_ddq) or [Mikrotik CRS804-DDQ](https://mikrotik.com/product/crs804_ddq).
 Please refer to [this post](https://forums.developer.nvidia.com/t/6x-spark-setup/354399/56) for an example of setting up a 6-8 node Spark cluster.
 
 ## Network setup
@@ -444,3 +447,304 @@ mpirun -np 3 -H spark1:1,spark2:1,spark3:1 \
   -x LD_LIBRARY_PATH=$LD_LIBRARY_PATH -x NCCL_IB_MERGE_NICS=0 -x NCCL_NET_PLUGIN=none -x NCCL_IB_SUBNET_AWARE_ROUTING=1 \
   $HOME/nccl-tests/build/all_gather_perf -b 16G -e 16G -f 3
 ```
+
+## Closed rings of four or more Sparks
+
+A closed ring connects each Spark's two QSFP ports to two different neighbors.
+Keep all nodes on the management network and configure passwordless SSH similarly to other topologies. 
+
+Assign each link's addressed CX-7 interfaces their
+own subnet, as in the three-node mesh setup above. Discovery requires Python 3,
+`ibdev2netdev`, `ip`, and `ping` on every node.
+
+### Example: four-node ring
+
+Use four QSFP cables to connect `spark1 -> spark2 -> spark3 -> spark4 -> spark1`.
+Connect port 0 of each Spark to port 1 of the next Spark, including the closing
+cable from `spark4` to `spark1`:
+
+```mermaid
+flowchart LR
+    s1["spark1 (head)"]
+    s2["spark2"]
+    s3["spark3"]
+    s4["spark4"]
+    s1 <-->|"spark1 port 0 / spark2 port 1"| s2
+    s2 <-->|"spark2 port 0 / spark3 port 1"| s3
+    s3 <-->|"spark3 port 0 / spark4 port 1"| s4
+    s4 <-->|"spark4 port 0 / spark1 port 1"| s1
+```
+
+All four Sparks also connect to the same management LAN through their RJ-45
+ports. The example assumes these management identities on `enP7s7`:
+
+| Node | Management address | Rank |
+| :--- | :--- | :--- |
+| `spark1` | `192.0.2.11` | 0 (head) |
+| `spark2` | `192.0.2.12` | 1 |
+| `spark3` | `192.0.2.13` | 2 |
+| `spark4` | `192.0.2.14` | 3 |
+
+These are documentation addresses; use the nodes' actual management addresses.
+Keep the management LAN configuration in its existing netplan file. The CX-7
+examples below use eight separate `/24` subnets: two per cable, one for each
+PCIe rail. Choose subnets that do not overlap your other networks.
+
+| Cable | First endpoint | Second endpoint | CX-7 subnets |
+| :--- | :--- | :--- | :--- |
+| 1 | `spark1` port 0 | `spark2` port 1 | `10.20.0.0/24`, `10.20.1.0/24` |
+| 2 | `spark2` port 0 | `spark3` port 1 | `10.20.2.0/24`, `10.20.3.0/24` |
+| 3 | `spark3` port 0 | `spark4` port 1 | `10.20.4.0/24`, `10.20.5.0/24` |
+| 4 | `spark4` port 0 | `spark1` port 1 | `10.20.6.0/24`, `10.20.7.0/24` |
+
+Port 0 uses `enp1s0f0np0` and `enP2p1s0f0np0`; port 1 uses
+`enp1s0f1np1` and `enP2p1s0f1np1`. Both endpoints of each rail must use the
+same subnet and MTU. This example uses MTU 9000 throughout.
+
+Create `/etc/netplan/40-cx7.yaml` on each node with its corresponding content
+below. If those interfaces already have netplan definitions, update those
+definitions to match the example instead of adding duplicate entries.
+
+**spark1:**
+
+```yaml
+network:
+  version: 2
+  ethernets:
+    enp1s0f0np0:
+      dhcp4: no
+      dhcp6: no
+      link-local: []
+      mtu: 9000
+      addresses: [10.20.0.11/24]
+    enP2p1s0f0np0:
+      dhcp4: no
+      dhcp6: no
+      link-local: []
+      mtu: 9000
+      addresses: [10.20.1.11/24]
+    enp1s0f1np1:
+      dhcp4: no
+      dhcp6: no
+      link-local: []
+      mtu: 9000
+      addresses: [10.20.6.11/24]
+    enP2p1s0f1np1:
+      dhcp4: no
+      dhcp6: no
+      link-local: []
+      mtu: 9000
+      addresses: [10.20.7.11/24]
+```
+
+**spark2:**
+
+```yaml
+network:
+  version: 2
+  ethernets:
+    enp1s0f0np0:
+      dhcp4: no
+      dhcp6: no
+      link-local: []
+      mtu: 9000
+      addresses: [10.20.2.12/24]
+    enP2p1s0f0np0:
+      dhcp4: no
+      dhcp6: no
+      link-local: []
+      mtu: 9000
+      addresses: [10.20.3.12/24]
+    enp1s0f1np1:
+      dhcp4: no
+      dhcp6: no
+      link-local: []
+      mtu: 9000
+      addresses: [10.20.0.12/24]
+    enP2p1s0f1np1:
+      dhcp4: no
+      dhcp6: no
+      link-local: []
+      mtu: 9000
+      addresses: [10.20.1.12/24]
+```
+
+**spark3:**
+
+```yaml
+network:
+  version: 2
+  ethernets:
+    enp1s0f0np0:
+      dhcp4: no
+      dhcp6: no
+      link-local: []
+      mtu: 9000
+      addresses: [10.20.4.13/24]
+    enP2p1s0f0np0:
+      dhcp4: no
+      dhcp6: no
+      link-local: []
+      mtu: 9000
+      addresses: [10.20.5.13/24]
+    enp1s0f1np1:
+      dhcp4: no
+      dhcp6: no
+      link-local: []
+      mtu: 9000
+      addresses: [10.20.2.13/24]
+    enP2p1s0f1np1:
+      dhcp4: no
+      dhcp6: no
+      link-local: []
+      mtu: 9000
+      addresses: [10.20.3.13/24]
+```
+
+**spark4:**
+
+```yaml
+network:
+  version: 2
+  ethernets:
+    enp1s0f0np0:
+      dhcp4: no
+      dhcp6: no
+      link-local: []
+      mtu: 9000
+      addresses: [10.20.6.14/24]
+    enP2p1s0f0np0:
+      dhcp4: no
+      dhcp6: no
+      link-local: []
+      mtu: 9000
+      addresses: [10.20.7.14/24]
+    enp1s0f1np1:
+      dhcp4: no
+      dhcp6: no
+      link-local: []
+      mtu: 9000
+      addresses: [10.20.4.14/24]
+    enP2p1s0f1np1:
+      dhcp4: no
+      dhcp6: no
+      link-local: []
+      mtu: 9000
+      addresses: [10.20.5.14/24]
+```
+
+On each node, validate and apply its configuration:
+
+```bash
+sudo chmod 600 /etc/netplan/40-cx7.yaml
+sudo netplan generate
+sudo netplan apply
+ibdev2netdev
+```
+
+All four RoCE interfaces should report `Up`. Check the two neighbors from each
+node, binding each ping to the matching interface. For example, on `spark1`:
+
+```bash
+# spark2, reached through spark1 port 0
+ping -c 3 -I enp1s0f0np0 10.20.0.12
+ping -c 3 -I enP2p1s0f0np0 10.20.1.12
+# spark4, reached through spark1 port 1
+ping -c 3 -I enp1s0f1np1 10.20.6.14
+ping -c 3 -I enP2p1s0f1np1 10.20.7.14
+```
+
+Use the existing [passwordless SSH configurator](#passwordless-ssh-and-benchmarks)
+to enable access from the head to every node. With `spark1` as head, the expected
+rank order is `spark1, spark2, spark3, spark4`; `spark3` is the indirect copy
+destination and is reached through `spark2`. Discovery derives that path from
+the links, without extra SSH-user or jump-host fields in `.env`.
+
+### Discovery, distribution, and launch
+
+Management discovery already finds the whole cluster. With four or more nodes
+in mesh mode, discovery also inspects the active RoCE interfaces on each node
+and verifies matching subnets in both directions. It counts the twin rails as
+one neighbor. When the resulting graph is a closed ring, it orders
+`CLUSTER_NODES` along that ring, with the local node first, and saves the link
+endpoints in the same `.env` file:
+
+```bash
+./run-recipe.sh --discover
+```
+
+The only new field is `CLUSTER_LINKS`: a single-line JSON list of links, enclosed
+in single quotes. Each link maps two management IPv4 addresses to their
+respective CX-7 IPv4 addresses. For the four-node example above, the generated
+rank order and first rail of each cable look like this:
+
+```dotenv
+CLUSTER_NODES=192.0.2.11,192.0.2.12,192.0.2.13,192.0.2.14
+CLUSTER_LINKS='[{"192.0.2.11":"10.20.0.11","192.0.2.12":"10.20.0.12"},{"192.0.2.12":"10.20.2.12","192.0.2.13":"10.20.2.13"},{"192.0.2.13":"10.20.4.13","192.0.2.14":"10.20.4.14"},{"192.0.2.14":"10.20.6.14","192.0.2.11":"10.20.6.11"}]'
+```
+
+This example shows one rail per cable; discovery saves every verified addressed
+rail. Existing `LOCAL_IP`, `ETH_IF`, and `IB_IF` fields remain in the file.
+Discovery also saves the existing NCCL settings `CONTAINER_NCCL_ALGO=Ring`,
+`CONTAINER_NCCL_NET_PLUGIN=none`, `CONTAINER_NCCL_IB_SUBNET_AWARE_ROUTING=1`, and
+`CONTAINER_NCCL_IB_MERGE_NICS=0`. There is no additional topology type, rank-order
+list, SSH user, or saved copy-route table.
+
+For a ring, launch validation checks the selected ranks, including any trimming
+caused by the requested parallelism. The native backend preserves rank placement;
+Ray and mixed TP/PP/DP layouts are currently rejected for a sparse ring. Use the
+full ring with tensor parallelism, a directly connected pair, or solo mode.
+Selecting three nodes from a four-node ring breaks its closing link and is
+rejected before containers start. Ring defaults are supplied when omitted;
+conflicting NCCL settings are rejected. Automatic NCCL algorithm selection may
+attempt connections between non-neighbor nodes, which caused QP timeouts in the
+four-node validation. SSH jump paths do not provide RDMA routing for NCCL.
+
+Image and model distribution derive shortest paths through the saved links.
+Direct neighbors receive transfers directly; other nodes use SSH `ProxyJump`
+through as many intermediate nodes as needed, without staging weights or images
+on those nodes. These are TCP transfers over CX-7; every jump host must permit
+SSH TCP forwarding.
+Existing SSH identities, authentication, and host-key configuration are reused.
+Temporary SSH routing files are removed when each transfer finishes.
+
+There is no four-node limit in discovery or distribution. For example, the
+farthest destination in a six-node ring uses two jump hosts; in an eight-node
+ring it uses three. Mocked integration tests cover discovery, rank validation,
+and image/model distribution to every worker in both serial and parallel modes
+for those sizes. Physical NCCL inference has been validated on four nodes;
+larger-ring inference still needs validation with the intended model and tensor
+parallel size. Each copy originates at the head, so concurrent transfers share
+link bandwidth and SSH forwarding capacity; distribution throughput does not
+scale linearly with the number of nodes.
+
+```bash
+# Preview the four-node launch before setup
+./run-recipe.sh recipes/qwen3.8-27b-nvfp4-dflash2.yaml --tp 4 --dry-run
+# Download/build as needed, distribute to all workers, and launch
+./run-recipe.sh recipes/qwen3.8-27b-nvfp4-dflash2.yaml --tp 4 --setup
+```
+
+To distribute an existing image or a model separately:
+
+```bash
+./build-and-copy.sh --no-build -c --copy-parallel
+./hf-download.sh org/model -c --copy-parallel
+```
+
+New ring configs omit `COPY_HOSTS`, so `-c` includes every worker. Explicit
+`--copy-to` hosts or an explicitly saved `COPY_HOSTS` subset still select only
+those destinations. Management addresses and saved link addresses are accepted
+as destinations. Recipe setup forwards the selected config to both copy scripts,
+compares image IDs through the same routes, and distributes models even when
+already cached on the head.
+
+Two-node, three-node mesh, and switch-connected configurations retain their
+existing discovery, NCCL, and `COPY_HOSTS` behavior. A complete graph discovered
+with four active NICs follows the legacy copy scan. Autodiscovery leaves
+`NCCL_ALGO` unset on those topologies; it sets `Ring` for a true ring. Existing
+config files without `CLUSTER_LINKS` continue to work unchanged; rediscover to
+enable ring support.
+Saved links describe the network at discovery time. Run discovery again after
+recabling or changing addresses; copy failures do not silently fall back to the
+management network.

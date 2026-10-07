@@ -64,6 +64,9 @@ setup_fixture() {
     cp "$PROJECT_DIR/Dockerfile" "$FIXTURE_DIR/"
     cp "$PROJECT_DIR/Dockerfile.mxfp4" "$FIXTURE_DIR/"
     cp -a "$PROJECT_DIR/docker" "$FIXTURE_DIR/"
+    LOCAL_INSPECT_FILE="$PROJECT_DIR/tests/fixtures/image-identity/classic.json"
+    REMOTE_INSPECT_FILE="$PROJECT_DIR/tests/fixtures/image-identity/containerd.json"
+    export LOCAL_INSPECT_FILE REMOTE_INSPECT_FILE
     mkdir -p \
         "$FIXTURE_DIR/.wheel-cache/flashinfer/regular" \
         "$FIXTURE_DIR/.wheel-cache/flashinfer/custom" \
@@ -137,8 +140,15 @@ if [ "${1:-}" = "build" ]; then
     )
 fi
 if [ "${1:-}" = "image" ] && [ "${2:-}" = "inspect" ]; then
-    echo "${LOCAL_IMAGE_ID:-sha256:local}"
-    exit 0
+    if [ "${LOCAL_IMAGE_MISSING:-false}" = true ]; then
+        exit 1
+    fi
+    if [ "${3:-}" = "--format" ]; then
+        echo "${LOCAL_IMAGE_ID:-sha256:local}"
+        exit 0
+    fi
+    cat "$LOCAL_INSPECT_FILE"
+    exit "${LOCAL_INSPECT_STATUS:-0}"
 fi
 if [ "${1:-}" = "save" ]; then
     out=""
@@ -164,6 +174,10 @@ target="${1:-}"
 host="${target#*@}"
 cmd="${*:2}"
 if [[ "$cmd" == *"docker image inspect"* ]]; then
+    if [[ "$cmd" != *"--format"* ]]; then
+        cat "$REMOTE_INSPECT_FILE"
+        exit "${REMOTE_INSPECT_STATUS:-0}"
+    fi
     case "$host" in
         samehost)
             echo "${LOCAL_IMAGE_ID:-sha256:local}"
@@ -654,11 +668,85 @@ test_copy_skips_matching_remote_image() {
 
 test_copy_only_updates_missing_or_different_hosts() {
     setup_fixture
-    run_build -c samehost,host1 --copy-parallel || fail "mixed remote copy run failed"
+    REMOTE_INSPECT_FILE="$CASE_DIR/different.json"
+    sed 's/2222222222/3333333333/g' "$LOCAL_INSPECT_FILE" > "$REMOTE_INSPECT_FILE"
+    run_build -c samehost,diffhost,host1 --copy-parallel || fail "mixed remote copy run failed"
     assert_log_contains '^docker save -o .* vllm-node$'
     assert_log_not_contains '^ssh .*@samehost docker load$'
     assert_log_contains '^ssh .*@host1 docker load$'
-    pass "copy loads only hosts whose image ID is missing or different"
+    assert_log_contains '^ssh .*@diffhost docker load$'
+    pass "copy loads only hosts whose image content is missing or different"
+}
+
+test_copy_skips_matching_content_across_stores() {
+    for parallel in false true; do
+        setup_fixture
+        if [ "$parallel" = true ]; then
+            run_build --no-build -c diffhost --copy-parallel || fail "parallel mixed-store copy check failed"
+        else
+            run_build --no-build -c diffhost || fail "mixed-store copy check failed"
+        fi
+        assert_log_contains '^docker image inspect sha256:local$'
+        assert_log_contains '^ssh .*@diffhost docker image inspect sha256:remote$'
+        assert_log_not_contains '^docker save '
+        assert_log_not_contains '^ssh .* docker load$'
+        assert_output_contains 'skipping \(matching image content\)'
+    done
+    pass "matching content skips save/load across stores in serial and parallel modes"
+}
+
+test_copy_mixed_stores_only_loads_missing_hosts() {
+    setup_fixture
+    run_build --no-build -c samehost,diffhost,host1 --copy-parallel || fail "mixed-store partial copy failed"
+    assert_log_contains '^docker save '
+    assert_log_not_contains '^ssh .*@samehost docker load$'
+    assert_log_not_contains '^ssh .*@diffhost docker load$'
+    assert_log_contains '^ssh .*@host1 docker load$'
+    pass "mixed-store content matches skip individual hosts during a parallel copy"
+}
+
+test_copy_detects_changed_runtime_config() {
+    setup_fixture
+    REMOTE_INSPECT_FILE="$CASE_DIR/different-config.json"
+    sed 's/"bash"/"python3"/' "$LOCAL_INSPECT_FILE" > "$REMOTE_INSPECT_FILE"
+    run_build --no-build -c diffhost || fail "config mismatch copy run failed"
+    assert_log_contains '^docker save '
+    assert_log_contains '^ssh .*@diffhost docker load$'
+    pass "matching layers with different runtime config still trigger copy"
+}
+
+test_copy_does_not_skip_unreadable_content() {
+    for side in local remote; do
+        for failure in malformed command; do
+            setup_fixture
+            if [ "$failure" = malformed ]; then
+                if [ "$side" = local ]; then
+                    LOCAL_INSPECT_FILE=/dev/null
+                else
+                    REMOTE_INSPECT_FILE=/dev/null
+                fi
+                run_build --no-build -c diffhost || fail "unreadable metadata copy failed"
+            elif [ "$side" = local ]; then
+                LOCAL_INSPECT_STATUS=1 run_build --no-build -c diffhost || fail "local inspect failure copy failed"
+            else
+                REMOTE_INSPECT_STATUS=1 run_build --no-build -c diffhost || fail "remote inspect failure copy failed"
+            fi
+            assert_log_contains '^docker save '
+            assert_log_contains '^ssh .*@diffhost docker load$'
+        done
+    done
+    pass "unreadable metadata or failed inspection cannot skip copying different IDs"
+}
+
+test_copy_missing_local_image_fails() {
+    setup_fixture
+    if LOCAL_IMAGE_MISSING=true run_build --no-build -c diffhost; then
+        fail "copy succeeded without a local image"
+    fi
+    assert_output_contains "Local image 'vllm-node' not found"
+    assert_log_not_contains '^docker save '
+    assert_log_not_contains '^ssh .* docker load$'
+    pass "missing local image stops copying"
 }
 
 test_no_build_skips_prebuilt() {
@@ -1713,6 +1801,11 @@ test_cleanup_stays_prebuilt
 test_prebuilt_copy_parallel
 test_copy_skips_matching_remote_image
 test_copy_only_updates_missing_or_different_hosts
+test_copy_skips_matching_content_across_stores
+test_copy_mixed_stores_only_loads_missing_hosts
+test_copy_detects_changed_runtime_config
+test_copy_does_not_skip_unreadable_content
+test_copy_missing_local_image_fails
 test_no_build_skips_prebuilt
 test_build_only_flags_warn_on_prebuilt
 test_flashinfer_ref_forwards_selected_ref

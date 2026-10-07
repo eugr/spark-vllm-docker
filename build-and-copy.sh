@@ -249,15 +249,25 @@ prepare_local_vllm_source() {
 get_remote_image_id() {
     local host="$1"
     local image="$2"
-    ssh "${SSH_USER}@${host}" "docker image inspect --format '{{.Id}}' ${image}" 2>/dev/null
+    local inspect_cmd
+    printf -v inspect_cmd "docker image inspect --format '{{.Id}}' %q" "$image"
+    cluster_copy_ssh "$host" "$inspect_cmd" 2>/dev/null
 }
+
+get_remote_image_fingerprint() (
+    set -o pipefail
+    local inspect_cmd
+    printf -v inspect_cmd 'docker image inspect %q' "$2"
+    cluster_copy_ssh "$1" "$inspect_cmd" |
+        python3 "$SCRIPT_DIR/docker/image_identity.py"
+)
 
 copy_to_host() {
     local host="$1"
     echo "Loading image into ${SSH_USER}@${host}..."
     local host_copy_start host_copy_end host_copy_time
     host_copy_start=$(date +%s)
-    if cat "$TMP_IMAGE" | ssh "${SSH_USER}@${host}" "docker load"; then
+    if cluster_copy_ssh "$host" "docker load" < "$TMP_IMAGE"; then
         host_copy_end=$(date +%s)
         host_copy_time=$((host_copy_end - host_copy_start))
         printf "Copy to %s completed in %02d:%02d:%02d\n" "$host" $((host_copy_time/3600)) $((host_copy_time%3600/60)) $((host_copy_time%60))
@@ -921,6 +931,9 @@ if [ "$COPY_TO_FLAG" = true ] && [ "${#COPY_HOSTS[@]}" -eq 0 ]; then
         echo "Using COPY_HOSTS from .env: $DOTENV_COPY_HOSTS"
         IFS=',' read -ra HOSTS_FROM_ENV <<< "$DOTENV_COPY_HOSTS"
         COPY_HOSTS=("${HOSTS_FROM_ENV[@]}")
+    elif [[ -n "${DOTENV_CLUSTER_LINKS:-}" ]]; then
+        IFS=',' read -ra COPY_HOSTS <<< "${DOTENV_CLUSTER_NODES#*,}"
+        [[ "$DOTENV_CLUSTER_NODES" == *,* ]] || COPY_HOSTS=()
     else
         echo "No hosts specified. Using autodiscovery..."
         detect_interfaces || { echo "Error: Interface detection failed."; exit 1; }
@@ -938,6 +951,10 @@ if [ "$COPY_TO_FLAG" = true ] && [ "${#COPY_HOSTS[@]}" -eq 0 ]; then
         fi
         echo "Autodiscovered hosts: ${COPY_HOSTS[*]}"
     fi
+fi
+
+if [[ "$COPY_TO_FLAG" == true && -n "${DOTENV_CLUSTER_LINKS:-}" ]]; then
+    python3 "$SCRIPT_DIR/cluster_topology.py" check || exit 1
 fi
 
 # Validate flag combinations
@@ -1412,24 +1429,43 @@ if [ "${#COPY_HOSTS[@]}" -gt 0 ]; then
     echo "Checking image '$IMAGE_TAG' on ${#COPY_HOSTS[@]} host(s): ${COPY_HOSTS[*]}"
     COPY_START=$(date +%s)
 
-    if ! LOCAL_IMAGE_ID=$(docker image inspect --format '{{.Id}}' "$IMAGE_TAG"); then
+    if ! LOCAL_IMAGE_ID=$(docker image inspect --format '{{.Id}}' "$IMAGE_TAG") || [ -z "$LOCAL_IMAGE_ID" ]; then
         echo "Error: Local image '$IMAGE_TAG' not found."
         exit 1
     fi
 
     COPY_TARGETS=()
+    LOCAL_IMAGE_FINGERPRINT=""
+    LOCAL_FINGERPRINT_CHECKED=false
     for host in "${COPY_HOSTS[@]}"; do
-        REMOTE_IMAGE_ID=$(get_remote_image_id "$host" "$IMAGE_TAG" || true)
+        REMOTE_IMAGE_ID=$(get_remote_image_id "$host" "$IMAGE_TAG") || REMOTE_IMAGE_ID=""
         if [ -n "$REMOTE_IMAGE_ID" ] && [ "$REMOTE_IMAGE_ID" = "$LOCAL_IMAGE_ID" ]; then
             echo "Image '$IMAGE_TAG' is already up to date on ${SSH_USER}@${host}; skipping."
-        else
-            if [ -n "$REMOTE_IMAGE_ID" ]; then
-                echo "Image '$IMAGE_TAG' differs on ${SSH_USER}@${host}; will copy."
-            else
-                echo "Image '$IMAGE_TAG' not found on ${SSH_USER}@${host}; will copy."
-            fi
-            COPY_TARGETS+=("$host")
+            continue
         fi
+        if [ -n "$REMOTE_IMAGE_ID" ]; then
+            # Different stores can report different IDs for identical content.
+            # Inspect the resolved IDs so a retag cannot change this comparison.
+            if [ "$LOCAL_FINGERPRINT_CHECKED" = false ]; then
+                LOCAL_FINGERPRINT_CHECKED=true
+                LOCAL_IMAGE_FINGERPRINT=$(
+                    set -o pipefail
+                    docker image inspect "$LOCAL_IMAGE_ID" |
+                        python3 "$SCRIPT_DIR/docker/image_identity.py"
+                ) 2>/dev/null || LOCAL_IMAGE_FINGERPRINT=""
+            fi
+            if [ -n "$LOCAL_IMAGE_FINGERPRINT" ]; then
+                REMOTE_IMAGE_FINGERPRINT=$(get_remote_image_fingerprint "$host" "$REMOTE_IMAGE_ID" 2>/dev/null) || REMOTE_IMAGE_FINGERPRINT=""
+                if [ "$REMOTE_IMAGE_FINGERPRINT" = "$LOCAL_IMAGE_FINGERPRINT" ]; then
+                    echo "Image '$IMAGE_TAG' is already up to date on ${SSH_USER}@${host}; skipping (matching image content)."
+                    continue
+                fi
+            fi
+            echo "Image '$IMAGE_TAG' differs on ${SSH_USER}@${host}; will copy."
+        else
+            echo "Image '$IMAGE_TAG' not found on ${SSH_USER}@${host}; will copy."
+        fi
+        COPY_TARGETS+=("$host")
     done
 
     if [ "${#COPY_TARGETS[@]}" -eq 0 ]; then

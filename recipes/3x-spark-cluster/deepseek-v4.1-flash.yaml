@@ -1,0 +1,58 @@
+# Recipe: DeepSeek V4.1 Flash (3x DGX Spark)
+
+recipe_version: "1"
+name: DeepSeek-V4.1-Flash (TP=3)
+description: DeepSeek V4.1 Flash on three DGX Sparks with B12X and DSpark speculative decoding
+
+model: deepseek-ai/DeepSeek-V4.1-Flash
+container: vllm-node-b12x
+
+build_args:
+  - --exp-b12x
+
+cluster_only: true
+
+defaults:
+  port: 8000
+  host: 0.0.0.0
+  tensor_parallel: 3
+  block_size: 256
+  gpu_memory_utilization: 0.87
+  max_model_len: auto
+  max_num_seqs: 2
+  max_num_batched_tokens: 4096
+  num_speculative_tokens: 7
+  kv_cache_memory_bytes: "0.5g"
+
+env:
+  VLLM_ENABLE_ROCE_ALLREDUCE: "1"
+  VLLM_ROCE_ALLREDUCE_MAX_SIZE: "2MB"
+  B12X_COMPILE_WORKERS: "4"
+  CUTE_DSL_ARCH: "sm_121a"
+  VLLM_USE_V2_MODEL_RUNNER: "1"
+  VLLM_USE_BREAKABLE_CUDAGRAPH: "1"
+  VLLM_MXFP8_LM_HEAD: "1"
+
+command: |
+  vllm serve deepseek-ai/DeepSeek-V4.1-Flash \
+      --host {host} \
+      --port {port} \
+      --dtype bfloat16 \
+      --tensor-parallel-size {tensor_parallel} \
+      --load-format b12x \
+      --block-size {block_size} \
+      --enable-prefix-caching \
+      --gpu-memory-utilization {gpu_memory_utilization} \
+      --max-model-len {max_model_len} \
+      --max-num-seqs {max_num_seqs} \
+      --max-num-batched-tokens {max_num_batched_tokens} \
+      --limit-mm-per-prompt '{{"image":1}}' \
+      --engram-config '{{"cpu_offload":false,"table_memory":"disk"}}' \
+      --linear-backend b12x \
+      --moe-backend b12x \
+      --attention-backend b12x \
+      --speculative-config '{{"method":"dspark","num_speculative_tokens":{num_speculative_tokens},"draft_tensor_parallel_size":{tensor_parallel},"attention_backend":"B12X","draft_sample_method":"probabilistic","rejection_sample_method":"standard","enable_adaptive_verification":true}}' \
+      --reasoning-parser deepseek_v41 \
+      --tool-call-parser deepseek_v41 \
+      --enable-auto-tool-choice \
+      --kv-cache-memory-bytes {kv_cache_memory_bytes}

@@ -17,6 +17,7 @@ SSH_USER=testuser
 # Load only the function so configuration, discovery, and downloads cannot run.
 sed -n '/^copy_model_to_host() {$/,/^}$/p' "$PROJECT_DIR/hf-download.sh" > "$TMP_DIR/copy-function.sh"
 source "$TMP_DIR/copy-function.sh"
+source <(sed -n '/^cluster_copy_rsync() {$/,/^}$/p' "$PROJECT_DIR/autodiscover.sh")
 
 rsync() {
     local args=("$@")
