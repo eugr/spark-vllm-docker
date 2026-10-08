@@ -9,6 +9,9 @@ description: vLLM serving nvidia/Qwen3.6-35B-A3B-NVFP4 with Marlin MoE backend
 model: nvidia/Qwen3.6-35B-A3B-NVFP4
 
 # Container image to use
+mods:
+  - mods/fix-qwen3.6-chat-template
+
 container: vllm-node
 
 # Default settings (can be overridden via CLI)
@@ -39,6 +42,7 @@ command: |
     --max-model-len {max_model_len} \
     --max-num-seqs {max_num_seqs} \
     --max-num-batched-tokens {max_num_batched_tokens} \
+    --chat-template fixed_chat_template.jinja \
     --enable-chunked-prefill \
     --async-scheduling \
     --enable-prefix-caching \
