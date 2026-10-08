@@ -381,7 +381,9 @@ startup timing is not a benchmark. It never introduces distributed collectives.
 Runtime observation failures warn and preserve the original vLLM operation or
 exception; source layouts that lack the required hooks are rejected before
 patching. Regular and B12X V1 worker layouts, including their V2 model runners,
-are supported. Other engines/backends are not covered by this mod.
+are supported. The admission hook accepts both the two-argument `request_memory`
+call and the newer call with `external_weight_memory`, forwarding that argument
+unchanged. Other engines/backends are not covered by this mod.
 
 Run the CPU-only regression suite with:
 

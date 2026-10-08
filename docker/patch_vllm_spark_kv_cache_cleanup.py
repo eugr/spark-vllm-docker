@@ -152,6 +152,32 @@ if not profile_cleanup_present:
     ]
     changed = True
 
+cpu_trim_marker = "spark-vllm-docker: trim CPU heap before KV cache sizing"
+if cpu_trim_marker not in "".join(lines):
+    # Apply to our cleanup block or an equivalent upstream refresh. The CPU
+    # pages must be returned before measuring/recomputing the non-KV charge,
+    # including before B12X takes its later final_profile_snapshot.
+    index, match = find_line(
+        r"^(?P<indent>[ \t]+)profile_result\.after_profile\.measure\(\)\n$"
+    )
+    indent = match.group("indent")
+    lines[index:index] = [
+        f"{indent}# {cpu_trim_marker}.\n",
+        f"{indent}# On UMA, glibc-held CPU pages also reduce available GPU memory.\n",
+        f"{indent}# Startup's post-warmup trim runs too late to enlarge the cache.\n",
+        f"{indent}try:\n",
+        f"{indent}    import ctypes\n",
+        "\n",
+        f"{indent}    malloc_trim = ctypes.CDLL(None).malloc_trim\n",
+        f"{indent}    malloc_trim.argtypes = [ctypes.c_size_t]\n",
+        f"{indent}    malloc_trim.restype = ctypes.c_int\n",
+        f"{indent}    malloc_trim(0)\n",
+        f"{indent}except (AttributeError, OSError):\n",
+        f"{indent}    # Non-glibc platforms/allocators may not provide malloc_trim.\n",
+        f"{indent}    pass\n",
+    ]
+    changed = True
+
 if not prealloc_cleanup_present:
     func_index = None
     func_indent = None

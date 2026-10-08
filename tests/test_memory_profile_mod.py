@@ -78,6 +78,24 @@ class PatchTests(unittest.TestCase):
         self.assertEqual((self.package / "v1/worker/gpu_worker.py").read_text(), WORKER)
         self.assertFalse((self.root / "output").exists())
 
+    def test_regular_admission_with_external_weight_memory(self):
+        for argument in ("external_weight_memory", "external_weight_memory=external_weight_memory"):
+            with self.subTest(argument=argument):
+                source = WORKER.replace("self.init_snapshot, self.cache_config)",
+                                        f"self.init_snapshot, self.cache_config, {argument})")
+                result = PATCHER.patched(source, "worker")
+                self.assertTrue(result.startswith(source.rstrip()))
+                self.assertEqual(PATCHER.patched(result, "worker"), result)
+
+    def test_unsupported_admission_still_fails_before_writes(self):
+        target = self.package / "v1/worker/gpu_worker.py"
+        source = WORKER.replace("self.init_snapshot, self.cache_config", "self.init_snapshot")
+        target.write_text(source)
+        with patch.dict(os.environ, self.env), self.assertRaisesRegex(ValueError, "request_memory"):
+            PATCHER.install(self.package)
+        self.assertEqual(target.read_text(), source)
+        self.assertFalse((self.root / "output").exists())
+
     def test_legacy_lifespan_location(self):
         original = self.package / "entrypoints/launchers/utils/server_utils.py"
         original.unlink()
@@ -174,6 +192,31 @@ class ProbeTests(unittest.TestCase):
         with patch.object(PROBE, "record", side_effect=lambda phase: order.append(phase)):
             PROBE.wrap_gc(original)()
         self.assertEqual(order, ["before_startup_gc", "original", "after_startup_gc"])
+
+    def test_admission_forwards_external_weights_and_preserves_failures(self):
+        for keyword in (False, True):
+            for fail in (False, True):
+                with self.subTest(keyword=keyword, fail=fail):
+                    request = Mock(return_value=70,
+                                   side_effect=ValueError("original admission failure") if fail else None)
+                    namespace = {"request_memory": request}
+                    exec(WORKER.split("from .utils import request_memory\n", 1)[1], namespace)
+                    PROBE.install_worker(namespace)
+                    snapshot = SimpleNamespace(free_memory=75, total_memory=100)
+                    cache = SimpleNamespace(gpu_memory_utilization=.8)
+                    args = (snapshot, cache) if keyword else (snapshot, cache, 10)
+                    kwargs = {"external_weight_memory": 10} if keyword else {}
+                    with patch.object(PROBE, "record") as record:
+                        if fail:
+                            with self.assertRaisesRegex(ValueError, "original admission failure"):
+                                namespace["request_memory"](*args, **kwargs)
+                        else:
+                            self.assertEqual(namespace["request_memory"](*args, **kwargs), 70)
+                    request.assert_called_once_with(*args, **kwargs)
+                    self.assertEqual(record.call_args_list[0].kwargs["snapshot"],
+                                     {"free_memory": 75, "total_memory": 100})
+                    phases = [call.args[0] for call in record.call_args_list]
+                    self.assertEqual(phases, ["utilization_check"] + ([] if fail else ["utilization_check_passed"]))
 
     def test_metadata_does_not_serialize_credentials_or_arbitrary_config(self):
         config = SimpleNamespace(model_config=SimpleNamespace(model="org/model", hf_config=None),

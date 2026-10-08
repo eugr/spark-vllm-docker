@@ -285,7 +285,14 @@ def select_hosts(count, config_path, explicit=None):
         return ['local']
     spec = importlib.util.spec_from_file_location('memory_capacity_runner', ROOT / 'run-recipe.py')
     runner = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(runner)
+    # Loading by path does not put the runner's sibling modules (including
+    # cluster_topology) on sys.path as invoking the script normally would.
+    original_path = sys.path[:]
+    try:
+        sys.path.insert(0, str(ROOT))
+        spec.loader.exec_module(runner)
+    finally:
+        sys.path[:] = original_path
     runner.ENV_FILE = config_path
     env = runner.load_env_file()
     nodes = runner.parse_nodes(env.get('CLUSTER_NODES'))
