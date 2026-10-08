@@ -48,8 +48,10 @@ def patched(source, kind):
             raise ValueError("Unsupported Worker startup methods")
         requests = [node for node in ast.walk(methods["init_device"]) if isinstance(node, ast.Call)
                     and isinstance(node.func, ast.Name) and node.func.id == "request_memory"]
-        if len(requests) != 1 or len(requests[0].args) != 2:
-            raise ValueError("Expected request_memory(snapshot, cache_config) in init_device")
+        # Newer regular builds also pass external_weight_memory. The runtime
+        # wrapper forwards that optional argument unchanged to vLLM.
+        if len(requests) != 1 or len(requests[0].args) not in (2, 3):
+            raise ValueError("Expected request_memory(snapshot, cache_config[, external_weight_memory]) in init_device")
     else:
         name = "freeze_gc_heap" if kind == "gc" else "lifespan"
         cls = ast.FunctionDef if kind == "gc" else ast.AsyncFunctionDef
