@@ -1,0 +1,92 @@
+# Recipe: MiMo-V2.6-Flash-RL (PP=3, three nodes)
+# Xiaomi MiMo-V2.6-Flash-RL (309B MoE, 15B active, MXFP4 experts + fp8
+# attention) as TP=1 x PP=3 across three DGX Spark nodes, one of which has
+# reduced memory (108 GB instead of 121 GB).
+#
+# Why PP and not TP=3: the model has 64 attention heads, 4 KV heads (8 on SWA
+# layers) and 256 routed experts -- none divisible by 3, so vLLM rejects
+# tensor_parallel_size=3 at startup. The 48 layers divide exactly into 16 per
+# pipeline stage, and ~58 GB of weights per stage fits the 108 GB node.
+#
+# Baseline first: no DFlash speculative decoding and no UCM KV offload. Both
+# are restricted or unverified upstream under PP>1 (see todo.md); carry them
+# over only after verification, together with their mods.
+
+recipe_version: "1"
+name: MiMo-V2.6-Flash-RL (PP=3, 3-node)
+description: vLLM serving XiaomiMiMo/MiMo-V2.6-Flash-RL with TP=1 x PP=3 across three DGX Spark nodes
+
+# HuggingFace model to download (optional, for --download-model)
+model: XiaomiMiMo/MiMo-V2.6-Flash-RL
+
+# Container image to use (vLLM main from 2026-09-21 or newer; needs the
+# mimo_v2 implementation incl. MXFP4 experts + bf16 router, PRs #57508/#57784)
+container: vllm-node
+
+# ~173 GB of weights: three-node split. Two-node TP=2 would place ~86.5 GB of
+# weights on the 108 GB node (0.87 -> 94.0 GB budget), leaving no KV headroom.
+cluster_only: true
+
+# Baseline carries only the fp8 KV enablement mod (required by
+# --kv-cache-dtype fp8). When PP>1 is verified, add mods/mimo-v2.6-flash with
+# DFlash and mods/ucm-kv-offload with the UCM connector.
+mods:
+  - mods/mimo-diffkv-fp8-kv
+
+defaults:
+  port: 8000
+  host: 0.0.0.0
+  tensor_parallel: 1
+  pipeline_parallel: 3
+  gpu_memory_utilization: 0.87
+  max_model_len: 1048576
+  max_num_seqs: 8
+  max_num_batched_tokens: 8192
+
+# Environment variables
+env: {}
+
+# The vLLM serve command template
+# - --moe-backend marlin: the MXFP4 MoE auto-selection would pick DeepGEMM on
+#   sm_121; Marlin is the tested path for these experts (independent of the
+#   parallel layout).
+# - Hybrid 192/128 K/V head dims make the target select the *_DIFFKV attention
+#   backends (Triton on sm_121, where FlashAttention has no sink support).
+# - Memory: 0.87 x 108 GiB = 94.0 GiB on the reduced-memory node vs ~58 GiB of
+#   weights per pipeline stage -> ~30 GiB of KV/activation headroom; vLLM sizes
+#   the KV cache from the smallest worker. fp8 KV requires
+#   mods/mimo-diffkv-fp8-kv (upstream ignores --kv-cache-dtype for this model),
+#   and that mod must keep the full-attention layers' window unset: before the
+#   2026-09-23 fix it capped them at the model's 128-token sliding window, and
+#   long generations looped (see decisions.md). bf16 KV (drop the flag and the
+#   mod) measured 3.24M tokens at a 1M max-model-len.
+# - No --compilation-config: the default (PIECEWISE) cudagraph mode is used.
+#   FULL_DECODE_ONLY in the TP=2 recipes bought memory headroom on the 121 GB
+#   pool; at ~58 GB weights per stage that pressure is gone, and this repo has
+#   no precedent for FULL modes under PP>1.
+# - generation_config.json carries max_new_tokens=2048, which would become a
+#   server-wide max_tokens cap, so only top_p is taken over from it.
+# - No --speculative-config (DFlash) and no --kv-transfer-config (UCM):
+#   spec decode is restricted and KV connectors are partial under PP>1
+#   upstream. --no-async-scheduling is not needed here: the async+spec decode
+#   corruption (vllm#46669) requires a draft method this recipe omits.
+#   Launch with three nodes (-n addr1,addr2,addr3) or .env
+#   CLUSTER_NODES; nested recipes are passed by path.
+command: |
+  vllm serve XiaomiMiMo/MiMo-V2.6-Flash-RL \
+      --trust-remote-code \
+      --host {host} \
+      --port {port} \
+      --tensor-parallel-size {tensor_parallel} \
+      --pipeline-parallel-size {pipeline_parallel} \
+      --moe-backend marlin \
+      --max-model-len {max_model_len} \
+      --kv-cache-dtype fp8 \
+      --max-num-seqs {max_num_seqs} \
+      --max-num-batched-tokens {max_num_batched_tokens} \
+      --gpu-memory-utilization {gpu_memory_utilization} \
+      --generation-config vllm \
+      --override-generation-config '{{"top_p":0.95}}' \
+      --reasoning-parser mimo \
+      --tool-call-parser mimo \
+      --enable-auto-tool-choice
