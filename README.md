@@ -134,7 +134,7 @@ Launch the server:
     --port 8000 \
     --trust-remote-code \
     --kv-cache-dtype fp8 \
-    --gpu-memory-utilization 0.7 \
+    --gpu-memory-utilization 0.8 \
     --max-model-len 262144 \
     --max-num-seqs 8 \
     --max-num-batched-tokens 16384 \
