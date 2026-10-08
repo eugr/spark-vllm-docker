@@ -1,0 +1,49 @@
+# Recipe: Mistral-Small-4-119B-2603-NVFP4
+# Mistral-Small-4-119B-2603 model with NVFP4 quantization support
+
+recipe_version: "1"
+name: Mistral-Small-4-119B-2603-NVFP4
+description: vLLM serving Mistral-Small-4-119B-2603-NVFP4
+
+# HuggingFace model to download (optional, for --download-model)
+model: mistralai/Mistral-Small-4-119B-2603-NVFP4
+
+# Only solo now
+solo_only: true
+
+# Container image to use
+container: vllm-node-tf5
+
+build_args:
+  - --tf5
+
+# Mods
+mods:
+  - mods/fix-mistral-small-4-119b-2603-nvfp4
+
+# Default settings (can be overridden via CLI)
+defaults:
+  port: 8000
+  host: 0.0.0.0
+  tensor_parallel: 1
+  gpu_memory_utilization: 0.8
+  max_model_len: 262144
+  max_num_batched_tokens: 16384
+
+# Environment variables
+env: {}
+
+# The vLLM serve command template
+# see: https://huggingface.co/mistralai/Mistral-Small-4-119B-2603-NVFP4#serve-the-model
+command: |
+  vllm serve mistralai/Mistral-Small-4-119B-2603-NVFP4 \
+    --max-model-len {max_model_len} \
+    --gpu-memory-utilization {gpu_memory_utilization} \
+    --port {port} \
+    --host {host} \
+    --attention-backend TRITON_MLA \
+    --tool-call-parser mistral \
+    --enable-auto-tool-choice \
+    --reasoning-parser mistral \
+    --max-num-batched-tokens {max_num_batched_tokens}
+
