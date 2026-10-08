@@ -26,7 +26,7 @@ defaults:
   gpu_memory_utilization: 0.8
   max_model_len: 262144
   max_num_batched_tokens: 16384
-  enable_thinking: '{\"enable_thinking\":true}'
+  enable_thinking: '{\"enable_thinking\":false}'
 
 # Environment variables
 env: 
