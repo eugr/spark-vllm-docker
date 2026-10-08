@@ -643,8 +643,8 @@ RUN python3 /tmp/vllm-patches/patch_vllm_disable_minimax_qk_rmsnorm_ipc.py .
 # through this path. Preserve vector metadata when the destination slot matches.
 RUN python3 /tmp/vllm-patches/patch_vllm_routed_experts_weight_shape.py .
 
-# DGX Spark UMA cleanup: profile warmup can leave temporary CUDA allocator
-# reservations behind just before vLLM sizes and allocates KV cache blocks.
+# DGX Spark UMA cleanup for regular and B12X builds: release temporary CUDA
+# reservations and unused glibc CPU heap pages before measuring the KV budget.
 RUN python3 /tmp/vllm-patches/patch_vllm_spark_kv_cache_cleanup.py .
 
 # Return unused glibc CPU heap pages after startup GC in API servers and

@@ -1310,7 +1310,10 @@ PY
         fail "Spark KV cache cleanup patch accepted an unknown profiling snapshot"
     fi
 
-    pass "Spark KV cache cleanup supports upstream and B12X final-snapshot source shapes"
+    if ! python3 "$PROJECT_DIR/tests/test_vllm_spark_kv_cache_cleanup_patch.py"; then
+        fail "Pre-KV CPU heap trim regression tests failed"
+    fi
+    pass "Spark KV cache cleanup trims CPU heap before upstream and B12X budget measurements"
 }
 
 test_mrv2_speculator_cudagraph_pool_patch_is_guarded_and_idempotent() {
