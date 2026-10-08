@@ -15,6 +15,7 @@ on:
       - 'hf-cache.py'
       - 'recipes/**'
       - 'mods/fix-qwen3-next-autoround/**'
+      - 'mods/inkling-sm12-paged-kv/**'
       - 'mods/memory-profile/**'
       - 'tests/**'
       - '.github/workflows/test-recipes.yml'
@@ -31,6 +32,7 @@ on:
       - 'hf-cache.py'
       - 'recipes/**'
       - 'mods/fix-qwen3-next-autoround/**'
+      - 'mods/inkling-sm12-paged-kv/**'
       - 'mods/memory-profile/**'
       - 'tests/**'
       - '.github/workflows/test-recipes.yml'
@@ -66,6 +68,9 @@ jobs:
     
     - name: Test Qwen3-Next AutoRound compatibility mod
       run: python3 tests/test_qwen3_next_autoround_mod.py
+
+    - name: Test Inkling SM12 paged-KV mod patcher
+      run: python3 tests/test_inkling_sm12_paged_kv_mod.py
 
     - name: Test Hugging Face cache ownership repair
       run: python3 tests/test_hf_download_permissions.py
