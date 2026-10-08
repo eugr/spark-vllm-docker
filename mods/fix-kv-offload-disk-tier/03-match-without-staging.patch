@@ -1,0 +1,2985 @@
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/offloading/parking_gate.py b/vllm/distributed/kv_transfer/kv_connector/v1/offloading/parking_gate.py
+new file mode 100644
+index 0000000..cf546aa
+--- /dev/null
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/offloading/parking_gate.py
+@@ -0,0 +1,184 @@
++# SPDX-License-Identifier: Apache-2.0
++#
++# REQUEST PARKING (draft). Pure, dependency-free (stdlib only) admission-control
++# logic for the deepcached wave-streaming load path -- the decision of whether a
++# request with a known on-disk hit should be ADMITTED now, or PARKED (kept in
++# vLLM's "waiting" state, allocating nothing) until the primary tier has room.
++#
++# Why this exists: with matching decoupled from promotion (promote=False), the
++# old "the match truncates when the primary tier is full" safety valve is gone,
++# so ANY over-capacity request will demand the primary tier's rows. The
++# wave-streaming drafts bound the resulting contention (OPEN A) by retrying (A)
++# or by a restarting abort (B) -- both unsatisfying. Parking instead prevents
++# the request from ever ENTERING the contended state: it sits in vLLM's waiting
++# set (get_num_new_matched_tokens -> (None, ...), no GPU blocks, no primary
++# rows) until admission is guaranteed, then streams through as waves.
++#
++# Deliberately has NO vllm import so it can be unit-tested on the host without a
++# container -- run:  python3 parking_gate_test.py  (see alongside).
++#
++# SIZE INDEPENDENCE: the module never assumes a particular primary-tier size
++# (e.g. the historical ~498 rows). Capacity always arrives via TierState and all
++# policy thresholds are FRACTIONS of the tier, not row counts -- so it behaves
++# the same whether the primary tier is 4 GB (~hundreds of rows) or 1 GB (a
++# handful of rows), which is what you want given the primary tier is being
++# shrunk to free budget for more concurrent offloaded KV. Wiring the observables
++# up, and the "how to actually park / resume" mechanism, is the scheduler's job
++# (see README.md / INTEGRATION.md in this directory).
++from dataclasses import dataclass
++from enum import Enum
++
++
++class Admission(Enum):
++    """What the scheduler should do with a request this step.
++
++    PARK             -- put the request in the waiting set (return None from
++                        get_num_new_matched_tokens), allocate/promote nothing,
++                        re-decide next step. Cost: the request waits; benefit:
++                        it consumes zero GPU blocks and zero primary rows, so it
++                        contributes no contention of its own.
++    ADMIT_STREAM     -- admitted; slice the matched load into waves and let the
++                        wave driver stage+load it. Use when the tier can absorb
++                        the request alongside whoever is running now (or it is
++                        already mid-stream).
++    ADMIT_MONOLITHIC -- admitted; load it in today's single-shot monolithic job
++                        (no waves). Use for small demands or cold (no on-disk
++                        data) requests that must just compute.
++    """
++
++    PARK = "PARK"
++    ADMIT_STREAM = "ADMIT_STREAM"
++    ADMIT_MONOLITHIC = "ADMIT_MONOLITHIC"
++
++
++@dataclass(frozen=True)
++class AdmissionPolicy:
++    """Tunables for the admission decision. All capacity thresholds are
++    FRACTIONS of the primary tier's total rows, so the policy is indifferent to
++    whether the tier is 4 GB or 1 GB. Defaults sized for a home setup with at
++    most one over-ceiling request at a time."""
++
++    # Coexistence: fraction of the tier we refuse to let existing traffic fill
++    # past before parking a new request -- keeps headroom for unrelated
++    # concurrent requests so one request's staging never starves others.
++    max_occupancy: float = 0.5
++    # Absolute free-row floor, purely as a safety net for pathologically tiny
++    # tiers where occupancy ratios are meaningless. Independent of tier size.
++    min_free_absolute: int = 8
++    # One-LARGE-stream-at-a-time. When True, a request whose demand exceeds
++    # monolithic_max_fraction is PARKED while another such request holds the
++    # admission slot -- "wait for the previous big request to vacate the tier".
++    #
++    # REVIEW #4 (N3) -- what this does NOT do, stated precisely because the name
++    # over-promises: the slot is taken only on ADMIT_STREAM (parking_sm.
++    # slot_after), while `update_state_after_alloc` waves EVERY admitted request
++    # whenever STREAM_WAVE_CHUNKS > 0. So requests small enough to get
++    # ADMIT_MONOLITHIC still stream, concurrently, without holding the slot.
++    # Concurrency is therefore bounded by the occupancy guards below (which are
++    # real, now that free_rows counts evictable rows), not by this flag alone.
++    #
++    # That is deliberate, not an oversight: concurrent streams are CORRECT (the
++    # cross-request readiness hole that made them unsafe is fixed in
++    # tiering_manager.pop_ready_keys, N2), and serializing every on-disk hit --
++    # including two 10-chunk ones -- would throttle the box for no correctness
++    # benefit. If contention is ever MEASURED to matter, strict serialization is
++    # a one-line change in parking_sm.slot_after: take the slot on any ADMIT_*
++    # rather than only on ADMIT_STREAM.
++    #
++    # Note the third option is NOT available: "make ADMIT_MONOLITHIC actually
++    # load monolithically" would crash. With streaming on, the match walk runs
++    # promote=False, so nothing is resident when update_state_after_alloc's
++    # monolithic branch calls prepare_load -> `assert block is not None`.
++    serialize_streaming: bool = True
++    # Below this fraction of the tier, a request's staging need is small enough
++    # that it is not treated as an over-ceiling stream for admission purposes.
++    # (It is still loaded in waves when STREAM_WAVE_CHUNKS > 0 -- see the N3 note
++    # above; this fraction gates ADMISSION, not the load shape.)
++    monolithic_max_fraction: float = 0.5
++    # To admit a STREAM, at least this fraction of the tier must be free right
++    # now -- a working set of roughly one wave so the stream can make progress
++    # on its first wave without immediately exhausting the tier or starving
++    # unrelated traffic. This is NOT the request's total demand, which may
++    # exceed the entire tier (that is what waves are for).
++    stream_working_fraction: float = 0.4
++
++
++@dataclass(frozen=True)
++class TierState:
++    """Snapshot of primary-tier capacity at decision time."""
++
++    total_rows: int   # total staging rows (whatever capacity is configured)
++    free_rows: int    # rows that can accept a NEW promotion right now
++
++
++@dataclass(frozen=True)
++class RequestProspect:
++    """What we know about the request being decided."""
++
++    demand_rows: int        # primary rows the request needs if fully admitted
++    has_on_disk_data: bool  # does it have real loadable on-disk KV?
++    already_admitted: bool  # already past the gate (mid-stream) -- never re-park
++
++
++def decide(
++    policy: AdmissionPolicy,
++    tier: TierState,
++    other_streaming_in_flight: bool,
++    req: RequestProspect,
++) -> Admission:
++    """Decide PARK / ADMIT_STREAM / ADMIT_MONOLITHIC for one request now.
++
++    Invariants (asserted by parking_gate_test.py):
++      - An already-admitted request is never PARKED (no mid-stream re-entry).
++      - A request with no on-disk data is never PARKED (it has nothing to wait
++        on; parking it would deadlock a cold request that must compute).
++      - PARK is the only decision that consumes nothing. An ADMIT_* is only
++        reached once the tier's *coexistence* conditions hold (occupancy under
++        the watermark, free rows above the floor / working-set) -- so admission
++        never collides with whoever is already running. The client timeout is
++        the backstop bound on any PARK duration.
++      - With serialize_streaming, two requests that both need waves cannot both
++        be ADMIT_STREAM at the same decision instant.
++    """
++    # Already in the stream: keep feeding it; never leave it parked mid-way.
++    if req.already_admitted:
++        return Admission.ADMIT_STREAM
++
++    # Cold request: nothing on disk to wait for; must compute on GPU. Parking it
++    # behind a busy tier could deadlock it, so a cold request is never parked.
++    if not req.has_on_disk_data:
++        return Admission.ADMIT_MONOLITHIC
++
++    if tier.total_rows <= 0:
++        # No meaningful tier; nothing to wait for.
++        return Admission.ADMIT_MONOLITHIC
++
++    # Serialize over-ceiling streams: wait for the current occupant to finish
++    # (its rows become evictable, free_rows rises) before admitting another.
++    if policy.serialize_streaming and other_streaming_in_flight:
++        return Admission.PARK
++
++    # Coexistence guards: the tier is too busy to make safe progress right now;
++    # wait for concurrent requests to vacate rows.
++    occupancy = (tier.total_rows - tier.free_rows) / tier.total_rows
++    if (
++        tier.free_rows < policy.min_free_absolute
++        or occupancy > policy.max_occupancy
++    ):
++        return Admission.PARK
++
++    # Small enough to load in one shot: today's monolithic path, no waving.
++    if req.demand_rows <= policy.monolithic_max_fraction * tier.total_rows:
++        return (
++            Admission.ADMIT_MONOLITHIC
++            if tier.free_rows >= req.demand_rows
++            else Admission.PARK
++        )
++
++    # Large demand: admit as a stream whenever there is a working set of free
++    # rows to make progress on. The request may exceed the entire tier -- that
++    # is exactly what sequential waves amortize -- so the gate here is the
++    # coexistence checks above, not the request's total demand.
++    if tier.free_rows >= policy.stream_working_fraction * tier.total_rows:
++        return Admission.ADMIT_STREAM
++    return Admission.PARK
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/offloading/parking_sm.py b/vllm/distributed/kv_transfer/kv_connector/v1/offloading/parking_sm.py
+new file mode 100644
+index 0000000..3f21ca9
+--- /dev/null
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/offloading/parking_sm.py
+@@ -0,0 +1,121 @@
++# SPDX-License-Identifier: Apache-2.0
++#
++# REQUEST PARKING (draft). Pure state transitions for the scheduler-side parking
++# wiring -- the part of `offload_scheduler.py` that earlier drafts got wrong
++# (B1 latch, B1.5 two-parked deadlock, admission-slot leak, B3's finished_recving
++# hook) and that has NO vLLM dependency, so it can be unit-tested on the host
++# (see parking_sm_test.py). This matches the pattern of `parking_gate.py` /
++# `wave_slicer.py`: stdlib-only, importable and testable without a container.
++#
++# The scheduler keeps two pieces of per-process parking state, both of which are
++# driven through these pure functions:
++#   * parking_demand_rows (int | None) -- the request's on-disk demand cached
++#     while it is parked, so a parked step is cheap (no _lookup).
++#   * _parking_admittee (str | None)   -- the single request admitted through the
++#     gate and consuming the primary tier (the serialize slot).
++#
++# This module does NOT compute the admission decision (that is parking_gate.decide);
++# it turns {a decision + current state} into {the next state / action}. Keeping the
++# state transitions here is what makes the previously-untested wiring testable.
++from __future__ import annotations
++
++from collections.abc import Callable, Iterable
++
++# REVIEW #4 (N1): this MUST be a relative import. In the container this module
++# is deployed as a submodule of
++# vllm/distributed/kv_transfer/kv_connector/v1/offloading/, where `parking_gate`
++# is a package sibling and NOT a top-level module on sys.path -- a bare
++# `from parking_gate import ...` raises ModuleNotFoundError at container start,
++# before any VLLM_OFFLOAD_* flag is read, so it would break even the dark
++# baseline. The fallback exists only so the host test suite can keep importing
++# this file as a top-level module (`python3 parking_sm_test.py`); it is not a
++# "missing deploy" escape hatch -- if neither form resolves, the import still
++# fails loudly. See parking_sm_test.py::TestPackageImportShape, which loads this
++# module the way the container does.
++try:
++    from .parking_gate import Admission
++except ImportError:  # loaded as a top-level module (host unit tests)
++    from parking_gate import Admission
++
++
++class ParkAction:
++    """Action for a request that is currently parked.
++
++    (B1) a parked request is RE-decided every step, not short-circuited; 'stay
++    parked' is only ever the explicit PARK case.
++    """
++
++    STAY_PARKED = "STAY_PARKED"  # keep the cached demand; return None (still parked)
++    ADMIT = "ADMIT"              # clear the demand; proceed to resolve + commit
++
++
++def parked_step(cached_demand: int, admission: Admission) -> tuple[int | None, str]:
++    """Transition for a currently-parked request, given the gate's decision NOW.
++
++    Returns (next_cached_demand, action):
++      - PARK         -> (cached_demand, STAY_PARKED)   # still parked, cheap step
++      - ADMIT_*      -> (None,           ADMIT)        # un-park, resolve below
++    """
++    if admission is Admission.PARK:
++        return cached_demand, ParkAction.STAY_PARKED
++    return None, ParkAction.ADMIT
++
++
++def other_stream_in_flight(admittee: str | None, request_id: str) -> bool:
++    """B1.5: is the serialize slot held by a DIFFERENT, progressing request?
++
++    A parked request never holds the slot, so two parked requests each see this
++    as False and cannot deadlock each other on the serialize rule; the first to
++    re-decide when the tier clears / the slot frees takes it.
++    """
++    return admittee is not None and admittee != request_id
++
++
++def holds_slot(admittee: str | None, request_id: str) -> bool:
++    """Is this request the current admission slot-holder?"""
++    return admittee is not None and admittee == request_id
++
++
++def slot_after(
++    admittee: str | None, request_id: str, admission: Admission
++) -> str | None:
++    """Admission-slot transition after a decision. Only ADMIT_STREAM takes the
++    slot; a park or a monolithic admission leaves it unchanged (a small
++    admission completes quickly and does not need serializing).
++
++    REVIEW #4 (N3): this means the slot serializes LARGE streams against each
++    other, not all streaming. With STREAM_WAVE_CHUNKS > 0 an ADMIT_MONOLITHIC
++    request is still waved, concurrently, without the slot -- bounded instead by
++    parking_gate's occupancy guards. Correct (see tiering_manager.pop_ready_keys,
++    N2), and cheaper than serializing every hit. For strict one-stream-at-a-time,
++    return `request_id` for any ADMIT_* here; see the note on
++    AdmissionPolicy.serialize_streaming for why the alternative fix -- honouring
++    ADMIT_MONOLITHIC as an actual monolithic load -- is NOT available.
++    """
++    if admission is Admission.ADMIT_STREAM:
++        return request_id
++    return admittee
++
++
++def release_slot(admittee: str | None, request_id: str) -> str | None:
++    """Free the slot when an admitted request finishes / aborts / preempts /
++    resets. A no-op unless request_id held it -- this is what prevents a slot
++    leak, which would otherwise deadlock every future admission.
++    """
++    if admittee == request_id:
++        return None
++    return admittee
++
++
++def filter_finished_recving(
++    finished_recving: Iterable[str],
++    is_mid_stream: Callable[[str], bool],
++) -> set[str]:
++    """B3: rewrite the worker-emitted done-receiving set before the base
++    scheduler consumes it. Any request still mid-stream (still holding pending
++    waves) is DROPPED -- its earlier load jobs are not the end of its external
++    load, so it must NOT be released from WAITING_FOR_REMOTE_KVS yet. Requests
++    whose last wave just retired (pending_waves cleared) and monolithic loads
++    (which never set pending_waves) are retained, preserving the dark baseline.
++    """
++    return {r for r in finished_recving if not is_mid_stream(r)}
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py b/vllm/distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py
+index 6694897..891fa31 100644
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py
+@@ -1,5 +1,28 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++#
++# LOCAL PATCH (~/expose/patches/deepcached/offload_scheduler.py) — lookup probe.
++# Base: vllm/distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py
++#       md5 87afde4be2512a3d8efdb678bbfc226e (image vllm-node-b12x-dsv4f).
++#
++# WHY: `_lookup` has FOUR exits that return "no hit" and THREE of them
++# (lines ~613 / ~651 / ~665 upstream) return before the only log statement
++# in the function (`hit %s offloaded tokens`). So a run can show 0 external
++# hits with zero evidence of WHICH constraint produced the zero. That is the
++# state the 2026-08-20..23 run ended in: 111 of 113 tiering lookups RESOLVED,
++# every one returning 0, and no way to tell whether the binding constraint was
++# a per-group chunk-window floor, a first-key miss, or the cross-group AND.
++#
++# WHAT: one INFO line per `_lookup` call naming the exit taken, the group that
++# triggered it, and per-group HIT/MISS/RETRY/PENDING counts plus the index of
++# the first MISS. INFO on purpose — the DEBUG route needs
++# VLLM_LOGGING_CONFIG_PATH, and a bad logging config already cost one night
++# (it orphaned `uvicorn.error` and hung vllm-switch's readiness poll).
++#
++# Gated on VLLM_OFFLOAD_LOOKUP_PROBE=1. Unset => byte-for-byte upstream
++# behaviour, one `if probe is not None` per key on a path that is dominated by
++# a stat() syscall.
++import os
+ import time
+ from collections.abc import Iterable, Sequence
+ from dataclasses import dataclass, field
+@@ -52,9 +75,529 @@ from vllm.v1.kv_offload.base import (
+ from vllm.v1.outputs import KVConnectorOutput
+ from vllm.v1.request import Request
+ 
++# WAVE STREAMING (draft, 2026-09-05). See docs/superpowers/specs/2026-09-05-
++# deepcached-wave-streaming-design.md for the full design and its four review
++# passes. NOT YET DEPLOYED -- wave_slicer.py needs its own bind-mount/COPY
++# line before this import resolves in the running container; see that file's
++# header. Kept as a plain import (not try/except) so a missing deploy step
++# fails loudly at container start rather than silently falling back.
++from vllm.distributed.kv_transfer.kv_connector.v1.offloading.wave_slicer import (
++    WaveSpec,
++    num_waves_for_request,
++    slice_group_into_waves,
++)
++# REQUEST PARKING (draft). Pure, stdlib-only admission logic; same deploy path
++# as wave_slicer.py (needs its own COPY + bind-mount line before this import
++# resolves in the container). Kept a plain import so a missed deploy fails
++# loudly at container start.
++from vllm.distributed.kv_transfer.kv_connector.v1.offloading.parking_gate import (
++    Admission as ParkingAdmission,
++    AdmissionPolicy as ParkingPolicy,
++    RequestProspect,
++    TierState,
++    decide as parking_decide,
++)
++# REQUEST PARKING (draft): pure state transitions for the parking wiring
++# (admission slot, parked re-decide, finished_recving rewrite). Same deploy path
++# as parking_gate.py. Plain import so a missed deploy fails loudly.
++from vllm.distributed.kv_transfer.kv_connector.v1.offloading.parking_sm import (
++    ParkAction,
++    filter_finished_recving as parking_filter_finished_recving,
++    other_stream_in_flight as parking_other_stream_in_flight,
++    parked_step as parking_parked_step,
++    release_slot as parking_release_slot,
++    slot_after as parking_slot_after,
++)
++
+ logger = init_logger(__name__)
+ 
+ 
++def _probe_enabled() -> bool:
++    return os.environ.get("VLLM_OFFLOAD_LOOKUP_PROBE", "").strip().lower() not in (
++        "",
++        "0",
++        "false",
++        "no",
++    )
++
++
++PROBE_ENABLED = _probe_enabled()
++# Log every Nth resolved lookup (misses are always logged when N>1 is a concern;
++# see _LookupProbe.should_log). 1 = log every lookup.
++PROBE_EVERY = max(1, int(os.environ.get("VLLM_OFFLOAD_LOOKUP_PROBE_EVERY", "1") or 1))
++
++
++def _store_prov_enabled() -> bool:
++    return os.environ.get(
++        "VLLM_OFFLOAD_STORE_PROVENANCE", ""
++    ).strip().lower() not in ("", "0", "false", "no")
++
++
++# LOCAL PATCH (2026-08-31). Store-side provenance probe. Independent of
++# PROBE_ENABLED so it can run alone -- the D1/D2 counters were shown not to
++# discriminate a clean store from a corrupt one (x1 clean d1=18 d2_blocks=663
++# vs x2 corrupt d1=10 d2_blocks=717), so there is no reason to pay for both.
++#
++# It answers two questions about the concurrent-store corruption:
++#
++# KVPROV SHIFT -- the hypothesis. The store dispatch appends a block to
++#   src_block_ids only when block_id != 0, but describes the result to the
++#   worker as a CONTIGUOUS run via group_sizes + block_indices (a single start
++#   index). So if a block inside a chunk that is still being stored has been
++#   zeroed, every later block in that group shifts down by one slot and the
++#   chunk is written from the wrong source blocks. chunk_is_storable is
++#   supposed to make that unreachable by dropping any chunk containing a zero;
++#   this logs whether it actually does. A non-zero SHIFT count on a request
++#   that later reads back as garbage is the mechanism, and it is silent today.
++#
++# KVPROV MAP -- chunk key (which IS the on-disk filename) -> request that
++#   wrote it, group, chunk index, source blocks. Cross-referenced against a
++#   tools/deepcached-chunkdiff.py archive this says whether a file served to
++#   one request was written by another, which is the shape that would explain
++#   "unrelated sessions bleeding into mine". Off by default within the probe
++#   because it is one line per chunk (~450 per 131k-token request); enable with
++#   VLLM_OFFLOAD_STORE_PROVENANCE=map.
++STORE_PROV_ENABLED = _store_prov_enabled()
++STORE_PROV_MAP = os.environ.get(
++    "VLLM_OFFLOAD_STORE_PROVENANCE", ""
++).strip().lower() == "map"
++
++# LOCAL PATCH (2026-08-30). Joint load-point solver — see _solve_load_point().
++#   off      (default) upstream behaviour, solver never runs.
++#   shadow   solver runs and LOGS its answer + certificate, _lookup still returns
++#            upstream's result. Cannot affect output. Use this first.
++#   enforce  solver's answer is returned. CAN AFFECT OUTPUT. Only on throwaway traffic
++#            until a load has been verified correct end to end.
++# LOCAL PATCH (2026-08-30). Kill switch for LOADS ONLY.
++#   VLLM_OFFLOAD_DISABLE_LOADS=1 makes get_num_new_matched_tokens always answer
++#   "nothing to load", which is the same answer it already gives on ~99% of real
++#   requests, so it is a well-trodden path and not a new one.
++#   STORES ARE UNAFFECTED: they run from _build_store_jobs via build_connector_meta
++#   and never consult this. So the tier keeps warming while nothing is read back.
++#   That is the safe way to keep serving real sessions on this profile while the
++#   transfer path is still known to corrupt KV -- and it keeps the cache pressure
++#   that makes the tier worth testing at all.
++#   Unset (or 0) restores normal behaviour. Requires a restart to take effect.
++DISABLE_LOADS = os.environ.get("VLLM_OFFLOAD_DISABLE_LOADS", "").strip().lower() not in (
++    "",
++    "0",
++    "false",
++    "no",
++)
++LOAD_SOLVER_MODE = os.environ.get("VLLM_OFFLOAD_LOAD_SOLVER", "off").strip().lower()
++if LOAD_SOLVER_MODE not in ("off", "shadow", "enforce"):
++    LOAD_SOLVER_MODE = "off"
++# enforce-mode paranoia: also require this many chunks ABOVE the load point to be
++# present in every sliding-window group, beyond the 1 the eagle certificate needs.
++# Lets us over-certify a first real load to separate "wrong decision" from
++# "wrong transfer" without a second deploy.
++LOAD_SOLVER_MARGIN = max(0, int(os.environ.get("VLLM_OFFLOAD_LOAD_SOLVER_MARGIN", "0") or 0))
++
++# PATCH (deepcached, 2026-09-03): KVCOV — one INFO line per request, the whole
++# instrument for the staging-ceiling business case (ledger §8).
++#
++#   KVCOV req=<id> prompt=<n> local=<n> ext=<n> cov=<pct> defer=<0|1>
++#
++#   prompt  request.num_prompt_tokens
++#   local   GPU prefix-cache hit (num_computed_tokens)
++#   ext     tokens this connector supplied on top of it
++#   cov     (local+ext)/prompt — total coverage, i.e. the fraction NOT re-prefilled
++#   defer   1 if the request waited on a secondary-tier (disk) lookup
++#
++#   FIXED 2026-09-08 (ledger §13): cov was `local/prompt`, silently EXCLUDING the
++#   connector's own contribution — so the whole instrument reported 0.000 on the
++#   very requests where the tier did its job. The first confirmed cold-start hit
++#   (294,186-token prompt served 290,816 from disk) logged as `cov=0.000`.
++#   Lines in this ledger/journal dated BEFORE 2026-09-08 with `ext>0` understate
++#   coverage; recompute them as (local+ext)/prompt. Lines with ext=0 are
++#   unaffected — for those the two definitions coincide.
++#
++# The question this answers: of the tokens we re-prefill, how many belong to
++# COLD arrivals ABOVE the ~145k staging ceiling (recoverable in principle) and
++# how many are genuinely new turn text (recoverable by nothing)? The aggregate
++# metrics cannot separate those; prompt-size buckets cannot either, because a
++# 300k prompt at cov=0.91 and one at cov=0.00 sit in the same bucket 11x apart
++# in cost.
++#
++# Deliberately NOT gated behind VLLM_OFFLOAD_LOOKUP_PROBE: that switch emits
++# KVPROBE/KVLOAD/KVSTALE per group per iteration (the flood). This is ~1 line
++# per request, so it defaults ON. Set VLLM_OFFLOAD_COVERAGE_LOG=0 to silence it.
++COVERAGE_LOG = os.environ.get("VLLM_OFFLOAD_COVERAGE_LOG", "1").strip().lower() not in (
++    "0",
++    "false",
++    "no",
++)
++
++# WAVE STREAMING (draft, 2026-09-05): docs/superpowers/specs/2026-09-05-
++# deepcached-wave-streaming-design.md. 0 (default) = disabled, byte-for-byte
++# today's monolithic single-job promote-and-load. N > 0 = wave size in
++# chunks; both matching's promote=False behavior (§1) AND wave slicing (§2)
++# are gated by this SAME flag (design finding #4) -- there is no
++# intermediate state where one half of the change is live and the other
++# isn't. Recommended starting value 256 (see §4) -- comfortably below the
++# 498-row primary tier, leaving headroom for concurrent unrelated requests.
++STREAM_WAVE_CHUNKS = max(
++    0, int(os.environ.get("VLLM_OFFLOAD_STREAM_WAVE_CHUNKS", "0") or 0)
++)
++STREAM_ENABLED = STREAM_WAVE_CHUNKS > 0
++# WAVE STREAMING (draft): bounded retry for a wave's promotion being refused
++# by a full primary tier under concurrent contention (design §2, "define what
++# happens when a later wave's promotion is refused" / review OPEN A). Each
++# retry costs one engine step; this is not a timeout, just a ceiling on how
++# long one request will wait before giving up on its remaining waves.
++MAX_WAVE_PROMOTE_RETRIES = max(
++    1, int(os.environ.get("VLLM_OFFLOAD_STREAM_WAVE_MAX_RETRIES", "50") or 50)
++)
++# REQUEST PARKING (draft): admission-control for over-ceiling on-disk hits.
++#   0 / unset  = disabled, today's behavior: every request matches and commits.
++#   1          = serialize: at most one over-ceiling stream in flight; a known
++#                on-disk hit parks in the waiting state (consumes NO GPU blocks,
++#                NO primary rows) until the primary tier can admit it, then
++#                streams through as waves. Resolves OPEN A by preventing the
++#                contention rather than bounding a refusal.
++# Deliberately a SEPARATE flag from STREAM_WAVE_CHUNKS so parking can be
++# validated / bisected independently of wave sizing.
++PARK_ENABLED = os.environ.get("VLLM_OFFLOAD_PARK", "").strip().lower() not in (
++    "",
++    "0",
++    "false",
++    "no",
++)
++# Policy knobs, surfaced as env so they need no code rebuild. All capacity
++# ratios are fractions of the primary tier, so they stay valid even if the tier
++# is shrunk (e.g. to 1 GB) to free budget for concurrent offloaded KV.
++PARK_POLICY = ParkingPolicy(
++    max_occupancy=float(
++        os.environ.get("VLLM_OFFLOAD_PARK_MAX_OCCUPANCY", "0.5") or 0.5
++    ),
++    min_free_absolute=int(
++        os.environ.get("VLLM_OFFLOAD_PARK_MIN_FREE", "8") or 8
++    ),
++    serialize_streaming=PARK_ENABLED,
++    monolithic_max_fraction=float(
++        os.environ.get("VLLM_OFFLOAD_PARK_MONOLITHIC_FRACTION", "0.5") or 0.5
++    ),
++    stream_working_fraction=float(
++        os.environ.get("VLLM_OFFLOAD_PARK_WORKING_FRACTION", "0.4") or 0.4
++    ),
++)
++
++
++class _GroupProbe:
++    """Per-KV-group tally for a single _lookup() call."""
++
++    __slots__ = (
++        "group_idx",
++        "kind",
++        "tokens_per_chunk",
++        "n_keys_total",
++        "queried",
++        "hit",
++        "miss",
++        "pending",
++        "retry",
++        "first_miss",
++        "start_chunk_idx",
++        "num_hit_chunks",
++        "num_hit_chunks_eff",
++        "window",
++        "iteration",
++        "max_hit_before",
++        "max_hit_after",
++    )
++
++    def __init__(
++        self,
++        group_idx: int,
++        kind: str,
++        tokens_per_chunk: int,
++        n_keys_total: int,
++        start_chunk_idx: int,
++        window: int | None,
++        iteration: int,
++        max_hit_before: int,
++    ) -> None:
++        self.group_idx = group_idx
++        self.kind = kind
++        self.tokens_per_chunk = tokens_per_chunk
++        self.n_keys_total = n_keys_total
++        self.start_chunk_idx = start_chunk_idx
++        self.window = window
++        self.iteration = iteration
++        self.max_hit_before = max_hit_before
++        self.max_hit_after: int | None = None
++        self.queried = 0
++        self.hit = 0
++        self.miss = 0
++        self.pending = 0
++        self.retry = 0
++        self.first_miss: int | None = None
++        self.num_hit_chunks: int | None = None
++        # num_hit_chunks after the eagle/MTP pop, i.e. the value that actually
++        # tightens max_hit_size_tokens. Differs from num_hit_chunks by 1 on an
++        # unverified eagle group; that 1 chunk is what turns g2's 2048 into g3's
++        # 1536-token query window.
++        self.num_hit_chunks_eff: int | None = None
++
++    def record(self, idx: int, result: LookupResult) -> None:
++        self.queried += 1
++        if result is LookupResult.HIT:
++            self.hit += 1
++        elif result is LookupResult.MISS:
++            self.miss += 1
++            if self.first_miss is None:
++                self.first_miss = idx
++        elif result is LookupResult.HIT_PENDING:
++            self.pending += 1
++        else:
++            self.retry += 1
++
++    def __str__(self) -> str:
++        fm = "-" if self.first_miss is None else str(self.first_miss)
++        win = "-" if self.window is None else str(self.window)
++        nhc = "-" if self.num_hit_chunks is None else str(self.num_hit_chunks)
++        eff = (
++            ""
++            if self.num_hit_chunks_eff is None
++            or self.num_hit_chunks_eff == self.num_hit_chunks
++            else f"->{self.num_hit_chunks_eff}"
++        )
++        after = "-" if self.max_hit_after is None else str(self.max_hit_after)
++        cut = "*" if (
++            self.max_hit_after is not None and self.max_hit_after < self.max_hit_before
++        ) else ""
++        return (
++            f"it{self.iteration}:g{self.group_idx}/{self.kind} "
++            f"tpc={self.tokens_per_chunk} "
++            f"win={win} keys={self.n_keys_total} start={self.start_chunk_idx} "
++            f"q={self.queried} h={self.hit} m={self.miss} p={self.pending} "
++            f"r={self.retry} firstmiss={fm} hitchunks={nhc}{eff} "
++            f"mh={self.max_hit_before}->{after}{cut}"
++        )
++
++
++class _LookupProbe:
++    """Records why a single _lookup() call returned what it returned.
++
++    Exit codes:
++      WINDOW  the remaining window is shorter than one chunk of this group,
++              BEFORE any key was queried (upstream line ~613)
++      ZERO    the group's own lookup found no leading/trailing hit run
++              (upstream line ~651)
++      SHORT   hits were found but the surviving window is under one chunk
++              (upstream line ~665)
++      DEFER   backend asked to be retried (upstream line ~686)
++      INFLIGHT  hit chunks are already being loaded (upstream line ~717)
++      HIT     resolved with a non-zero token count (upstream line ~726)
++    """
++
++    _counter = 0
++
++    __slots__ = (
++        "req_id",
++        "num_computed",
++        "num_tokens",
++        "groups",
++        "exit",
++        "trigger",
++        "iteration",
++        "max_hit_initial",
++    )
++
++    def __init__(self, req_id: str, num_computed: int, num_tokens: int) -> None:
++        self.req_id = req_id
++        self.num_computed = num_computed
++        self.num_tokens = num_tokens
++        # LOCAL PATCH (2026-08-29). Was dict[group_idx] -> _GroupProbe, i.e. one
++        # record per group, LAST WRITE WINS. That threw away the only interesting
++        # iteration: max_hit_size_tokens is tightened monotonically and persists
++        # across convergence iterations, so by the final pass every group is merely
++        # re-confirming an already-collapsed window. On every ZERO@g3 line the log
++        # showed g1/g2/g4 agreeing on exactly 2048 tokens with no indication of who
++        # cut it there. Keep the full ordered history instead.
++        self.groups: list[_GroupProbe] = []
++        self.iteration = 0
++        self.max_hit_initial: int | None = None
++        self.exit = "?"
++        self.trigger: int | None = None
++
++    def next_iteration(self) -> None:
++        self.iteration += 1
++
++    def group(
++        self,
++        group_idx: int,
++        kind: str,
++        tokens_per_chunk: int,
++        n_keys_total: int,
++        start_chunk_idx: int,
++        window: int | None,
++        max_hit_before: int,
++    ) -> _GroupProbe:
++        gp = _GroupProbe(
++            group_idx,
++            kind,
++            tokens_per_chunk,
++            n_keys_total,
++            start_chunk_idx,
++            window,
++            self.iteration,
++            max_hit_before,
++        )
++        self.groups.append(gp)
++        return gp
++
++    def emit(self, exit_code: str, trigger: int | None, hit_tokens: int | None) -> None:
++        self.exit = exit_code
++        self.trigger = trigger
++        type(self)._counter += 1
++        if exit_code == "HIT" and type(self)._counter % PROBE_EVERY:
++            return
++        # Ordered by call, not by group index: the first record whose mh= shrinks
++        # is the group that collapsed the loadable window. That is the one to fix.
++        parts = " | ".join(str(gp) for gp in self.groups)
++        logger.info(
++            "KVPROBE req=%s exit=%s trigger=%s computed=%d total=%d mh0=%s "
++            "hit_tokens=%s | %s",
++            self.req_id,
++            exit_code,
++            "-" if trigger is None else f"g{trigger}",
++            self.num_computed,
++            self.num_tokens,
++            "-" if self.max_hit_initial is None else self.max_hit_initial,
++            "-" if hit_tokens is None else hit_tokens,
++            parts or "(no groups reached)",
++        )
++
++
++def _log_kv_layout(
++    spec: OffloadingSpec,
++    vllm_config: VllmConfig,
++    kv_cache_config: KVCacheConfig,
++) -> None:
++    """One-shot dump of the actual KV layout, per group.
++
++    Exists because the layout could not be derived from outside the engine.
++    Measured 2026-08-24: the GPU cache costs 18.2 KiB/token (stable across five
++    restarts) while the fs tier writes a flat 1,077,248 B record for EVERY key
++    of EVERY group -- ~64 KiB/token, 3.5x the GPU. Two candidate explanations
++    (per-group page padding vs. genuinely large small-span groups) predict the
++    same file sizes, and reading the files cannot separate them: the records
++    are 80-98% non-zero, but the CPU tier is a recycled /dev/shm mmap, so a
++    non-zero tail may be a previous occupant rather than content.
++
++    These numbers separate them. If page_size_bytes varies across groups then
++    the flat record is padding and the fix belongs in FileSystemTierManager
++    (write page_size_bytes, not the row stride). If it does not vary, the small
++    -span groups are genuinely that expensive and no amount of repacking helps.
++    """
++    try:
++        tensors = getattr(kv_cache_config, "kv_cache_tensors", ()) or ()
++        # PACKED LAYOUTS: when block_stride is set, every KVCacheTensor is a view
++        # of ONE shared buffer and each reports the full size, so summing them
++        # overcounts wildly (measured 2026-08-25: 64 tensors -> "1006 GiB" on a
++        # 121 GiB box). build_offloading_config() takes tensors[0].size in that
++        # case; mirror it exactly or the number is nonsense.
++        packed = any(bool(getattr(t, "block_stride", 0)) for t in tensors)
++        total_bytes = (
++            int(getattr(tensors[0], "size", 0))
++            if packed and tensors
++            else sum(int(getattr(t, "size", 0)) for t in tensors)
++        )
++        num_blocks = int(getattr(kv_cache_config, "num_blocks", 0))
++        cfg = spec.config
++        logger.info(
++            "KVLAYOUT global: num_blocks=%d n_tensors=%d packed=%s "
++            "total_kv_bytes=%d (%.2f GiB) worker_kv_bytes_per_block=%d "
++            "blocks_per_chunk=%d tokens_per_hash=%d cache_dtype=%s world_size=%d",
++            num_blocks,
++            len(tensors),
++            packed,
++            total_bytes,
++            total_bytes / (1 << 30),
++            cfg.worker_kv_bytes_per_block,
++            spec.blocks_per_chunk,
++            spec.tokens_per_hash,
++            cfg.model.dtype,
++            cfg.parallel.world_size,
++        )
++        # _get_lockstep_mla_tensor_slots() emits ONE SLOT PER LAYER, so the pool's
++        # per-block cost is the sum of page_size_bytes over every layer of every
++        # group. If that sum equals worker_kv_bytes_per_block -- which is the fs
++        # tier's flat record size -- then each record is sized for ALL layers of
++        # ALL groups while carrying one group's block, and the padding is real.
++        slot_total = 0
++        for idx, group in enumerate(kv_cache_config.kv_cache_groups):
++            ks = group.kv_cache_spec
++            n_layers = len(group.layer_names)
++            page = int(getattr(ks, "page_size_bytes", 0))
++            block_size = int(getattr(ks, "block_size", 0) or 0)
++            storage_bs = int(getattr(ks, "storage_block_size", 0) or 0)
++            compress = int(getattr(ks, "compress_ratio", 0) or 0)
++            group_total = page * n_layers
++            slot_total += group_total
++            logger.info(
++                "KVLAYOUT g%d: %s block_size=%d storage_block_size=%d "
++                "compress_ratio=%d offload_tokens_per_block=%d n_layers=%d "
++                "page_size_bytes=%d group_total=%d (%.1f%% of pool block) "
++                "-> %.1f B/token/layer, %.1f B/token for the group",
++                idx,
++                type(ks).__name__,
++                block_size,
++                storage_bs,
++                compress,
++                spec.tokens_per_block[idx],
++                n_layers,
++                page,
++                group_total,
++                100.0 * group_total / cfg.worker_kv_bytes_per_block
++                if cfg.worker_kv_bytes_per_block
++                else 0.0,
++                page / block_size if block_size else 0.0,
++                (page * n_layers / block_size) if block_size else 0.0,
++            )
++        if packed:
++            logger.info(
++                "KVLAYOUT NOTE: layout is PACKED (%d layer entries share %d "
++                "tensors), so layers share storage and the per-group "
++                "'B/token for the group' column above OVERCOUNTS -- it assumes "
++                "one page per layer. Measured 2026-08-25 it overstated the true "
++                "cost by ~18x. Trust worker_kv_bytes_per_block and the reported "
++                "'GPU KV cache size' only; treat the per-layer split as shape, "
++                "not magnitude.",
++                sum(len(g.layer_names) for g in kv_cache_config.kv_cache_groups),
++                len(tensors),
++            )
++        wkb = cfg.worker_kv_bytes_per_block
++        logger.info(
++            "KVLAYOUT verdict: sum(page*layers)=%d worker_kv_bytes_per_block=%d "
++            "match=%s -- %s",
++            slot_total,
++            wkb,
++            slot_total == wkb,
++            (
++                "PADDING CONFIRMED: the fs tier writes a record sized for every "
++                "layer of every group but carries one group's block; the largest "
++                "group is only %.1f%% of it, so a per-group record size is worth "
++                "roughly %.1fx on disk and on store/load I/O."
++                % (
++                    100.0 * max_group / wkb,
++                    wkb / max_group,
++                )
++                if (max_group := max(
++                    (int(getattr(g.kv_cache_spec, "page_size_bytes", 0))
++                     * len(g.layer_names))
++                    for g in kv_cache_config.kv_cache_groups
++                )) and slot_total == wkb and wkb
++                else "NO PADDING: the record size is not the all-layer sum, so the "
++                "small-span groups are genuinely this expensive and repacking the "
++                "fs tier buys nothing. Do not write that patch."
++            ),
++        )
++    except Exception:  # never let instrumentation break startup
++        logger.exception("KVLAYOUT dump failed (harmless; probe only)")
++
++
+ @dataclass(slots=True)
+ class TransferJobStatus:
+     """Tracks scheduler-side state for a single transfer job."""
+@@ -258,6 +801,25 @@ class RequestOffloadState:
+     # time.monotonic() of this request's first deferred offload lookup;
+     # None once consumed (observed) or while no lookup is pending.
+     deferred_lookup_start_time: float | None = None
++    # PATCH (deepcached, 2026-09-03): KVCOV emitted once. get_num_new_matched_tokens
++    # can resolve more than once per request (it re-queries after in-flight
++    # transfers drain), and this class is slots=True so the flag needs a field.
++    coverage_logged: bool = False
++    # WAVE STREAMING (draft). None = not streaming (either STREAM_ENABLED is
++    # False, or this request has no external hit). Non-None for the entire
++    # multi-wave window, from update_state_after_alloc's first slice through
++    # the last wave's load job retiring -- see design §2/Appendix B. Cleared
++    # (set back to None) on: normal completion (update_connector_output),
++    # abort mid-stream, preemption, and reset_cache (findings #7/#8) --
++    # anywhere transfer_jobs is already cleared for the same reasons.
++    pending_waves: list[WaveSpec] | None = None
++    wave_idx: int = 0
++    # REQUEST PARKING (draft). None = not parked. Non-None = a known on-disk hit
++    # is sitting in the waiting state awaiting admission; the int is its cached
++    # staging demand in primary rows, so get_num_new_matched_tokens returns
++    # cheaply while parked without re-walking the prefix every step. Cleared on
++    # admission / abort / preempt / reset, alongside pending_waves.
++    parking_demand_rows: int | None = None
+ 
+     def __post_init__(self) -> None:
+         self.group_states = tuple(
+@@ -387,6 +949,8 @@ class OffloadingConnectorScheduler:
+         self.config = SchedulerOffloadConfig.from_spec(
+             spec, vllm_config, kv_cache_config
+         )
++        if PROBE_ENABLED:
++            _log_kv_layout(spec, vllm_config, kv_cache_config)
+         self.manager: OffloadingManager = spec.get_manager()
+         self._connector_stats = OffloadingConnectorStats()
+ 
+@@ -414,6 +978,15 @@ class OffloadingConnectorScheduler:
+         )
+ 
+         self._req_status: dict[ReqId, RequestOffloadState] = {}
++        # LOCAL PATCH (2026-09-08): consecutive prepare_store allocation
++        # failures per request, for log throttling. Cleared on the first
++        # success and on request_finished, so it cannot outlive the request.
++        self._store_fail_streak: dict[ReqId, int] = {}
++        # REQUEST PARKING (draft): the single request currently admitted through
++        # the gate and consuming the primary tier. At most one at a time (the
++        # serialize rule); None = slot free. Parked requests never hold it, so
++        # parked requests cannot deadlock each other.
++        self._parking_admittee: str | None = None
+         self._current_batch_load_jobs: dict[int, TransferJob] = {}
+         self._current_batch_jobs_to_flush: set[int] = set()
+         # GPU block IDs allocated in the current engine step
+@@ -440,6 +1013,48 @@ class OffloadingConnectorScheduler:
+ 
+         self._events_tracker = OffloadingEventsTracker(spec.kv_events_config)
+ 
++        # ---- KVSTALE probe (2026-08-30, pure instrumentation) -------------
++        # The corruption threshold is in the STORE, not the load: the same
++        # 32,768-token / 323.14 MB load is clean 4/4 behind a 1,500-line store
++        # and garbage behind a 6,000-line one. The suspect is a source GPU
++        # block recycled out from under an in-flight store, which upstream
++        # already defends against in two places:
++        #
++        #   D1  _update_req_states zeroes a pending-store block_id whose block
++        #       was re-allocated this step, so chunk_is_storable drops the
++        #       whole chunk (never stored, no wrong bytes).
++        #   D2  _block_id_to_pending_jobs + jobs_to_flush flushes an ALREADY
++        #       DISPATCHED job whose source block was re-allocated. Sliding
++        #       window blocks are watched from job creation (they can be freed
++        #       by remove_skipped_blocks mid-request); full-attention blocks
++        #       only from request_finished, since ref_cnt protects them while
++        #       the request runs.
++        #
++        # So the question is NOT "is anything watching" — something is. It is
++        # which of these three the data shows:
++        #   (a) D2 fires at 48k and not at 33k, and a flush is too late to
++        #       protect the bytes  -> fix the flush semantics;
++        #   (b) D2 never fires at either size -> the detector is blind, the
++        #       recycling is happening somewhere it cannot see;
++        #   (c) neither fires -> the whole reallocation theory is dead and
++        #       this becomes wrong hypothesis #5, cheaply.
++        # Counters, not a fix. Nothing below changes a store decision.
++        self._probe_step: int = 0
++        # job_id -> step at which the store job was dispatched
++        self._probe_job_step: dict[int, int] = {}
++        # req_id -> [D1 zeroed BLOCKS, D2 flushed jobs, D2 colliding blocks,
++        #            stores dispatched, max steps in flight]
++        # NB index 0 counts BLOCKS, not chunks -- it increments once per zeroed
++        # block_id. At bpc=8 a single zeroed block poisons its whole 8-block
++        # chunk, so N zeroed blocks drop between ceil(N/8) and N chunks
++        # depending on clustering. The log field was originally named
++        # d1_chunks_dropped, which overstated the count by up to 8x; renamed
++        # d1_blocks_zeroed 2026-08-30 after the first bpc=8 run reported 11.
++        self._probe_stale: dict[str, list[int]] = {}
++
++    def _probe_counters(self, req_id: str) -> list[int]:
++        return self._probe_stale.setdefault(req_id, [0, 0, 0, 0, 0])
++
+     def _maybe_observe_lookup_async_delay(
+         self, req_status: RequestOffloadState
+     ) -> None:
+@@ -480,17 +1095,52 @@ class OffloadingConnectorScheduler:
+     ) -> None:
+         """Clean up req_status if finished and no in-flight jobs."""
+         if req_status.req.is_finished() and not req_status.transfer_jobs:
++            self._release_admittee(req_id)  # REQUEST PARKING (draft): never leak the slot
++            if PROBE_ENABLED:
++                # This is the branch requests ACTUALLY retire through -- the
++                # summary in update_connector_output emitted 0 times in the whole
++                # 2026-08-30 session, so d1_chunks_dropped went unobserved while
++                # D2 looked fully characterised. Emit here too.
++                ctr = self._probe_stale.pop(req_id, None)
++                if ctr is not None and any(ctr):
++                    logger.info(
++                        "KVSTALE req=%s tokens=%d stores=%d d1_blocks_zeroed=%d "
++                        "d2_jobs=%d d2_blocks=%d d2_max_age=%d (via cleanup)",
++                        req_id,
++                        req_status.req.num_tokens,
++                        ctr[3],
++                        ctr[0],
++                        ctr[1],
++                        ctr[2],
++                        ctr[4],
++                    )
+             del self._req_status[req_id]
+ 
+     def _maximal_prefix_lookup(
+-        self, keys: Iterable[OffloadKey], req_context: ReqContext
++        self,
++        keys: Iterable[OffloadKey],
++        req_context: ReqContext,
++        probe: "_GroupProbe | None" = None,
++        promote: bool | None = None,
+     ) -> int | None:
+         """Return the number of consecutive offloaded chunks from the start,
+-        or None if the backend deferred a lookup."""
++        or None if the backend deferred a lookup.
++
++        WAVE STREAMING (draft): `promote` defaults to `not STREAM_ENABLED`
++        (rather than being threaded explicitly by every caller) so this
++        helper's OTHER call site — `_lookup`'s g0-ceiling recompute — gets
++        the fix for free without being touched (design finding #5). When
++        streaming is disabled this is `True`, identical to upstream.
++        """
++        if promote is None:
++            promote = not STREAM_ENABLED
+         hit_count = 0
+         defer_lookup = False
+-        for key in keys:
+-            match self.manager.lookup(key, req_context):
++        for idx, key in enumerate(keys):
++            result = self.manager.lookup(key, req_context, promote=promote)
++            if probe is not None:
++                probe.record(idx, result)
++            match result:
+                 case LookupResult.HIT:
+                     hit_count += 1
+                 case LookupResult.HIT_PENDING:
+@@ -509,14 +1159,25 @@ class OffloadingConnectorScheduler:
+         keys: Sequence[OffloadKey],
+         sliding_window_size: int,
+         req_context: ReqContext,
++        probe: "_GroupProbe | None" = None,
++        promote: bool | None = None,
+     ) -> int | None:
+         """Return the end index (in `keys`) of the last run of
+         `sliding_window_size` consecutive hits, scanning from the end.
+-        Returns 0 on miss, None if the backend deferred a lookup."""
++        Returns 0 on miss, None if the backend deferred a lookup.
++
++        WAVE STREAMING (draft): see `_maximal_prefix_lookup`'s docstring —
++        same default-from-STREAM_ENABLED rationale.
++        """
++        if promote is None:
++            promote = not STREAM_ENABLED
+         defer_lookup = False
+         consecutive_hits = 0
+         for idx in range(len(keys) - 1, -1, -1):
+-            match self.manager.lookup(keys[idx], req_context):
++            result = self.manager.lookup(keys[idx], req_context, promote=promote)
++            if probe is not None:
++                probe.record(idx, result)
++            match result:
+                 case LookupResult.HIT:
+                     consecutive_hits += 1
+                 case LookupResult.HIT_PENDING:
+@@ -556,7 +1217,199 @@ class OffloadingConnectorScheduler:
+                     req_status.req_context,
+                 )
+ 
++    # ------------------------------------------------------------------
++    # LOCAL PATCH (2026-08-30): joint load-point solver.
++    # ------------------------------------------------------------------
++    #
++    # WHY. Upstream's _lookup() finds the load point by successive narrowing, and
++    # in this group configuration that does not converge: g2's eagle pop subtracts
++    # a fixed 512 tokens, g3 can only serve at multiples of 2048 so it snaps down
++    # 1536 more, g3's tightening re-arms the pop, and the window walks to zero at
++    # -2048 per iteration. Deleting the re-arm (tried 2026-08-29) breaks the loop
++    # but loads an uncertified boundary and produces GIBBERISH.
++    #
++    # The defect is the formulation, not any single constraint. Each group's
++    # requirement is a PREDICATE on the load point L, not a subtraction. Applying a
++    # subtraction repeatedly is what ratchets; evaluating a predicate does not.
++    #
++    # PREDICATES, read off the upstream code they replace:
++    #
++    #   full attention (g0)   chunks [C/T, L/T) all present.
++    #                         Downward closed in L, so evaluate the run ONCE with
++    #                         _maximal_prefix_lookup and keep it as a ceiling.
++    #                         (upstream: _maximal_prefix_lookup + min())
++    #
++    #   sliding window        chunks [L/T - W, L/T) present — the W immediately
++    #                         below L. (upstream: _sliding_window_lookup returns
++    #                         idx+W at the first backward run of W hits, and
++    #                         max_hit = T*(start+idx+W), i.e. exactly this window.)
++    #
++    #   eagle/MTP (g2)        the above PLUS chunk L/T itself present. That is the
++    #                         staleness certificate: it proves the token at position
++    #                         L matches the one the draft KV at L-1 was written
++    #                         against. (upstream: required_window = W+1, then
++    #                         num_hit_chunks -= 1 — the extra chunk queried and then
++    #                         dropped is the one AT the boundary.)
++    #                         THIS IS THE ONE THE 2026-08-29 REGRESSION VIOLATED.
++    #
++    # L must be a chunk boundary for every group simultaneously, so candidates are
++    # multiples of the coarsest tokens_per_chunk (2048 here = 4x512 = 64x32 = 32x64).
++    # Asserted, not assumed.
++
++    def _solve_load_point(
++        self,
++        req_status: RequestOffloadState,
++        num_computed_tokens: int,
++        max_hit_size_tokens: int,
++        g0_ceiling: int | None,
++    ) -> tuple[int | None, str]:
++        """Largest L every group can serve.
++
++        Returns (L, evidence). L is 0 if nothing is admissible, or None if the
++        answer is not yet determined because a lookup returned RETRY.
++        """
++        configs = self.config.kv_group_configs
++        granule = max(g.tokens_per_chunk for g in configs)
++        for g in configs:
++            assert granule % g.tokens_per_chunk == 0, (
++                f"group {g.group_idx} tpc={g.tokens_per_chunk} does not divide "
++                f"the candidate granule {granule}; candidate enumeration invalid"
++            )
++
++        upper = max_hit_size_tokens
++        if g0_ceiling is not None:
++            upper = min(upper, g0_ceiling)
++        for cfg, st in zip(configs, req_status.group_states):
++            upper = min(upper, len(st.offload_keys) * cfg.tokens_per_chunk)
++        hi_k = upper // granule
++        lo_k = num_computed_tokens // granule  # must gain at least one granule
++
++        cache: dict[OffloadKey, LookupResult] = {}
++
++        def present(key: OffloadKey) -> LookupResult:
++            r = cache.get(key)
++            if r is None:
++                # WAVE STREAMING (draft, finding #5): explicit, unlike the two
++                # walk helpers -- this calls self.manager.lookup() directly,
++                # not through _maximal_prefix_lookup/_sliding_window_lookup,
++                # so it doesn't inherit their promote-defaults-from-
++                # STREAM_ENABLED behavior automatically.
++                r = self.manager.lookup(
++                    key, req_status.req_context, promote=not STREAM_ENABLED
++                )
++                cache[key] = r
++            return r
++
++        undetermined = False
++        for k in range(hi_k, lo_k, -1):
++            L = k * granule
++            if L - num_computed_tokens < granule:
++                # Same rule as upstream's SHORT exit: a load must be worth at
++                # least one chunk of the coarsest group.
++                break
++            ok = True
++            retry_here = False
++            for cfg, st in zip(configs, req_status.group_states):
++                T = cfg.tokens_per_chunk
++                W = cfg.sliding_window_size_in_chunks
++                e = L // T
++                start = num_computed_tokens // T
++                if W is None:
++                    # handled by g0_ceiling; nothing per-candidate to check
++                    continue
++                lo_idx = e - W
++                # +1 for the eagle certificate, +margin for deliberate over-certification
++                hi_idx = e + (1 if cfg.is_eagle_group else 0) + LOAD_SOLVER_MARGIN
++                if lo_idx < start or hi_idx > len(st.offload_keys):
++                    ok = False
++                    break
++                for i in range(lo_idx, hi_idx):
++                    r = present(st.offload_keys[i])
++                    if r is LookupResult.MISS:
++                        ok = False
++                        break
++                    if r is not LookupResult.HIT:
++                        # RETRY / HIT_PENDING: cannot decide this candidate yet.
++                        retry_here = True
++                if not ok:
++                    break
++            if ok and not retry_here:
++                return L, f"L={L} k={k} granule={granule} probed={len(cache)}"
++            if retry_here:
++                undetermined = True
++        if undetermined:
++            return None, f"undetermined probed={len(cache)}"
++        return 0, f"none admissible probed={len(cache)} hi_k={hi_k} lo_k={lo_k}"
++
+     def _lookup(self, req_status: RequestOffloadState) -> int | None:
++        """Dispatch to upstream's loop, and optionally to the joint solver.
++
++        LOCAL PATCH (2026-08-30). Deliberately a wrapper: the upstream loop below
++        is left byte-identical (probe calls aside) so that `off` and `shadow` are
++        provably incapable of changing behaviour, and so the two answers can be
++        compared on live traffic before anything is enforced.
++        """
++        upstream = self._lookup_upstream(req_status)
++        if LOAD_SOLVER_MODE == "off":
++            return upstream
++
++        C = req_status.num_locally_computed_tokens
++        max_hit = req_status.req.num_tokens
++        if self._sliding_window_groups:
++            max_hit -= 1
++            if self._mamba_align_size is not None:
++                max_hit = round_down(max_hit, self._mamba_align_size)
++
++        # g0's run is downward closed in L, so evaluate it once as a ceiling.
++        # Recomputed here rather than threaded out of the loop above, to keep that
++        # loop untouched; the async lookup manager caches these keys anyway.
++        g0_ceiling: int | None = None
++        deferred_ceiling = False
++        for group_idx in self._lookup_groups:
++            cfg = self.config.kv_group_configs[group_idx]
++            if cfg.sliding_window_size_in_chunks is not None:
++                continue
++            st = req_status.group_states[group_idx]
++            T = cfg.tokens_per_chunk
++            start = C // T
++            end = min(cdiv(max_hit, T), len(st.offload_keys))
++            run = self._maximal_prefix_lookup(
++                st.offload_keys[start:end], req_status.req_context
++            )
++            if run is None:
++                deferred_ceiling = True
++                break
++            cand = T * (start + run)
++            g0_ceiling = cand if g0_ceiling is None else min(g0_ceiling, cand)
++
++        if deferred_ceiling:
++            solved, evidence = None, "ceiling undetermined"
++        else:
++            solved, evidence = self._solve_load_point(
++                req_status, C, max_hit, g0_ceiling
++            )
++
++        if solved is not None:
++            logger.info(
++                "KVSOLVER req=%s mode=%s computed=%d total=%d upstream=%s "
++                "solved=%s gain=%s | %s",
++                req_status.req.request_id,
++                LOAD_SOLVER_MODE,
++                C,
++                req_status.req.num_tokens,
++                "defer" if upstream is None else upstream,
++                solved,
++                max(0, solved - C),
++                evidence,
++            )
++
++        if LOAD_SOLVER_MODE != "enforce":
++            return upstream
++        if solved is None:
++            return None
++        return max(0, solved - C)
++
++    def _lookup_upstream(self, req_status: RequestOffloadState) -> int | None:
+         """
+         Find how many tokens beyond num_locally_computed_tokens can be loaded.
+ 
+@@ -566,6 +1419,15 @@ class OffloadingConnectorScheduler:
+         happens until num_hit_tokens converges.
+         """
+         num_computed_tokens = req_status.num_locally_computed_tokens
++        probe = (
++            _LookupProbe(
++                req_status.req.request_id,
++                num_computed_tokens,
++                req_status.req.num_tokens,
++            )
++            if PROBE_ENABLED
++            else None
++        )
+         max_hit_size_tokens: int = req_status.req.num_tokens
+         if self._sliding_window_groups:
+             # the last prompt token has to be recomputed to get the logprobs
+@@ -578,6 +1440,9 @@ class OffloadingConnectorScheduler:
+                     max_hit_size_tokens, self._mamba_align_size
+                 )
+ 
++        if probe is not None:
++            probe.max_hit_initial = max_hit_size_tokens
++
+         num_hit_tokens: int = 0
+         defer_lookup = False
+         lookup_groups = self._lookup_groups
+@@ -585,9 +1450,13 @@ class OffloadingConnectorScheduler:
+         # Tracks which eagle groups have already popped their volatile trailing chunk
+         # in the current convergence iteration. Reset when a non-eagle group
+         # tightens the hit boundary, requiring a fresh pop.
++        # (Stock upstream. Making the pop once-per-_lookup instead was tried on
++        # 2026-08-29 and produced corrupt output; see the branch below.)
+         eagle_verified: set[int] = set()
+         while lookup_groups:
+             looked_up_sliding_window: bool = False
++            if probe is not None:
++                probe.next_iteration()
+             groups_iter = iter(lookup_groups)
+             lookup_groups = ()
+             for group_idx in groups_iter:
+@@ -606,12 +1475,30 @@ class OffloadingConnectorScheduler:
+                     group_config.is_eagle_group and group_idx not in eagle_verified
+                 )
+ 
++                # Snapshot BEFORE this group gets to narrow anything, so the log
++                # attributes each cut to the group that made it.
++                max_hit_before = max_hit_size_tokens
++
+                 # Constrain to a chunk-aligned boundary for this group.
+                 max_hit_size_tokens = min(
+                     max_hit_size_tokens, len(offload_keys) * tokens_per_chunk
+                 )
+                 if max_hit_size_tokens - num_computed_tokens < tokens_per_chunk:
+                     # We can only load less than a chunk, so skip.
++                    if probe is not None:
++                        gp = probe.group(
++                            group_idx,
++                            "fa"
++                            if group_config.sliding_window_size_in_chunks is None
++                            else "sw",
++                            tokens_per_chunk,
++                            len(offload_keys),
++                            num_computed_tokens // tokens_per_chunk,
++                            group_config.sliding_window_size_in_chunks,
++                            max_hit_before,
++                        )
++                        gp.max_hit_after = max_hit_size_tokens
++                        probe.emit("WINDOW", group_idx, 0)
+                     return 0
+ 
+                 sliding_window_size_in_chunks = (
+@@ -629,14 +1516,29 @@ class OffloadingConnectorScheduler:
+ 
+                 num_chunks = min(cdiv(query_max, tokens_per_chunk), len(offload_keys))
+                 start_chunk_idx = num_computed_tokens // tokens_per_chunk
++                n_keys_total = len(offload_keys)
+                 offload_keys = offload_keys[start_chunk_idx:num_chunks]
+ 
++                gprobe = (
++                    probe.group(
++                        group_idx,
++                        "fa" if sliding_window_size_in_chunks is None else "sw",
++                        tokens_per_chunk,
++                        n_keys_total,
++                        start_chunk_idx,
++                        sliding_window_size_in_chunks,
++                        max_hit_before,
++                    )
++                    if probe is not None
++                    else None
++                )
++
+                 # end index (in the sliced offload_keys) up to which we
+                 # have backend-confirmed hits
+                 num_hit_chunks: int | None
+                 if sliding_window_size_in_chunks is None:
+                     num_hit_chunks = self._maximal_prefix_lookup(
+-                        offload_keys, req_status.req_context
++                        offload_keys, req_status.req_context, gprobe
+                     )
+                 else:
+                     required_window = sliding_window_size_in_chunks
+@@ -646,8 +1548,15 @@ class OffloadingConnectorScheduler:
+                         offload_keys,
+                         required_window,
+                         req_status.req_context,
++                        gprobe,
+                     )
++                if gprobe is not None:
++                    gprobe.num_hit_chunks = num_hit_chunks
+                 if num_hit_chunks == 0:
++                    if gprobe is not None:
++                        gprobe.max_hit_after = max_hit_size_tokens
++                    if probe is not None:
++                        probe.emit("ZERO", group_idx, 0)
+                     return 0
+ 
+                 if num_hit_chunks is None:
+@@ -662,12 +1571,52 @@ class OffloadingConnectorScheduler:
+                         tokens_per_chunk * (start_chunk_idx + num_hit_chunks),
+                     )
+ 
++                if gprobe is not None:
++                    # Post-eagle-pop count and the window this group leaves behind.
++                    gprobe.num_hit_chunks_eff = num_hit_chunks
++                    gprobe.max_hit_after = max_hit_size_tokens
++
+                 new_num_hit_tokens = max_hit_size_tokens - num_computed_tokens
+                 if new_num_hit_tokens < tokens_per_chunk:
+                     # We can only load less than a chunk, so skip.
++                    if probe is not None:
++                        probe.emit("SHORT", group_idx, new_num_hit_tokens)
+                     return 0
+ 
+                 if new_num_hit_tokens < num_hit_tokens:
++                    # REVERTED 2026-08-29 (same day). This branch briefly dropped
++                    # upstream's `eagle_verified.clear()` to break the -2048/iteration
++                    # ratchet documented in kv-offload-deepcached-conclusion.md. It DID
++                    # break the ratchet and produced this profile's first ever load
++                    # (124,928 tokens). THE OUTPUT WAS GIBBERISH. Restored.
++                    #
++                    # THE DISPROOF, from the HIT line itself:
++                    #   it1:g1/sw q=9 h=1 m=8 firstmiss=255 hitchunks=248
++                    #
++                    # The removal rested on "the eagle staleness proof is inherited
++                    # downward: every chunk below the verified ceiling sits in the same
++                    # contiguous verified run and so has a present successor." That is
++                    # FALSE. _sliding_window_lookup scans BACKWARD and returns at the
++                    # FIRST run of `required_window` consecutive hits, so it certifies
++                    # only a W-wide (W+1 for eagle) window AT THE TOP. Below it the run
++                    # is sparse -- 8 misses then a hit, above, exactly as the 1-in-4
++                    # alignment store filter dictates. Nothing below the window is proven.
++                    #
++                    # So when a non-eagle group lowers the boundary, the eagle
++                    # certification does NOT carry: the run at the old boundary says
++                    # nothing about the chunk at the new one. Concretely, the bad load
++                    # ended at g2 chunk 244 while it1 had only certified chunks 246-247.
++                    # The chunk after the load point was never proven present, so the
++                    # draft/MTP KV at the last loaded position was written against a
++                    # next-token that is not certified to match this request's. Gibberish.
++                    #
++                    # Upstream's clear() is therefore REQUIRED FOR CORRECTNESS, and the
++                    # ratchet is real: in this configuration the loop genuinely does not
++                    # converge. Both are true. The fix is not to delete a constraint but
++                    # to stop iterating -- solve the constraints jointly for the largest
++                    # admissible L. See the conclusion doc, "the correct fix".
++                    #
++                    # DO NOT REMOVE THIS AGAIN WITHOUT A CERTIFICATE AT THE NEW BOUNDARY.
+                     if not group_config.is_eagle_group:
+                         eagle_verified.clear()
+                     if defer_lookup:
+@@ -688,6 +1637,8 @@ class OffloadingConnectorScheduler:
+                 "Offloading manager delayed request %s as backend requested",
+                 req_status.req.request_id,
+             )
++            if probe is not None:
++                probe.emit("DEFER", None, num_hit_tokens)
+             return None
+ 
+         # Possibly delay the request if any hit chunk is already being loaded.
+@@ -714,6 +1665,10 @@ class OffloadingConnectorScheduler:
+                         " chunks are already being loaded",
+                         req_status.req.request_id,
+                     )
++                    if probe is not None:
++                        probe.emit(
++                            "INFLIGHT", group_config.group_idx, num_hit_tokens
++                        )
+                     return None
+ 
+         logger.debug(
+@@ -723,6 +1678,9 @@ class OffloadingConnectorScheduler:
+             num_computed_tokens,
+         )
+ 
++        if probe is not None:
++            probe.emit("HIT", None, num_hit_tokens)
++
+         return num_hit_tokens
+ 
+     def on_new_request(self, request: Request) -> None:
+@@ -737,6 +1695,63 @@ class OffloadingConnectorScheduler:
+         )
+         self._req_status[request.request_id] = req_status
+ 
++    # ---- REQUEST PARKING (draft) helpers -----------------------------------
++    def _tier_state(self) -> TierState:
++        """Snapshot of primary-tier capacity for the admission gate."""
++        total, free = self.manager.free_primary_rows()
++        return TierState(total_rows=total, free_rows=free)
++
++    def _request_has_offload_data(self, req_status: RequestOffloadState) -> bool:
++        """Cheap check: does this request have any on-disk KV to load at all?
++
++        Mirrors 'is this a hit candidate' without walking the prefix. A request
++        with no offloaded keys is cold and must compute -- never parked.
++        """
++        return any(gs.offload_keys for gs in req_status.group_states)
++
++    def _demand_rows_for(
++        self, num_hit_tokens: int | None, req_status: RequestOffloadState
++    ) -> int:
++        """Primary rows the full match needs if admitted (for the admission gate).
++
++        Full-attention demand is the on-disk chunk count (num_hit_tokens mapped
++        through tokens_per_chunk); the sliding-window groups' small, constant
++        contribution is added from offload_keys so we err HIGH, not low (an
++        under-estimate reopens OPEN A). The production value to match, exactly,
++        is `update_state_after_alloc`'s keys-to-stage count; reconcile against
++        the primary tier's real row-per-chunk accounting before relying on the
++        margin being tight.
++        """
++        if not num_hit_tokens:
++            return 0
++        fa_tpc = 1
++        sw_rows = 0
++        for gc, gs in zip(self.config.kv_group_configs, req_status.group_states):
++            if gc.sliding_window_size_in_chunks is None:
++                fa_tpc = gc.tokens_per_chunk
++            else:
++                sw_rows += len(gs.offload_keys)
++        return -(-num_hit_tokens // fa_tpc) + sw_rows  # ceil(fa) + sw
++
++    def _request_is_mid_stream(self, req_id: str) -> bool:
++        """True if the request still has pending waves (its external load is NOT
++        complete). Used by blocker (a) to withhold finished_recving until the
++        last wave retires. Note: only the wave path sets pending_waves, so a
++        monolithic (non-streaming) request returns False and is released normally
++        -- preserving the STREAM_WAVE_CHUNKS=0 dark baseline."""
++        rs = self._req_status.get(req_id)
++        return bool(rs is not None and rs.pending_waves)
++
++    def _release_admittee(self, req_id: str) -> None:
++        """Free the request-level admission slot when an admitted request's load
++        finishes / aborts / is preempted / is reset. A no-op unless `req_id`
++        held the slot (prevents a slot leak that would deadlock all admits).
++        Pure transition in parking_sm.py."""
++        before = self._parking_admittee
++        self._parking_admittee = parking_release_slot(self._parking_admittee, req_id)
++        if PROBE_ENABLED and before is not None and self._parking_admittee is None:
++            logger.info("RKPARK slot released by %s", req_id)
++
+     def get_num_new_matched_tokens(
+         self, request: Request, num_computed_tokens: int
+     ) -> tuple[int | None, bool]:
+@@ -763,17 +1778,100 @@ class OffloadingConnectorScheduler:
+         for group_state in req_status.group_states:
+             group_state.block_ids.clear()
+ 
+-        if req_status.transfer_jobs:
++        if DISABLE_LOADS:
++            # Loads are disabled; still keep per-request bookkeeping current so
++            # the STORE path is completely unaffected.
++            req_status.update_offload_keys()
++            req_status.num_locally_computed_tokens = num_computed_tokens
++            req_status.update_num_hit_chunks(num_computed_tokens)
++            self._touch(req_status)
++            return 0, False
++
++        # WAVE STREAMING (draft, design finding #7): `transfer_jobs` alone is
++        # not enough here. It is EMPTY during the promotion-wait gap between
++        # one wave's load job retiring and the next wave's promotion
++        # completing (Appendix B's driver, phase 1) -- without also checking
++        # `pending_waves`, this would re-run `_lookup` for a request that's
++        # already mid-stream, get the same (now unconditionally correct,
++        # since matching no longer self-truncates to primary-tier capacity)
++        # full hit length again, and the scheduler would re-invoke
++        # update_state_after_alloc, clobbering wave_idx and restarting wave 0.
++        if req_status.transfer_jobs or req_status.pending_waves:
+             logger.debug(
+-                "Delaying request %s since it still has in-flight transfers",
++                "Delaying request %s since it still has in-flight transfers "
++                "or pending wave-streamed loads",
+                 request.request_id,
+             )
+             return None, False
+ 
++        # ---- REQUEST PARKING (draft) ----
++        # "Another stream in flight" = the admission slot (_parking_admittee) is
++        # held by a DIFFERENT request that is actually progressing. A PARKED
++        # request never holds the slot, so two parked requests do not deadlock
++        # each other on the serialize rule; the oldest to re-decide when the slot
++        # frees is the one that takes it. Pure transition in parking_sm.py.
++        other_stream = parking_other_stream_in_flight(
++            self._parking_admittee, request.request_id
++        )
++
++        # 1. Already parked: RE-DECIDE cheaply using the cached demand (no
++        #    _lookup). This is what un-parks the request the step the tier clears
++        #    / the slot frees: stay parked (None) only if still PARK; on ADMIT_*,
++        #    clear the marker and fall through so THIS step resolves + commits.
++        if PARK_ENABLED and req_status.parking_demand_rows is not None:
++            admission = parking_decide(
++                PARK_POLICY,
++                self._tier_state(),
++                other_stream,
++                RequestProspect(
++                    demand_rows=req_status.parking_demand_rows,
++                    has_on_disk_data=True,
++                    already_admitted=False,
++                ),
++            )
++            # B1 (pure transition, parking_sm): a parked request is RE-decided
++            # every step; only an explicit PARK keeps it parked. Any admit clears
++            # the marker and proceeds -- the un-park path is reachable.
++            _cached, _action = parking_parked_step(
++                req_status.parking_demand_rows, admission
++            )
++            if _action is ParkAction.STAY_PARKED:
++                return None, True          # still parked: cheap step, no lookup
++            req_status.parking_demand_rows = None   # admitted -> resolve below
++
++        # 2. Cheap coexistence pre-gate for a not-yet-known request, BEFORE the
++        #    (expensive) _lookup walk. Only the coexistence rules (serialize +
++        #    tier-busy) run here; they need no demand. A request with no on-disk
++        #    data is never parked (rule 2), which is why a brand-new over-ceiling
++        #    hit's FIRST visit is not parked here — it walks once, then parks by
++        #    the length-aware gate (step 3) — but once parked, every step is cheap.
++        if (
++            PARK_ENABLED
++            and req_status.parking_demand_rows is None
++            and self._parking_admittee != request.request_id
++        ):
++            admission = parking_decide(
++                PARK_POLICY,
++                self._tier_state(),
++                other_stream,
++                RequestProspect(
++                    demand_rows=0,
++                    has_on_disk_data=self._request_has_offload_data(req_status),
++                    already_admitted=False,
++                ),
++            )
++            if admission is ParkingAdmission.PARK:
++                return None, True       # parked: no lookup, no alloc, no rows
++
+         req_status.update_offload_keys()
+         req_status.num_locally_computed_tokens = num_computed_tokens
+ 
+         num_hit_tokens: int | None
++        # PATCH (deepcached, 2026-09-03): KVCOV needs to know whether this request
++        # ever waited on a secondary-tier lookup, but
++        # _maybe_observe_lookup_async_delay() CONSUMES deferred_lookup_start_time
++        # (sets it to None) on the resolving call. Capture it first.
++        was_deferred = req_status.deferred_lookup_start_time is not None
+         if request.skip_reading_prefix_cache:
+             num_hit_tokens = 0
+         else:
+@@ -792,6 +1890,59 @@ class OffloadingConnectorScheduler:
+ 
+         self._touch(req_status)
+ 
++        # PATCH (deepcached, 2026-09-03): KVCOV. Only once the lookup has actually
++        # resolved — num_hit_tokens is None while the request is still deferring,
++        # and logging then would count one request many times.
++        if COVERAGE_LOG and num_hit_tokens is not None and not req_status.coverage_logged:
++            req_status.coverage_logged = True
++            prompt_tokens = request.num_prompt_tokens
++            logger.info(
++                "KVCOV req=%s prompt=%d local=%d ext=%d cov=%.3f defer=%d",
++                request.request_id,
++                prompt_tokens,
++                num_computed_tokens,
++                num_hit_tokens,
++                # FIXED 2026-09-08 (ledger §13): was `num_computed_tokens /
++                # prompt_tokens`, which excluded ext and therefore reported
++                # cov=0.000 for the connector's own successful hits.
++                (
++                    (num_computed_tokens + num_hit_tokens) / prompt_tokens
++                    if prompt_tokens
++                    else 0.0
++                ),
++                1 if was_deferred else 0,
++            )
++
++        # ---- REQUEST PARKING (draft) ----
++        # 3. Length-aware gate, once the demand is known: PARK -> cache it and
++        #    wait (steps are cheap from then on); ADMIT_* -> clear any residual
++        #    park marker and proceed to the normal monolithic / streaming path. A
++        #    request already holding the admission slot is skipped so it is never
++        #    re-parked mid-flight.
++        if PARK_ENABLED and self._parking_admittee != request.request_id:
++            demand = self._demand_rows_for(num_hit_tokens, req_status)
++            admission = parking_decide(
++                PARK_POLICY,
++                self._tier_state(),
++                other_stream,
++                RequestProspect(
++                    demand_rows=demand,
++                    has_on_disk_data=bool(num_hit_tokens),
++                    already_admitted=False,
++                ),
++            )
++            if admission is ParkingAdmission.PARK:
++                req_status.parking_demand_rows = demand
++                return None, True
++            # Admitted. Clear the parking marker so the cheap gate no longer
++            # short-circuits; take the serialize slot on a STREAM admission so no
++            # second over-ceiling request is admitted concurrently (pure
++            # transition, parking_sm).
++            req_status.parking_demand_rows = None
++            self._parking_admittee = parking_slot_after(
++                self._parking_admittee, request.request_id, admission
++            )
++
+         return num_hit_tokens, bool(num_hit_tokens)
+ 
+     def update_state_after_alloc(
+@@ -810,6 +1961,12 @@ class OffloadingConnectorScheduler:
+         # per group
+         group_sizes: list[int] = []
+         block_indices: list[int] = []
++        # WAVE STREAMING (draft): per-group capture for slice_group_into_waves
++        # below, used only when STREAM_ENABLED. Kept alongside (not instead
++        # of) the flat lists above so the non-streaming path is provably
++        # untouched -- this list is simply never read when STREAM_ENABLED is
++        # False.
++        per_group_for_waves: list[tuple[list[OffloadKey], list[int], int, bool]] = []
+         for group_config, group_state, group_blocks in zip(
+             self.config.kv_group_configs,
+             req_status.group_states,
+@@ -847,20 +2004,70 @@ class OffloadingConnectorScheduler:
+ 
+             num_chunks = cdiv(num_cached_tokens, tokens_per_chunk)
+             assert len(offload_keys) >= num_chunks
++            this_group_keys: list[OffloadKey] = []
+             if num_pending_gpu_blocks:
+                 start_chunk_idx = (
+                     num_locally_computed_gpu_blocks // self.config.blocks_per_chunk
+                 )
+-                keys_to_load.extend(offload_keys[start_chunk_idx:num_chunks])
++                this_group_keys = offload_keys[start_chunk_idx:num_chunks]
++                keys_to_load.extend(this_group_keys)
+ 
+-            dst_block_ids.extend(
++            this_group_dst_block_ids = [
+                 block.block_id
+                 for block in group_blocks[
+                     num_locally_computed_gpu_blocks:num_gpu_blocks
+                 ]
+-            )
++            ]
++            dst_block_ids.extend(this_group_dst_block_ids)
+             group_sizes.append(num_pending_gpu_blocks)
+             block_indices.append(num_locally_computed_gpu_blocks)
++            if STREAM_ENABLED:
++                per_group_for_waves.append((
++                    this_group_keys,
++                    this_group_dst_block_ids,
++                    num_locally_computed_gpu_blocks,
++                    group_config.sliding_window_size_in_chunks is not None,
++                ))
++
++            # LOCAL PATCH (2026-08-30): KVLOAD probe.
++            # A partial load -- tier supplies a prefix, engine computes the rest --
++            # produces total garbage, DETERMINISTICALLY (3/3 identical runs), while
++            # the GPU prefix cache resumes at the SAME boundary perfectly. So the
++            # defect is in this function's per-group block accounting, not in the
++            # model's ability to resume. This logs what each group is actually
++            # asked to load so the mismatch is visible instead of inferred.
++            #   want   = blocks this group needs for num_cached_tokens
++            #   have   = blocks already valid on GPU (scan stops at first
++            #            non-null block with no hash)
++            #   pend   = blocks this load must fill        (want - have)
++            #   nulls  = null placeholders inside [have, want)  <- SWA/mamba padding
++            #   keys   = offload keys appended for this group
++            if PROBE_ENABLED:
++                _nulls = sum(
++                    1 for b in group_blocks[
++                        num_locally_computed_gpu_blocks:num_gpu_blocks
++                    ] if b.is_null
++                )
++                _keys = (num_chunks - (
++                    num_locally_computed_gpu_blocks // self.config.blocks_per_chunk
++                )) if num_pending_gpu_blocks else 0
++                logger.info(
++                    "KVLOAD req=%s g%d tpb=%d tpc=%d ext=%d cached=%d | "
++                    "want=%d have=%d pend=%d nulls=%d chunks=%d keys=%d dst=%d",
++                    request.request_id,
++                    group_config.group_idx,
++                    tokens_per_block,
++                    tokens_per_chunk,
++                    num_external_tokens,
++                    num_cached_tokens,
++                    num_gpu_blocks,
++                    num_locally_computed_gpu_blocks,
++                    num_pending_gpu_blocks,
++                    _nulls,
++                    num_chunks,
++                    _keys,
++                    len(dst_block_ids),
++                )
+ 
+             # Skip prefix-hit chunks for block-level policy; for
+             # request-level, next_stored_chunk_idx stays at 0 so all
+@@ -868,29 +2075,79 @@ class OffloadingConnectorScheduler:
+             if req_status.offloading_context.policy == OffloadPolicy.BLOCK_LEVEL:
+                 group_state.next_stored_chunk_idx = num_chunks
+ 
+-        src_spec = self.manager.prepare_load(keys_to_load, req_status.req_context)
+-        dst_spec = GPULoadStoreSpec(
+-            dst_block_ids, group_sizes=group_sizes, block_indices=block_indices
+-        )
++        if not STREAM_ENABLED:
++            # Unmodified upstream/pre-streaming path.
++            src_spec = self.manager.prepare_load(keys_to_load, req_status.req_context)
++            dst_spec = GPULoadStoreSpec(
++                dst_block_ids, group_sizes=group_sizes, block_indices=block_indices
++            )
+ 
+-        load_job_id = self._generate_job_id()
+-        self._current_batch_load_jobs[load_job_id] = TransferJob(
+-            req_id=request.request_id,
+-            src_spec=src_spec,
+-            dst_spec=dst_spec,
+-        )
+-        # a load can only be issued when no other jobs are pending.
+-        assert not req_status.transfer_jobs
+-        req_status.transfer_jobs.add(load_job_id)
+-        self._jobs[load_job_id] = TransferJobStatus(
+-            req_id=request.request_id,
+-            pending_count=self.config.num_workers,
+-            keys=set(keys_to_load),
+-            is_store=False,
++            load_job_id = self._generate_job_id()
++            self._current_batch_load_jobs[load_job_id] = TransferJob(
++                req_id=request.request_id,
++                src_spec=src_spec,
++                dst_spec=dst_spec,
++            )
++            # a load can only be issued when no other jobs are pending.
++            assert not req_status.transfer_jobs
++            req_status.transfer_jobs.add(load_job_id)
++            self._jobs[load_job_id] = TransferJobStatus(
++                req_id=request.request_id,
++                pending_count=self.config.num_workers,
++                keys=set(keys_to_load),
++                is_store=False,
++            )
++
++            if self._chunks_being_loaded is not None:
++                self._chunks_being_loaded.update(keys_to_load)
++            return
++
++        # WAVE STREAMING (draft). Slice the already-fully-computed per-group
++        # data into waves and store them on req_status; issue NO job and
++        # start NO promotion here (design §2/Appendix B) -- the driver in
++        # build_connector_meta owns the whole rest of this request's
++        # load-and-promote lifecycle from here.
++        num_waves = num_waves_for_request(
++            [len(keys) for keys, _, _, _ in per_group_for_waves],
++            [is_sw for _, _, _, is_sw in per_group_for_waves],
++            STREAM_WAVE_CHUNKS,
+         )
++        per_group_waves = [
++            slice_group_into_waves(
++                num_waves=num_waves,
++                wave_chunks=STREAM_WAVE_CHUNKS,
++                is_sliding_window=is_sw,
++                blocks_per_chunk=self.config.blocks_per_chunk,
++                keys=keys,
++                dst_block_ids=dst,
++                block_index_start=block_index_start,
++            )
++            for keys, dst, block_index_start, is_sw in per_group_for_waves
++        ]
++        waves: list[WaveSpec] = []
++        for w in range(num_waves):
++            wave = WaveSpec()
++            for group_waves in per_group_waves:
++                gk, gd, ggs, gbi = group_waves[w]
++                wave.keys.extend(gk)
++                wave.dst_block_ids.extend(gd)
++                wave.group_sizes.append(ggs)
++                wave.block_indices.append(gbi)
++            waves.append(wave)
++
++        if PROBE_ENABLED:
++            logger.info(
++                "KVWAVE req=%s num_waves=%d wave_chunks=%d ext=%d "
++                "wave_sizes=%s",
++                request.request_id,
++                num_waves,
++                STREAM_WAVE_CHUNKS,
++                num_external_tokens,
++                [len(w.keys) for w in waves],
++            )
+ 
+-        if self._chunks_being_loaded is not None:
+-            self._chunks_being_loaded.update(keys_to_load)
++        req_status.pending_waves = waves
++        req_status.wave_idx = 0
+ 
+     def _update_req_states(self, scheduler_output: SchedulerOutput) -> None:
+         """
+@@ -942,6 +2199,10 @@ class OffloadingConnectorScheduler:
+                             in self._current_batch_allocated_block_ids
+                         ):
+                             group_state.block_ids[j] = 0
++                            # KVSTALE D1: a not-yet-stored block was recycled.
++                            # Costs a chunk, cannot corrupt one.
++                            if PROBE_ENABLED:
++                                self._probe_counters(req_id)[0] += 1
+ 
+     def _build_store_jobs(
+         self,
+@@ -981,29 +2242,149 @@ class OffloadingConnectorScheduler:
+                 if num_chunks <= start_chunk_idx:
+                     continue
+                 offload_keys = group_state.offload_keys[start_chunk_idx:num_chunks]
+-                # For each chunk, take the last corresponding GPU block. For
+-                # blocks_per_chunk=3 and GPU block IDs 1 5 6 7 2 4 9 3 8,
+-                # this selects GPU blocks 6 4 8.
+-                # A block_id of 0 means either a sliding window / SSM skip
+-                # or a stale entry that was zeroed out — skip it either way.
+-                offload_block_ids = group_state.block_ids[
+-                    start_chunk_idx * blocks_per_chunk
+-                    + blocks_per_chunk
+-                    - 1 : num_chunks * blocks_per_chunk : blocks_per_chunk
++                # A chunk is storable only if EVERY one of its GPU blocks is
++                # live. A block_id of 0 means either a sliding window / SSM skip
++                # or a stale entry zeroed out by the reallocation sweep above;
++                # either way that block's KV is no longer ours to copy.
++                #
++                # LOCAL PATCH (2026-08-26). Upstream tests only the chunk's LAST
++                # block:
++                #     block_ids[start*bpc + bpc - 1 : num_chunks*bpc : bpc]
++                # At blocks_per_chunk=1 the last block IS the chunk, so that test
++                # is complete and this code is behaviourally identical. At bpc>1
++                # it lets holed chunks through, and both consumers then go wrong:
++                #
++                #   * the src spec below lists only live blocks, so the worker's
++                #     cdiv(group_size + block_idx % bpc, bpc) stops matching the
++                #     one-CPU-block-per-key the manager allocated, and
++                #     `assert dst_offset == num_dst_blocks` kills the worker
++                #     (cpu/gpu_worker.py:359 — hit 2026-08-26 21:46 after 22h up,
++                #     taking EngineCore and the whole server with it);
++                #
++                #   * when the counts happen to agree anyway, the store is worse
++                #     than the crash: compute_sub_block_ptrs maps the k-th live
++                #     block to the k-th CONSECUTIVE CPU sub-slot, so every block
++                #     after a hole is written one slot early. The chunk is marked
++                #     stored and a later load returns KV shifted off its token
++                #     positions.
++                #
++                # Enumerated over all 2-chunk hole patterns at bpc=8:
++                #   last-block test: 3473/65536 crash, 43623/65536 silently shift
++                #   all-blocks test:      0/65536 crash,      0/65536 shift
++                #
++                # Cost: a chunk that loses any block to reallocation is skipped
++                # whole rather than stored wrong. Only sliding-window groups can
++                # hole (full attention never zeroes), and next_stored_chunk_idx
++                # advances past it either way, so the chunk is not retried —
++                # same as the alignment filter below.
++                chunk_block_ids = group_state.block_ids[
++                    start_chunk_idx * blocks_per_chunk : num_chunks * blocks_per_chunk
++                ]
++                assert len(chunk_block_ids) == len(offload_keys) * blocks_per_chunk
++                chunk_is_storable = [
++                    all(chunk_block_ids[i : i + blocks_per_chunk])
++                    for i in range(0, len(chunk_block_ids), blocks_per_chunk)
+                 ]
+-                assert len(offload_keys) == len(offload_block_ids)
+ 
+                 alignment_chunk_count = group_config.alignment_chunk_count
+                 tail = group_config.sliding_window_size_in_chunks
+-                # The EAGLE certificate chunk sits at the segment boundary.
++                # LOCAL PATCH (2026-08-27): eagle/MTP groups need tail + 1.
++                #
++                # The filter below keeps the trailing `tail` chunks of each
++                # alignment segment because that is what _sliding_window_lookup
++                # asks for — but ONLY for non-eagle groups. For an eagle group
++                # the reader raises the bar to `tail + 1` and then pops one:
++                #
++                #     required_window = sliding_window_size_in_chunks
++                #     if is_eagle_unverified:
++                #         required_window += 1        # ~line 642, upstream
++                #
++                # (EAGLE needs the tokens right before the generation point
++                # RECOMPUTED — the draft head consumes a hidden state that only
++                # exists if that token went through the forward pass — so the
++                # last matched chunk is deliberately discarded. Same trick and
++                # the same comment in the GPU cache:
++                # single_type_kv_cache_manager.py _contiguous_blocks_for_hit.)
++                #
++                # `tail` consecutive chunks can therefore NEVER satisfy a reader
++                # that needs `tail + 1` consecutive. On DeepSeek V4, g2 is the
++                # eagle group with alignment_chunk_count=4 and tail=1: upstream
++                # stored 1 chunk in every 4 and required 2 in a row, so g2
++                # returned 0 hit chunks on every lookup for its entire life, and
++                # since _lookup ANDs across groups it vetoed every other group's
++                # hits. Measured over 22h/542 lookups: g2 resolved 5 times,
++                # hitchunks=0 all 5, while g0 was finding 23 of 24 chunks
++                # (47,104 tokens) on disk and g1 — identical spec, not eagle —
++                # returned 92. Every ZERO exit that had hits elsewhere was
++                # trigger=g2.
++                #
++                # This does not loosen any check: the reader still demands
++                # tail+1 consecutive and still pops one, so the surviving window
++                # is proven present exactly as before. It only stops starving it
++                # of the input it was written against — the GPU prefix cache
++                # satisfies the same requirement trivially because it stores
++                # every block. Chunk CONTENTS are validated by OffloadKey (a
++                # content hash of the token ids), which this does not touch.
++                #
++                # SUPERSEDED 2026-08-30 — `tail += 1` ADDED THE WRONG CHUNK.
++                # It widened the kept run DOWNWARD (residues {2,3} of 4), which did
++                # un-starve the reader's `tail + 1` requirement, so g2 stopped
++                # returning 0. But it left the joint problem UNSATISFIABLE, and that
++                # is why the profile still never loaded:
++                #
++                #   A load point L must be a chunk boundary for EVERY group, so L is a
++                #   multiple of the coarsest tokens_per_chunk (2048 = g0's, and a
++                #   multiple of 512/32/64). Hence e = L/512 is a multiple of 4:
++                #                           e = 0 (mod 4).
++                #   The eagle certificate needs chunk e ITSELF present (that is the
++                #   chunk `required_window += 1` queries and `num_hit_chunks -= 1`
++                #   then drops — the one AT the boundary, proving the token at L
++                #   matches what the draft KV at L-1 was written against).
++                #   With residues {2,3}, chunk e = 0 (mod 4) is NEVER stored.
++                #   => the eagle certificate can never hold at any admissible L.
++                #
++                #   Equivalently: g2 can only certify e = 3 (mod 4), i.e.
++                #   L = 1536 (mod 2048), while g3 admits only L = 0 (mod 2048).
++                #   The two sets are DISJOINT. There is no valid load point at all,
++                #   and upstream's convergence loop was searching an empty set --
++                #   which is exactly the -2048/iteration ratchet.
++                #
++                # THE FIX: also keep the LEADING chunk of each alignment segment
++                # (pos_in_segment == 0) for eagle groups, and restore `tail` to
++                # stock. Residues become {0, 3}: chunk 3 satisfies the window, chunk
++                # 4 (= 0 of the next segment) satisfies the certificate, and the
++                # reader's backward scan finds the consecutive pair (3, 4), returns
++                # 5, pops to 4, giving L = 4*512 = 2048 -- ALIGNED. g3 then needs no
++                # snap-down, so it never re-arms the pop, so the ratchet does not
++                # occur either. One store-side change, and the load path stays
++                # BYTE-IDENTICAL TO STOCK -- it still demands the certificate and
++                # still pops, so this cannot produce an uncertified load. That is
++                # the whole point after the 2026-08-29 regression: the only thing
++                # being changed is which chunks exist on disk.
++                #
++                # Cost: DEPENDS ON blocks_per_chunk, and the "unchanged" claim
++                # originally written here was only true at bpc=8.
++                #   bpc=8: g2 tpc=512, tail=cdiv(W,512)=1, acc=4
++                #          -> keeps {0,3} = 2-in-4. A swap, not an increase.
++                #   bpc=1: g2 tpc=64,  tail=cdiv(W,64)=2,  acc=4
++                #          -> keeps {0,2,3} = 3-in-4. A 50% INCREASE in g2 stores.
++                # Correctness is bpc-independent either way: the kept set is
++                # {0} u {acc-tail .. acc-1}, which is by construction a run of
++                # exactly tail+1 consecutive chunks across the segment boundary
++                # -- exactly what the eagle reader demands before it pops one.
++                # The pop lands on a chunk = 0 (mod acc), so L is a multiple of
++                # acc * tpc = alignment_tokens = g0's tokens_per_chunk, which is
++                # the admissible set. Both sides scale with bpc, so it cancels.
++                # tail < acc is guaranteed: _alignment_chunk_count returns None
++                # (filter disabled) when tail >= per_segment.
+                 eagle_keep_segment_head = (
+                     tail is not None and group_config.is_eagle_group
+                 )
+ 
+-                for key_idx, (offload_key, block_id) in enumerate(
+-                    zip(offload_keys, offload_block_ids)
++                for key_idx, (offload_key, storable) in enumerate(
++                    zip(offload_keys, chunk_is_storable)
+                 ):
+-                    if block_id == 0:
++                    if not storable:
+                         continue
+                     # Skip SWA chunks that can never serve a load hit:
+                     # within each full-attention alignment segment, only the
+@@ -1015,16 +2396,8 @@ class OffloadingConnectorScheduler:
+                         abs_chunk_idx = start_chunk_idx + key_idx
+                         pos_in_segment = abs_chunk_idx % alignment_chunk_count
+                         keep = pos_in_segment >= alignment_chunk_count - tail
+-                        # EAGLE/MTP groups additionally need the chunk at the
+-                        # segment head. _sliding_window_lookup finds `tail`
+-                        # chunks, but an unverified eagle group then pops one
+-                        # (num_hit_chunks -= 1), so it must see tail + 1
+-                        # CONSECUTIVE chunks or it certifies nothing. Keeping
+-                        # {0} u {acc-tail .. acc-1} forms exactly such a run
+-                        # across the segment boundary. Because _lookup() ANDs
+-                        # the per-group results, an eagle group that can never
+-                        # certify vetoes every other group as well -- which is
+-                        # why the tier returns zero hits without this.
++                        # LOCAL PATCH (2026-08-30): the eagle certificate chunk sits
++                        # at the segment boundary, i.e. pos 0. See the note above.
+                         if eagle_keep_segment_head and pos_in_segment == 0:
+                             keep = True
+                         if not keep:
+@@ -1043,9 +2416,36 @@ class OffloadingConnectorScheduler:
+                 self._connector_stats.increase_counter(
+                     _ConnectorMetricName.ALLOCATION_FAILURE
+                 )
+-                logger.warning("Request %s: cannot store chunks", req_id)
++                # LOCAL PATCH (2026-09-08): THROTTLE. This path does not
++                # advance_stored_idx, so the request retries the identical
++                # oversized batch on EVERY scheduler step, forever. Unthrottled
++                # that is one WARNING per step per request: measured 8,870 lines
++                # from 40 requests, the worst one repeating 1,847 times, at
++                # ~218/min. The retry itself is arguably correct (capacity may
++                # free up), but the log must not scale with it.
++                #
++                # Log the 1st, then powers of two, and carry the streak so the
++                # line is diagnostic rather than merely repeated. A batch that
++                # needs more rows than the tier HAS can never succeed, and the
++                # streak is what makes that visible: a number that keeps
++                # doubling means "too big", not "unlucky".
++                streak = self._store_fail_streak.get(req_id, 0) + 1
++                self._store_fail_streak[req_id] = streak
++                if streak & (streak - 1) == 0:  # 1, 2, 4, 8, 16, ...
++                    logger.warning(
++                        "Request %s: cannot store chunks (%d consecutive; "
++                        "%d chunks wanted, primary tier has %d rows total). "
++                        "A streak that keeps doubling means the batch exceeds "
++                        "the tier and will never fit -- raise "
++                        "cpu_bytes_to_use.",
++                        req_id,
++                        streak,
++                        len(new_offload_keys),
++                        getattr(self.manager, "total_primary_rows", -1),
++                    )
+                 self._maybe_cleanup_finished_req(req_id, req_status)
+                 continue
++            self._store_fail_streak.pop(req_id, None)
+ 
+             if not store_output.keys_to_store:
+                 req_status.advance_stored_idx(num_offloadable_tokens)
+@@ -1061,8 +2461,8 @@ class OffloadingConnectorScheduler:
+             src_block_ids: list[int] = []
+             sliding_window_block_ids: list[int] = []
+             non_sliding_window_block_ids: list[int] = []
+-            for group_config, group_state in zip(
+-                self.config.kv_group_configs, req_status.group_states
++            for gidx, (group_config, group_state) in enumerate(
++                zip(self.config.kv_group_configs, req_status.group_states)
+             ):
+                 is_sliding_window = (
+                     group_config.sliding_window_size_in_chunks is not None
+@@ -1074,6 +2474,10 @@ class OffloadingConnectorScheduler:
+                 block_ids = group_state.block_ids
+                 num_group_blocks = 0
+                 start_gpu_block_idx: int | None = None
++                # KVPROV: blocks skipped as zero INSIDE chunks that are still
++                # being stored. Must stay 0 -- see the STORE_PROV_ENABLED note.
++                prov_zero_skips = 0
++                prov_chunks: list[tuple[str, int, int, int]] = []
+                 for idx, offload_key in enumerate(
+                     group_state.offload_keys[start_chunk_idx:num_chunks]
+                 ):
+@@ -1087,18 +2491,51 @@ class OffloadingConnectorScheduler:
+                     )
+ 
+                     gpu_block_idx = chunk_idx * blocks_per_chunk
++                    chunk_first_block = None
++                    chunk_nblocks = 0
+                     for i in range(blocks_per_chunk):
+                         block_id = block_ids[gpu_block_idx + i]
+                         if block_id == 0:
++                            if STORE_PROV_ENABLED:
++                                prov_zero_skips += 1
+                             continue
+                         if start_gpu_block_idx is None:
+                             start_gpu_block_idx = gpu_block_idx + i
++                        if chunk_first_block is None:
++                            chunk_first_block = block_id
++                        chunk_nblocks += 1
+                         src_block_ids.append(block_id)
+                         num_group_blocks += 1
+                         if is_sliding_window:
+                             sliding_window_block_ids.append(block_id)
+                         else:
+                             non_sliding_window_block_ids.append(block_id)
++                    if STORE_PROV_MAP:
++                        prov_chunks.append(
++                            (str(offload_key), chunk_idx,
++                             chunk_first_block or -1, chunk_nblocks)
++                        )
++
++                if STORE_PROV_ENABLED and prov_zero_skips:
++                    # src_block_ids is now non-contiguous, but group_sizes +
++                    # block_indices describe it to the worker as a contiguous
++                    # run from start_gpu_block_idx. Every block after the gap
++                    # is read from the wrong slot.
++                    logger.warning(
++                        "KVPROV SHIFT req=%s g%d chunks=%d..%d zero_skipped=%d "
++                        "blocks_sent=%d start_idx=%s bpc=%d -- stored chunks "
++                        "contain zeroed blocks, source run is misaligned",
++                        req_id, gidx, start_chunk_idx, num_chunks,
++                        prov_zero_skips, num_group_blocks,
++                        start_gpu_block_idx, blocks_per_chunk,
++                    )
++                if STORE_PROV_MAP:
++                    for key, cidx, first_block, nblocks in prov_chunks:
++                        logger.info(
++                            "KVPROV MAP req=%s g%d chunk=%d key=%s "
++                            "first_block=%d nblocks=%d",
++                            req_id, gidx, cidx, key, first_block, nblocks,
++                        )
+ 
+                 group_sizes.append(num_group_blocks)
+                 block_indices.append(start_gpu_block_idx or 0)
+@@ -1118,6 +2555,10 @@ class OffloadingConnectorScheduler:
+                 assert self._jobs[any_jid].is_store
+             req_status.transfer_jobs.add(job_id)
+ 
++            if PROBE_ENABLED:
++                self._probe_job_step[job_id] = self._probe_step
++                self._probe_counters(req_id)[3] += 1
++
+             # Watch sliding window blocks as they may get evicted
+             # before the request finishes
+             for bid in sliding_window_block_ids or ():
+@@ -1158,6 +2599,7 @@ class OffloadingConnectorScheduler:
+     def build_connector_meta(
+         self, scheduler_output: SchedulerOutput
+     ) -> KVConnectorMetadata:
++        self._probe_step += 1
+         self._update_req_states(scheduler_output)
+         schedule_end_context = ScheduleEndContext(
+             new_req_ids=[req.req_id for req in scheduler_output.scheduled_new_reqs],
+@@ -1168,7 +2610,18 @@ class OffloadingConnectorScheduler:
+         # Flush jobs for preempted requests.
+         for req_id in scheduler_output.preempted_req_ids or ():
+             req_status = self._req_status.get(req_id)
+-            if req_status is None or not req_status.transfer_jobs:
++            if req_status is None:
++                continue
++            # WAVE STREAMING (draft, design finding #8): a request preempted
++            # during the promotion-wait gap (no job in flight, by design of
++            # the driver below) has empty transfer_jobs and would skip the
++            # block below entirely, leaving pending_waves referencing GPU
++            # blocks the preemption just freed. Clear it unconditionally,
++            # not just when a job also needs flushing.
++            req_status.pending_waves = None
++            req_status.parking_demand_rows = None  # REQUEST PARKING (draft): re-decide
++            self._release_admittee(req_id)  # REQUEST PARKING (draft): slot free
++            if not req_status.transfer_jobs:
+                 continue
+             any_jid = next(iter(req_status.transfer_jobs))
+             assert self._jobs[any_jid].is_store
+@@ -1181,21 +2634,164 @@ class OffloadingConnectorScheduler:
+                 self._current_batch_allocated_block_ids
+             )
+         ):
+-            self._current_batch_jobs_to_flush.update(
++            reallocated = {
+                 jid
+                 for bid in self._current_batch_allocated_block_ids
+                 if bid in self._block_id_to_pending_jobs
+                 for jid in self._block_id_to_pending_jobs[bid]
+-            )
+-
+-        # on_schedule_end() above already ran the tier manager's completed-job
+-        # processing, so promotions that landed this step travel in the SAME
+-        # metadata as the load job that will read them.
++            }
++            # KVSTALE D2: an ALREADY DISPATCHED store's source block has been
++            # handed to someone else. This is the event that would corrupt a
++            # chunk if the flush does not beat the next forward pass. Logged
++            # per job with its in-flight age -- age 0 means the collision was
++            # caught in the same step the job was dispatched (harmless), age
++            # >= 1 means the worker has had the descriptor for a full step.
++            if PROBE_ENABLED and reallocated:
++                for jid in sorted(reallocated):
++                    job = self._jobs.get(jid)
++                    jreq = job.req_id if job is not None else "?"
++                    ncoll = sum(
++                        1
++                        for bid in self._current_batch_allocated_block_ids
++                        if jid in self._block_id_to_pending_jobs.get(bid, ())
++                    )
++                    age = self._probe_step - self._probe_job_step.get(jid, self._probe_step)
++                    ctr = self._probe_counters(jreq)
++                    ctr[1] += 1
++                    ctr[2] += ncoll
++                    ctr[4] = max(ctr[4], age)
++                    logger.info(
++                        "KVSTALE D2 req=%s job=%d age=%d steps blocks_recycled=%d "
++                        "already_flushed=%s",
++                        jreq,
++                        jid,
++                        age,
++                        ncoll,
++                        jid in self._current_batch_jobs_to_flush,
++                    )
++            self._current_batch_jobs_to_flush.update(reallocated)
++
++        # PATCH (deepcached, 2026-09-01): hand the workers the primary-tier
++        # rows that a promotion filled this step. on_schedule_end() above has
++        # already run _process_completed_jobs(), so anything that landed this
++        # step is included and travels in the SAME metadata as the load job
++        # that will read it. Workers mirror these rows from the tier-manager
++        # rank before submitting any load. See offload_worker.py.
+         promoted_rows = None
+         drain = getattr(self.manager, "drain_promoted_rows", None)
+         if drain is not None:
+             promoted_rows = drain() or None
+ 
++        # WAVE STREAMING (draft). See docs/superpowers/specs/2026-09-05-
++        # deepcached-wave-streaming-design.md Appendix B (and its four review
++        # passes, all folded in here). Placed HERE deliberately: on_schedule_end
++        # above has already polled every secondary tier for finished jobs and
++        # reflected any promotion that completed this step (tiering_manager.py
++        # _process_finished_jobs -> primary_tier.complete_write), so a wave
++        # whose disk read just landed is visible to pop_ready_keys() below in
++        # THIS same step -- and _current_batch_load_jobs hasn't been
++        # snapshotted into `meta` yet (that happens a few lines down), so a
++        # load job built here ships in this step's metadata, not next step's.
++        if STREAM_ENABLED:
++            # Snapshot the dict: a wave ship / release below can mutate it (e.g.
++            # a finished request's delete) and we must not blow up mid-iteration.
++            for req_id, req_status in list(self._req_status.items()):
++                waves = req_status.pending_waves
++                if not waves:
++                    continue
++                if req_status.transfer_jobs:
++                    # NEW #9: this is the normal state for most of a
++                    # streaming request's lifetime (a wave's load job is
++                    # usually in flight for multiple steps) -- skip, don't
++                    # assert. The one-job-at-a-time invariant is enforced by
++                    # only ever building a new job below when no job exists
++                    # for this request, not by asserting it holds on every
++                    # visit to an unrelated request state.
++                    continue
++
++                w = waves[req_status.wave_idx]
++
++                if not w.promoting and not w.promoted:
++                    # OPEN A: capture the refusal case. promote_for_staging
++                    # inherits _initiate_promotion's bool contract (False =
++                    # primary tier refused). Ignoring it would leave
++                    # w.promoting stuck False forever (never retried) -- a
++                    # silent permanent hang in exactly the contention
++                    # scenario §2/§3 require bounded behavior for.
++                    if self.manager.promote_for_staging(w.keys, req_status.req_context):
++                        w.promoting = True
++                    else:
++                        w.retry_count += 1
++                        # NOT YET RESOLVED (left deliberately conservative --
++                        # see design §2's "define what happens when a later
++                        # wave's promotion is refused"): the design considered
++                        # aborting the remaining waves and falling back to
++                        # recomputation once a retry ceiling is hit. That is
++                        # NOT implemented here. GPU blocks for this request's
++                        # FULL matched length were already committed by
++                        # update_state_after_alloc's single upfront alloc
++                        # (§1) -- whether clearing pending_waves at this point
++                        # safely triggers a idempotent re-derivation of the
++                        # SAME already-allocated blocks on the next
++                        # get_num_new_matched_tokens call, or whether it
++                        # causes a double-allocation/inconsistent-state bug,
++                        # was not verified against vLLM's actual
++                        # KVCacheManager re-entrancy behavior before this was
++                        # written. Retrying indefinitely (bounded only by
++                        # rate-limited logging, not by giving up) is the
++                        # conservative choice until that's checked: a stuck
++                        # request that recovers once contention clears is
++                        # recoverable; an incorrectly-aborted one might not
++                        # be. MAX_WAVE_PROMOTE_RETRIES therefore only
++                        # escalates log severity below, it does not abort.
++                        if w.retry_count == MAX_WAVE_PROMOTE_RETRIES:
++                            logger.warning(
++                                "Request %s: wave %d promotion refused %d "
++                                "times and counting -- primary tier "
++                                "contention is not clearing. Retrying "
++                                "indefinitely (see code comment on whether "
++                                "an abort-and-recompute fallback is safe "
++                                "here; it is not yet implemented).",
++                                req_id,
++                                req_status.wave_idx,
++                                w.retry_count,
++                            )
++                        elif PROBE_ENABLED:
++                            logger.info(
++                                "KVWAVE req=%s wave=%d promote_refused "
++                                "retry_count=%d",
++                                req_id,
++                                req_status.wave_idx,
++                                w.retry_count,
++                            )
++                    continue  # wait for the completion signal, or retry next step
++
++                if not w.promoted and self.manager.pop_ready_keys(req_id, w.keys):
++                    w.promoted = True
++
++                if w.promoted and w.load_job_id is None:
++                    src_spec = self.manager.prepare_load(w.keys, req_status.req_context)
++                    dst_spec = GPULoadStoreSpec(
++                        w.dst_block_ids,
++                        group_sizes=w.group_sizes,
++                        block_indices=w.block_indices,
++                    )
++                    jid = self._generate_job_id()
++                    self._current_batch_load_jobs[jid] = TransferJob(
++                        req_id=req_id, src_spec=src_spec, dst_spec=dst_spec
++                    )
++                    req_status.transfer_jobs.add(jid)
++                    self._jobs[jid] = TransferJobStatus(
++                        req_id=req_id,
++                        pending_count=self.config.num_workers,
++                        keys=set(w.keys),
++                        is_store=False,
++                    )
++                    if self._chunks_being_loaded is not None:
++                        # per-wave, not the whole request's keys (finding #6)
++                        self._chunks_being_loaded.update(w.keys)
++                    w.load_job_id = jid
++
+         meta = OffloadingConnectorMetadata(
+             load_jobs=self._current_batch_load_jobs,
+             store_jobs=self._build_store_jobs(scheduler_output),
+@@ -1212,8 +2808,26 @@ class OffloadingConnectorScheduler:
+ 
+         While True, build_connector_meta() and update_connector_output()
+         continue to be called even when no requests are scheduled.
++
++        WAVE STREAMING (draft, design finding #10): neither `self._jobs` nor
++        `manager.has_pending_work()` covers the one-step gap between the
++        driver queuing a wave's promotion (in build_connector_meta, this
++        step) and the next step's on_schedule_end flushing it into an actual
++        transfer job (manager.has_pending_work() only looks at
++        _transfer_jobs, populated exclusively by _flush_pending_promotions).
++        That gap recurs at every wave boundary, including the very first —
++        without this third term, the engine could go quiet and never call
++        build_connector_meta again, hanging the request before it loads even
++        wave 0.
+         """
+-        return bool(self._jobs) or self.manager.has_pending_work()
++        return (
++            bool(self._jobs)
++            or self.manager.has_pending_work()
++            or any(
++                s.pending_waves or s.parking_demand_rows is not None
++                for s in self._req_status.values()
++            )
++        )
+ 
+     def update_connector_output(self, connector_output: KVConnectorOutput):
+         """
+@@ -1292,9 +2906,81 @@ class OffloadingConnectorScheduler:
+ 
+             del self._jobs[job_id]
+             req_status.transfer_jobs.remove(job_id)
++            if PROBE_ENABLED:
++                self._probe_job_step.pop(job_id, None)
++
++            # WAVE STREAMING (draft, review OPEN B). Must run BEFORE the
++            # finished-request delete a few lines below: a normal request
++            # can't reach is_finished() before its prefix is fully loaded,
++            # but an ABORTED one can, mid-wave, with this load job's
++            # completion being exactly what makes transfer_jobs empty and
++            # trips that delete. Touching req_status/pending_waves AFTER
++            # that delete would KeyError on an already-removed dict entry;
++            # advancing here, first, avoids the ordering hazard entirely.
++            if (
++                not job_status.is_store
++                and req_status.pending_waves is not None
++            ):
++                if req_status.req.is_finished():
++                    # Aborted mid-stream: stop advancing and let the
++                    # finished-request delete below (which still runs, since
++                    # transfer_jobs is now empty) clean up, same as it
++                    # already does for a non-streaming request.
++                    req_status.pending_waves = None
++                else:
++                    req_status.wave_idx += 1
++                    if req_status.wave_idx >= len(req_status.pending_waves):
++                        req_status.pending_waves = None  # all waves loaded
++                        # REQUEST PARKING (draft): this request is done staging;
++                        # free the admission slot for the next parked request.
++                        self._release_admittee(job_status.req_id)
++                    # else: nothing else here -- the next wave is picked up
++                    # by the driver in build_connector_meta on the next
++                    # call, which is guaranteed by has_pending_push_work()
++                    # (finding #10) even if nothing else is scheduled.
++
+             if not req_status.transfer_jobs and req_status.req.is_finished():
++                # KVSTALE summary: one line per request, at the moment its last
++                # store job retires. Compare a clean run against a corrupt one
++                # -- if d2_jobs is 0 on both, reallocation is not the mechanism.
++                if PROBE_ENABLED:
++                    ctr = self._probe_stale.pop(job_status.req_id, None)
++                    if ctr is not None and any(ctr):
++                        logger.info(
++                            "KVSTALE req=%s tokens=%d stores=%d "
++                            "d1_blocks_zeroed=%d d2_jobs=%d d2_blocks=%d "
++                            "d2_max_age=%d",
++                            job_status.req_id,
++                            req_status.req.num_tokens,
++                            ctr[3],
++                            ctr[0],
++                            ctr[1],
++                            ctr[2],
++                            ctr[4],
++                        )
+                 del self._req_status[job_status.req_id]
+ 
++        # REQUEST PARKING / WAVE STREAMING (draft), blocker (a). The base v1
++        # scheduler uses connector_output.finished_recving to release a request
++        # from WAITING_FOR_REMOTE_KVS (resuming prefill/decode). The Worker-side
++        # connector raises finished_recving on EVERY load-job retirement; for a
++        # wave-streaming request that would fire after wave 0, while waves 1..N
++        # are still being staged -- silent KV corruption. The retire loop above
++        # has already advanced waves, so a request that retired its LAST wave now
++        # has pending_waves == None and is retained, while one that retired a
++        # non-last wave still has pending_waves and is dropped here. Same step,
++        # same process; this runs immediately before the base scheduler consumes
++        # the set (OffloadingConnectorScheduler.update_connector_output is called
++        # in _update_from_kv_xfer_finished, right before the finished_recving
++        # loop). See the validation step in README.
++        if connector_output.finished_recving:
++            # B3 (pure transition, parking_sm): drop any request still mid-stream
++            # so the base scheduler never resumes it before its last wave is
++            # staged. Retains last-wave-just-retired and monolithic requests.
++            connector_output.finished_recving = parking_filter_finished_recving(
++                connector_output.finished_recving, self._request_is_mid_stream
++            )
++
+     def get_stats(self) -> OffloadingConnectorStats | None:
+         stats: OffloadingConnectorStats | None = None
+         if not self._connector_stats.is_empty():
+@@ -1325,6 +3011,9 @@ class OffloadingConnectorScheduler:
+             returned by the engine.
+         """
+         req_status = self._req_status.get(request.request_id)
++        # Must happen before the untracked-request early return below, or the
++        # streak entry leaks for the lifetime of the process.
++        self._store_fail_streak.pop(request.request_id, None)
+ 
+         if req_status is None:
+             # Untracked request (offloading never started): no in-flight jobs,
+@@ -1337,6 +3026,14 @@ class OffloadingConnectorScheduler:
+         self.manager.on_request_finished(req_status.req_context)
+         self._maybe_observe_lookup_async_delay(req_status)
+ 
++        # REQUEST PARKING / WAVE STREAMING (draft): a finished/aborted request is
++        # dead; stop streaming/parking it so the driver stops promoting a dead
++        # request and the engine can drop out via has_pending_push_work (ported
++        # from draft B; draft A only cleared on preempt/reset/completion).
++        req_status.pending_waves = None
++        req_status.parking_demand_rows = None
++        self._release_admittee(request.request_id)
++
+         # Update offload keys with final block hash so _build_store_jobs can
+         # create store jobs for the last block(s) on the next schedule step.
+         req_status.update_offload_keys()
+@@ -1378,6 +3075,8 @@ class OffloadingConnectorScheduler:
+ 
+         for req_id, status in list(self._req_status.items()):
+             if status.req.is_finished():
++                if PROBE_ENABLED:
++                    self._probe_stale.pop(req_id, None)
+                 del self._req_status[req_id]
+ 
+         # Reset offloading manager cache
+@@ -1388,6 +3087,16 @@ class OffloadingConnectorScheduler:
+             for group_state in status.group_states:
+                 group_state.next_stored_chunk_idx = 0
+             status.transfer_jobs.clear()
++            # WAVE STREAMING (draft, design finding #8): self.manager.reset_cache()
++            # above (which wipes the primary tier) already runs before this
++            # loop, so any pending_waves surviving it would reference rows
++            # that no longer hold what they claim to. Clear alongside
++            # transfer_jobs, which this same loop already treats the same way.
++            status.pending_waves = None
++            status.parking_demand_rows = None  # REQUEST PARKING (draft): re-decide
++        # REQUEST PARKING (draft): the whole tier was wiped, so drop the
++        # admission slot too -- every request re-decides against the new state.
++        self._parking_admittee = None
+ 
+         # Discard jobs and save job_counter to be able to discard worker responses
+         self._stale_job_threshold = self._job_counter
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/offloading/wave_slicer.py b/vllm/distributed/kv_transfer/kv_connector/v1/offloading/wave_slicer.py
+new file mode 100644
+index 0000000..1d56a95
+--- /dev/null
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/offloading/wave_slicer.py
+@@ -0,0 +1,140 @@
++# SPDX-License-Identifier: Apache-2.0
++#
++# WAVE STREAMING (draft). Pure, dependency-free (stdlib only) slicing logic
++# for docs/superpowers/specs/2026-09-05-deepcached-wave-streaming-design.md
++# Appendix A. Deliberately has NO vllm import so it can be unit-tested on the
++# host without a container -- see wave_slicer_test.py alongside this file.
++#
++# NOT YET WIRED INTO THE IMAGE/SERVICE. To go live this needs its own
++# COPY (image/Dockerfile) and bind-mount (vllm-deepcached.service +
++# vllm-deepcached-remote.service) line, installed at
++# vllm/distributed/kv_transfer/kv_connector/v1/offloading/wave_slicer.py
++# (a NEW file at that path, not an override -- it doesn't exist upstream),
++# same as every other patches/deepcached/*.py file. offload_scheduler.py's
++# draft copy imports it from there.
++from dataclasses import dataclass, field
++from typing import Any
++
++# Kept as `Any` rather than importing vllm.v1.kv_offload.base.OffloadKey --
++# this module never inspects key content, only indexes/slices lists of them,
++# so the real type doesn't matter here and importing it would pull in vllm.
++OffloadKey = Any
++
++
++@dataclass
++class WaveSpec:
++    """A contiguous chunk of an already-fully-matched request's load, to
++    become one future load job. One WaveSpec covers ALL groups' contribution
++    for that wave (mirrors update_state_after_alloc's existing flat
++    keys_to_load/dst_block_ids/group_sizes/block_indices shape, just for one
++    wave's slice instead of the whole request)."""
++
++    keys: list[OffloadKey] = field(default_factory=list)
++    dst_block_ids: list[int] = field(default_factory=list)
++    group_sizes: list[int] = field(default_factory=list)
++    block_indices: list[int] = field(default_factory=list)
++    # Scheduler-side driver state (Appendix B). Not touched by slicing.
++    promoting: bool = False
++    promoted: bool = False
++    load_job_id: int | None = None
++    retry_count: int = 0
++
++
++def slice_group_into_waves(
++    num_waves: int,
++    wave_chunks: int,
++    is_sliding_window: bool,
++    blocks_per_chunk: int,
++    keys: list[OffloadKey],
++    dst_block_ids: list[int],
++    block_index_start: int,
++) -> list[tuple[list[OffloadKey], list[int], int, int]]:
++    """Split ONE group's pending (keys, dst_block_ids) into `num_waves`
++    per-wave (keys, dst_block_ids, group_size, block_index) tuples.
++
++    Sliding-window groups are never split — their entire pending range rides
++    the LAST wave, with `group_size=0` (empty contribution) in every earlier
++    wave. This is not a simplification of convenience: per the design's §3,
++    a sliding-window group's real (non-null) KV is a small, constant-size
++    trailing window regardless of prefix length, so it has nothing useful to
++    contribute to an earlier wave even if split.
++
++    Full-attention groups are split at `wave_chunks`-chunk boundaries in
++    THIS GROUP'S OWN chunk units. With a single full-attention group (this
++    profile's actual case — DeepSeek-V4-Flash has exactly one, g0) that is
++    equivalent to token-aligned waves. With more than one full-attention
++    group at different tokens_per_chunk, independent per-group slicing means
++    their wave boundaries needn't align in token space — harmless (each
++    wave's (keys, dst_block_ids) pair stays internally self-consistent), just
++    potentially leaves a faster group's wave loaded slightly ahead of a
++    slower one's before both catch up. Not a concern for the one profile this
++    targets (DeepSeek-V4-Flash has exactly one full-attention group).
++
++    `block_index_start` may be misaligned to `blocks_per_chunk` (a partial
++    leading chunk) — the same as it may be for a whole non-streamed request
++    today; only the FIRST wave inherits that misalignment, since every later
++    wave boundary is itself chunk-aligned by construction.
++
++    Invariants (asserted by the caller's tests, not here — see
++    wave_slicer_test.py):
++      - sum(group_size for every wave) == len(dst_block_ids)
++      - concatenation of every wave's `keys`, in order, == `keys`
++      - concatenation of every wave's `dst_block_ids`, in order, == `dst_block_ids`
++    """
++    result: list[tuple[list[OffloadKey], list[int], int, int]] = [
++        ([], [], 0, block_index_start) for _ in range(num_waves)
++    ]
++    if not keys:
++        return result
++
++    if is_sliding_window:
++        result[-1] = (keys, dst_block_ids, len(dst_block_ids), block_index_start)
++        return result
++
++    n_chunks = len(keys)
++    block_cursor = 0
++    for w in range(num_waves):
++        chunk_start = w * wave_chunks
++        chunk_end = min(chunk_start + wave_chunks, n_chunks)
++        if chunk_start >= chunk_end:
++            result[w] = ([], [], 0, block_index_start + block_cursor)
++            continue
++
++        wave_keys = keys[chunk_start:chunk_end]
++
++        if chunk_start == 0:
++            misalignment = block_index_start % blocks_per_chunk
++            first_chunk_blocks = blocks_per_chunk - misalignment
++            n_wave_blocks = first_chunk_blocks + (chunk_end - chunk_start - 1) * blocks_per_chunk
++        else:
++            n_wave_blocks = (chunk_end - chunk_start) * blocks_per_chunk
++        n_wave_blocks = max(0, min(n_wave_blocks, len(dst_block_ids) - block_cursor))
++
++        wave_dst_block_ids = dst_block_ids[block_cursor : block_cursor + n_wave_blocks]
++        result[w] = (
++            wave_keys,
++            wave_dst_block_ids,
++            len(wave_dst_block_ids),
++            block_index_start + block_cursor,
++        )
++        block_cursor += n_wave_blocks
++
++    return result
++
++
++def num_waves_for_request(
++    per_group_num_chunks: list[int],
++    per_group_is_sliding_window: list[bool],
++    wave_chunks: int,
++) -> int:
++    """How many waves this request needs, given each group's pending chunk
++    count. Only full-attention (non-sliding-window) groups drive this — see
++    slice_group_into_waves's docstring for why sliding-window groups never
++    need more than the one (last) wave they already ride."""
++    assert wave_chunks > 0
++    candidates = [
++        -(-n // wave_chunks)  # ceil division, stdlib-only
++        for n, is_sw in zip(per_group_num_chunks, per_group_is_sliding_window)
++        if not is_sw
++    ]
++    return max(1, max(candidates, default=1))
+diff --git a/vllm/v1/kv_offload/tiering/manager.py b/vllm/v1/kv_offload/tiering/manager.py
+index 4a3805d..b491917 100644
+--- a/vllm/v1/kv_offload/tiering/manager.py
++++ b/vllm/v1/kv_offload/tiering/manager.py
+@@ -76,6 +76,15 @@ class RequestState:
+     # time.monotonic() of this request's first deferred secondary-tier lookup;
+     # None once consumed (observed) or while no secondary lookup is pending.
+     secondary_lookup_start_time: float | None = None
++    # WAVE STREAMING (draft, see docs/superpowers/specs/2026-09-05-deepcached-
++    # wave-streaming-design.md). Keys whose secondary->primary promotion has
++    # completed (is_promotion job success in _process_finished_jobs) but that
++    # the scheduler-side wave driver has not yet consumed. Populated only when
++    # a wave's promotion was initiated via promote_for_staging(); a normal
++    # (non-streaming) request never touches this. Cleared per-key by
++    # pop_ready_keys(), and wholesale on reset_cache/finalize so it can never
++    # outlive the primary-tier rows it claims are resident.
++    wave_ready_keys: set[OffloadKey] = field(default_factory=set)
+ 
+ 
+ class CPUPrimaryTierOffloadingManager(CPUOffloadingManager):
+@@ -282,6 +291,21 @@ class TieringOffloadingManager(OffloadingManager):
+                         self._promoted_rows.extend(
+                             int(b) for b in job_metadata.block_ids
+                         )
++                        # WAVE STREAMING (draft): record which keys just
++                        # became resident, for promote_for_staging() callers
++                        # (the scheduler-side wave driver) to poll via
++                        # pop_ready_keys(). Deliberately NOT folded into
++                        # _promoted_rows above -- that list is flat block_id
++                        # ints shared with the cross-rank KVMIRROR sync and
++                        # has no per-request grouping; overloading it with a
++                        # second meaning was flagged during design review as
++                        # exactly the kind of shared-state sharp edge this
++                        # investigation keeps getting cut on.
++                        req_state = self._req_state.get(
++                            job_metadata.req_context.req_id
++                        )
++                        if req_state is not None:
++                            req_state.wave_ready_keys.update(job_metadata.keys)
+                 else:
+                     # primary→secondary transfer completed.
+                     # Decrement ref_cnt on primary blocks.
+@@ -296,6 +320,7 @@ class TieringOffloadingManager(OffloadingManager):
+         req_context: ReqContext,
+         *,
+         exclude_tier: SecondaryTierManager | None = None,
++        promote: bool = True,
+     ) -> LookupResult:
+         """
+         Check whether a single block is offloaded and ready.
+@@ -309,14 +334,26 @@ class TieringOffloadingManager(OffloadingManager):
+         Args:
+             key: Block hash to look up.
+             req_context: Per-request context.
++            promote: WAVE STREAMING (draft). When False, a secondary-tier HIT
++                is returned as-is instead of triggering `_initiate_promotion`
++                — the caller is only checking existence (e.g. the scheduler's
++                matching walk, which must not spend primary-tier rows to
++                confirm a hit; see docs/superpowers/specs/2026-09-05-
++                deepcached-wave-streaming-design.md §1). Callers that need the
++                match to also stage the data keep the default. This does not
++                change primary-tier HIT/HIT_PENDING reporting — a block
++                already resident (from an earlier wave, or another request's
++                promotion) is reported accurately either way.
+ 
+         Returns:
+-            HIT       — block is ready in the primary tier.
++            HIT       — block is ready in the primary tier, OR (promote=False)
++                        confirmed present in a secondary tier without being
++                        staged.
+             HIT_PENDING — block found but not yet readable (write
+                         in-flight on the primary tier).
+             RETRY     — promotion started or a secondary tier is busy.
+-            MISS      — block not found in any tier, or primary is full
+-                        and cannot accept a promotion.
++            MISS      — block not found in any tier, or (promote=True)
++                        primary is full and cannot accept a promotion.
+         """
+         # Poll first so a promotion that finished since the last call is
+         # already reflected as HIT (not stale HIT_PENDING/MISS) below, and
+@@ -339,6 +376,9 @@ class TieringOffloadingManager(OffloadingManager):
+                 continue
+             result = tier.lookup(key, req_context)
+             if result is LookupResult.HIT:
++                if not promote:
++                    self._accumulate_lookup_sync_delay(req_state, lookup_start)
++                    return LookupResult.HIT
+                 promoted = self._initiate_promotion(tier, key, req_context)
+                 self._accumulate_lookup_sync_delay(req_state, lookup_start)
+                 if (
+@@ -435,6 +475,151 @@ class TieringOffloadingManager(OffloadingManager):
+         entry.block_ids.extend(store_spec.block_ids)
+         return True
+ 
++    def promote_for_staging(
++        self, keys: list[OffloadKey], req_context: ReqContext
++    ) -> bool:
++        """WAVE STREAMING (draft). Batch-reserve primary-tier rows for an
++        already-matched wave's keys and queue their secondary->primary read,
++        deferred to _flush_pending_promotions() exactly like a normal
++        promotion.
++
++        Unlike `_initiate_promotion` (called once per key, during matching,
++        from `lookup()`), this is called once per *wave* — after matching has
++        already fully resolved via `lookup(..., promote=False)` — by the
++        scheduler-side wave driver (`OffloadingConnectorScheduler`'s
++        `build_connector_meta`, see docs/superpowers/specs/2026-09-05-
++        deepcached-wave-streaming-design.md Appendix B). Batching the whole
++        wave into one `prepare_write` call is also strictly cheaper than the
++        per-key loop `_initiate_promotion` uses: one allocation/eviction pass
++        instead of `len(keys)` of them.
++
++        Assumes a single secondary tier (this profile has exactly one, `fs`;
++        see the design's "Single secondary tier assumption" — tracking which
++        tier a wave's keys came from is not implemented, matching that YAGNI
++        call). Asserts rather than silently picking one if that ever changes.
++
++        Args:
++            keys: every key in one wave, already confirmed present on the
++                secondary tier by a prior `lookup(..., promote=False)` call.
++            req_context: per-request context, forwarded to
++                `primary_tier.prepare_write()`.
++
++        Returns:
++            True if the promotion was queued (rows reserved, submit_load()
++            will run at the next `on_schedule_end()`). False if the primary
++            tier refused (no evictable capacity right now) — the caller must
++            retry later or give up per its own bounded policy; this method
++            does not retry.
++        """
++        if not keys:
++            return True  # nothing to stage (ported from draft B; harmless)
++        if not self.secondary_tiers:
++            # No secondary source to promote from (ported from draft B). The
++            # single-tier assumption is a documented YAGNI for this profile;
++            # if a second secondary tier is ever added, revisit this.
++            return False
++        tier = self.secondary_tiers[0]
++
++        primary_write_result = self.primary_tier.prepare_write(keys, req_context)
++        if primary_write_result is None:
++            return False
++
++        store_spec = primary_write_result.store_spec
++        assert isinstance(store_spec, CPULoadStoreSpec)
++        tier_pending = self._pending_load_submissions.setdefault(tier, {})
++        ctx_id = req_context.req_id
++        if ctx_id not in tier_pending:
++            tier_pending[ctx_id] = PendingPromotion(
++                keys=[], block_ids=[], req_context=req_context
++            )
++        entry = tier_pending[ctx_id]
++        new_keys = list(primary_write_result.keys_to_store)
++        entry.keys.extend(new_keys)
++        entry.block_ids.extend(store_spec.block_ids)
++
++        # REQUEST PARKING / WAVE STREAMING (draft), blocker (b): prepare_write
++        # reports only NEW keys, so a key already resident (shared prefix left
++        # resident, or promoted by another request) never appears in keys_to_store
++        # and would forever look "not ready" to pop_ready_keys, hanging the wave.
++        # Treat the ready complement as ready immediately. BUT the complement is
++        # not "already resident" in general: prepare_store excludes a key from
++        # keys_to_store whenever the policy has it at all -- including ref_cnt
++        # == -1, a promotion ANOTHER request is mid-write (lookup -> HIT_PENDING).
++        # Marking that ready lets the driver ship a wave that prepare_load then
++        # crashes on (`assert block.is_ready`). So only keys that are genuinely
++        # ready (HIT) are seeded; the write-pending ones stay unready and resolve
++        # through the normal completion path.
++        already_resident = {
++            k
++            for k in set(keys) - set(new_keys)
++            if self.primary_tier.lookup(k, req_context) is LookupResult.HIT
++        }
++        if already_resident:
++            req_state = self._req_state.get(ctx_id)
++            if req_state is not None:
++                req_state.wave_ready_keys.update(already_resident)
++        return True
++
++    def pop_ready_keys(self, req_id: str, keys: Collection[OffloadKey]) -> bool:
++        """WAVE STREAMING (draft). True and clears `keys` from the ready set
++        iff every one of `keys` has been recorded as promotion-complete by
++        `_process_finished_jobs` since the last call. Partial readiness
++        (some but not all of `keys` ready) returns False and leaves the ready
++        set untouched, so a later call sees the full set once the rest lands.
++
++        Called by the scheduler-side wave driver, after `on_schedule_end()`
++        has run for this step (so any promotion that completed this step is
++        already reflected), to decide whether a wave is safe to
++        `prepare_load()`.
++
++        REVIEW #4 (N2): `wave_ready_keys` alone is NOT sufficient. It is fed by
++        `_process_finished_jobs`, which records completions under the id of the
++        request that INITIATED the promotion (`job_metadata.req_context.req_id`)
++        — so a key this request's wave needs, but that ANOTHER request was
++        mid-promotion on when `promote_for_staging` ran, never lands here:
++        `prepare_write` skipped it (the policy already held it, so it is not in
++        `keys_to_store`) and the blocker-(b) seed skipped it too (it read back
++        HIT_PENDING, not HIT, and seeding a write-pending key would crash
++        `prepare_load`'s `assert block.is_ready`). Without the re-probe below
++        that key is never reported ready by anyone and the wave hangs forever.
++
++        So: fall back to asking the primary tier directly for whatever is not
++        yet in the ready set. `lookup()` is the authoritative readiness
++        discriminator — HIT means resident and readable, HIT_PENDING means a
++        write is still in flight — and it is exactly what `prepare_load`'s
++        assert checks. The probe is bounded by one wave's key count and only
++        runs for keys still outstanding.
++
++        Side-effect-free as configured: `CPUOffloadingManager.lookup` only
++        mutates its `counts` store-threshold tracker when `store_threshold >= 2`,
++        and `CPUPrimaryTierOffloadingManager.__init__` never passes one, so
++        `counts` is None for the primary tier. If a store_threshold is ever
++        configured there, revisit this — repeated probing would inflate those
++        counts and perturb the STORE path, which this design must not touch.
++        """
++        req_state = self._req_state.get(req_id)
++        if req_state is None:
++            return False
++        wanted = set(keys)
++        outstanding = wanted - req_state.wave_ready_keys
++        if outstanding:
++            # N2: adopt any outstanding key the primary tier now reports as
++            # genuinely readable, whoever promoted it. Anything still
++            # HIT_PENDING (or MISS) stays outstanding and is retried next step.
++            newly_ready = {
++                k
++                for k in outstanding
++                if self.primary_tier.lookup(k, req_state.req_context)
++                is LookupResult.HIT
++            }
++            if newly_ready:
++                req_state.wave_ready_keys.update(newly_ready)
++                outstanding -= newly_ready
++            if outstanding:
++                return False
++        req_state.wave_ready_keys.difference_update(wanted)
++        return True
++
+     def _flush_pending_promotions(self) -> None:
+         """Submit one batched submit_load() per (tier, request).
+ 
+@@ -776,6 +961,25 @@ class TieringOffloadingManager(OffloadingManager):
+             self._maybe_observe_lookup_sync_delay(state)
+             self._maybe_observe_lookup_async_delay(state)
+ 
++    # REQUEST PARKING (draft): read-only primary-tier capacity snapshot for the
++    # scheduler's admission gate. Returns (total_rows, free_rows) where
++    # free_rows = rows that can accept a NEW promotion right now.
++    #
++    # "Can accept a promotion now" is _get_num_free_blocks() PLUS
++    # _num_evictable_cache_blocks: the CPU manager's prepare_store refuses only
++    # when num_blocks_to_evict > _num_evictable_cache_blocks (cpu/manager.py),
++    # i.e. it can always evict evictable rows and admit. Using only
++    # _get_num_free_blocks() (never-allocated + explicitly-freed) reports ~0
++    # free on a warm tier of evictable rows -- exactly the post-stream state
++    # parking exists to release on -- and would park every request. Hard
++    # attribute access, consistent with the 'fail loudly' stance elsewhere: a
++    # renamed field must crash, not silently return 0.
++    def free_primary_rows(self) -> tuple[int, int]:
++        pt = self.primary_tier
++        total = int(pt._num_blocks)
++        free = int(pt._get_num_free_blocks() + pt._num_evictable_cache_blocks)
++        return total, max(0, min(free, total))
++
+     @override
+     def has_pending_work(self) -> bool:
+         # In-flight primary<->secondary transfers (pending promotions are
+@@ -825,6 +1029,13 @@ class TieringOffloadingManager(OffloadingManager):
+         finished_req_ids = []
+         for req_id, state in self._req_state.items():
+             state.pending_primary_stores = 0
++            # WAVE STREAMING (draft): primary_tier.reset_cache() below wipes
++            # every row, so any wave_ready_keys claiming a key is resident
++            # would be stale the instant this returns. Clear for active
++            # requests too, not just finished ones -- an active request whose
++            # rows just got wiped must re-promote, not `prepare_load()` a
++            # dead row.
++            state.wave_ready_keys.clear()
+             if not state.is_finished:
+                 continue
+             for tier in self.secondary_tiers:
