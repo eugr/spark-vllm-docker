@@ -301,10 +301,9 @@ ARG VLLM_REF=main
 ARG VLLM_SOURCE_MODE=remote
 ARG VLLM_SOURCE_COMMIT=""
 
-# Pinned while investigating an SM121 DeepSeek-V4 MXFP4 grouped scale-factor
-# regression first observed at nv_dev f8e8fb5 (PR #384); last known good.
-ARG DEEPGEMM_REPO=https://github.com/deepseek-ai/DeepGEMM.git
-ARG DEEPGEMM_REF=a6b593d2826719dcf4892609af7b84ee23aaf32a
+# Empty overrides select DeepGEMM to match the patched vLLM source below.
+ARG DEEPGEMM_REPO=""
+ARG DEEPGEMM_REF=""
 ENV DEEPGEMM_SRC_DIR=/workspace/DeepGEMM
 
 # The upstream repository uses the shared checkout cache. Custom repositories
@@ -369,27 +368,6 @@ RUN --mount=type=cache,id=repo-cache,target=/repo-cache \
         git gc --auto; \
         cp -a /repo-cache/vllm "$VLLM_BASE_DIR/"; \
     fi
-
-RUN --mount=type=cache,id=repo-cache,target=/repo-cache \
-    set -eux; \
-    cd /repo-cache; \
-    if [ ! -d "deepgemm" ]; then \
-        echo "Cache miss: Cloning DeepGEMM from scratch..."; \
-        git clone --recursive "$DEEPGEMM_REPO" deepgemm; \
-    else \
-        echo "Cache hit: Fetching DeepGEMM updates..."; \
-        cd deepgemm; \
-        git fetch origin; \
-        git fetch origin --tags --force; \
-        cd ..; \
-    fi; \
-    cd deepgemm; \
-    git checkout --detach "$DEEPGEMM_REF" 2>/dev/null || git checkout --detach "origin/$DEEPGEMM_REF"; \
-    git reset --hard; \
-    git submodule update --init --recursive; \
-    git clean -fdx; \
-    rm -rf "$DEEPGEMM_SRC_DIR"; \
-    cp -a /repo-cache/deepgemm "$DEEPGEMM_SRC_DIR"
 
 WORKDIR $VLLM_BASE_DIR/vllm
 
@@ -703,6 +681,13 @@ RUN --mount=type=cache,id=uv-cache,target=/root/.cache/uv \
 # TEMPORARY PATCH for broken vLLM build (unguarded Hopper code) - reverting PR #34758 and #34302
 # RUN curl -L https://patch-diff.githubusercontent.com/raw/vllm-project/vllm/pull/34758.diff | patch -p1 -R || echo "Cannot revert PR #34758, skipping"
 # RUN curl -L https://patch-diff.githubusercontent.com/raw/vllm-project/vllm/pull/34302.diff | patch -p1 -R || echo "Cannot revert PR #34302, skipping"
+
+# Resolve after PRs and source patches: stable-ABI vLLM requires its declared
+# DeepGEMM fork/pin; older refs retain the SM121 regression workaround.
+COPY docker/prepare_deepgemm.py /tmp/prepare_deepgemm.py
+RUN --mount=type=cache,id=repo-cache,target=/repo-cache,sharing=locked \
+    python3 /tmp/prepare_deepgemm.py . /repo-cache "$DEEPGEMM_SRC_DIR" \
+        --repo "$DEEPGEMM_REPO" --ref "$DEEPGEMM_REF"
 
 # Final Compilation
 RUN --mount=type=cache,id=ccache,target=/root/.ccache \
