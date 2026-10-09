@@ -128,6 +128,76 @@ class RouteDumpTests(unittest.TestCase):
                 worker.remap_route_dump(data, {2: 19})
 
 
+class StatePathTests(unittest.TestCase):
+    def setUp(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        self.root = Path(temp.name).resolve()
+        self.current = self.root / "spark-vllm-docker/cluster-setup.json"
+        self.legacy = self.root / "spark-vllm/cluster-setup.json"
+        self.manifest = {"version": 1, "nodes": NODES[:2], "user": "fixture", "transaction": "fixture"}
+        self.transport = Mock()
+        for owner, name, value in (
+            (setup, "DEFAULT_STATE", self.current), (setup, "LEGACY_STATE", self.legacy),
+            (setup.os, "getuid", Mock(return_value=1000)),
+            (setup.pwd, "getpwuid", Mock(return_value=SimpleNamespace(pw_name="fixture"))),
+            (setup, "check_head", Mock()), (setup, "Transport", Mock(return_value=self.transport)),
+        ):
+            patcher = patch.object(owner, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def save(self, path):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(self.manifest))
+
+    def test_new_setup_uses_renamed_directory_even_with_empty_legacy_directory(self):
+        self.legacy.parent.mkdir()
+        with patch.object(setup, "setup") as configure:
+            setup.main(NODES[:2])
+        self.assertEqual(configure.call_args.args[0].state_file, self.current)
+        self.assertFalse(self.legacy.exists())
+
+    def test_saved_modes_find_current_and_legacy_manifests(self):
+        for path in (self.current, self.legacy):
+            self.save(path)
+            for mode, target in (("--restore", "restore_cluster"), ("--doctor", "doctor"),
+                                 ("--save-env", "save_existing_env")):
+                with self.subTest(path=path, mode=mode), patch.object(setup, target) as operation, \
+                     contextlib.redirect_stdout(io.StringIO()):
+                    setup.main([mode])
+                    selected = (operation.call_args.args[3] if mode == "--restore"
+                                else operation.call_args.args[0].state_file)
+                    self.assertEqual(selected, path)
+                    self.assertEqual(json.loads(path.read_text()), self.manifest)
+            path.unlink()
+
+    def test_legacy_manifest_blocks_new_setup_before_connecting(self):
+        self.save(self.legacy)
+        with self.assertRaisesRegex(ValueError, "use --restore before another setup"):
+            setup.main(NODES[:2])
+        setup.Transport.assert_not_called()
+        self.assertFalse(self.current.exists())
+
+    def test_conflicting_manifests_require_explicit_selection(self):
+        self.save(self.current)
+        self.save(self.legacy)
+        with self.assertRaisesRegex(ValueError, "select.*--state-file"):
+            setup.main(["--restore"])
+        setup.Transport.assert_not_called()
+        for path in (self.current, self.legacy, self.root / "custom.json"):
+            self.save(path)
+            with patch.object(setup, "restore_cluster") as restore, contextlib.redirect_stdout(io.StringIO()):
+                setup.main(["--restore", "--state-file", str(path)])
+            self.assertEqual(restore.call_args.args[3], path)
+
+    def test_explicit_missing_path_is_not_replaced_by_legacy_state(self):
+        self.save(self.legacy)
+        with self.assertRaises(FileNotFoundError):
+            setup.main(["--restore", "--state-file", str(self.current)])
+        setup.Transport.assert_not_called()
+
+
 class PlanningTests(unittest.TestCase):
     def test_mtu_default_custom_values_and_invalid_arguments(self):
         self.assertIsNone(setup.parser().parse_args([]).mtu)
@@ -428,6 +498,7 @@ class NodeTests(unittest.TestCase):
         self.home.mkdir()
         self.state = self.root / "state"
         self.state.mkdir(mode=0o700)
+        self.legacy = self.root / "legacy-state"
         self.ipv6 = self.root / "ipv6"
         for name in ["all", "default", "management0", *worker.PORTS[0], *worker.PORTS[1]]:
             (self.ipv6 / name).mkdir(parents=True)
@@ -441,7 +512,8 @@ class NodeTests(unittest.TestCase):
         self.request = {**self.plan, "transaction": "test-transaction", "user": "fixture"}
         self.info = inventory(NODES[0])
         self.calls = []
-        for name, value in (("STATE", self.state), ("NETPLAN", self.netplan), ("IPV6_CONF", self.ipv6)):
+        for name, value in (("STATE", self.state), ("LEGACY_STATE", self.legacy),
+                            ("NETPLAN", self.netplan), ("IPV6_CONF", self.ipv6)):
             patcher = patch.object(worker, name, value)
             patcher.start()
             self.addCleanup(patcher.stop)
@@ -500,6 +572,85 @@ class NodeTests(unittest.TestCase):
         result = worker.prepare(self.request, self.account)
         self.assertEqual(result, {"public_key": "ssh-ed25519 AAAA fixture"})
         return worker.Journal(json.loads((self.state / "journal.json").read_text()))
+
+    def dispatch(self, action, **request):
+        original_stat = Path.stat
+
+        def stat(path, *args, **kwargs):
+            info = original_stat(path, *args, **kwargs)
+            if path in (self.state, self.legacy):
+                fields = list(info)
+                fields[4] = 0  # Simulate root ownership of node state directories.
+                return os.stat_result(fields)
+            return info
+
+        with patch.object(worker.pwd, "getpwnam", return_value=self.account), \
+             patch.object(worker.os, "geteuid", return_value=0), \
+             patch.object(Path, "stat", stat):
+            return worker.dispatch({**self.request, **request, "action": action})
+
+    def test_legacy_restore_is_retryable_and_next_setup_uses_new_directory(self):
+        self.prepare()
+        self.state.rename(self.legacy)
+        self.assertEqual(self.dispatch("check-restore"), {})
+        self.assertEqual(self.dispatch("restore"), {})
+        self.assertFalse((self.legacy / "journal.json").exists())
+        self.assertEqual(self.dispatch("check-restore"), {})
+        self.assertEqual(self.dispatch("restore"), {})
+        self.dispatch("prepare")
+        self.assertTrue((self.state / "journal.json").exists())
+        self.assertFalse((self.legacy / "journal.json").exists())
+
+    def test_legacy_doctor_reads_and_updates_original_journal(self):
+        self.prepare()
+        self.state.rename(self.legacy)
+
+        def repair(request, account, journal):
+            journal.state["repair_marker"] = True
+            journal.save()
+            return {}
+
+        with patch.object(worker, "doctor_report", return_value={"issues": []}) as report:
+            self.assertEqual(self.dispatch("doctor-inspect"), {"issues": []})
+            self.assertEqual(report.call_args.args[1].root, self.legacy)
+        with patch.object(worker, "repair_node", side_effect=repair):
+            self.dispatch("doctor-repair")
+        self.assertTrue(json.loads((self.legacy / "journal.json").read_text())["repair_marker"])
+        self.assertFalse(self.state.exists())
+
+    def test_legacy_journal_blocks_fresh_preflight_and_prepare(self):
+        self.prepare()
+        self.state.rename(self.legacy)
+        for action in ("preflight", "prepare"):
+            with self.subTest(action=action), self.assertRaisesRegex(ValueError, "restore"):
+                self.dispatch(action, transaction="new-transaction")
+        self.assertFalse(self.state.exists())
+
+    def test_conflicting_node_journals_are_preserved(self):
+        self.prepare()
+        self.legacy.mkdir(mode=0o700)
+        before = (self.state / "journal.json").read_bytes()
+        (self.legacy / "journal.json").write_bytes(before)
+        for action in ("preflight", "check-restore", "restore", "doctor-inspect", "prepare"):
+            with self.subTest(action=action), self.assertRaisesRegex(ValueError, "journals exist in both"):
+                self.dispatch(action)
+        for directory in (self.state, self.legacy):
+            self.assertEqual((directory / "journal.json").read_bytes(), before)
+
+    def test_legacy_journal_keeps_directory_permission_checks(self):
+        self.prepare()
+        self.state.rename(self.legacy)
+        self.legacy.chmod(0o755)
+        with self.assertRaisesRegex(ValueError, "root-owned mode 0700"):
+            self.dispatch("restore")
+        self.assertTrue((self.legacy / "journal.json").exists())
+
+    def test_legacy_journal_symlink_is_rejected(self):
+        self.legacy.mkdir(mode=0o700)
+        (self.legacy / "journal.json").symlink_to(self.root / "missing.json")
+        with self.assertRaisesRegex(ValueError, "Refusing symlink"):
+            self.dispatch("prepare")
+        self.assertFalse((self.state / "journal.json").exists())
 
     def test_exact_migration_preserves_management_and_sets_guide_fields(self):
         files = worker.network_files(self.request, worker.preflight(self.request, self.info))

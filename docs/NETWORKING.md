@@ -267,14 +267,21 @@ Run on the same head, as the same user:
 ./setup-cluster.sh --restore
 ```
 
-The default head manifest is `~/.local/state/spark-vllm/cluster-setup.json`.
+The default head manifest is `~/.local/state/spark-vllm-docker/cluster-setup.json`.
 Use `--state-file /path/to/manifest.json` for both setup and restore to choose
 another location. Restore uses the recorded file paths automatically; do not
 repeat `--netplan-file` with `--restore`. Each node keeps its original file
 contents and permissions in a root-only journal under
-`/var/lib/spark-vllm/setup-cluster/`. Keep the head
+`/var/lib/spark-vllm-docker/setup-cluster/`. Keep the head
 manifest and node journals until restoration is complete. Only one active
 setup per node is supported; restore it before changing topology or addresses.
+
+Existing manifests and journals under the former `spark-vllm` directories are
+detected automatically and used in place, including by `--doctor` and
+`--save-env`. Explicit `--state-file` paths are used as given. After restoring
+an older setup, new setups use the `spark-vllm-docker` directories. If both head
+manifest locations contain saved state, select the intended one with
+`--state-file`; conflicting node journals require manual reconciliation.
 
 Restore checks all nodes for file changes before restoring any node. It
 restores the original Netplan, SSH, and head `.env` files and their permissions, removes

@@ -21,8 +21,20 @@ import zlib
 
 from setup_cluster_node import DEFAULT_MTU, NETPLAN, PORTS, mtu_value, netplan_path, requested_mtu
 
-DEFAULT_STATE = Path.home() / ".local/state/spark-vllm/cluster-setup.json"
+DEFAULT_STATE = Path.home() / ".local/state/spark-vllm-docker/cluster-setup.json"
+LEGACY_STATE = Path.home() / ".local/state/spark-vllm/cluster-setup.json"
 DEFAULT_ENV = Path(__file__).resolve().with_name(".env")
+
+
+def state_file_path(path):
+    if path is not None:
+        return path
+    if LEGACY_STATE.exists():
+        if DEFAULT_STATE.exists():
+            raise ValueError(f"Setup manifests exist at both {DEFAULT_STATE} and {LEGACY_STATE}; "
+                             "select the intended manifest with --state-file")
+        return LEGACY_STATE
+    return DEFAULT_STATE
 
 
 def parse_nodes(values):
@@ -794,7 +806,8 @@ def parser():
     mode.add_argument("--restore", action="store_true", help="restore the setup recorded in --state-file")
     mode.add_argument("--save-env", action="store_true", help="verify an existing saved setup and save its head .env")
     mode.add_argument("--doctor", action="store_true", help="check a saved setup and offer repairs; --dry-run checks only")
-    result.add_argument("--state-file", type=Path, default=DEFAULT_STATE, help="head-node restore manifest (default: %(default)s)")
+    result.add_argument("--state-file", type=Path,
+                        help=f"head-node restore manifest (default: {DEFAULT_STATE}; detects existing legacy state)")
     return result
 
 
@@ -812,12 +825,14 @@ def main(argv=None):
                 or (args.no_env and not args.doctor)
                 or (args.restore and (args.dry_run or args.env_file))):
             raise ValueError("--restore/--save-env/--doctor use the saved node list; omit nodes and networking options")
+        args.state_file = state_file_path(args.state_file)
         manifest = json.loads(args.state_file.read_text())
         if manifest["version"] != 1 or manifest["user"] != user:
             raise ValueError("Restore manifest version/user mismatch")
         nodes = parse_nodes(manifest["nodes"])
     else:
         nodes = parse_nodes(args.nodes)
+        args.state_file = state_file_path(args.state_file)
         if args.state_file.exists():
             raise ValueError(f"Setup already recorded at {args.state_file}; use --restore before another setup")
     check_head(nodes)

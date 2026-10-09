@@ -22,7 +22,8 @@ import subprocess
 import tempfile
 
 NETPLAN = Path("/etc/netplan/98-spark-vllm-docker.yaml")
-STATE = Path("/var/lib/spark-vllm/setup-cluster")
+STATE = Path("/var/lib/spark-vllm-docker/setup-cluster")
+LEGACY_STATE = Path("/var/lib/spark-vllm/setup-cluster")
 IPV6_CONF = Path("/proc/sys/net/ipv6/conf")
 DEFAULT_MTU = 9000
 PORTS = {p: [f"enp1s0f{p}np{p}", f"enP2p1s0f{p}np{p}"] for p in (0, 1)}
@@ -82,6 +83,21 @@ def no_symlinks(path):
             raise ValueError(f"Refusing symlink: {part}")
 
 
+def state_directory():
+    # Finish existing setups in place. Empty legacy directories left by restore
+    # must not keep new setups from using the renamed directory.
+    active = []
+    for directory in (STATE, LEGACY_STATE):
+        path = directory / "journal.json"
+        no_symlinks(path)
+        if path.exists():
+            active.append(directory)
+    if len(active) > 1:
+        raise ValueError(f"Setup journals exist in both {STATE} and {LEGACY_STATE}; "
+                         "reconcile the saved journals before proceeding")
+    return active[0] if active else STATE
+
+
 def snapshot(path):
     no_symlinks(path)
     if not path.exists():
@@ -119,11 +135,12 @@ def atomic_write(path, data, mode=0o600, uid=0, gid=0):
 
 
 class Journal:
-    def __init__(self, state):
+    def __init__(self, state, state_dir=None):
         self.state = state
+        self.root = STATE if state_dir is None else state_dir
 
     def save(self):
-        atomic_write(STATE / "journal.json", json.dumps(self.state).encode())
+        atomic_write(self.root / "journal.json", json.dumps(self.state).encode())
 
     def write(self, path, data, mode=0o600, uid=0, gid=0):
         if any(entry["path"] == str(path) for entry in self.state["files"]):
@@ -456,7 +473,7 @@ def netplan_changes(interfaces, links=(), target=None):
 
 def preflight(request, info):
     requested_mtu(request)
-    journal_path = STATE / "journal.json"
+    journal_path = state_directory() / "journal.json"
     if journal_path.exists():
         state = json.loads(journal_path.read_text())
         if not request.get("transaction") or state["transaction"] != request["transaction"]:
@@ -642,8 +659,9 @@ def restored_routes(journal, links):
     return result
 
 
-def prepare(request, account):
-    if (STATE / "journal.json").exists():
+def prepare(request, account, state_dir=None):
+    state_dir = state_directory() if state_dir is None else state_dir
+    if (state_dir / "journal.json").exists():
         raise ValueError("A setup journal already exists on this node; restore it before a new setup")
     info = inventory(account.pw_name)
     files = network_files(request, preflight(request, info))
@@ -660,12 +678,13 @@ def prepare(request, account):
                        "files": [], "directories": [], "network_started": False,
                        "interfaces": request["interfaces"], "mtu": requested_mtu(request),
                        "routes": save_routes(request["interfaces"]),
-                       "runtime": [item for item in info["links"] if item["ifname"] in request["interfaces"]]})
+                       "runtime": [item for item in info["links"] if item["ifname"] in request["interfaces"]]},
+                      state_dir)
     journal.save()
     journal.directory(directory, account.pw_uid, account.pw_gid)
     journal.directory(managed, account.pw_uid, account.pw_gid)
     # Generate locally, then journal installation. The private key is never returned.
-    with tempfile.TemporaryDirectory(prefix="key-", dir=STATE) as temp:
+    with tempfile.TemporaryDirectory(prefix="key-", dir=state_dir) as temp:
         key = Path(temp) / "id_ed25519"
         run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-C",
              "spark-vllm:" + request["transaction"], "-f", str(key)])
@@ -796,11 +815,11 @@ def restore(journal):
         except OSError:
             pass
     # A hard kill during ssh-keygen can leave its root-only temporary directory.
-    for path in STATE.glob("key-*"):
+    for path in journal.root.glob("key-*"):
         no_symlinks(path)
         if path.is_dir():
             shutil.rmtree(path)
-    (STATE / "journal.json").unlink()
+    (journal.root / "journal.json").unlink()
     return {}
 
 
@@ -991,32 +1010,32 @@ def dispatch(request):
         return verify(request, account)
     if os.geteuid() != 0:
         raise ValueError("Node changes require sudo")
-    no_symlinks(STATE)
+    state_dir = state_directory()
     readonly = action in ("check-restore", "inspect-setup", "doctor-inspect", "doctor-env")
-    if not STATE.exists() and (readonly or action == "restore"):
+    if not state_dir.exists() and (readonly or action == "restore"):
         if action in ("check-restore", "restore"):
             return {}
         raise ValueError("No saved setup journal on this node; configure the cluster first")
     if not readonly:
-        STATE.mkdir(parents=True, mode=0o700, exist_ok=True)
-    if STATE.stat().st_uid != 0 or stat.S_IMODE(STATE.stat().st_mode) != 0o700:
-        raise ValueError(f"Expected root-owned mode 0700 state directory: {STATE}")
+        state_dir.mkdir(parents=True, mode=0o700, exist_ok=True)
+    if state_dir.stat().st_uid != 0 or stat.S_IMODE(state_dir.stat().st_mode) != 0o700:
+        raise ValueError(f"Expected root-owned mode 0700 state directory: {state_dir}")
     # Serialize mutating requests and restorations on each node.
     import fcntl
-    lock_path = STATE / "lock"
+    lock_path = state_dir / "lock"
     if readonly and not lock_path.exists():
-        lock_path = STATE / "journal.json"
+        lock_path = state_dir / "journal.json"
     with lock_path.open("r" if readonly else "a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         if action == "prepare":
-            return prepare(request, account)
-        path = STATE / "journal.json"
+            return prepare(request, account, state_dir)
+        path = state_dir / "journal.json"
         if not path.exists() and action in ("restore", "check-restore"):
             return {}
         state = json.loads(path.read_text())
         if state["transaction"] != request["transaction"] or state["user"] != account.pw_name:
             raise ValueError("Setup journal belongs to a different transaction/user")
-        journal = Journal(state)
+        journal = Journal(state, state_dir)
         if action == "check-restore":
             check_restore(journal)
             return {}
