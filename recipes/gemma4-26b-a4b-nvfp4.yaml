@@ -28,6 +28,8 @@ defaults:
   gpu_memory_utilization: 0.7
   max_model_len: 262144
   max_num_batched_tokens: 8192
+  # JSON-valued args live here whole: the renderer can't substitute inside JSON braces
+  speculative_config: '{"method":"mtp","model":"google/gemma-4-26B-A4B-it-assistant","num_speculative_tokens":4, "moe_backend": "triton"}'
 
 # Environment variables
 env: {}
@@ -46,6 +48,6 @@ command: |
     --reasoning-parser gemma4 \
     --kv-cache-dtype fp8 \
     --max-num-batched-tokens {max_num_batched_tokens} \
-    --speculative-config '{{"method":"mtp","model":"google/gemma-4-26B-A4B-it-assistant","num_speculative_tokens":4, "moe_backend": "triton"}}' \
+    --speculative-config '{speculative_config}' \
     -tp {tensor_parallel} --distributed-executor-backend ray
     

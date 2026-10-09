@@ -27,7 +27,9 @@ defaults:
   block_size: 256
   max_num_seqs: 4
   max_num_batched_tokens: 8192
-  num_speculative_tokens: 2
+  # JSON-valued args live here whole: the renderer can't substitute inside JSON braces
+  speculative_config: '{"method":"mtp","num_speculative_tokens":2}'
+  reasoning_config: '{"reasoning_parser":"deepseek_v4","reasoning_start_str":"","reasoning_end_str":""}'
 
 # Environment variables
 env:
@@ -49,13 +51,13 @@ command: |
       --max-num-batched-tokens {max_num_batched_tokens} \
       --gpu-memory-utilization {gpu_memory_utilization} \
       --enable-prefix-caching \
-      --speculative-config '{{"method":"mtp","num_speculative_tokens":{num_speculative_tokens}}}' \
+      --speculative-config '{speculative_config}' \
       --tokenizer-mode deepseek_v4 \
       --distributed-executor-backend ray \
       --tool-call-parser deepseek_v4 \
       --enable-auto-tool-choice \
       --reasoning-parser deepseek_v4 \
-      --reasoning-config '{{"reasoning_parser":"deepseek_v4","reasoning_start_str":"","reasoning_end_str":""}}' \
+      --reasoning-config '{reasoning_config}' \
       --default-chat-template-kwargs.thinking=true \
       --default-chat-template-kwargs.reasoning_effort=high \
       --load-format instanttensor
