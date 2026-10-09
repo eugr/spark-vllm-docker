@@ -1,0 +1,43 @@
+# Recipe: Qwen3.6-35B-A3B-NVFP4-Unsloth (W4A4)
+# Unsloth NVFP4 quant - true W4A4 on Blackwell FP4 tensor cores (faster than
+# NVIDIA W4A16). MTP built into the quant. Mixed NVFP4+FP8 MoE:
+# let vLLM auto-select the MoE backend (flashinfer_b12x breaks the FP8 layers;
+# Marlin is 2.5x slower for W4A4). Thinking is on by default.
+
+recipe_version: "1"
+name: Qwen3.6-35B-A3B-NVFP4-Unsloth-std
+description: vLLM serving unsloth/Qwen3.6-35B-A3B-NVFP4 (auto MoE backend)
+
+model: unsloth/Qwen3.6-35B-A3B-NVFP4
+
+container: vllm-node
+
+defaults:
+  port: 8000
+  host: 0.0.0.0
+  tensor_parallel: 1
+  gpu_memory_utilization: 0.65
+  max_model_len: 262144
+  max_num_seqs: 16
+  max_num_batched_tokens: 8192
+
+command: |
+  vllm serve unsloth/Qwen3.6-35B-A3B-NVFP4 \
+    --host {host} \
+    --port {port} \
+    --tensor-parallel-size {tensor_parallel} \
+    --trust-remote-code \
+    --kv-cache-dtype fp8 \
+    --attention-backend flashinfer \
+    --gpu-memory-utilization {gpu_memory_utilization} \
+    --max-model-len {max_model_len} \
+    --max-num-seqs {max_num_seqs} \
+    --max-num-batched-tokens {max_num_batched_tokens} \
+    --enable-chunked-prefill \
+    --async-scheduling \
+    --enable-prefix-caching \
+    --speculative-config '{{"method":"mtp","num_speculative_tokens":2}}' \
+    --load-format fastsafetensors \
+    --reasoning-parser qwen3 \
+    --tool-call-parser qwen3_xml \
+    --enable-auto-tool-choice

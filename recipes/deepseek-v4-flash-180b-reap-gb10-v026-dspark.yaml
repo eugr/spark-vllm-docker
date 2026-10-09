@@ -1,0 +1,145 @@
+# Recipe: DeepSeek-V4-Flash-180B REAP on GB10 — vLLM v0.26.0, DSpark speculative
+#
+# DSpark sibling of deepseek-v4-flash-180b-reap-gb10-v026-mtp.yaml. That
+# recipe uses eugr-spark-vllm-deepseek-v4-reap-gb10:0.26-dgfix (the only
+# confirmed-working 180B build via generic --speculative-config method:"mtp").
+# This one uses DSpark instead (method:"dspark"), ported byte-for-byte from
+# https://github.com/MykhailoTamarin/vllm-starter — see
+# deepseek-v4-flash-0731-reap-k160-gb10-v026-dspark.yaml's header for the
+# full rationale, which applies identically here since 180B and the
+# 0731-REAP K160 checkpoint are both REAP K160 prunes of the same
+# DeepSeek-V4-Flash-0731 architecture (same 43 backbone MoE layers, same 3
+# DSpark/MTP blocks at layers 40-42). In short:
+#
+# container is the PRISTINE `vllm/vllm-openai:v0.26.0`, NOT dgfix. dgfix's
+# baked-in REAP router/FlashInfer-IPC fix (from mods/deepseek-v4-reap-gb10-v026,
+# applied at image-build time) uses different wording than what
+# patch_vllm_k160_dspark.py's ported router/IPC steps search for, causing
+# spurious "old text not found" failures unrelated to DSpark itself —
+# confirmed by testing the verbatim ported script against dgfix directly.
+# vllm-starter's own tested log (models/logs/deepseek-v4-flash-0731-nvfp4-dspark.log)
+# shows all 18 patch steps applying cleanly (ok=17 fail=0) against pristine
+# v0.26.0, so that's the image this recipe uses too. `mods/use-official-vllm`
+# runs first per this repo's own documented convention for official images.
+#
+# mods/deepseek-v4-reap-gb10-v026-dspark/ (overlay files + patch script) is
+# shared verbatim between both dspark recipes; its only deviation from
+# upstream is DSPARK_OVERLAY's path (relative to the mod's own copied-in
+# directory, since this repo's mod mechanism has no bind-mount `volumes:`
+# key) — every other line matches vllm-starter exactly.
+#
+# REQUIRES a one-time local cache edit — 0xSero/DeepSeek-V4-Flash-180B's
+# config.json genuinely lacks the DSpark metadata fields vLLM's speculator
+# needs, unlike 0xSero/DeepSeek-V4-Flash-0731-REAP (the K160 checkpoint),
+# which has dspark_noise_token_id=128799, dspark_block_size=5,
+# dspark_markov_rank=256, dspark_target_layer_ids=[40,41,42]. First attempt
+# failed at engine-core init:
+#   ValueError: Model config must specify `dflash_config.mask_token_id`,
+#   `mask_token_id`, `dspark_noise_token_id`, `pard_token`, or
+#   `ptd_token_id` for parallel drafting.
+#
+# Tried --hf-overrides first (CLI-only, no cache edit) — does NOT work for
+# this. vllm/config/speculative.py's SpeculativeConfig.__post_init__ builds
+# a SEPARATE draft_model_config via its own ModelConfig(...) call for
+# eagle/eagle3/dflash/dspark methods, and compose_draft_hf_overrides()
+# explicitly drops dict-style overrides for that second config ("Dict
+# overrides are target-specific key patches and are not applied to the
+# draft" — only a *callable* override propagates, and the CLI has no way to
+# pass one). get_parallel_drafting_token_id() reads
+# self.draft_model_config.hf_config specifically, so --hf-overrides on the
+# target config never reaches the object DSpark actually checks. Confirmed
+# by testing: identical error, byte-for-byte, with --hf-overrides set.
+#
+# Actual fix: the 4 fields were added directly to the cached checkpoint's
+# config.json blob (~/.cache/huggingface/hub/models--0xSero--DeepSeek-V4-Flash-180B/
+# blobs/0e4ea5f80a80904a896bb27d3674751629e71e06 — a backup of the original
+# lives alongside it as .orig-before-dspark-patch). Both target_model_config
+# and the separately-constructed draft_model_config load config.json off
+# disk independently, so a file-level edit reaches both, sidestepping the
+# dict-vs-callable override split entirely. This edit is LOCAL ONLY (not
+# pushed upstream) and reapplying `hf download` for this revision would
+# overwrite it — re-patch from the .orig backup's known-missing state if
+# that happens.
+#
+# Values are not a guess: 180B's tokenizer.json is SHA256-IDENTICAL to the
+# K160 checkpoint's (both hash to 8f9f37ca37fd...), token 128799 is the same
+# reserved `<｜place▁holder▁no▁799｜>` special token in both, and both
+# configs report the same num_hidden_layers=43 — i.e. this is the same REAP
+# K160 pruning of the same DeepSeek-V4-Flash-0731 backbone, just exported
+# without the DSpark metadata block.
+#
+# UNVERIFIED beyond config resolution: whether 180B's actual MTP/DSpark
+# block WEIGHTS at layers 40/41/42 are present and structurally compatible
+# with the DSpark overlay's forward pass — this edit only fixes config
+# resolution, not tensor-shape or missing-weight issues if any exist
+# further into model loading.
+
+recipe_version: "1"
+name: DeepSeek-V4-Flash-180B-REAP-GB10-v026-DSpark
+description: >-
+  vLLM v0.26.0 serving 0xSero/DeepSeek-V4-Flash-180B (REAP K160, MXFP4
+  experts) on a single DGX Spark GB10 node, with DSpark speculative decoding
+  (nvfp4_ds_mla KV cache, b12x MoE backend) ported from vllm-starter.
+
+model: 0xSero/DeepSeek-V4-Flash-180B
+container: vllm/vllm-openai:v0.26.0
+
+mods:
+  - mods/deepseek-v4-reap-gb10-v026-dspark
+
+defaults:
+  port: 8000
+  host: 0.0.0.0
+  gpu_memory_utilization: 0.9
+  max_model_len: 262144
+  max_num_seqs: 2
+  max_num_batched_tokens: 4104
+  num_speculative_tokens: 5
+
+env:
+  VLLM_ALLOW_LONG_MAX_MODEL_LEN: "1"
+  VLLM_HTTP_TIMEOUT_KEEP_ALIVE: "10000"
+  FLASHINFER_DISABLE_VERSION_CHECK: "1"
+  TILELANG_CLEANUP_TEMP_FILES: "1"
+  DG_JIT_USE_NVRTC: "0"
+  DG_JIT_NVCC_COMPILER: "/usr/local/cuda/bin/nvcc"
+  NCCL_IB_DISABLE: "1"
+  NCCL_DEBUG: "WARN"
+  K160_DISABLE_CUTEDSL: "0"
+  CUTEDSL_VERSION: ""
+  PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
+  VLLM_USE_FLASHINFER_SAMPLER: "1"
+  VLLM_SPARSE_INDEXER_MAX_LOGITS_MB: "256"
+  VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS: "0"
+
+command: |
+  vllm serve 0xSero/DeepSeek-V4-Flash-180B \
+    --served-model-name deepseek-v4-flash-REAP-180B-dspark \
+    --host {host} \
+    --port {port} \
+    --trust-remote-code \
+    --tensor-parallel-size 1 \
+    --pipeline-parallel-size 1 \
+    --kv-cache-dtype nvfp4_ds_mla \
+    --block-size 256 \
+    --max-model-len {max_model_len} \
+    --max-num-seqs {max_num_seqs} \
+    --max-num-batched-tokens {max_num_batched_tokens} \
+    --gpu-memory-utilization {gpu_memory_utilization} \
+    --distributed-executor-backend mp \
+    --tokenizer-mode deepseek_v4 \
+    --load-format safetensors \
+    --enable-chunked-prefill \
+    --async-scheduling \
+    --enable-prefix-caching \
+    --tool-call-parser deepseek_v4 \
+    --enable-auto-tool-choice \
+    --reasoning-parser deepseek_v4 \
+    --reasoning-config '{{"reasoning_parser":"deepseek_v4","reasoning_start_str":"<think>","reasoning_end_str":"</think>"}}' \
+    --default-chat-template-kwargs '{{"thinking":true}}' \
+    --default-chat-template-kwargs.reasoning_effort=high \
+    --compilation-config '{{"cudagraph_mode":"FULL_AND_PIECEWISE","custom_ops":["all"]}}' \
+    --speculative-config '{{"method":"dspark","num_speculative_tokens":{num_speculative_tokens},"draft_sample_method":"greedy"}}' \
+    --generation-config vllm \
+    --enable-flashinfer-autotune \
+    --disable-access-log-for-endpoints /health,/metrics,/ping

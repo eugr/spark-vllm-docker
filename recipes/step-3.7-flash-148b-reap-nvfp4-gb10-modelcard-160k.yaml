@@ -1,0 +1,56 @@
+# Recipe: Step-3.7-Flash-148B-REAP-NVFP4-GB10 — model-card baseline @ 160k
+# The 0xSero/Step-3.7-Flash-148B model-card "Loading" command, adapted for a
+# single DGX Spark GB10 (tp1 + mp instead of the card's tp4 + expert-parallel)
+# and with context raised to 160k. Deliberately minimal: no MTP, no
+# chunked-prefill/prefix-caching, no enable_in_reasoning, no disable-cascade-attn,
+# no instanttensor, no reasoning_effort default — just the card's flags.
+
+recipe_version: "1"
+name: Step-3.7-Flash-148B-REAP-NVFP4-GB10-modelcard-160k
+description: >-
+  vLLM serving 0xSero/Step-3.7-Flash-148B with the model-card flag set, adapted
+  for a single GB10 node and 160k context.
+
+model: 0xSero/Step-3.7-Flash-148B
+container: vllm-node
+
+cluster_only: false
+mods:
+  - mods/step-3.7-flash
+
+defaults:
+  port: 8000
+  host: 0.0.0.0
+  tensor_parallel: 1
+  gpu_memory_utilization: 0.95
+  # 160k = 160*1024. Native pre-yarn is 131072 (rope_scaling llama3 x2 -> 262144),
+  # so 160k needs VLLM_ALLOW_LONG_MAX_MODEL_LEN (set below).
+  max_model_len: 262144
+  max_num_seqs: 4
+
+env:
+  VLLM_ALLOW_LONG_MAX_MODEL_LEN: "1"
+  VLLM_HTTP_TIMEOUT_KEEP_ALIVE: "10000"
+  FLASHINFER_DISABLE_VERSION_CHECK: "1"
+  PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
+  NCCL_IB_DISABLE: "1"
+  NCCL_DEBUG: "WARN"
+  HF_HUB_OFFLINE: "1"
+
+command: |
+  vllm serve 0xSero/Step-3.7-Flash-148B \
+      --served-model-name step3p7-flash-148b \
+      --trust-remote-code \
+      --port {port} \
+      --host {host} \
+      --gpu-memory-utilization {gpu_memory_utilization} \
+      -tp {tensor_parallel} \
+      --distributed-executor-backend mp \
+      --quantization modelopt \
+      --kv-cache-dtype fp8 \
+      --max-model-len {max_model_len} \
+      --max-num-seqs {max_num_seqs} \
+      --enable-auto-tool-choice \
+      --reasoning-parser step3p5 \
+      --tool-call-parser step3p5 \
+      --disable-access-log-for-endpoints /health,/metrics,/ping

@@ -1,0 +1,42 @@
+# Recipe: Qwen3.6-27B-NVFP4-Unsloth (W4A4, dense)
+# Unsloth NVFP4 quant - true W4A4 on Blackwell FP4 tensor cores. Dense 27B
+# (not MoE), so no MoE-backend knob and no built-in MTP (unsloth ships MTP as a
+# separate repo) - speculative decoding is omitted. Thinking is on by default.
+# Tuned for DGX Spark (GB10/SM121).
+
+recipe_version: "1"
+name: Qwen3.6-27B-NVFP4-Unsloth
+description: vLLM serving unsloth/Qwen3.6-27B-NVFP4 (dense W4A4)
+
+model: unsloth/Qwen3.6-27B-NVFP4
+
+container: vllm-node
+
+defaults:
+  port: 8000
+  host: 0.0.0.0
+  tensor_parallel: 1
+  gpu_memory_utilization: 0.65
+  max_model_len: 262144
+  max_num_seqs: 8
+  max_num_batched_tokens: 8192
+
+command: |
+  vllm serve unsloth/Qwen3.6-27B-NVFP4 \
+    --host {host} \
+    --port {port} \
+    --tensor-parallel-size {tensor_parallel} \
+    --trust-remote-code \
+    --kv-cache-dtype fp8 \
+    --attention-backend flashinfer \
+    --gpu-memory-utilization {gpu_memory_utilization} \
+    --max-model-len {max_model_len} \
+    --max-num-seqs {max_num_seqs} \
+    --max-num-batched-tokens {max_num_batched_tokens} \
+    --enable-chunked-prefill \
+    --async-scheduling \
+    --enable-prefix-caching \
+    --load-format fastsafetensors \
+    --reasoning-parser qwen3 \
+    --tool-call-parser qwen3_xml \
+    --enable-auto-tool-choice

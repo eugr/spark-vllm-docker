@@ -1,0 +1,100 @@
+# ============================================================================
+# NoSpec variant — NO speculative decoding (neither DSpark nor MTP).
+# ============================================================================
+# Derived from deepseek-v4-flash-0731-reap-k160-gb10-v026-dspark-marlin-officialpatch.yaml.
+#
+# WHY no MTP: the 0xSero REAP checkpoint's speculative weights are a DSpark
+# block (mtp.0.* with attn_sink / wkv / main_norm; ZERO classic-MTP tensors
+# like eh_proj / enorm / shared_head), so vLLM's method:mtp cannot load them
+# (KeyError: model.layers.43.mtp_block.main_norm.weight). This recipe removes
+# --speculative-config entirely: vLLM serves the base model and skips the
+# unused mtp.0.* weights (the normal "no MTP" load path), so it LOADS without
+# dspark and without mtp. Trade-off: no speculative speedup (~1 token/verify,
+# lower tok/s than DSpark's observed MAL ~3.2). Use the DSpark recipe if you
+# want the speedup; use this for a spec-free baseline guaranteed to load.
+#
+# Both mods kept on purpose:
+#   - official_0xsero: K160 router fallback, required to load the 160-expert
+#     model regardless of speculation.
+#   - dspark-sparse-mla-sm120: overlays the MAIN deepseek_v4 attention so small
+#     decode batches route through the sm120 kernel instead of the >64 paged
+#     path. Plain autoregressive decode also produces small (<=64) batches, so
+#     this is still needed on GB10. FALLBACK: if plain decode errors out of
+#     this overlay, drop it and try stock attention.
+#
+# max_num_batched_tokens: 4096 (was 4104) — with no spec draft slots reserved,
+# a clean power-of-2 is fine and the earlier "max_num_scheduled_tokens
+# suboptimal" spec warning no longer applies.
+# ============================================================================
+
+recipe_version: "1"
+name: DeepSeek-V4-Flash-0731-REAP-K160-GB10-v026-NoSpec-Marlin-OfficialPatch
+description: >-
+  vLLM v0.26.0 serving 0xSero/DeepSeek-V4-Flash-0731-REAP (REAP K160, MXFP4
+  experts) on a single DGX Spark GB10 node with NO speculative decoding
+  (neither DSpark nor MTP), MoE backend pinned to Marlin.
+
+model: 0xSero/DeepSeek-V4-Flash-0731-REAP
+model_revision: ddc04540efda3d2a0788b129f1fad828ddc19b60
+container: vllm/vllm-openai:v0.26.0
+
+mods:
+  - mods/deepseek-v4-reap-gb10-official_0xsero
+  - mods/dspark-sparse-mla-sm120
+
+defaults:
+  port: 8000
+  host: 0.0.0.0
+  gpu_memory_utilization: 0.945
+  max_model_len: 262144
+  max_num_seqs: 2
+  max_num_batched_tokens: 4096
+
+env:
+  VLLM_ALLOW_LONG_MAX_MODEL_LEN: "1"
+  VLLM_HTTP_TIMEOUT_KEEP_ALIVE: "10000"
+  FLASHINFER_DISABLE_VERSION_CHECK: "1"
+  TILELANG_CLEANUP_TEMP_FILES: "1"
+  DG_JIT_USE_NVRTC: "0"
+  DG_JIT_NVCC_COMPILER: "/usr/local/cuda/bin/nvcc"
+  NCCL_IB_DISABLE: "1"
+  NCCL_DEBUG: "WARN"
+  K160_DISABLE_CUTEDSL: "0"
+  CUTEDSL_VERSION: ""
+  PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
+  VLLM_USE_FLASHINFER_SAMPLER: "1"
+  VLLM_SPARSE_INDEXER_MAX_LOGITS_MB: "256"
+  VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS: "0"
+
+command: |
+  vllm serve 0xSero/DeepSeek-V4-Flash-0731-REAP \
+    --revision ddc04540efda3d2a0788b129f1fad828ddc19b60 \
+    --served-model-name deepseek-v4-flash-0731-REAP-K160-nospec \
+    --host {host} \
+    --port {port} \
+    --trust-remote-code \
+    --tensor-parallel-size 1 \
+    --pipeline-parallel-size 1 \
+    --moe-backend marlin \
+    --kv-cache-dtype fp8 \
+    --block-size 256 \
+    --max-model-len {max_model_len} \
+    --max-num-seqs {max_num_seqs} \
+    --max-num-batched-tokens {max_num_batched_tokens} \
+    --gpu-memory-utilization {gpu_memory_utilization} \
+    --distributed-executor-backend mp \
+    --tokenizer-mode deepseek_v4 \
+    --load-format safetensors \
+    --enable-chunked-prefill \
+    --async-scheduling \
+    --enable-prefix-caching \
+    --tool-call-parser deepseek_v4 \
+    --enable-auto-tool-choice \
+    --reasoning-parser deepseek_v4 \
+    --reasoning-config '{{"reasoning_parser":"deepseek_v4","reasoning_start_str":"<think>","reasoning_end_str":"</think>"}}' \
+    --default-chat-template-kwargs '{{"thinking":true}}' \
+    --default-chat-template-kwargs.reasoning_effort=low \
+    --compilation-config '{{"cudagraph_mode":"FULL_AND_PIECEWISE","custom_ops":["all"]}}' \
+    --generation-config vllm \
+    --enable-flashinfer-autotune \
+    --disable-access-log-for-endpoints /health,/metrics,/ping

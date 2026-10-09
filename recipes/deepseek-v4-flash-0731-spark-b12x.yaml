@@ -1,0 +1,90 @@
+# Recipe: DeepSeek-V4-Flash-0731-Spark on GB10 — B12X_MLA_SPARSE attention,
+# b12x MoE, b12x linear
+#
+# NOT a variant of the deepseek-v4-flash-0731-reap-k160-*.yaml family in this
+# same directory. Those serve 0xSero/DeepSeek-V4-Flash-0731-REAP (MXFP4,
+# REAP-pruned experts) on PRISTINE `vllm/vllm-openai:v0.26.0`, patched at
+# container-start by mods/deepseek-v4-reap-gb10-v026-dspark. This recipe
+# serves a DIFFERENT model — 0xSero/deepseek-v4-flash-0731-spark
+# (EXL3/Trellis-quantized weights, untouched target experts) — on a
+# DIFFERENT, much more heavily forked vLLM: local-inference-lab/vllm
+# (commit 3003860, reports version "dev"), built into
+# https://github.com/0xSero/deepseek-v4-flash-0731-spark-sparkinfer.
+#
+# Why this can't be a small patch like the REAP-K160 mods: `grep -rli b12x`
+# against that fork's /opt/vllm source hits ~65 files (attention backends,
+# MoE experts, linear kernels, compilation, config, warmup, distributed...).
+# vllm/config/kernel.py there defines real Literal["...","b12x",...,
+# "flashinfer_b12x",...] types for both MoEBackend and LinearBackend — "b12x"
+# and "flashinfer_b12x" are two DISTINCT, both-real values (b12x = this
+# fork's own in-tree Triton/CUTLASS kernels; flashinfer_b12x = FlashInfer's
+# unrelated CuteDSL kernel, present in upstream vLLM too). vllm/v1/attention/
+# backends/registry.py registers B12X_MLA_SPARSE -> B12xMLASparseBackend
+# (v1/attention/backends/mla/b12x_mla_sparse.py, ~1700 lines). None of this
+# imports the public `pip install b12x` package or SparkInfer's integration
+# shims — it's self-contained hand-written kernels bearing the same "B12X"
+# name by coincidence of branding, not a dependency.
+#
+# So the container here is NOT built by this repo's mods/build-and-copy.sh
+# pipeline — it's the pre-built image from the sparkinfer repo directly.
+# `command` is unusual for this repo's convention (normally a literal `vllm
+# serve ...` string): it execs that image's own tested entrypoint chain
+# (entrypoint.sh: HF download + EXL3 rank-shard coalesce + DSpark K64 draft
+# build + selftest -> serve-ds4-flash.sh, which is what actually renders
+# --attention-backend/--moe-backend/--linear-backend from BACKEND=b12x-a8).
+# Hand-transcribing serve-ds4-flash.sh's ~15 branches of bash into a literal
+# vllm-serve command here would be strictly riskier than just running it.
+#
+# Model/build cache reuse: if /home/obiwan/deepseek-v4-flash-0731-spark-sparkinfer
+# on this box already has ./data and ./cache populated (it does — that's
+# where this image was originally built and run from), pass at launch:
+#   -v /home/obiwan/deepseek-v4-flash-0731-spark-sparkinfer/data:/models
+#   -v /home/obiwan/deepseek-v4-flash-0731-spark-sparkinfer/cache:/cache
+# to skip the ~107GB re-download and reuse the already-built K64 DSpark draft.
+
+recipe_version: "1"
+name: DeepSeek-V4-Flash-0731-Spark-GB10-B12X-MLA-Sparse
+description: >-
+  0xSero/deepseek-v4-flash-0731-spark (EXL3/Trellis) on local-inference-lab's
+  own vLLM fork, DSpark speculative decoding, with B12X_MLA_SPARSE attention,
+  b12x MoE, and b12x linear kernels (the fork's native in-tree Blackwell
+  kernels — not FlashInfer's flashinfer_b12x, and not the public b12x pip
+  package).
+
+model: 0xSero/deepseek-v4-flash-0731-spark
+model_revision: 22f28d32b9b29b4352eaa380ff8c2c170b2847ab
+container: ghcr.io/0xsero/deepseek-v4-flash-0731-spark-sparkinfer@sha256:2e077489a83a0360952828051fe7f7a32c1801e5ce8436d85f7267583d614ff4
+
+mods: []
+
+# No `defaults:`/{placeholders} — `command` execs the image's own entrypoint
+# rather than a templated `vllm serve` string, so run-recipe.py's --port/
+# --gpu-mem overrides don't apply here. Override via `-e HOST=... -e PORT=...`
+# etc. at launch instead; entrypoint.sh's own defaults (0.0.0.0:8000) match
+# what would otherwise go in `defaults:` anyway.
+
+env:
+  MODEL_REPO: "0xSero/deepseek-v4-flash-0731-spark"
+  MODEL_REVISION: "22f28d32b9b29b4352eaa380ff8c2c170b2847ab"
+  MODE: "dspark"
+  BACKEND: "b12x-a8"
+  INDEXER_BACKEND: "b12x"
+  ALLREDUCE_MODE: "nccl"
+  DSPARK_DRAFT_ATTENTION_BACKEND: "B12X_MLA_SPARSE"
+  KV_CACHE_DTYPE: "nvfp4_ds_mla"
+  MAX_MODEL_LEN: "262144"
+  MAX_NUM_SEQS: "4"
+  MAX_NUM_BATCHED_TOKENS: "8224"
+  MAX_CUDAGRAPH_CAPTURE_SIZE: "6"
+  CUDAGRAPH_CAPTURE_SIZES: "6"
+  GPU_MEMORY_UTILIZATION: "0.9465"
+  DSPARK_TOKENS: "5"
+  VERIFY_MODEL_CHECKSUMS: "1"
+
+# Not a `vllm serve` invocation — see the header comment. entrypoint.sh
+# downloads/coalesces the model if needed, builds the DSpark draft if
+# missing, self-tests, then execs serve-ds4-flash.sh, which is what
+# actually renders --attention-backend B12X_MLA_SPARSE --moe-backend b12x
+# --linear-backend b12x from BACKEND=b12x-a8 above.
+command: |
+  exec /opt/recipe/scripts/entrypoint.sh

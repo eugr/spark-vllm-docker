@@ -1,0 +1,77 @@
+# Recipe: MiniMax-M2.7-REAP-172B-A10B-NVFP4-GB10 (TurboQuant KV)
+# Same scottgl checkpoint + mod as minimax-m2.7-reap-nvfp4-gb10.yaml, but with
+# TurboQuant KV-cache compression (turboquant_k8v4) instead of fp8.
+#
+# TurboQuant compresses the KV cache ~3.8x (vLLM blog 2026-05-11) at ~same
+# quality, which frees enough memory to push context to ~192k and run 4
+# concurrent sequences on a single GB10 node. This is a MEMORY/CONTEXT change,
+# not an output-quality fix -- the NVFP4 weight path is unchanged.
+#
+# TurboQuant KV works with the default FlashInfer attention backend (per
+# mrjiaruiwang's saricles-M2.5 config, which used turboquant_k8v4 with the
+# stock attention backend). If startup errors that turboquant needs a specific
+# attention kernel, add: --attention-backend turboquant
+
+recipe_version: "1"
+name: MiniMax-M2.7-REAP-172B-NVFP4-GB10-TurboQuant
+description: >-
+  vLLM serving scottgl/MiniMax-M2.7-REAP-172B-A10B-NVFP4-GB10 with TurboQuant
+  k8v4 KV cache, ~192k context, 4-way sequence parallelism on a single GB10.
+
+model: scottgl/MiniMax-M2.7-REAP-172B-A10B-NVFP4-GB10
+container: vllm-node
+
+cluster_only: false
+mods:
+  - mods/minimax-m2.7-reap-nvfp4-gb10
+
+defaults:
+  port: 8000
+  host: 0.0.0.0
+  gpu_memory_utilization: 0.945
+  max_model_len: 131072          # 192k -- enabled by TurboQuant KV compression
+  max_num_seqs: 4                # 4-way sequence parallel
+  max_num_batched_tokens: 8192   # raised to feed 4 concurrent seqs
+
+env:
+  VLLM_ALLOW_LONG_MAX_MODEL_LEN: "1"
+  VLLM_HTTP_TIMEOUT_KEEP_ALIVE: "10000"
+  FLASHINFER_DISABLE_VERSION_CHECK: "1"
+  TILELANG_CLEANUP_TEMP_FILES: "1"
+  DG_JIT_USE_NVRTC: "0"
+  DG_JIT_NVCC_COMPILER: "/usr/local/cuda/bin/nvcc"
+  NCCL_IB_DISABLE: "1"
+  NCCL_DEBUG: "WARN"
+  PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
+  VLLM_USE_BREAKABLE_CUDAGRAPH: "0"
+  VLLM_USE_FLASHINFER_MOE_FP4: "0"
+  HF_HUB_OFFLINE: "1"
+
+command: |
+  vllm serve scottgl/MiniMax-M2.7-REAP-172B-A10B-NVFP4-GB10 \
+    --served-model-name minimax-m27-reap-nvfp4-gb10-tq \
+    --host {host} \
+    --port {port} \
+    --trust-remote-code \
+    --quantization compressed-tensors \
+    --tensor-parallel-size 1 \
+    --pipeline-parallel-size 1 \
+    --kv-cache-dtype turboquant_4bit_nc \
+    --block-size 128 \
+    --max-model-len {max_model_len} \
+    --max-num-seqs {max_num_seqs} \
+    --max-num-batched-tokens {max_num_batched_tokens} \
+    --gpu-memory-utilization {gpu_memory_utilization} \
+    --distributed-executor-backend mp \
+    --load-format instanttensor \
+    --enable-chunked-prefill \
+    --async-scheduling \
+    --enable-prefix-caching \
+    --enable-auto-tool-choice \
+    --tool-call-parser minimax_m2 \
+    --reasoning-parser minimax_m2_optthink \
+    --reasoning-parser-plugin /workspace/mods/minimax-m2.7-reap-nvfp4-gb10/minimax_m2_optthink_reasoning_parser.py \
+    --default-chat-template-kwargs '{{"thinking":true}}' \
+    --default-chat-template-kwargs.reasoning_effort=high \
+    --compilation-config '{{"mode":"VLLM_COMPILE","cudagraph_mode":"FULL_AND_PIECEWISE","custom_ops":["all"]}}' \
+    --disable-access-log-for-endpoints /health,/metrics,/ping
