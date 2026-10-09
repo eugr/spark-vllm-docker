@@ -163,6 +163,12 @@ RUN --mount=type=cache,id=repo-cache,target=/repo-cache \
 
 WORKDIR /workspace/flashinfer
 
+ARG FLASHINFER_APPLY_REGULAR_PATCHES=0
+COPY docker/apply_patch_series.sh /tmp/apply_patch_series.sh
+COPY docker/patches/qwen3.8/flashinfer/ /tmp/regular-flashinfer/
+RUN bash /tmp/apply_patch_series.sh flashinfer "$FLASHINFER_REPO" \
+    "$FLASHINFER_APPLY_REGULAR_PATCHES" /tmp/regular-flashinfer
+
 ARG FLASHINFER_PRS=""
 
 # PR refs include the branch history they were developed on. Use upstream main
@@ -393,26 +399,33 @@ ARG VLLM_PRS=""
 ARG VLLM_PRESERVE_SM12X_TARGET=0
 ARG VLLM_PATCH_B12X_C128A_ALIGNMENT=0
 
+COPY docker/apply_patch_series.sh /tmp/apply_patch_series.sh
+COPY docker/patches/qwen3.8/vllm/ /tmp/regular-vllm/
+
 # Numeric PR refs are resolved from vllm-project/vllm. Full GitHub PR URLs are
 # downloaded from the named repository, preserving that PR's own base range.
 # In both cases, apply only the resulting patch to VLLM_REF.
 RUN set -eux; \
     VLLM_ALL_PRS=""; \
     VLLM_SELECTED_PRESET_PRS=""; \
+    VLLM_APPLY_REGULAR_PATCHES=0; \
     VLLM_REQUESTED_HEAD="$(git rev-parse HEAD)"; \
     case "$VLLM_APPLY_PRESET_PRS" in \
-        1|true|TRUE|yes|YES) VLLM_SELECTED_PRESET_PRS="$VLLM_PRESET_PRS";; \
+        1|true|TRUE|yes|YES) VLLM_SELECTED_PRESET_PRS="$VLLM_PRESET_PRS"; VLLM_APPLY_REGULAR_PATCHES=1;; \
         0|false|FALSE|no|NO) VLLM_SELECTED_PRESET_PRS="";; \
         ""|auto|AUTO) \
             if [ -z "$VLLM_PRS" ]; then \
                 if [ "$VLLM_REF" = "main" ]; then \
                     VLLM_SELECTED_PRESET_PRS="$VLLM_PRESET_PRS"; \
+                    VLLM_APPLY_REGULAR_PATCHES=1; \
                 else \
                     echo "Skipping preset vLLM PRs in auto mode because VLLM_REF=$VLLM_REF is not main."; \
                 fi; \
             fi;; \
         *) echo "Invalid VLLM_APPLY_PRESET_PRS value: $VLLM_APPLY_PRESET_PRS"; exit 1;; \
     esac; \
+    bash /tmp/apply_patch_series.sh vllm "$VLLM_REPO" \
+        "$VLLM_APPLY_REGULAR_PATCHES" /tmp/regular-vllm; \
     for pr in $VLLM_SELECTED_PRESET_PRS $VLLM_PRS; do \
         case " $VLLM_ALL_PRS " in \
             *" $pr "*) ;; \
@@ -540,6 +553,7 @@ RUN python3 /tmp/vllm-patches/patch_vllm_api_key_auth.py .
 # path and restore the smallest-block fallback. Remove once supported refs
 # contain an equivalent upstream fix; unexpected source layouts fail closed.
 # Supports both the original selector and #53175's per-layer KV-spec API.
+# Recognizes #60252's divisor-aware replacement from the regular patch series.
 RUN python3 /tmp/vllm-patches/patch_vllm_swa_block_size.py .
 
 # TEMPORARY PATCH: vLLM PR #53306 added a preliminary CUDA-graph memory

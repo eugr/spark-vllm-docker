@@ -1,0 +1,813 @@
+From: stecasta
+Subject: [PATCH] [MRV2][Spec Decode] Quantized draft lm_head for drafters that share the target head
+
+Upstream-PR: https://github.com/vllm-project/vllm/pull/59973
+
+diff --git a/docs/features/speculative_decoding/mtp.md b/docs/features/speculative_decoding/mtp.md
+index 3b637c9de8ad77fe2b7a2c360ff7ff0a4904094b..34d8f9539b74a7ef8edd8252f7244dc37be98d0e 100644
+--- a/docs/features/speculative_decoding/mtp.md
++++ b/docs/features/speculative_decoding/mtp.md
+@@ -74,3 +74,12 @@ vllm serve XiaomiMiMo/MiMo-7B-Base \
+   is a good default to start with.
+ - If your model does not support MTP, use another method such as EAGLE or draft
+   model speculation.
++- When the MTP head shares the target's unquantized lm_head (most MTP models),
++  `"draft_lm_head_quantization": "fp8"` or `"nvfp4"` in `--speculative-config`
++  gives the drafter a quantized copy of that head (Model Runner V2). The target
++  still verifies with its own head, so outputs are unchanged; only the
++  acceptance length can move. It helps most on bandwidth-bound GPUs with a
++  large vocabulary. The copy costs about one byte (FP8) or 0.56 bytes (NVFP4)
++  per lm_head weight, e.g. 0.6 or 0.35 GiB for a 248k x 2560 head; it is
++  counted in the model weights, so with `--kv-cache-memory-bytes` leave room
++  for it.
+diff --git a/tests/v1/e2e/spec_decode/mtp/qwen3_5/test_mtp.py b/tests/v1/e2e/spec_decode/mtp/qwen3_5/test_mtp.py
+index c61838a65520af5b9767930f70587c4558875476..08f91b3baa799969c29300292eacd9afa6809db2 100644
+--- a/tests/v1/e2e/spec_decode/mtp/qwen3_5/test_mtp.py
++++ b/tests/v1/e2e/spec_decode/mtp/qwen3_5/test_mtp.py
+@@ -6,6 +6,11 @@ import pytest
+ from tests.utils import single_gpu_only
+ from vllm import SamplingParams
+ 
++from ...utils import (
++    assert_request_outputs_match,
++    compute_acceptance_len,
++    get_test_prompts,
++)
+ from .._correctness import check_mtp_correctness
+ 
+ 
+@@ -37,3 +42,102 @@ def test_mtp_correctness(
+         expected_accuracy_threshold,
+         vllm_runner,
+     )
++
++
++@single_gpu_only
++def test_mtp_draft_lm_head_quantization(
++    monkeypatch: pytest.MonkeyPatch,
++    sampling_config: SamplingParams,
++    vllm_runner,
++):
++    """A quantized draft copy of the shared lm_head only changes drafting:
++    greedy outputs match stock MTP and acceptance stays within 10%."""
++    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
++    prompts = get_test_prompts(mm_enabled=False)
++    results = {}
++    for quant in (None, "fp8", "nvfp4"):
++        with vllm_runner(
++            "Qwen/Qwen3.5-0.8B-Base",
++            block_size=None,
++            enable_chunked_prefill=None,
++            max_model_len=2048,
++            limit_mm_per_prompt={"image": 0, "video": 0},
++            speculative_config={
++                "method": "mtp",
++                "num_speculative_tokens": 3,
++                "draft_lm_head_quantization": quant,
++            },
++            disable_log_stats=False,
++        ) as runner:
++            outputs = runner.llm.chat(prompts, sampling_config)
++            results[quant] = (outputs, compute_acceptance_len(runner.llm.get_metrics()))
++
++    ref_outputs, ref_al = results.pop(None)
++    for quant, (outputs, al) in results.items():
++        assert_request_outputs_match(
++            ref_outputs,
++            outputs,
++            # Not bit-exact: a different acceptance length changes the target's
++            # verify batch shapes, which can flip a near-tied greedy token.
++            required_matches=int(0.8 * len(ref_outputs)) + 1,
++            context=f"draft_lm_head_quantization={quant}",
++        )
++        assert al >= 0.9 * ref_al, (
++            f"{quant}: acceptance length {al:.3f} vs {ref_al:.3f}"
++        )
++
++
++@single_gpu_only
++def test_mtp_draft_lm_head_quantization_survives_sleep_and_reload(
++    monkeypatch: pytest.MonkeyPatch,
++    sampling_config: SamplingParams,
++    vllm_runner,
++):
++    """The quantized draft head is derived from the target head: it must come
++    back intact after a level 1 sleep and be re-derived after a target weight
++    reload, so outputs and acceptance match the run before."""
++    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
++    prompts = get_test_prompts(mm_enabled=False)
++    with vllm_runner(
++        "Qwen/Qwen3.5-0.8B-Base",
++        block_size=None,
++        enable_chunked_prefill=None,
++        max_model_len=2048,
++        limit_mm_per_prompt={"image": 0, "video": 0},
++        speculative_config={
++            "method": "mtp",
++            "num_speculative_tokens": 3,
++            "draft_lm_head_quantization": "nvfp4",
++        },
++        enable_sleep_mode=True,
++        disable_log_stats=False,
++    ) as runner:
++        llm = runner.llm
++
++        def run():
++            before = llm.get_metrics()
++            outputs = llm.chat(prompts, sampling_config)
++            return outputs, compute_acceptance_len(llm.get_metrics(), before)
++
++        ref_outputs, ref_al = run()
++
++        llm.sleep(level=1)
++        llm.wake_up()
++        outputs, al = run()
++        assert_request_outputs_match(
++            ref_outputs,
++            outputs,
++            required_matches=int(0.8 * len(ref_outputs)) + 1,
++            context="after level 1 sleep",
++        )
++        assert al == pytest.approx(ref_al, rel=0.03)
++
++        llm.collective_rpc("reload_weights")
++        outputs, al = run()
++        assert_request_outputs_match(
++            ref_outputs,
++            outputs,
++            required_matches=int(0.8 * len(ref_outputs)) + 1,
++            context="after weight reload",
++        )
++        assert al == pytest.approx(ref_al, rel=0.03)
+diff --git a/tests/v1/worker/test_gpu_draft_lm_head.py b/tests/v1/worker/test_gpu_draft_lm_head.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..11d9354d9a40a4a5565ea8b2d4958785190cccd1
+--- /dev/null
++++ b/tests/v1/worker/test_gpu_draft_lm_head.py
+@@ -0,0 +1,210 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++import gc
++from types import SimpleNamespace
++
++import pytest
++import torch
++
++from vllm.model_executor.layers.logits_processor import LogitsProcessor
++from vllm.model_executor.layers.quantization.online.lm_head import (
++    quantized_lm_head_copy,
++    refresh_quantized_lm_heads,
++)
++from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
++from vllm.model_executor.model_loader.reload import (
++    finalize_layerwise_reload,
++    initialize_layerwise_reload,
++    record_metadata_for_reloading,
++)
++from vllm.model_executor.model_loader.weight_utils import default_weight_loader
++from vllm.v1.worker.gpu_worker import Worker
++
++# Not a multiple of the vocab padding, so the head has padded rows.
++VOCAB, HIDDEN = 4000, 512
++requires_cuda = pytest.mark.skipif(
++    not torch.cuda.is_available(), reason="Marlin needs CUDA"
++)
++
++
++def _target_head(monkeypatch, seed: int = 0) -> ParallelLMHead:
++    # Online methods read the model dtype from the current config.
++    model_config = SimpleNamespace(dtype=torch.bfloat16)
++    monkeypatch.setattr(
++        "vllm.model_executor.layers.quantization.online.fp8.get_current_vllm_config",
++        lambda: SimpleNamespace(model_config=model_config),
++    )
++    head = ParallelLMHead(VOCAB, HIDDEN, disable_tp=True)
++    gen = torch.Generator().manual_seed(seed)
++    head.weight.data.copy_(torch.randn(head.weight.shape, generator=gen) * 0.02)
++    return head.to("cuda", torch.bfloat16)
++
++
++def _tensors(module: torch.nn.Module) -> dict[str, torch.Tensor]:
++    return dict(module.named_parameters()) | dict(module.named_buffers())
++
++
++@requires_cuda
++@pytest.mark.parametrize(
++    ("quantization", "max_rel_err", "min_top1"),
++    [("fp8", 0.05, 0.9), ("nvfp4", 0.15, 0.75)],
++)
++def test_tracks_bf16_head_through_logits_processor(
++    default_vllm_config, dist_init, monkeypatch, quantization, max_rel_err, min_top1
++):
++    head = _target_head(monkeypatch)
++    target_weight = head.weight.detach().clone()
++    draft_head = quantized_lm_head_copy(head, quantization)
++
++    assert isinstance(draft_head, ParallelLMHead)
++    # The source head keeps its bf16 weight, and no bf16 copy is kept around.
++    assert torch.equal(head.weight, target_weight)
++    assert draft_head.weight.dtype != torch.bfloat16
++
++    logits_processor = LogitsProcessor(VOCAB)
++    hidden = torch.randn(2048, HIDDEN, device="cuda", dtype=torch.bfloat16)
++    ref = logits_processor(head, hidden).float()
++    out = logits_processor(draft_head, hidden).float()
++    assert out.shape == ref.shape == (2048, VOCAB)
++    rel_err = ((out - ref).norm() / ref.norm()).item()
++    top1 = (out.argmax(-1) == ref.argmax(-1)).float().mean().item()
++    assert rel_err < max_rel_err
++    assert top1 > min_top1
++
++
++@requires_cuda
++@pytest.mark.parametrize("quantization", ["fp8", "nvfp4"])
++def test_refresh_follows_target_update(
++    default_vllm_config, dist_init, monkeypatch, quantization
++):
++    """After the target's weights change, the copy is re-derived in place: it
++    equals a fresh quantization of the new target, keeps its storage, and
++    frees the temporary copy without waiting for the cycle collector."""
++    head = _target_head(monkeypatch)
++    drafter = torch.nn.Module()
++    drafter.lm_head = quantized_lm_head_copy(head, quantization)
++    ptrs = {k: t.data_ptr() for k, t in _tensors(drafter.lm_head).items()}
++
++    new_weight = _target_head(monkeypatch, seed=1).weight.detach()
++    head.weight.data.copy_(new_weight)
++    gc.disable()
++    try:
++        allocated = torch.accelerator.memory_allocated()
++        refresh_quantized_lm_heads(drafter)
++        assert torch.accelerator.memory_allocated() == allocated
++    finally:
++        gc.enable()
++
++    expected = _tensors(quantized_lm_head_copy(head, quantization))
++    for name, tensor in _tensors(drafter.lm_head).items():
++        assert tensor.data_ptr() == ptrs[name]
++        if name != "workspace":
++            assert torch.equal(tensor, expected[name]), name
++    assert torch.equal(head.weight, new_weight)
++
++
++def _draft_update_worker(vllm_config, drafter: torch.nn.Module, **engine) -> Worker:
++    worker = object.__new__(Worker)
++    worker.vllm_config = vllm_config
++    worker.weight_transfer_engine = SimpleNamespace(
++        supports_draft_weight_update=True,
++        reset_weight_update_target=lambda: None,
++        **engine,
++    )
++    worker.model_runner = SimpleNamespace(get_draft_model=lambda: drafter)
++    worker._weight_update_active = False
++    worker._set_draft_weight_update_target = lambda: None
++    return worker
++
++
++@requires_cuda
++def test_draft_weight_update_refreshes_copy(
++    default_vllm_config, dist_init, monkeypatch
++):
++    """A draft weight update can write a target weight the drafter shares, such
++    as an embedding tied to the lm_head; the copy must follow it."""
++    head = _target_head(monkeypatch)
++    drafter = torch.nn.Module()
++    drafter.lm_head = quantized_lm_head_copy(head, "fp8")
++    worker = _draft_update_worker(
++        default_vllm_config,
++        drafter,
++        start_weight_update=lambda: None,
++        finish_weight_update=lambda: None,
++    )
++
++    worker.start_draft_weight_update()
++    head.weight.data.copy_(_target_head(monkeypatch, seed=1).weight)
++    worker.finish_weight_update()
++
++    expected = _tensors(quantized_lm_head_copy(head, "fp8"))
++    for name, tensor in _tensors(drafter.lm_head).items():
++        assert torch.equal(tensor, expected[name]), name
++
++
++@requires_cuda
++@pytest.mark.parametrize("quantization", ["fp8", "nvfp4"])
++def test_draft_weight_update_loads_lm_head(
++    default_vllm_config, dist_init, monkeypatch, quantization
++):
++    """A draft update carrying lm_head.weight loads the shared target head, as
++    without quantization, and the copy is re-derived from it in place."""
++    head = _target_head(monkeypatch)
++    record_metadata_for_reloading(head)
++    drafter = torch.nn.Module()
++    draft_head = quantized_lm_head_copy(head, quantization)
++    drafter.lm_head = draft_head
++    ptrs = {k: t.data_ptr() for k, t in _tensors(draft_head).items()}
++    new_weight = torch.randn(VOCAB, HIDDEN, device="cuda", dtype=torch.bfloat16)
++
++    def load(update_info):
++        param = drafter.get_parameter("lm_head.weight")
++        getattr(param, "weight_loader", default_weight_loader)(param, new_weight)
++
++    worker = _draft_update_worker(
++        default_vllm_config,
++        drafter,
++        start_weight_update=lambda: initialize_layerwise_reload(drafter),
++        update_weights=load,
++        finish_weight_update=lambda: finalize_layerwise_reload(drafter, None),
++    )
++    worker.start_draft_weight_update()
++    worker.update_weights({})
++    worker.finish_weight_update()
++
++    assert drafter.lm_head is draft_head
++    assert torch.equal(head.weight[:VOCAB], new_weight)
++    expected = _tensors(quantized_lm_head_copy(head, quantization))
++    for name, tensor in _tensors(draft_head).items():
++        assert tensor.data_ptr() == ptrs[name]
++        if name != "workspace":
++            assert torch.equal(tensor, expected[name]), name
++    hidden = torch.randn(64, HIDDEN, device="cuda", dtype=torch.bfloat16)
++    assert LogitsProcessor(VOCAB)(draft_head, hidden).isfinite().all()
++
++
++@requires_cuda
++def test_layerwise_reload_of_drafter_keeps_copy(
++    default_vllm_config, dist_init, monkeypatch
++):
++    """A drafter weight update reloads the drafter layerwise; the derived copy
++    must come back unchanged, not be re-quantized."""
++    head = _target_head(monkeypatch)
++    drafter = torch.nn.Module()
++    record_metadata_for_reloading(drafter)
++    drafter.lm_head = quantized_lm_head_copy(head, "nvfp4")
++    before = {k: t.clone() for k, t in _tensors(drafter.lm_head).items()}
++
++    def fail(*args, **kwargs):
++        raise AssertionError("the copy was re-quantized")
++
++    monkeypatch.setattr(
++        drafter.lm_head.quant_method, "process_weights_after_loading", fail
++    )
++    initialize_layerwise_reload(drafter)
++    finalize_layerwise_reload(drafter, None)
++
++    after = _tensors(drafter.lm_head)
++    assert after.keys() == before.keys()
++    for name, tensor in before.items():
++        assert torch.equal(after[name], tensor), name
+diff --git a/tests/v1/worker/test_gpu_worker_weight_transfer.py b/tests/v1/worker/test_gpu_worker_weight_transfer.py
+index 49ef707894784acccafa86cf26811e9c35c50a66..84901da16f52e98106ffea076b08187d2dc34e02 100644
+--- a/tests/v1/worker/test_gpu_worker_weight_transfer.py
++++ b/tests/v1/worker/test_gpu_worker_weight_transfer.py
+@@ -61,6 +61,9 @@ class _RecordingModelRunner:
+     def reset_lora_state(self) -> None:
+         self.reset_lora_calls += 1
+ 
++    def get_draft_model(self) -> nn.Module | None:
++        return None
++
+ 
+ def _make_worker(engine: _RecordingEngine | None) -> Worker:
+     worker = object.__new__(Worker)
+diff --git a/vllm/config/speculative.py b/vllm/config/speculative.py
+index 4c61ead82dabdddef79eea4d77558fd260cd7b8d..4b63b36bd5f5116e25882ff9e5447002f110f2ef 100644
+--- a/vllm/config/speculative.py
++++ b/vllm/config/speculative.py
+@@ -454,6 +454,12 @@ class SpeculativeConfig:
+     speculative methods. This is an experimental option for measuring the
+     acceptance-rate impact of reusing that block. It does not disable the
+     speculative drafter itself."""
++    draft_lm_head_quantization: Literal["fp8", "nvfp4"] | None = None
++    """Quantize the drafter's copy of a target lm_head it shares (EAGLE and
++    MTP). "fp8" uses per-row weight and per-token activation scales on the
++    platform's FP8 linear kernel; "nvfp4" is weight-only on the Marlin kernel.
++    The target verifies with its own head, so only the acceptance length can
++    change. Model Runner V2 only."""
+     use_local_argmax_reduction: bool = False
+     """Use vocab-parallel local argmax instead of all-gathering full logits
+     for draft token generation. Reduces communication from O(vocab_size) to
+@@ -1816,6 +1822,20 @@ class SpeculativeConfig:
+                 "n_predict parameter."
+             )
+ 
++        if self.draft_lm_head_quantization is not None:
++            # Gemma-4 MTP scores tied embedding rows directly; no lm_head to share.
++            if self.method not in ("eagle", "eagle3", "mtp") or self.use_gemma4_mtp():
++                raise ValueError(
++                    "draft_lm_head_quantization is not supported for method "
++                    f"{self.method!r}."
++                )
++            draft = self.draft_model_config
++            if draft is not None and draft.head_dtype != draft.dtype:
++                raise ValueError(
++                    "draft_lm_head_quantization needs the lm_head to run in the "
++                    f"model dtype, got head_dtype={draft.head_dtype}."
++                )
++
+         if self.num_speculative_tokens <= 0:
+             raise ValueError(
+                 "Expected num_speculative_tokens to be greater "
+diff --git a/vllm/config/vllm.py b/vllm/config/vllm.py
+index 5d38b6765308fb95cccb72606199fb0de37c5e7a..d22adbe3b5e2f3a5249beaa21fcfaf27fc5bb76a 100644
+--- a/vllm/config/vllm.py
++++ b/vllm/config/vllm.py
+@@ -3034,6 +3034,8 @@ class VllmConfig:
+                 unsupported.append("dspark speculative decoding")
+             if self.speculative_config.enable_adaptive_verification:
+                 unsupported.append("adaptive draft verification")
++            if self.speculative_config.draft_lm_head_quantization is not None:
++                unsupported.append("draft lm_head quantization")
+ 
+         # Mixed sliding/full DFlash drafts need multiple KV groups (V2 only).
+         if self._dflash_needs_multi_kv_group():
+diff --git a/vllm/model_executor/layers/quantization/online/lm_head.py b/vllm/model_executor/layers/quantization/online/lm_head.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..fdaec93a348037918051c9306730d520fc72804b
+--- /dev/null
++++ b/vllm/model_executor/layers/quantization/online/lm_head.py
+@@ -0,0 +1,226 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Online-quantized copies of an already-loaded lm_head."""
++
++from itertools import chain
++from typing import Literal
++from weakref import WeakKeyDictionary
++
++import torch
++from torch.nn import Module, Parameter
++
++from vllm.logger import init_logger
++from vllm.model_executor.layers.linear import UnquantizedLinearMethod
++from vllm.model_executor.layers.quantization.online.fp8 import (
++    Fp8PtpcOnlineLinearMethod,
++    OnlineLinearBase,
++)
++from vllm.model_executor.layers.quantization.utils.marlin_utils import (
++    marlin_make_workspace_new,
++)
++from vllm.model_executor.layers.quantization.utils.marlin_utils_fp4 import (
++    apply_fp4_marlin_linear,
++    is_fp4_marlin_supported,
++    prepare_fp4_layer_for_marlin,
++)
++from vllm.model_executor.layers.quantization.utils.nvfp4_emulation_utils import (
++    FLOAT4_E2M1_MAX,
++    ref_nvfp4_quant,
++)
++from vllm.model_executor.layers.quantization.utils.quant_utils import weight_amax
++from vllm.model_executor.layers.vocab_parallel_embedding import (
++    ParallelLMHead,
++    UnquantizedEmbeddingMethod,
++)
++from vllm.model_executor.model_loader.reload.layerwise import get_layerwise_info
++from vllm.model_executor.utils import replace_parameter
++from vllm.utils.torch_utils import set_default_torch_dtype
++
++logger = init_logger(__name__)
++
++
++def _quantize_nvfp4(
++    weight: torch.Tensor, chunk_rows: int = 8192
++) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
++    """NVFP4-quantize the rows of `weight` without the SM100+ quant kernel.
++
++    Returns packed E2M1 codes (low nibble first), E4M3 scales per 16 values and
++    the fp32 dequantization global scale, in the layout Marlin expects.
++    """
++    fp8_max = torch.finfo(torch.float8_e4m3fn).max
++    global_scale = (weight_amax(weight).float() / (FLOAT4_E2M1_MAX * fp8_max)).clamp(
++        min=1e-12
++    )
++    inv_global_scale = (1.0 / global_scale).reshape(())
++    # E2M1 magnitudes 0, 0.5, ..., 6 doubled to integers, mapped to their codes.
++    code_of = torch.zeros(13, dtype=torch.uint8, device=weight.device)
++    code_of[torch.tensor([0, 1, 2, 3, 4, 6, 8, 12])] = torch.arange(
++        8, dtype=torch.uint8
++    ).to(weight.device)
++    n, k = weight.shape
++    packed = torch.empty(n, k // 2, dtype=torch.uint8, device=weight.device)
++    scales = torch.empty(n, k // 16, dtype=torch.float8_e4m3fn, device=weight.device)
++    for start in range(0, n, chunk_rows):
++        rows = slice(start, start + chunk_rows)
++        values, block_scales = ref_nvfp4_quant(weight[rows], inv_global_scale, 16)
++        codes = code_of[(values.abs() * 2).long()] | ((values < 0).to(torch.uint8) << 3)
++        packed[rows] = codes[:, 0::2] | (codes[:, 1::2] << 4)
++        scales[rows] = block_scales.to(torch.float8_e4m3fn)
++    return packed, scales, global_scale
++
++
++class _LMHeadNvfp4MarlinMethod(OnlineLinearBase):
++    """NVFP4 lm_head copy on the W4A16 Marlin kernel; activations stay in the
++    model dtype."""
++
++    def process_weights_after_loading(self, layer: Module) -> None:
++        packed, scales, global_scale = _quantize_nvfp4(layer.weight)
++        replace_parameter(layer, "weight", packed)
++        layer.weight_scale = Parameter(scales, requires_grad=False)
++        layer.weight_global_scale = Parameter(global_scale, requires_grad=False)
++        prepare_fp4_layer_for_marlin(layer)
++        layer.register_buffer(
++            "workspace", marlin_make_workspace_new(packed.device), persistent=False
++        )
++
++    def apply(
++        self, layer: Module, x: torch.Tensor, bias: torch.Tensor | None = None
++    ) -> torch.Tensor:
++        return apply_fp4_marlin_linear(
++            x,
++            layer.weight,
++            layer.weight_scale,
++            layer.weight_global_scale,
++            layer.workspace,
++            layer.output_size_per_partition,
++            layer.input_size_per_partition,
++            bias,
++        )
++
++
++_LM_HEAD_METHODS: dict[str, type[OnlineLinearBase]] = {
++    "fp8": Fp8PtpcOnlineLinearMethod,
++    "nvfp4": _LMHeadNvfp4MarlinMethod,
++}
++
++
++def _quantize_copy(lm_head: ParallelLMHead, quantization: str) -> ParallelLMHead:
++    if (
++        not isinstance(
++            lm_head.quant_method, (UnquantizedEmbeddingMethod, UnquantizedLinearMethod)
++        )
++        or getattr(lm_head, "bias", None) is not None
++        or lm_head.weight.dtype not in (torch.float16, torch.bfloat16)
++    ):
++        raise ValueError(
++            "Quantizing an lm_head copy needs an unquantized fp16/bf16 lm_head "
++            "without bias."
++        )
++    if quantization == "nvfp4" and not is_fp4_marlin_supported():
++        raise ValueError(
++            "nvfp4 lm_head quantization needs a CUDA GPU with compute capability "
++            "7.5 or newer."
++        )
++    # Online methods take their output dtype from the default dtype, which is
++    # only the model dtype while the model itself is being built.
++    dtype = lm_head.weight.dtype
++    with set_default_torch_dtype(dtype):
++        head = ParallelLMHead(
++            lm_head.num_embeddings,
++            lm_head.embedding_dim,
++            params_dtype=dtype,
++            org_num_embeddings=lm_head.org_vocab_size,
++            padding_size=lm_head.padding_size,
++            prefix=lm_head.prefix,
++            disable_tp=lm_head.disable_tp,
++            quant_method=_LM_HEAD_METHODS[quantization](),
++        )
++    replace_parameter(head, "weight", lm_head.weight.data)
++    head.quant_method.process_weights_after_loading(head)
++    # The copy is never loaded. The online loader wrapper captures the layer,
++    # so keeping it would leave each copy to the cycle collector.
++    for param in head.parameters(recurse=False):
++        if hasattr(param, "weight_loader"):
++            del param.weight_loader
++    return head
++
++
++# Each quantized copy maps to the head it is derived from. Weak keys, and no
++# module attribute, so the copy never owns the source as a submodule.
++_SOURCES: WeakKeyDictionary[Module, tuple[ParallelLMHead, str]] = WeakKeyDictionary()
++
++
++def quantized_lm_head_copy(
++    lm_head: ParallelLMHead, quantization: Literal["fp8", "nvfp4"]
++) -> ParallelLMHead:
++    """A ParallelLMHead holding this rank's shard of `lm_head`, quantized.
++
++    "fp8" uses per-row weight and per-token activation scales on the platform's
++    FP8 linear kernel; "nvfp4" is weight-only on Marlin. `lm_head` is left
++    unchanged and no bf16 copy of its weight is made. The copy is derived state:
++    `refresh_quantized_lm_heads` re-derives it after `lm_head` changes.
++    """
++    head = _quantize_copy(lm_head, quantization)
++    # Keep it out of layerwise reload, which would re-run
++    # process_weights_after_loading on the already-quantized weight.
++    get_layerwise_info(head).reset()
++    _SOURCES[head] = (lm_head, quantization)
++    logger.info(
++        "Quantized a %s copy of the lm_head (%d x %d per rank).",
++        quantization,
++        head.output_size_per_partition,
++        head.input_size_per_partition,
++    )
++    return head
++
++
++@torch.no_grad()
++def refresh_quantized_lm_heads(model: Module) -> None:
++    """Re-derive the quantized lm_head copies in `model` from their source heads.
++
++    Copies in place, so CUDA graphs keep pointing at valid tensors.
++    """
++    for module in model.modules():
++        if module not in _SOURCES:
++            continue
++        fresh = _quantize_copy(*_SOURCES[module])
++        for name, tensor in chain(
++            fresh.named_parameters(recurse=False), fresh.named_buffers(recurse=False)
++        ):
++            getattr(module, name).copy_(tensor)
++
++
++# (parent, attribute, copy) for each copy swapped out by share_source_lm_heads.
++_SWAPPED: dict[Module, list[tuple[Module, str, Module]]] = {}
++
++
++def share_source_lm_heads(model: Module) -> None:
++    """Replace each quantized copy in `model` with its source head.
++
++    `model` then loads weights like a drafter sharing the unquantized head,
++    until `restore_quantized_lm_heads` swaps the copies back in.
++    """
++    swapped = [
++        (module, name, child)
++        for module in model.modules()
++        for name, child in module.named_children()
++        if child in _SOURCES
++    ]
++    for module, name, child in swapped:
++        setattr(module, name, _SOURCES[child][0])
++    _SWAPPED[model] = swapped
++
++
++def restore_quantized_lm_heads(model: Module, refresh: bool = True) -> None:
++    """Undo `share_source_lm_heads`, then re-derive the copies in `model`.
++
++    Args:
++        model: The model passed to `share_source_lm_heads`, if any.
++        refresh: Whether to re-derive the copies; False when the source heads
++            may be mid-reload.
++
++    """
++    for module, name, head in _SWAPPED.pop(model, ()):
++        setattr(module, name, head)
++    if refresh:
++        refresh_quantized_lm_heads(model)
+diff --git a/vllm/model_executor/layers/vocab_parallel_embedding.py b/vllm/model_executor/layers/vocab_parallel_embedding.py
+index be20c412438c9fc30bd4a008c7054e682494931f..ae5a8c3840048e37800715b9ab3547311cc4f0c1 100644
+--- a/vllm/model_executor/layers/vocab_parallel_embedding.py
++++ b/vllm/model_executor/layers/vocab_parallel_embedding.py
+@@ -606,6 +606,7 @@ class ParallelLMHead(VocabParallelEmbedding):
+         prefix: str = "",
+         *,
+         disable_tp: bool = False,
++        quant_method: QuantizeMethodBase | None = None,
+     ):
+         self.has_bias = bias
+         super().__init__(
+@@ -617,6 +618,7 @@ class ParallelLMHead(VocabParallelEmbedding):
+             quant_config,
+             prefix,
+             disable_tp=disable_tp,
++            quant_method=quant_method,
+         )
+         self.quant_config = quant_config
+         if bias:
+diff --git a/vllm/v1/worker/gpu/model_runner.py b/vllm/v1/worker/gpu/model_runner.py
+index 61d6197ceb9d41f05d70a3b3a6f9ad46f4ca1826..227529d56e6e7fac0488c9eafa1a425f78068829 100644
+--- a/vllm/v1/worker/gpu/model_runner.py
++++ b/vllm/v1/worker/gpu/model_runner.py
+@@ -32,7 +32,7 @@ import vllm.envs as envs
+ from vllm.compilation.counter import compilation_counter
+ from vllm.compilation.cuda_graph import CUDAGraphStat
+ from vllm.compilation.wrapper import compile_model_with_stock_torch
+-from vllm.config import VllmConfig
++from vllm.config import VllmConfig, set_current_vllm_config
+ from vllm.config.compilation import CompilationMode, CUDAGraphMode
+ from vllm.distributed.aux_output_connector.worker import (
+     AuxOutputWorkerConnector,
+@@ -45,6 +45,9 @@ from vllm.model_executor.layers.fused_moe.all2all_utils import get_ep_all2all_ma
+ from vllm.model_executor.layers.mamba.ops.ssu_dispatch import (
+     initialize_mamba_ssu_backend,
+ )
++from vllm.model_executor.layers.quantization.online.lm_head import (
++    refresh_quantized_lm_heads,
++)
+ from vllm.model_executor.model_loader import get_model_loader
+ from vllm.model_executor.models.interfaces import requires_raw_input_tokens
+ from vllm.model_executor.offloader import (
+@@ -554,6 +557,15 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+             return None
+         return speculator.model
+ 
++    def reset_lora_state(self) -> None:
++        super().reset_lora_state()
++        # Called whenever the target's weights are replaced (reload, weight
++        # transfer), so draft weights derived from them must follow.
++        draft_model = self.get_draft_model()
++        if draft_model is not None:
++            with set_current_vllm_config(self.vllm_config):
++                refresh_quantized_lm_heads(draft_model)
++
+     def reload_weights(self, *args, **kwargs) -> None:
+         # TODO(Wentao): Use full version instead of import when fully migrated to v2
+         from vllm.v1.worker.gpu_model_runner import GPUModelRunner as GPUModelRunnerV1
+diff --git a/vllm/v1/worker/gpu/spec_decode/eagle/utils.py b/vllm/v1/worker/gpu/spec_decode/eagle/utils.py
+index 65289bb18e6af0ad4b8ef84968b2ed03fd6a70f8..63e999b75fbfa7278fece3bf1d80a595376c7cef 100644
+--- a/vllm/v1/worker/gpu/spec_decode/eagle/utils.py
++++ b/vllm/v1/worker/gpu/spec_decode/eagle/utils.py
+@@ -6,6 +6,9 @@ import torch.nn as nn
+ from vllm.config import VllmConfig, replace
+ from vllm.distributed.parallel_state import get_pp_group
+ from vllm.lora.layers.base import BaseLayerWithLoRA
++from vllm.model_executor.layers.quantization.online.lm_head import (
++    quantized_lm_head_copy,
++)
+ from vllm.model_executor.model_loader import get_model
+ from vllm.model_executor.model_loader.utils import get_draft_load_config
+ from vllm.model_executor.models.utils import PPMissingLayer
+@@ -106,9 +109,14 @@ def load_eagle_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mod
+     if target_lm_head is not None and _should_share(
+         eagle_model, "has_own_lm_head", draft_lm_head, target_lm_head
+     ):
++        draft_head = target_lm_head
++        if speculative_config.draft_lm_head_quantization is not None:
++            draft_head = quantized_lm_head_copy(
++                target_lm_head, speculative_config.draft_lm_head_quantization
++            )
+         if draft_lm_head is not None:
+             del eagle_model.lm_head
+-        eagle_model.lm_head = target_lm_head
++        eagle_model.lm_head = draft_head
+ 
+         # MTP layers route logits through layer.shared_head.head, not
+         # eagle_model.lm_head, so the per-layer copies need fixing up too.
+@@ -119,7 +127,11 @@ def load_eagle_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mod
+                 sh = getattr(layer, "shared_head", None)
+                 if sh is not None and hasattr(sh, "head"):
+                     del sh.head
+-                    sh.head = target_lm_head
++                    sh.head = draft_head
++    elif speculative_config.draft_lm_head_quantization is not None:
++        raise ValueError(
++            "draft_lm_head_quantization needs a drafter that shares the target lm_head."
++        )
+ 
+     # MTP shares topk_indices_buffer with the target model. We update
+     # every module in the draft that holds a buffer reference so that
+diff --git a/vllm/v1/worker/gpu_worker.py b/vllm/v1/worker/gpu_worker.py
+index f2dfc8a689f07c5c79b50d36fe99f9248f95594f..fa464538bc058d9b82e56dac782258d99fe6fe3c 100644
+--- a/vllm/v1/worker/gpu_worker.py
++++ b/vllm/v1/worker/gpu_worker.py
+@@ -57,6 +57,10 @@ from vllm.distributed.weight_transfer import (
+ )
+ from vllm.logger import init_logger
+ from vllm.lora.request import LoRARequest
++from vllm.model_executor.layers.quantization.online.lm_head import (
++    restore_quantized_lm_heads,
++    share_source_lm_heads,
++)
+ from vllm.model_executor.model_loader import get_model_loader
+ from vllm.model_executor.model_loader.weight_checksum import (
+     compute_tensor_digests,
+@@ -1493,12 +1497,19 @@ class Worker(WorkerBase):
+                 "active. Call finish_weight_update first."
+             )
+ 
++        draft_model = self.get_draft_model() if is_draft else None
+         try:
+             if is_draft:
+                 self._set_draft_weight_update_target()
++            if draft_model is not None:
++                # Load through the unquantized target head, as without
++                # draft_lm_head_quantization; finish re-derives the copies.
++                share_source_lm_heads(draft_model)
+             self.weight_transfer_engine.start_weight_update()
+         except BaseException:
+             self.weight_transfer_engine.reset_weight_update_target()
++            if draft_model is not None:
++                restore_quantized_lm_heads(draft_model, refresh=False)
+             raise
+         self._weight_update_active = True
+         self._weight_update_is_draft = is_draft
+@@ -1538,6 +1549,10 @@ class Worker(WorkerBase):
+             except BaseException:
+                 self._weight_update_active = False
+                 self.weight_transfer_engine.reset_weight_update_target()
++                if self._weight_update_is_draft and (
++                    (draft_model := self.get_draft_model()) is not None
++                ):
++                    restore_quantized_lm_heads(draft_model, refresh=False)
+                 raise
+ 
+     def finish_weight_update(self) -> None:
+@@ -1554,6 +1569,10 @@ class Worker(WorkerBase):
+             self.weight_transfer_engine.finish_weight_update()
+             self.weight_transfer_engine.reset_weight_update_target()
+             self._weight_update_active = False
++            if self._weight_update_is_draft and (
++                (draft_model := self.get_draft_model()) is not None
++            ):
++                restore_quantized_lm_heads(draft_model)
+ 
+         # Weight transfer bypasses GPUModelRunner.reload_weights().
+         if not self._weight_update_is_draft:

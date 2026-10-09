@@ -1,0 +1,1401 @@
+From 81cd9dc75a7169746f62a95e9b7cfe84cda32214 Mon Sep 17 00:00:00 2001
+From: Stefano Castagnetta <scastagnetta@nvidia.com>
+Date: Wed, 7 Oct 2026 20:10:43 +0200
+Subject: [PATCH] [PR #54614] [Kernel] Dynamic NVFP4 W4A4/W4A16 selection with
+ shared weights
+
+Rebased onto current main. Preserve round_up=True, retain the full-model BF16 autotune path after #60434, and update the warmup test fixtures for dynamic linear selection.
+
+Upstream-PR: https://github.com/vllm-project/vllm/pull/54614
+
+diff --git a/.buildkite/test_areas/kernels.yaml b/.buildkite/test_areas/kernels.yaml
+index aa0971b4c55ed08435cf21689eb332865d9fa075..fb792c4716882a87b49257adc3d7c17fa909ac09 100644
+--- a/.buildkite/test_areas/kernels.yaml
++++ b/.buildkite/test_areas/kernels.yaml
+@@ -717,11 +717,16 @@ steps:
+   - vllm/model_executor/layers/quantization/mxfp4.py
+   - vllm/model_executor/layers/quantization/utils/b12x_moe.py
+   - vllm/model_executor/warmup/b12x_warmup.py
++  - vllm/model_executor/warmup/kernel_warmup.py
++  - vllm/model_executor/models/qwen2_moe.py
+   - vllm/utils/b12x.py
+   - tests/kernels/moe/test_b12x.py
+   - tests/kernels/quantization/nvfp4_utils.py
+   - tests/model_executor/kernels/test_b12x_linear.py
+   - tests/model_executor/test_b12x_warmup.py
++  - tests/kernels/quantization/test_flashinfer_nvfp4_scaled_mm.py
++  - tests/kernels/quantization/test_nvfp4_kernel_selection.py
++  - tests/model_executor/test_flashinfer_autotune_warmup.py
+   - tests/kernels/quantization/test_block_fp8.py
+   - tests/quantization/reference_mxfp4.py
+   - tests/quantization/test_auto_round.py
+@@ -732,6 +737,13 @@ steps:
+       kernels/quantization/test_block_fp8.py
+       kernels/moe/test_b12x.py
+       quantization/test_auto_round.py -k b12x
++  # Native W4A16 is merged but not included in FlashInfer 0.7.0.
++  - BUILD_NVEP=0 uv pip install --system --no-deps
++      'flashinfer-python @ git+https://github.com/flashinfer-ai/flashinfer.git@2f3bc5acff26e239696b57fe27d86af1624a8f86'
++  - pytest -v -s kernels/quantization/test_flashinfer_nvfp4_scaled_mm.py
++      -k dynamic_precision
++  - pytest -v -s kernels/quantization/test_nvfp4_kernel_selection.py
++      model_executor/test_flashinfer_autotune_warmup.py
+ 
+ - label: ":nvidia: (H100) Helion Kernels Shard %N"
+   key: kernels-helion-test
+diff --git a/benchmarks/kernels/benchmark_nvfp4_dynamic.py b/benchmarks/kernels/benchmark_nvfp4_dynamic.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..6b17169b5860ff547fd689ba57b977e38593fbb9
+--- /dev/null
++++ b/benchmarks/kernels/benchmark_nvfp4_dynamic.py
+@@ -0,0 +1,475 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Compare complete NVFP4 linear operations on Qwen3.8-27B matrix shapes.
++
++Example: python benchmarks/kernels/benchmark_nvfp4_dynamic.py --output results
++Source manifests, checkpoint configs and clock admission receipts are optional
++provenance inputs. Timed runs require CUPTI; --qualify-only checks correctness.
++"""
++
++import argparse
++import hashlib
++import importlib.metadata
++import json
++import os
++import statistics
++import time
++from pathlib import Path
++from types import SimpleNamespace
++
++import flashinfer
++import torch
++import torch.nn.functional as F
++from flashinfer.autotuner import AutoTuner, autotune
++from flashinfer.gemm.kernels.native_bf16_fp4.runner import get_runner
++from flashinfer.quantization.fp4_quantization import silu_and_mul_nvfp4_quantize
++from flashinfer.testing import bench_gpu_time_with_cupti
++
++from vllm import _custom_ops as ops
++from vllm.model_executor.kernels.linear.nvfp4.base import NvFp4LinearLayerConfig
++from vllm.model_executor.kernels.linear.nvfp4.cutedsl_silu import run as native_silu
++from vllm.model_executor.kernels.linear.nvfp4.dynamic import (
++    dynamic_nvfp4,
++)
++from vllm.model_executor.kernels.linear.nvfp4.flashinfer import (
++    FlashInferCutlassNvFp4LinearKernel,
++)
++from vllm.model_executor.layers.quantization.utils.marlin_utils_fp4 import (
++    apply_fp4_marlin_linear,
++    prepare_fp4_layer_for_marlin,
++)
++from vllm.utils.flashinfer import flashinfer_scaled_fp4_mm
++
++FP4 = (0, 0.5, 1, 1.5, 2, 3, 4, 6, 0, -0.5, -1, -1.5, -2, -3, -4, -6)
++SHAPES = {
++    "gate_up": (34816, 5120, False),
++    "down": (5120, 17408, True),
++    "head": (248320, 5120, False),
++}
++
++
++def file_hash(path):
++    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
++
++
++def tensor_hash(tensor):
++    return hashlib.sha256(tensor.view(torch.uint8).cpu().numpy().tobytes()).hexdigest()
++
++
++def unpack(packed, scales):
++    codes = torch.stack((packed & 15, packed >> 4), dim=-1).long()
++    lut = torch.tensor(FP4, device=packed.device, dtype=torch.float32)
++    return lut[codes].reshape(packed.shape[0], -1) * scales.float().repeat_interleave(
++        16, dim=1
++    )
++
++
++def linear_scales(swizzled, rows, k):
++    return (
++        swizzled.view(torch.float8_e4m3fn)
++        .reshape((rows + 127) // 128, k // 64, 32, 4, 4)
++        .permute(0, 3, 2, 1, 4)
++        .reshape(((rows + 127) // 128) * 128, k // 16)[:rows]
++    )
++
++
++def stock_silu(x):
++    output = x.new_empty((x.shape[0], x.shape[1] // 2))
++    torch.ops._C.silu_and_mul(output, x)
++    return output
++
++
++def stock_quant(x, input_inv, fused):
++    if not fused:
++        return ops.scaled_fp4_quant(
++            x, input_inv, is_sf_swizzled_layout=True, backend="flashinfer-cutlass"
++        )
++    qa, sa = ops.create_fp4_output_tensors(x.shape[0], x.shape[1] // 2, x.device, True)
++    torch.ops._C.silu_and_mul_nvfp4_quant(qa, sa, x, input_inv)
++    return qa, sa
++
++
++def reference(x, packed, scales, weight_global, input_inv, fused, provider):
++    k = packed.shape[1] * 2
++    if provider == "stock_a4":
++        qa, sa = stock_quant(x, input_inv, fused)
++        activation = unpack(qa, linear_scales(sa, x.shape[0], k)) / input_inv
++    elif provider == "dynamic_cutlass_a4":
++        if fused:
++            qa, sa = silu_and_mul_nvfp4_quantize(x, input_inv)
++        else:
++            qa, sa = flashinfer.nvfp4_quantize(x, input_inv, backend="cute-dsl")
++        activation = unpack(qa, linear_scales(sa, x.shape[0], k)) / input_inv
++    else:
++        activation = (F.silu(x[:, :k]) * x[:, k:] if fused else x).float()
++    result = torch.empty((x.shape[0], packed.shape[0]), device=x.device)
++    for start in range(0, packed.shape[0], 1024):
++        end = min(start + 1024, packed.shape[0])
++        weight = unpack(packed[start:end], scales[start:end])
++        result[:, start:end] = (activation @ weight.T) * weight_global
++    return result.bfloat16()
++
++
++def check(actual, expected):
++    torch.testing.assert_close(actual, expected, atol=0.03, rtol=0.01)
++    diff = actual.float() - expected.float()
++    return {
++        "max_abs_error": diff.abs().max().item(),
++        "rms_error": diff.square().mean().sqrt().item(),
++    }
++
++
++def verify_sources(manifest_path):
++    manifest = json.loads(manifest_path.read_text())
++    for path, expected in manifest["files"].items():
++        assert file_hash(path) == expected, path
++    return manifest
++
++
++def make_variants(
++    x,
++    packed,
++    sf,
++    wg,
++    ai,
++    alpha,
++    fused,
++    stock_layer,
++    marlin_layer,
++    stock_kernel,
++    n,
++    k,
++    prepared_a16,
++):
++    def stock_a4():
++        if not fused:
++            return stock_kernel.apply_weights(stock_layer, x)
++        qa, sa = stock_quant(x, ai, True)
++        return flashinfer_scaled_fp4_mm(
++            qa, packed, sa, sf, alpha, torch.bfloat16, "cutlass"
++        )
++
++    def dynamic_a4():
++        return dynamic_nvfp4(x, packed, sf, wg, ai, alpha, 0, fused)
++
++    def native_a16():
++        return dynamic_nvfp4(x, packed, sf, wg, ai, alpha, 16, fused)
++
++    def marlin():
++        activation = stock_silu(x) if fused else x
++        return apply_fp4_marlin_linear(
++            activation,
++            marlin_layer.weight,
++            marlin_layer.weight_scale,
++            marlin_layer.weight_global_scale,
++            marlin_layer.workspace,
++            size_n=n,
++            size_k=k,
++        )
++
++    def flashinfer_a16():
++        activation = stock_silu(x) if fused else x
++        return flashinfer.mm_bf16_fp4(
++            activation, *prepared_a16, backend="cute-dsl", out_dtype=torch.bfloat16
++        )
++
++    variants = [
++        ("stock_a4", stock_a4),
++        ("dynamic_cutlass_a4", dynamic_a4),
++        ("flashinfer_a16", flashinfer_a16),
++        ("marlin", marlin),
++    ]
++    if x.shape[0] <= 16:
++        variants.insert(2, ("native_a16", native_a16))
++    return variants
++
++
++@torch.inference_mode()
++def main():
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument("--output", type=Path, required=True)
++    parser.add_argument("--source-manifest", type=Path)
++    parser.add_argument("--checkpoint-config", type=Path)
++    parser.add_argument("--expected-uuid")
++    parser.add_argument("--clock-admission", type=Path)
++    parser.add_argument("--qualify-only", action="store_true")
++    parser.add_argument("--all-a16-tactics", action="store_true")
++    parser.add_argument("--m", type=int, nargs="+", default=[1, 4, 8, 16])
++    parser.add_argument("--shapes", nargs="+", choices=SHAPES, default=list(SHAPES))
++    parser.add_argument("--rounds", type=int, default=4)
++    parser.add_argument("--samples", type=int, default=200)
++    args = parser.parse_args()
++    args.output.mkdir(parents=True, exist_ok=False)
++    assert torch.accelerator.device_count() == 1
++    props = torch.cuda.get_device_properties(0)
++    assert (props.major, props.minor) in ((12, 0), (12, 1))
++    if args.expected_uuid is not None:
++        assert str(props.uuid).removeprefix("GPU-") == args.expected_uuid.removeprefix(
++            "GPU-"
++        )
++    assert all(m >= 1 for m in args.m)
++    if args.clock_admission is not None:
++        admission = json.loads(args.clock_admission.read_text())
++        assert admission["passed"]
++        assert str(admission["jobid"]) == os.environ["SLURM_JOB_ID"]
++        assert str(admission["uuid"]).removeprefix("GPU-") == str(
++            props.uuid
++        ).removeprefix("GPU-")
++    if not args.qualify_only:
++        from cupti import cupti  # noqa: F401
++
++        assert int(importlib.metadata.version("cupti-python").split(".")[0]) >= 13
++    source = verify_sources(args.source_manifest) if args.source_manifest else None
++    torch.backends.cuda.matmul.allow_tf32 = False
++    metadata = {
++        "job": os.environ.get("SLURM_JOB_ID"),
++        "gpu": str(props),
++        "qualify_only": args.qualify_only,
++        "benchmark_sha256": file_hash(__file__),
++        "source_manifest_sha256": (
++            file_hash(args.source_manifest) if args.source_manifest else None
++        ),
++        "bases": source["bases"] if source else None,
++        "clock_admission_sha256": (
++            file_hash(args.clock_admission) if args.clock_admission else None
++        ),
++        "versions": {
++            name: importlib.metadata.version(name)
++            for name in (
++                "torch",
++                "vllm",
++                "flashinfer-python",
++                "numpy",
++                "nvidia-cutlass-dsl",
++                "cupti-python",
++            )
++        },
++        "inputs": "Seeded synthetic NVFP4 weights, exact checkpoint matrix shapes",
++        "checkpoint": "nvidia/Qwen3.8-27B-NVFP4",
++        "config_sha256": (
++            file_hash(args.checkpoint_config) if args.checkpoint_config else None
++        ),
++        "timing": "CUPTI full operation span, CUDA graph, cold L2, balanced order",
++        "stock_down": "Stock vLLM fused SiLU+NVFP4 quantization and stock CUTLASS GEMM",
++        "marlin_down": "Stock vLLM SiLU+multiply and stock NVFP4 Marlin",
++        "flashinfer_a16_down": "Stock SiLU+multiply and prepared CuTe W4A16",
++        "native_support": "M=1..16; omitted above 16, never relabeled W4A4",
++        "correctness": {
++            "atol": 0.03,
++            "rtol": 0.01,
++            "reference": "FP32 dequantized GEMM",
++        },
++        "m_order": args.m,
++    }
++    (args.output / "metadata.json").write_text(json.dumps(metadata, indent=2) + "\n")
++    rows = []
++    stock_kernel = FlashInferCutlassNvFp4LinearKernel(NvFp4LinearLayerConfig())
++    for name in args.shapes:
++        shape_index = list(SHAPES).index(name)
++        n, k, fused = SHAPES[name]
++        gen = torch.Generator(device="cuda").manual_seed(42 + shape_index)
++        packed = torch.randint(
++            256, (n, k // 2), generator=gen, device="cuda", dtype=torch.uint8
++        )
++        logical_sf = (
++            0.125 + torch.rand((n, k // 16), generator=gen, device="cuda") * 0.875
++        ).to(torch.float8_e4m3fn)
++        sf = (
++            logical_sf.reshape(n // 128, 4, 32, k // 64, 4)
++            .permute(0, 3, 2, 1, 4)
++            .contiguous()
++            .reshape(n, k // 16)
++        )
++        before = {"packed": tensor_hash(packed), "scales": tensor_hash(sf)}
++        wg = torch.tensor([0.0625], device="cuda")
++        ai = torch.tensor([8.0], device="cuda")
++        alpha = wg / ai
++        stock_layer = SimpleNamespace(
++            weight=packed,
++            weight_scale=sf,
++            alpha=alpha,
++            input_global_scale_inv=ai,
++            output_size_per_partition=n,
++            input_size_per_partition=k,
++        )
++        marlin_layer = torch.nn.Module()
++        marlin_layer.output_size_per_partition = n
++        marlin_layer.input_size_per_partition = k
++        marlin_layer.params_dtype = torch.bfloat16
++        marlin_layer.weight = torch.nn.Parameter(packed.clone(), requires_grad=False)
++        marlin_layer.weight_scale = torch.nn.Parameter(
++            logical_sf.clone(), requires_grad=False
++        )
++        marlin_layer.weight_global_scale = torch.nn.Parameter(
++            wg.clone(), requires_grad=False
++        )
++        prepare_fp4_layer_for_marlin(marlin_layer)
++        torch.accelerator.synchronize()
++        prep_start = time.perf_counter()
++        prepared_a16 = flashinfer.prepare_bf16_fp4_weights(
++            packed, sf, wg, backend="cute-dsl"
++        )
++        torch.accelerator.synchronize()
++        canonical_ptrs = {
++            tensor.untyped_storage().data_ptr() for tensor in (packed, sf, wg)
++        }
++        extra_storages = {
++            tensor.untyped_storage().data_ptr(): tensor.untyped_storage().nbytes()
++            for tensor in prepared_a16
++            if tensor is not None
++            and tensor.untyped_storage().data_ptr() not in canonical_ptrs
++        }
++        (args.output / f"preparation-{name}.json").write_text(
++            json.dumps(
++                {
++                    "backend": "cute-dsl",
++                    "first_call_wall_seconds": time.perf_counter() - prep_start,
++                    "additional_storage_bytes": sum(extra_storages.values()),
++                    "excluded_from_operation_timing": True,
++                    "tensors": [
++                        {"shape": list(t.shape), "dtype": str(t.dtype)}
++                        for t in prepared_a16
++                        if t is not None
++                    ],
++                },
++                indent=2,
++            )
++            + "\n"
++        )
++        for m in args.m:
++            x = torch.randn(
++                (m, k * (2 if fused else 1)),
++                generator=gen,
++                device="cuda",
++                dtype=torch.bfloat16,
++            )
++
++            variants = make_variants(
++                x,
++                packed,
++                sf,
++                wg,
++                ai,
++                alpha,
++                fused,
++                stock_layer,
++                marlin_layer,
++                stock_kernel,
++                n,
++                k,
++                prepared_a16,
++            )
++            print(f"PREPARE shape={name} m={m}", flush=True)
++            if args.qualify_only:
++                for _, fn in variants:
++                    fn()
++            else:
++                with autotune(True):
++                    for _, fn in variants:
++                        fn()
++            if name == args.shapes[0] and m == args.m[0]:
++                from flashinfer.gemm.gemm_base import (
++                    get_gemm_sm120_module_cutlass_fp4,
++                )
++
++                module = get_gemm_sm120_module_cutlass_fp4()
++                tactics = module.cutlass_fp4_gemm_runner().get_valid_tactics([], None)
++                (args.output / "stock-registry.json").write_text(
++                    json.dumps({"tactics": tactics}) + "\n"
++                )
++            refs = {
++                label: reference(x, packed, logical_sf, wg, ai, fused, label)
++                for label in ("stock_a4", "dynamic_cutlass_a4", "native_a16")
++            }
++            checks = {
++                label: check(
++                    fn(),
++                    refs[
++                        label
++                        if label in ("stock_a4", "dynamic_cutlass_a4")
++                        else "native_a16"
++                    ],
++                )
++                for label, fn in variants
++            }
++            if args.all_a16_tactics and m <= 16:
++                activation = (
++                    native_silu(x, block=256, vector=1, enable_pdl=True) if fused else x
++                )
++                out = x.new_empty((m, n))
++                inputs = [activation, packed, sf, wg, out, True]
++                tactics = get_runner().get_valid_tactics(inputs, None)
++                for tactic in tactics:
++                    get_runner()(inputs, tactic=tactic)
++                    check(out, refs["native_a16"])
++                checks["all_a16_tactics"] = len(tactics)
++            print(f"CORRECTNESS_PASS shape={name} m={m} {checks}", flush=True)
++            if args.qualify_only:
++                rows.append({"shape": name, "m": m, "correctness": checks})
++            else:
++                for repeat in range(args.rounds):
++                    order = variants if repeat % 2 == 0 else list(reversed(variants))
++                    for label, fn in order:
++                        times = bench_gpu_time_with_cupti(
++                            fn,
++                            dry_run_iters=10,
++                            repeat_iters=args.samples,
++                            use_cuda_graph=True,
++                            cold_l2_cache=True,
++                        )
++                        assert len(times) == args.samples and min(times) > 0
++                        row = {
++                            "shape": name,
++                            "m": m,
++                            "n": n,
++                            "k": k,
++                            "variant": label,
++                            "repeat": repeat,
++                            "median_us": 1000 * statistics.median(times),
++                            "samples_ms": times,
++                            "correctness": checks[label],
++                        }
++                        rows.append(row)
++                        with (args.output / "measurements.jsonl").open("a") as stream:
++                            stream.write(json.dumps(row) + "\n")
++                        print(
++                            "MEASURED "
++                            + json.dumps(
++                                {
++                                    key: row[key]
++                                    for key in (
++                                        "shape",
++                                        "m",
++                                        "variant",
++                                        "repeat",
++                                        "median_us",
++                                    )
++                                }
++                            ),
++                            flush=True,
++                        )
++            (args.output / "progress.json").write_text(
++                json.dumps(rows, indent=2) + "\n"
++            )
++            if not args.qualify_only:
++                AutoTuner.get().save_configs(str(args.output / "autotune-configs.json"))
++            del refs
++        assert tensor_hash(packed) == before["packed"]
++        assert tensor_hash(sf) == before["scales"]
++        (args.output / f"weights-preserved-{name}.json").write_text(
++            json.dumps(before) + "\n"
++        )
++        del stock_layer, marlin_layer, packed, logical_sf, sf, prepared_a16
++    if args.source_manifest is not None:
++        verify_sources(args.source_manifest)
++    (args.output / "complete.json").write_text(
++        json.dumps(
++            {"passed": True, "rows": len(rows), "qualify_only": args.qualify_only}
++        )
++        + "\n"
++    )
++    print("DONE_NVFP4_DYNAMIC_COMPARISON rc=0", flush=True)
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/tests/kernels/quantization/test_flashinfer_nvfp4_scaled_mm.py b/tests/kernels/quantization/test_flashinfer_nvfp4_scaled_mm.py
+index 54dcaa0b97eab2075586f486d500a539371a20e1..d6029a168925106f39fea56d22db70641e3c0bef 100644
+--- a/tests/kernels/quantization/test_flashinfer_nvfp4_scaled_mm.py
++++ b/tests/kernels/quantization/test_flashinfer_nvfp4_scaled_mm.py
+@@ -47,6 +47,114 @@ SEEDS = [42]
+ CUDA_DEVICES = ["cuda:0"]
+ 
+ 
++@pytest.mark.parametrize(
++    "w4a4_backend",
++    ["flashinfer_cutlass", "flashinfer_b12x", "flashinfer_cudnn", "flashinfer_cutedsl"],
++)
++@pytest.mark.parametrize("m", [1, 4, 5, 8, 16, 17, 129])
++@pytest.mark.parametrize("fuse_silu", [False, True])
++@pytest.mark.parametrize("silu_cutoff", [None, 16])
++@torch.inference_mode()
++def test_dynamic_precision_preserves_canonical_weights(
++    m, fuse_silu, silu_cutoff, w4a4_backend, monkeypatch
++):
++    """Both sides of the cutoff reuse weights and keep their own scale semantics."""
++    capability = current_platform.get_device_capability()
++    if capability is None or capability.to_int() not in (120, 121):
++        pytest.skip("Dynamic NVFP4 requires SM120/121")
++    from types import SimpleNamespace
++
++    import flashinfer
++    from flashinfer.quantization.fp4_quantization import silu_and_mul_nvfp4_quantize
++
++    from vllm.config.kernel import KernelConfig
++    from vllm.model_executor.kernels.linear.nvfp4 import dynamic
++
++    config = KernelConfig(
++        nvfp4_dynamic_max_tokens=4,
++        nvfp4_dynamic_silu_max_tokens=silu_cutoff,
++        nvfp4_dynamic_w4a4_backend=w4a4_backend,
++    )
++    monkeypatch.setattr(
++        dynamic,
++        "get_current_vllm_config",
++        lambda: SimpleNamespace(
++            kernel_config=config,
++            parallel_config=SimpleNamespace(tensor_parallel_size=1),
++            model_config=SimpleNamespace(dtype=torch.bfloat16),
++        ),
++    )
++    supported, reason = dynamic.DynamicNvFp4LinearKernel.is_supported()
++    if not supported:
++        if w4a4_backend == "flashinfer_cutlass":
++            pytest.fail(reason)
++        pytest.skip(reason)
++    kernel = dynamic.DynamicNvFp4LinearKernel(NvFp4LinearLayerConfig())
++    cutoff = silu_cutoff if fuse_silu and silu_cutoff is not None else 4
++
++    torch.manual_seed(42)
++    n, k = 256, 256
++    x = torch.randn(m, k * (2 if fuse_silu else 1), device="cuda", dtype=torch.bfloat16)
++    w = torch.randn(n, k, device="cuda", dtype=torch.bfloat16)
++    a_inv = torch.tensor([8.0], device="cuda")
++    w_global = torch.tensor([1 / 16.0], device="cuda")
++    alpha = w_global / a_inv
++    w_fp4, w_scale = flashinfer.nvfp4_quantize(
++        w, w_global.reciprocal(), backend="cute-dsl"
++    )
++    w_before, sf_before = w_fp4.clone(), w_scale.view(torch.uint8).clone()
++
++    def reference():
++        if m <= cutoff:
++            activation = F.silu(x[:, :k]) * x[:, k:] if fuse_silu else x
++        else:
++            if fuse_silu:
++                a_fp4, a_scale = silu_and_mul_nvfp4_quantize(x, a_inv)
++            else:
++                a_fp4, a_scale = flashinfer.nvfp4_quantize(x, a_inv, backend="cute-dsl")
++            activation = dequantize_nvfp4_to_dtype(
++                a_fp4,
++                a_scale,
++                a_inv,
++                dtype=torch.bfloat16,
++                device="cuda",
++                block_size=16,
++                is_sf_128x4_layout=True,
++            )
++        weight = dequantize_nvfp4_to_dtype(
++            w_fp4,
++            w_scale,
++            w_global.reciprocal(),
++            dtype=torch.bfloat16,
++            device="cuda",
++            block_size=16,
++            is_sf_128x4_layout=True,
++        )
++        return (activation.float() @ weight.float().T).bfloat16()
++
++    layer = SimpleNamespace(
++        weight=w_fp4,
++        weight_scale=w_scale,
++        weight_global_scale=w_global,
++        input_global_scale_inv=a_inv,
++        alpha=alpha,
++    )
++    actual = kernel.apply_silu_or_linear(layer, x, fuse_silu)
++    torch.testing.assert_close(actual, reference(), atol=0.03, rtol=0.01)
++    assert torch.equal(w_fp4, w_before)
++    assert torch.equal(w_scale.view(torch.uint8), sf_before)
++    if m in (4, 5, 16, 17):
++        graph = torch.cuda.CUDAGraph()
++        with torch.cuda.graph(graph):
++            replay = kernel.apply_silu_or_linear(layer, x, fuse_silu)
++        x.mul_(0.5)
++        w_scale.view(torch.uint8).fill_(0x38)
++        w_global.mul_(2)
++        alpha.mul_(2)
++        graph.replay()
++        torch.testing.assert_close(replay, reference(), atol=0.03, rtol=0.01)
++
++
+ def get_ref_results(
+     a_fp4,
+     b_fp4,
+diff --git a/tests/kernels/quantization/test_nvfp4_kernel_selection.py b/tests/kernels/quantization/test_nvfp4_kernel_selection.py
+index ba069dbad1767a29caebb9fa818b1f2e59852f7e..57fd844ec86701d4ff5d309835056a6faae8f542 100644
+--- a/tests/kernels/quantization/test_nvfp4_kernel_selection.py
++++ b/tests/kernels/quantization/test_nvfp4_kernel_selection.py
+@@ -2,6 +2,8 @@
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ """Tests for NVFP4 linear kernel selection order (CPU-only)."""
+ 
++from collections.abc import Callable
++
+ import pytest
+ 
+ from vllm.model_executor.kernels.linear import (
+@@ -22,6 +24,10 @@ W4A4_KERNELS_ON_SM12X = (
+ )
+ 
+ 
++def _constant_support(available: bool) -> Callable[[int], bool]:
++    return lambda cc: available
++
++
+ @pytest.mark.parametrize("w4a4_kernel", W4A4_KERNELS_ON_SM12X)
+ def test_w4a16_kernel_does_not_precede_w4a4_kernels(w4a4_kernel):
+     candidates = _POSSIBLE_NVFP4_KERNELS[PlatformEnum.CUDA]
+@@ -30,3 +36,92 @@ def test_w4a16_kernel_does_not_precede_w4a4_kernels(w4a4_kernel):
+         f"{w4a4_kernel.__name__} must be preferred over "
+         f"{FlashInferCuteDslNvFp4W4A16LinearKernel.__name__}"
+     )
++
++
++def test_dynamic_rejects_uncalibrated_weight_only_checkpoint(monkeypatch):
++    """An A16 checkpoint cannot supply the required calibrated A4 input scales."""
++    from vllm.model_executor.kernels import linear
++
++    monkeypatch.setattr(linear, "_get_linear_backend", lambda **kwargs: "nvfp4_dynamic")
++    with pytest.raises(ValueError, match="calibrated W4A4 checkpoint"):
++        linear.init_nvfp4_linear_kernel(use_a16=True)
++
++
++@pytest.mark.parametrize("batch_invariant_supported", [False, True])
++def test_dynamic_rejects_batch_invariant_mode(monkeypatch, batch_invariant_supported):
++    """Explicit dynamic selection must not silently override determinism."""
++    from vllm.model_executor.kernels import linear
++
++    monkeypatch.setenv("VLLM_BATCH_INVARIANT", "1")
++    monkeypatch.setattr(linear, "_get_linear_backend", lambda **kwargs: "nvfp4_dynamic")
++    monkeypatch.setattr(
++        CutlassNvFp4LinearKernel,
++        "is_supported",
++        lambda: (batch_invariant_supported, "test platform"),
++    )
++    with pytest.raises(ValueError, match="does not support VLLM_BATCH_INVARIANT"):
++        linear.init_nvfp4_linear_kernel()
++
++
++@pytest.mark.parametrize(
++    "name,bits,match",
++    [
++        ("marlin", 16, "Unknown canonical"),
++        ("flashinfer_trtllm", 4, "Unknown canonical"),
++        ("flashinfer_cutlass", 16, "does not implement W4A16"),
++        ("flashinfer_cutedsl_native", 4, "does not implement W4A4"),
++    ],
++)
++def test_dynamic_rejects_incompatible_candidate(name, bits, match):
++    from vllm.model_executor.kernels.linear.nvfp4.dynamic_backends import (
++        get_dynamic_backend,
++    )
++
++    with pytest.raises(ValueError, match=match):
++        get_dynamic_backend(name, bits)
++
++
++def test_dynamic_rejects_candidate_with_different_weight_layout(monkeypatch):
++    from dataclasses import replace
++
++    from vllm.model_executor.kernels.linear.nvfp4 import dynamic_backends
++
++    candidate = dynamic_backends.get_dynamic_backend("flashinfer_cutlass", 4)
++    monkeypatch.setitem(
++        dynamic_backends._BACKENDS,
++        "other_layout",
++        replace(candidate, weight_layout="shuffled"),
++    )
++    with pytest.raises(ValueError, match="different weight layout"):
++        dynamic_backends.get_dynamic_backend("other_layout", 4)
++
++
++@pytest.mark.parametrize("a4_available", [False, True])
++def test_dynamic_default_does_not_require_cutedsl_w4a4(monkeypatch, a4_available):
++    from dataclasses import replace
++    from types import SimpleNamespace
++
++    from vllm.config.kernel import KernelConfig
++    from vllm.model_executor.kernels.linear.nvfp4 import dynamic, dynamic_backends
++
++    config = KernelConfig(linear_backend="nvfp4_dynamic")
++    monkeypatch.setattr(
++        dynamic,
++        "get_current_vllm_config",
++        lambda: SimpleNamespace(kernel_config=config),
++    )
++    for name, bits, available in (
++        ("flashinfer_cutlass", 4, a4_available),
++        ("flashinfer_cutedsl_native", 16, True),
++    ):
++        candidate = dynamic_backends.get_dynamic_backend(name, bits)
++        monkeypatch.setitem(
++            dynamic_backends._BACKENDS,
++            name,
++            replace(candidate, is_supported=_constant_support(available)),
++        )
++    monkeypatch.delitem(dynamic_backends._BACKENDS, "flashinfer_cutedsl")
++    supported, reason = dynamic.DynamicNvFp4LinearKernel.is_supported(121)
++    assert supported == a4_available
++    if not supported:
++        assert "flashinfer_cutlass" in reason
+diff --git a/vllm/config/kernel.py b/vllm/config/kernel.py
+index fa3ecf5df95da3b2cc3da73b8601686698f7dc25..89280e024023ad05355704b839804fa75c22a9fe 100644
+--- a/vllm/config/kernel.py
++++ b/vllm/config/kernel.py
+@@ -246,6 +246,7 @@ LinearBackend = Literal[
+     "cutlass",
+     "flashinfer_cutlass",
+     "flashinfer_cutedsl",
++    "nvfp4_dynamic",
+     "flashinfer_trtllm",
+     "flashinfer_cudnn",
+     "flashinfer_b12x",
+@@ -276,6 +277,18 @@ class KernelConfig:
+     Platform defaults appended automatically during VllmConfig.__post_init__.
+     """
+ 
++    nvfp4_dynamic_max_tokens: int = Field(default=0, ge=0, le=16)
++    """NVFP4 A16 cutoff. Zero selects W4A4 for every call."""
++
++    nvfp4_dynamic_silu_max_tokens: int | None = Field(default=None, ge=0, le=16)
++    """A16 cutoff for fused SiLU down projections. None inherits the linear cutoff."""
++
++    nvfp4_dynamic_w4a4_backend: str = "flashinfer_cutlass"
++    """Canonical-layout W4A4 candidate for nvfp4_dynamic."""
++
++    nvfp4_dynamic_w4a16_backend: str = "flashinfer_cutedsl_native"
++    """Canonical-layout W4A16 candidate for nvfp4_dynamic."""
++
+     enable_flashinfer_autotune: bool = None  # type: ignore[assignment]
+     """If True, run FlashInfer autotuning during kernel warmup."""
+ 
+diff --git a/vllm/model_executor/kernels/linear/__init__.py b/vllm/model_executor/kernels/linear/__init__.py
+index 484143ffc14a0ac49486101fc423115a2c9c9965..575781630d4b73dffa64c138362bad683cca8751 100644
+--- a/vllm/model_executor/kernels/linear/__init__.py
++++ b/vllm/model_executor/kernels/linear/__init__.py
+@@ -1138,6 +1138,15 @@ def init_nvfp4_linear_kernel(use_a16: bool = False) -> NvFp4LinearKernel:
+         elif not prefers_humming(compute_capability):
+             force_kernel = MarlinNvFp4LinearKernel
+ 
++    if linear_backend == "nvfp4_dynamic":
++        from .nvfp4.dynamic import DynamicNvFp4LinearKernel
++
++        if use_a16:
++            raise ValueError("Dynamic NVFP4 requires a calibrated W4A4 checkpoint")
++        if envs.VLLM_BATCH_INVARIANT:
++            raise ValueError("Dynamic NVFP4 does not support VLLM_BATCH_INVARIANT")
++        force_kernel = DynamicNvFp4LinearKernel
++
+     if force_kernel is not None:
+         if use_a16 and force_kernel not in a16_kernels:
+             raise ValueError(f"{force_kernel.__name__} does not support W4A16")
+diff --git a/vllm/model_executor/kernels/linear/nvfp4/cutedsl_silu.py b/vllm/model_executor/kernels/linear/nvfp4/cutedsl_silu.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..53ceaebe78419da8bbc27730f260a91e727f93ec
+--- /dev/null
++++ b/vllm/model_executor/kernels/linear/nvfp4/cutedsl_silu.py
+@@ -0,0 +1,118 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""CuTe SiLU and multiply for the shared-weight NVFP4 decode path."""
++
++from typing import Any
++
++import torch
++from flashinfer.utils import get_compute_capability, get_device_index
++
++_COMPILED: dict[tuple, Any] = {}
++
++
++def _compile(m, k, block, vector, enable_pdl):
++    import cuda.bindings.driver as cuda
++    import cutlass
++    import cutlass.cute as cute
++    from cutlass import Float32, Uint32
++    from flashinfer.cute_dsl import fp4_common
++    from flashinfer.jit.cute_dsl_core import build_and_load_cute_dsl_kernel
++
++    @cute.jit
++    def silu_float(value):
++        denominator = Float32(1.0) + cute.math.exp(-value, fastmath=False)
++        result = Float32(0.0)
++        if value < Float32(-80.0):
++            result = value / denominator
++        else:
++            result = value * cute.arch.rcp_approx(denominator)
++        return result
++
++    class TiledSilu:
++        @cute.jit
++        def __call__(self, gate_up, out, stream: cuda.CUstream):
++            self.kernel(gate_up, out).launch(
++                grid=(cute.ceil_div(k // 2, block * vector), m, 1),
++                block=(block, 1, 1),
++                stream=stream,
++                use_pdl=enable_pdl,
++            )
++
++        @cute.kernel
++        def kernel(self, gate_up: cute.Tensor, out: cute.Tensor):
++            tid, _, _ = cute.arch.thread_idx()
++            column_block, row, _ = cute.arch.block_idx()
++            pair = (column_block * block + tid) * vector
++            if cutlass.const_expr(enable_pdl):
++                cute.arch.griddepcontrol_wait()
++            if pair < k // 2:
++                for index in cutlass.range_constexpr(vector):
++                    packed_gate = Uint32(gate_up[row, pair + index])
++                    packed_up = Uint32(gate_up[row, k // 2 + pair + index])
++                    lo, hi = fp4_common.bfloat2_to_float2_scaled(
++                        packed_gate, Float32(1.0)
++                    )
++                    activated = fp4_common.cvt_f32x2_to_bfloat2(
++                        silu_float(lo), silu_float(hi)
++                    )
++                    out[row, pair + index] = fp4_common.bfloat2_mul(
++                        activated, packed_up
++                    )
++            if cutlass.const_expr(enable_pdl):
++                cute.arch.griddepcontrol_launch_dependents()
++
++    operands = (
++        cute.runtime.make_fake_compact_tensor(
++            cutlass.Int32, (m, k), stride_order=(1, 0), assumed_align=16
++        ),
++        cute.runtime.make_fake_compact_tensor(
++            cutlass.Int32, (m, k // 2), stride_order=(1, 0), assumed_align=16
++        ),
++        cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
++    )
++    return build_and_load_cute_dsl_kernel(
++        "native_tiled_silu_sm12x",
++        f"m{m}_k{k}_b{block}_v{vector}_p{int(enable_pdl)}",
++        lambda: cute.compile(TiledSilu(), *operands, options="--enable-tvm-ffi"),
++        extra_key_files=(__file__, fp4_common.__file__),
++    )
++
++
++def run(gate_up, *, block=64, vector=1, enable_pdl=True, out=None):
++    if (
++        not gate_up.is_cuda
++        or gate_up.ndim != 2
++        or gate_up.dtype != torch.bfloat16
++        or not gate_up.is_contiguous()
++        or gate_up.data_ptr() % 16
++    ):
++        raise ValueError("Tiled SiLU requires contiguous aligned BF16 CUDA input")
++    if get_compute_capability(gate_up.device) not in ((12, 0), (12, 1)):
++        raise ValueError("Tiled SiLU requires SM12x")
++    m, width = gate_up.shape
++    if not 1 <= m <= 16 or width < 16 or width % 16:
++        raise ValueError("Tiled SiLU requires M in 1..16 and K divisible by 8")
++    if block not in (32, 64, 128, 256) or vector not in (1, 2, 4):
++        raise ValueError("Unsupported tiled SiLU launch configuration")
++    k = width // 2
++    if out is None:
++        out = torch.empty((m, k), device=gate_up.device, dtype=gate_up.dtype)
++    if (
++        out.device != gate_up.device
++        or out.dtype != gate_up.dtype
++        or out.shape != (m, k)
++        or not out.is_contiguous()
++        or out.data_ptr() % 16
++        or out.untyped_storage().data_ptr() == gate_up.untyped_storage().data_ptr()
++    ):
++        raise ValueError("Tiled SiLU requires an aligned, separate BF16 output")
++    key = get_device_index(gate_up.device), m, k, block, vector, enable_pdl
++    compiled = _COMPILED.get(key)
++    if compiled is None:
++        if torch.cuda.is_current_stream_capturing():
++            raise RuntimeError("Warm tiled SiLU before CUDA graph capture")
++        with torch.accelerator.device_index(gate_up.device.index):
++            compiled = _compile(m, k, block, vector, enable_pdl)
++        _COMPILED[key] = compiled
++    compiled(gate_up.view(torch.int32), out.view(torch.int32))
++    return out
+diff --git a/vllm/model_executor/kernels/linear/nvfp4/dynamic.py b/vllm/model_executor/kernels/linear/nvfp4/dynamic.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..14c72260aa1721219d9d26e1400e10c502878d1d
+--- /dev/null
++++ b/vllm/model_executor/kernels/linear/nvfp4/dynamic.py
+@@ -0,0 +1,162 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Select activation precision over one canonical NVFP4 weight representation."""
++
++import torch
++
++from vllm.config import get_current_vllm_config
++from vllm.model_executor.layers.quantization.utils.nvfp4_utils import swizzle_blockscale
++from vllm.platforms import current_platform
++from vllm.utils.torch_utils import direct_register_custom_op
++
++from .base import NvFp4LinearKernel, NvFp4LinearLayerConfig
++from .dynamic_backends import get_dynamic_backend
++
++
++def dynamic_nvfp4(
++    x: torch.Tensor,
++    weight: torch.Tensor,
++    weight_scale: torch.Tensor,
++    weight_global_scale: torch.Tensor,
++    input_global_scale_inv: torch.Tensor,
++    alpha: torch.Tensor,
++    max_a16_tokens: int,
++    fuse_silu: bool,
++    w4a4_backend: str = "flashinfer_cutlass",
++    w4a16_backend: str = "flashinfer_cutedsl_native",
++) -> torch.Tensor:
++    import flashinfer
++    from flashinfer.quantization.fp4_quantization import silu_and_mul_nvfp4_quantize
++
++    if x.ndim != 2 or x.dtype != torch.bfloat16 or not 0 <= max_a16_tokens <= 16:
++        raise ValueError("Dynamic NVFP4 requires BF16 matrices and a cutoff of 0..16")
++    x = x.contiguous()
++    if 0 < x.shape[0] <= max_a16_tokens:
++        if fuse_silu:
++            from vllm.model_executor.kernels.linear.nvfp4.cutedsl_silu import run
++
++            x = run(x, block=256, vector=1, enable_pdl=True)
++        return get_dynamic_backend(w4a16_backend, 16).run(
++            x, weight, None, weight_scale, weight_global_scale.reshape(1)
++        )
++
++    if fuse_silu:
++        x_fp4, x_scale = silu_and_mul_nvfp4_quantize(
++            x, input_global_scale_inv.reshape(1), enable_pdl=True
++        )
++    else:
++        x_fp4, x_scale = flashinfer.nvfp4_quantize(
++            x,
++            input_global_scale_inv.reshape(1),
++            sfLayout=flashinfer.SfLayout.layout_128x4,
++            do_shuffle=False,
++            backend="cute-dsl",
++            enable_pdl=True,
++        )
++    return get_dynamic_backend(w4a4_backend, 4).run(
++        x_fp4, weight, x_scale, weight_scale, alpha.reshape(1)
++    )
++
++
++def _dynamic_nvfp4_fake(
++    x: torch.Tensor,
++    weight: torch.Tensor,
++    weight_scale: torch.Tensor,
++    weight_global_scale: torch.Tensor,
++    input_global_scale_inv: torch.Tensor,
++    alpha: torch.Tensor,
++    max_a16_tokens: int,
++    fuse_silu: bool,
++    w4a4_backend: str = "flashinfer_cutlass",
++    w4a16_backend: str = "flashinfer_cutedsl_native",
++) -> torch.Tensor:
++    return x.new_empty((x.shape[0], weight.shape[0]))
++
++
++direct_register_custom_op(
++    "dynamic_nvfp4",
++    dynamic_nvfp4,
++    fake_impl=_dynamic_nvfp4_fake,
++    dispatch_key="CUDA",
++)
++
++
++class DynamicNvFp4LinearKernel(NvFp4LinearKernel):
++    """Select activation precision before quantization, without repacking weights."""
++
++    def __init__(self, config: NvFp4LinearLayerConfig) -> None:
++        super().__init__(config)
++        runtime = get_current_vllm_config()
++        if runtime.parallel_config.tensor_parallel_size != 1:
++            raise ValueError("Dynamic NVFP4 currently requires TP=1")
++        if runtime.model_config.dtype != torch.bfloat16:
++            raise ValueError("Dynamic NVFP4 requires BF16 activations")
++        self.w4a4_backend = runtime.kernel_config.nvfp4_dynamic_w4a4_backend
++        self.w4a16_backend = runtime.kernel_config.nvfp4_dynamic_w4a16_backend
++        self.max_a16_tokens = runtime.kernel_config.nvfp4_dynamic_max_tokens
++        silu_cutoff = runtime.kernel_config.nvfp4_dynamic_silu_max_tokens
++        self.max_silu_a16_tokens = (
++            self.max_a16_tokens if silu_cutoff is None else silu_cutoff
++        )
++
++    @classmethod
++    def is_supported(cls, compute_capability=None):
++        if compute_capability is None:
++            if not current_platform.is_cuda():
++                return False, "Dynamic NVFP4 requires CUDA"
++            cc = current_platform.get_device_capability()
++            compute_capability = cc.to_int() if cc is not None else None
++        if compute_capability not in (120, 121):
++            return False, "Dynamic NVFP4 currently requires SM120 or SM121"
++        config = get_current_vllm_config().kernel_config
++        for name, bits in (
++            (config.nvfp4_dynamic_w4a4_backend, 4),
++            (config.nvfp4_dynamic_w4a16_backend, 16),
++        ):
++            backend = get_dynamic_backend(name, bits)
++            if not backend.is_supported(compute_capability):
++                return False, f"Dynamic NVFP4 candidate {name!r} is unavailable"
++        return True, None
++
++    @classmethod
++    def can_implement(cls, config):
++        return True, None
++
++    def process_weights_after_loading(self, layer):
++        weight = layer.weight.data
++        n, packed_k = weight.shape
++        k = packed_k * 2
++        if weight.dtype != torch.uint8 or n % 128 or k % 256:
++            raise ValueError("Dynamic NVFP4 requires uint8 weights, N%128=K%256=0")
++        if tuple(layer.weight_scale.shape) != (n, k // 16):
++            raise ValueError("Expected unprepared block-16 weight scales")
++        if not all(
++            hasattr(layer, name)
++            for name in ("input_global_scale_inv", "weight_global_scale", "alpha")
++        ):
++            raise ValueError("Dynamic NVFP4 requires calibrated W4A4 scales")
++        layer.weight = torch.nn.Parameter(weight.contiguous(), requires_grad=False)
++        layer.weight_scale = torch.nn.Parameter(
++            swizzle_blockscale(layer.weight_scale.data), requires_grad=False
++        )
++
++    def apply_weights(self, layer, x, bias=None):
++        shape = (*x.shape[:-1], layer.output_size_per_partition)
++        out = self.apply_silu_or_linear(layer, x.reshape(-1, x.shape[-1]), False)
++        if bias is not None:
++            out = out + bias
++        return out.view(shape)
++
++    def apply_silu_or_linear(self, layer, x, fuse_silu):
++        return torch.ops.vllm.dynamic_nvfp4(
++            x,
++            layer.weight,
++            layer.weight_scale,
++            layer.weight_global_scale,
++            layer.input_global_scale_inv,
++            layer.alpha,
++            self.max_silu_a16_tokens if fuse_silu else self.max_a16_tokens,
++            fuse_silu,
++            self.w4a4_backend,
++            self.w4a16_backend,
++        )
+diff --git a/vllm/model_executor/kernels/linear/nvfp4/dynamic_backends.py b/vllm/model_executor/kernels/linear/nvfp4/dynamic_backends.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..15b2a4870acee673cebbe135b74cbe4fd5cdf9f0
+--- /dev/null
++++ b/vllm/model_executor/kernels/linear/nvfp4/dynamic_backends.py
+@@ -0,0 +1,100 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Candidates that consume canonical NVFP4 weights without preparing a copy."""
++
++from collections.abc import Callable
++from dataclasses import dataclass
++from functools import partial
++from typing import Literal
++
++import torch
++
++_CANONICAL_LAYOUT = "nvfp4_k_major_sf128x4"
++
++
++@dataclass(frozen=True)
++class DynamicNvFp4Backend:
++    activation_bits: Literal[4, 16]
++    weight_layout: str
++    is_supported: Callable[[int], bool]
++    # Alpha includes the activation dequantization scale only for W4A4.
++    run: Callable[
++        [torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor, torch.Tensor],
++        torch.Tensor,
++    ]
++
++
++def _flashinfer_supported(cc: int, *, api: str, backend: str) -> bool:
++    try:
++        import flashinfer
++
++        return getattr(flashinfer, api).is_backend_supported(backend, cc)
++    except (ImportError, AttributeError, KeyError, ValueError):
++        return False
++
++
++def _flashinfer_w4a4(a, weight, a_scale, weight_scale, alpha, *, backend):
++    import flashinfer
++
++    return flashinfer.mm_fp4(
++        a,
++        weight.T,
++        a_scale.view(torch.uint8),
++        weight_scale.view(torch.uint8).T,
++        alpha,
++        out_dtype=torch.bfloat16,
++        backend=backend,
++        use_nvfp4=True,
++        use_8x4_sf_layout=False,
++        enable_pdl=True,
++    )
++
++
++def _flashinfer_w4a16(a, weight, a_scale, weight_scale, alpha):
++    import flashinfer
++
++    return flashinfer.mm_bf16_fp4(
++        a,
++        weight,
++        weight_scale,
++        alpha,
++        backend="cute-dsl-native",
++        enable_pdl=True,
++    )
++
++
++_BACKENDS = {
++    name: DynamicNvFp4Backend(
++        activation_bits=4,
++        weight_layout=_CANONICAL_LAYOUT,
++        is_supported=partial(_flashinfer_supported, api="mm_fp4", backend=backend),
++        run=partial(_flashinfer_w4a4, backend=backend),
++    )
++    for name, backend in (
++        ("flashinfer_cutlass", "cutlass"),
++        ("flashinfer_b12x", "b12x"),
++        ("flashinfer_cudnn", "cudnn"),
++        ("flashinfer_cutedsl", "cute-dsl"),
++    )
++}
++_BACKENDS["flashinfer_cutedsl_native"] = DynamicNvFp4Backend(
++    activation_bits=16,
++    weight_layout=_CANONICAL_LAYOUT,
++    is_supported=partial(
++        _flashinfer_supported, api="mm_bf16_fp4", backend="cute-dsl-native"
++    ),
++    run=_flashinfer_w4a16,
++)
++
++
++def get_dynamic_backend(name: str, activation_bits: int) -> DynamicNvFp4Backend:
++    candidate = _BACKENDS.get(name)
++    if candidate is None:
++        raise ValueError(f"Unknown canonical NVFP4 candidate {name!r}")
++    if candidate.weight_layout != _CANONICAL_LAYOUT:
++        raise ValueError(f"NVFP4 candidate {name!r} requires a different weight layout")
++    if candidate.activation_bits != activation_bits:
++        raise ValueError(
++            f"NVFP4 candidate {name!r} does not implement W4A{activation_bits}"
++        )
++    return candidate
+diff --git a/vllm/model_executor/models/qwen2_moe.py b/vllm/model_executor/models/qwen2_moe.py
+index 1c095d6f091c8bc932cd4058bfd1e89f6f141b85..020f465cedc33b7fc2607bf8bbfd9a0380494550 100644
+--- a/vllm/model_executor/models/qwen2_moe.py
++++ b/vllm/model_executor/models/qwen2_moe.py
+@@ -111,11 +111,22 @@ class Qwen2MoeMLP(nn.Module):
+             )
+         self.act_fn = SiluAndMul()
+         self.expert_gate = expert_gate
++        from vllm.model_executor.kernels.linear.nvfp4.dynamic import (
++            DynamicNvFp4LinearKernel,
++        )
++
++        kernel = getattr(self.down_proj.quant_method, "kernel", None)
++        self._dynamic_nvfp4 = isinstance(kernel, DynamicNvFp4LinearKernel)
+ 
+     def forward(self, x):
+         gate_up, _ = self.gate_up_proj(x)
+-        out = self.act_fn(gate_up)
+-        out, _ = self.down_proj(out)
++        if self._dynamic_nvfp4:
++            kernel = getattr(self.down_proj.quant_method, "kernel", None)
++            assert kernel is not None
++            out = kernel.apply_silu_or_linear(self.down_proj, gate_up, True)
++        else:
++            out = self.act_fn(gate_up)
++            out, _ = self.down_proj(out)
+ 
+         if self.expert_gate is not None:
+             out = F.sigmoid(self.expert_gate(x)[0]) * out
+diff --git a/vllm/model_executor/warmup/kernel_warmup.py b/vllm/model_executor/warmup/kernel_warmup.py
+index e5751730e85d7466e5adb541624c94b5561bba95..9781539931197e12b56ae952b8fd8827df3bf14d 100644
+--- a/vllm/model_executor/warmup/kernel_warmup.py
++++ b/vllm/model_executor/warmup/kernel_warmup.py
+@@ -340,6 +340,19 @@ def _flashinfer_autotune_token_counts(runner: "GPUModelRunner") -> tuple[int, ..
+     max_tokens = runner.scheduler_config.max_num_batched_tokens
+     # Tune the widest bucket set first so bounded passes reuse its configs.
+     token_counts = [max_tokens]
++    linear_backend = runner.vllm_config.kernel_config.linear_backend
++    if linear_backend == "nvfp4_dynamic":
++        config = runner.vllm_config.kernel_config
++        cutoff = max(
++            config.nvfp4_dynamic_max_tokens,
++            config.nvfp4_dynamic_silu_max_tokens or 0,
++        )
++        capture_sizes = runner.vllm_config.compilation_config.cudagraph_capture_sizes
++        token_counts.extend(
++            m for m in capture_sizes or () if 0 < m <= min(cutoff, max_tokens)
++        )
++        if cutoff:
++            token_counts.append(min(cutoff, max_tokens))
+     token_counts.extend(_flashinfer_deferred_moe_token_counts(runner))
+     return tuple(dict.fromkeys(token_counts))
+ 
+@@ -377,13 +390,23 @@ def _run_flashinfer_autotune_dummy_runs(
+         # Round M up to match serving-time bucket selection for non-bucket M.
+         # See https://github.com/flashinfer-ai/flashinfer/issues/5450
+         with fi_utils.autotune(tuning_buckets=tuning_buckets, round_up=True):
+-            runner._dummy_run(
++            dummy_outputs = runner._dummy_run(
+                 num_tokens=num_tokens,
+                 skip_eplb=True,
+                 is_profile=True,
+                 randomize_inputs=True,
+                 **dummy_run_kwargs,
+             )
++            if runner.vllm_config.kernel_config.linear_backend == "nvfp4_dynamic":
++                _, sample_hidden_states = dummy_outputs
++                if sample_hidden_states is not None:
++                    logits_buckets = fi_utils.flashinfer_get_hybrid_num_tokens_buckets(
++                        sample_hidden_states.shape[0]
++                    )
++                    with fi_utils.autotune(tuning_buckets=logits_buckets):
++                        runner.get_model().compute_logits(
++                            torch.rand_like(sample_hidden_states)
++                        )
+ 
+ 
+ def _autotune_cache_fingerprint(path: Path) -> tuple[str, int] | None:
+diff --git a/tests/model_executor/test_flashinfer_autotune_warmup.py b/tests/model_executor/test_flashinfer_autotune_warmup.py
+index f7ea6847f26f12b7035a6a69a88d4170a410d435..f50b229228f73914dc8f6513376231d87188f8ba 100644
+--- a/tests/model_executor/test_flashinfer_autotune_warmup.py
++++ b/tests/model_executor/test_flashinfer_autotune_warmup.py
+@@ -4,7 +4,7 @@
+ import json
+ import sys
+ from collections import defaultdict
+-from contextlib import nullcontext
++from contextlib import contextmanager, nullcontext
+ from inspect import signature
+ from pathlib import Path
+ from types import ModuleType, SimpleNamespace
+@@ -12,6 +12,7 @@ from typing import Any
+ from unittest.mock import Mock, call, patch
+ 
+ import pytest
++import torch
+ 
+ from vllm.model_executor.warmup import kernel_warmup as warmup
+ from vllm.model_executor.warmup.kernel_warmup import (
+@@ -39,11 +40,12 @@ def _make_moe(*, max_deferred_tokens: int = 128, enabled: bool = True):
+     return moe
+ 
+ 
+-def _make_runner(modules, *, max_tokens: int = 8192):
++def _make_runner(modules, *, max_tokens: int = 8192, linear_backend: str = "auto"):
+     """Create a runner carrying only the state used by FlashInfer warmup."""
+     return SimpleNamespace(
+         scheduler_config=SimpleNamespace(max_num_batched_tokens=max_tokens),
+         vllm_config=SimpleNamespace(
++            kernel_config=SimpleNamespace(linear_backend=linear_backend),
+             attention_config=SimpleNamespace(hisparse_config=None),
+             parallel_config=SimpleNamespace(data_parallel_rank=0),
+         ),
+@@ -83,6 +85,29 @@ def test_flashinfer_autotune_token_counts_are_bounded_and_deduplicated():
+     assert token_counts == (32,)
+ 
+ 
++@pytest.mark.parametrize(
++    "linear_cutoff,silu_cutoff,max_tokens,expected",
++    [
++        (4, 16, 8192, (8192, 1, 2, 4, 8, 16)),
++        (4, None, 8192, (8192, 1, 2, 4)),
++        (0, 16, 8, (8, 1, 2, 4)),
++        (0, None, 8192, (8192,)),
++    ],
++)
++def test_dynamic_nvfp4_warmup_covers_fused_cutoff(
++    linear_cutoff, silu_cutoff, max_tokens, expected
++):
++    """Fused down projections may use W4A16 beyond the ordinary linear cutoff."""
++    runner = _make_runner([], max_tokens=max_tokens, linear_backend="nvfp4_dynamic")
++    runner.vllm_config.kernel_config.nvfp4_dynamic_max_tokens = linear_cutoff
++    runner.vllm_config.kernel_config.nvfp4_dynamic_silu_max_tokens = silu_cutoff
++    runner.vllm_config.compilation_config = SimpleNamespace(
++        cudagraph_capture_sizes=[1, 2, 4, 8, 16, 32]
++    )
++    with patch("vllm.model_executor.layers.fused_moe.MoERunner", _FakeMoERunner):
++        assert _flashinfer_autotune_token_counts(runner) == expected
++
++
+ @pytest.mark.parametrize("skip_attn", [False, True])
+ def test_flashinfer_autotune_uses_token_buckets_for_each_dummy_run(skip_attn):
+     from vllm.v1.worker.gpu.model_runner import GPUModelRunner as V2Runner
+@@ -386,3 +411,46 @@ def test_rejected_cache_retunes_every_rank_in_its_tuning_group(autotune_run, pp,
+     rerun.assert_collectives_match()
+     assert set(rerun.profile_groups) == set(range(tp))
+     assert {rank for rank, _, _ in rerun.saves} == set(range(tp))
++
++
++def test_dynamic_nvfp4_logits_tuning_is_bounded_by_sampled_sequences():
++    """Large prefill buckets must not allocate equally large logits buffers."""
++    runner = _make_runner([], max_tokens=2048, linear_backend="nvfp4_dynamic")
++    sampled = torch.empty((16, 32))
++    active_buckets = []
++    observed = {}
++
++    @contextmanager
++    def autotune(*, tuning_buckets, round_up=False):
++        active_buckets.append(tuning_buckets)
++        try:
++            yield
++        finally:
++            active_buckets.pop()
++
++    def backbone(**kwargs):
++        observed["prefill_max"] = max(active_buckets[-1])
++        return None, sampled
++
++    def logits(hidden_states):
++        observed["sampled_rows"] = hidden_states.shape[0]
++        observed["logits_buckets"] = active_buckets[-1]
++
++    runner._dummy_run.side_effect = backbone
++    runner.get_model.return_value.compute_logits = logits
++    with (
++        patch(
++            "vllm.model_executor.warmup.kernel_warmup."
++            "_flashinfer_autotune_token_counts",
++            return_value=(2048,),
++        ),
++        patch("vllm.utils.flashinfer.autotune", autotune),
++    ):
++        _run_flashinfer_autotune_dummy_runs(runner)
++
++    assert observed == {
++        "prefill_max": 2048,
++        "sampled_rows": 16,
++        "logits_buckets": (1, 2, 4, 8, 16),
++    }
++    assert not active_buckets

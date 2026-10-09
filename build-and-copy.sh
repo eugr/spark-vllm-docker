@@ -1259,6 +1259,17 @@ if [ "$NO_BUILD" = false ]; then
                 "--build-arg" "FLASHINFER_REPO=$FLASHINFER_REPO"
                 "--build-arg" "FLASHINFER_BUILD_CUBIN=$FLASHINFER_BUILD_CUBIN")
 
+            # The checked-in Qwen stack belongs to the upstream lane only.
+            # Custom FlashInfer refs/PRs keep their existing unmodified base.
+            if [ "$NORMALIZED_VLLM_REPO" = "$NORMALIZED_DEFAULT_VLLM_REPO" ] && \
+               [ "$VLLM_SOURCE_DIR_SET" = false ] && \
+               [ "$FLASHINFER_REPO" = "https://github.com/flashinfer-ai/flashinfer.git" ] && \
+               [ "$FLASHINFER_REF_SET" = false ] && [ -z "$FLASHINFER_PRS" ]; then
+                FI_CMD+=("--build-arg" "FLASHINFER_APPLY_REGULAR_PATCHES=1")
+            else
+                FI_CMD+=("--build-arg" "FLASHINFER_APPLY_REGULAR_PATCHES=0")
+            fi
+
             if [ "$REBUILD_FLASHINFER" = true ]; then
                 FI_CMD+=("--build-arg" "CACHEBUST_FLASHINFER=$(date +%s)")
             fi
