@@ -279,8 +279,10 @@ ENV CARGO_HOME=/opt/cargo
 ENV PATH=/opt/cargo/bin:$PATH
 ENV PROTOC_INCLUDE=/usr/include
 
+# DeepGEMM's DeepJIT headers include elfutils/libdwfl.h (provided by libdw-dev).
 RUN apt update && \
-    apt install -y --no-install-recommends ca-certificates pkg-config protobuf-compiler libprotobuf-dev && \
+    apt install -y --no-install-recommends \
+        ca-certificates pkg-config protobuf-compiler libprotobuf-dev libdw-dev && \
     rm -rf /var/lib/apt/lists/* && \
     curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
       sh -s -- -y --profile minimal --default-toolchain ${RUSTUP_TOOLCHAIN} --no-modify-path && \
@@ -751,13 +753,14 @@ ENV UV_LINK_MODE=copy
 
 # Mount additional packages from base builder image
 # Install runtime dependencies
+# DeepJIT dynamically loads libdw.so.1 for source locations in C++ stack traces.
 RUN --mount=type=bind,from=base,source=/workspace/vllm/nccl/build/pkg/deb,target=/workspace/nccl-pkg \
     apt update && \
     apt install -y --no-install-recommends \
     python3 python3-pip python3-dev vim curl git wget \
     libcudnn9-cuda-13 \
     libibverbs1 libibverbs-dev rdma-core \
-    libxcb1 earlyoom liburing-dev pkg-config \
+    libxcb1 earlyoom liburing-dev pkg-config libdw1t64 \
     && cd /workspace/nccl-pkg && apt install -y --no-install-recommends --allow-downgrades --allow-change-held-packages ./*.deb \
     && rm -rf /var/lib/apt/lists/* \
     && pip install uv
