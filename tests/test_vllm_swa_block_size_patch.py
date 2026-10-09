@@ -98,6 +98,62 @@ UPSTREAM_WITH_SPEC = UPSTREAM.replace(
     "                kv_cache_spec,\n",
 )
 
+# #60252: preserve exact page divisibility instead of always choosing the
+# smallest kernel when the primary size is unsupported.
+UPSTREAM_WITH_DIVISOR = UPSTREAM_WITH_SPEC.replace(
+    "    attn_backend, per_token_bytes, page_budget, fallback, kv_cache_spec=None,\n",
+    "    attn_backend, per_token_bytes, page_budget, fallback, kv_cache_spec=None,\n"
+    "    divisor_of: int | None = None,\n",
+).replace(
+    "    return max(fitting) if fitting else smallest\n",
+    "    if divisor_of is not None:\n"
+    "        dividing = [b for b in fitting if divisor_of % b == 0]\n"
+    "        dividing.extend(\n"
+    "            b\n"
+    "            for s in sizes\n"
+    "            if isinstance(s, MultipleOf)\n"
+    "            for b in range(s.base, max_block_size + 1, s.base)\n"
+    "            if divisor_of % b == 0\n"
+    "        )\n"
+    "        if dividing:\n"
+    "            return max(dividing)\n"
+    "    return max(fitting) if fitting else smallest\n",
+).replace(
+    "                kv_cache_spec,\n",
+    "                kv_cache_spec,\n"
+    "                divisor_of=None if shared_page else block_size,\n",
+)
+
+
+class SWADivisorSelectionTests(unittest.TestCase):
+    def test_divisor_fix_is_kept_without_layering_old_fallback(self):
+        patched, message = PATCHER.patch_source(UPSTREAM_WITH_DIVISOR)
+        self.assertEqual(patched, UPSTREAM_WITH_DIVISOR)
+        self.assertIn("#60252", message)
+        self.assertNotIn(PATCHER.MARKER, patched)
+        for sizes, primary, expected in [
+            ([16, 32, 64], 1648, 16),
+            ([16, 32, 64], 1536, 64),
+            ([MultipleOf(16)], 1648, 1648),
+        ]:
+            with self.subTest(sizes=sizes, primary=primary):
+                self.assertEqual(
+                    select_spec(patched, sizes, primary=primary).block_size, expected
+                )
+
+    def test_incomplete_divisor_fix_is_rejected(self):
+        for source in [
+            UPSTREAM_WITH_DIVISOR.replace("    divisor_of: int | None = None,\n", ""),
+            UPSTREAM_WITH_DIVISOR.replace("return max(dividing)", "return min(dividing)"),
+            UPSTREAM_WITH_DIVISOR.replace(
+                "divisor_of=None if shared_page else block_size", "divisor_of=None"
+            ),
+            UPSTREAM_WITH_DIVISOR + UPSTREAM_WITH_DIVISOR,
+        ]:
+            with self.subTest(source=source):
+                with self.assertRaises(PATCHER.PatchError):
+                    PATCHER.patch_source(source)
+
 
 @dataclass(frozen=True)
 class MultipleOf:

@@ -1,0 +1,2034 @@
+From 946bc791c84a32752f8c3fcc0b3fa0bd9fac5591 Mon Sep 17 00:00:00 2001
+From: Stefano Castagnetta <scastagnetta@nvidia.com>
+Date: Wed, 7 Oct 2026 20:10:09 +0200
+Subject: [PATCH] [PR #59740 + #60226] Context Aware Sparse LM Head, including
+ quantized lm_heads
+
+Combined net diff of #59740 and #60226 (#60226 is stacked on #59740), rebased to apply after #59958 and #59973. The only change versus the PR branches is in vllm/config/vllm.py: #59973 and #59740 each add an entry at the same spot in the V1 model runner unsupported-feature list, and both entries are kept.
+
+Upstream-PR: https://github.com/vllm-project/vllm/pull/59740
+Upstream-PR: https://github.com/vllm-project/vllm/pull/60226
+
+diff --git a/.buildkite/test_areas/spec_decode.yaml b/.buildkite/test_areas/spec_decode.yaml
+index d031d4fdea9b976173a6acd44cddeb8f9eba3d19..8d7cb3d417b42787e6c625f79fbe9cdbba60eed6 100644
+--- a/.buildkite/test_areas/spec_decode.yaml
++++ b/.buildkite/test_areas/spec_decode.yaml
+@@ -220,6 +220,7 @@ steps:
+   source_file_dependencies:
+     - vllm/v1/spec_decode/
+     - vllm/v1/worker/gpu/spec_decode/
++    - vllm/model_executor/layers/draft_vocab.py
+     - vllm/v1/attention/backends/
+     - vllm/transformers_utils/configs/speculators/
+     - tests/v1/e2e/spec_decode/
+diff --git a/docs/features/speculative_decoding/README.md b/docs/features/speculative_decoding/README.md
+index 7e2c36d29395d856ab71575542a3bff4f07b19bf..c7856e924e9674f003f2318be193a70c031ff863 100644
+--- a/docs/features/speculative_decoding/README.md
++++ b/docs/features/speculative_decoding/README.md
+@@ -92,6 +92,7 @@ only apply to model-based methods such as `draft_model`, `mtp`, `eagle3`, and
+ | `synthetic_acceptance_rates` | `list[float]` | `None` | Per-position unconditional acceptance rates for `synthetic` rejection sampling. Each entry in `[0, 1]`; length must equal `num_speculative_tokens`; must be non-increasing. |
+ | `synthetic_acceptance_length` | `float` | `None` | Target mean acceptance length for `synthetic`; in `[1, num_speculative_tokens + 1]`. Mutually exclusive with `synthetic_acceptance_rates`. |
+ | `use_heterogeneous_vocab` | `boolean` | `false` | Allow draft and target models with different vocabularies. Builds a token-level intersection at initialisation and constrains draft logits to shared tokens only. Only compatible with `method=draft_model`. Probabilistic draft sampling (`draft_sample_method='probabilistic'`) is not yet supported when this option is enabled. |
++| `draft_token_map` | `string` | `None` | Path to a list of target token ids the drafter may propose (`.pt` in SGLang's `--speculative-token-map` format, or a JSON list). Restricts a shared lm_head to those rows to cut drafting cost; verification is unchanged. Only for `mtp` drafters with an unquantized lm_head, on Model Runner V2. See [Reduced draft vocabulary](mtp.md#reduced-draft-vocabulary). |
+ 
+ !!! note
+     Gemma 4 assistant checkpoints are handled as Gemma 4 MTP speculators, not
+diff --git a/docs/features/speculative_decoding/mtp.md b/docs/features/speculative_decoding/mtp.md
+index 34d8f9539b74a7ef8edd8252f7244dc37be98d0e..2254827d13b54bf8f8f363c12364377446900765 100644
+--- a/docs/features/speculative_decoding/mtp.md
++++ b/docs/features/speculative_decoding/mtp.md
+@@ -67,6 +67,63 @@ vllm serve XiaomiMiMo/MiMo-7B-Base \
+     --speculative-config '{"method":"mtp","num_speculative_tokens":1}'
+ ```
+ 
++## Reduced draft vocabulary
++
++MTP heads usually share the target model's lm_head, so every draft token pays
++for a projection onto the full vocabulary. For large vocabularies on
++bandwidth-bound GPUs this can be a large share of the drafting cost. The
++`draft_token_map` key restricts the drafter's head to a list of frequent token
++ids (the [FR-Spec](https://arxiv.org/abs/2502.14856) idea):
++
++```bash
++vllm serve <mtp-model> \
++    --speculative-config '{"method": "mtp", "num_speculative_tokens": 3,
++                           "draft_token_map": "draft_vocab.pt"}'
++```
++
++- Requires Model Runner V2 (the default on CUDA).
++- Only drafting changes. The target still verifies with its full lm_head, so a
++  token outside the list costs a rejected draft, never a different output
++  distribution. With probabilistic drafting
++  (`draft_sample_method: "probabilistic"`), the proposal is a distribution over
++  the full vocabulary with zero mass outside the list, so rejection sampling
++  stays exact.
++- The file is SGLang's `--speculative-token-map` format (a `.pt` list of ids)
++  or a JSON list. EOS ids are always added.
++- Drafters whose model code builds a `DraftVocab` support it (Qwen3.5 and
++  Qwen4Exp MTP); others raise an error. A quantized lm_head (for example a
++  ModelOpt NVFP4 checkpoint) keeps its checkpoint format: the listed rows are
++  cut from the checkpoint tensors and run on the same quantized kernel.
++- Acceptance drops when the list misses tokens your traffic uses, so build it
++  from representative text, ideally the model's own outputs, and include all
++  special tokens. [`build_draft_token_map.py`](../../../examples/features/speculative_decoding/build_draft_token_map.py)
++  ranks token ids by frequency over a corpus and reports held-out coverage.
++  Measure the real acceptance length (see
++  [acceptance metrics](acceptance_metrics.md)) with and without the list.
++
++A static list loses acceptance on traffic it was not built from (for example
++other languages). `draft_token_map_dynamic_rows` adds that many tokens per
++draft step on top of the list: the rows outside the list are scored with a
++rank-`draft_token_map_dynamic_rank` (default 256) projection of the lm_head and
++the best ones get exact logits.
++
++```bash
++vllm serve <mtp-model> \
++    --speculative-config '{"method": "mtp", "num_speculative_tokens": 3,
++                           "draft_token_map": "draft_vocab_32k.pt",
++                           "draft_token_map_dynamic_rows": 16384}'
++```
++
++It costs more per draft token than the list alone, and that cost grows with
++batch size, so measure decode speed at your concurrency. Tensor parallel size 1
++only.
++
++`draft_token_map_quantization` (`"fp8"` or `"nvfp4"`) stores the listed and
++dynamic rows weight-only quantized, which cuts the bytes read per draft token
++further; the dynamic rows' scorer is then stored in FP8. Only the acceptance
++length can change. It is rejected when the lm_head is already quantized in the
++checkpoint. Dynamic rows on a quantized lm_head need the ModelOpt NVFP4 format.
++
+ ## Notes
+ 
+ - MTP only works for model families that support MTP in vLLM.
+diff --git a/examples/features/speculative_decoding/build_draft_token_map.py b/examples/features/speculative_decoding/build_draft_token_map.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..d5f7d87f42ca67837f4e7c5d407269d0f3052f4b
+--- /dev/null
++++ b/examples/features/speculative_decoding/build_draft_token_map.py
+@@ -0,0 +1,140 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Build a frequency-ranked draft vocabulary for `draft_token_map`.
++
++Counts token frequencies over a text corpus and keeps the most frequent ids,
++plus every special/added token and, optionally, all ids below a floor. The
++corpus should look like the traffic you serve: ideally text the target model
++generated, otherwise chat, code and tool-call data. The last `--holdout`
++fraction of documents is kept out of the counts and used to report how much of
++unseen text the list covers.
++
++Example:
++    python examples/features/speculative_decoding/build_draft_token_map.py \\
++        --tokenizer Qwen/Qwen3-8B \\
++        --dataset HuggingFaceH4/ultrachat_200k:train_sft \\
++        --text-file my_outputs.jsonl \\
++        --num-tokens 32768 --id-floor 4096 --output draft_vocab.pt
++
++    vllm serve Qwen/Qwen3-8B --speculative-config \\
++        '{"method": "mtp", "num_speculative_tokens": 3,
++          "draft_token_map": "draft_vocab.pt"}'
++
++The `.pt` output uses SGLang's `--speculative-token-map` format; a `.json`
++output is also accepted by vLLM.
++
++"""
++
++import argparse
++import json
++from collections import Counter
++from collections.abc import Iterator
++
++import torch
++from transformers import AutoTokenizer
++
++
++def _row_text(row: dict, tokenizer) -> str:
++    for key in ("messages", "conversations"):
++        turns = row.get(key)
++        if isinstance(turns, list) and turns and isinstance(turns[0], dict):
++            messages = [
++                {
++                    "role": t.get("role") or t.get("from", "user"),
++                    "content": str(t.get("content") or t.get("value") or ""),
++                }
++                for t in turns
++            ]
++            if tokenizer.chat_template:
++                return tokenizer.apply_chat_template(messages, tokenize=False)
++            return "\n".join(m["content"] for m in messages)
++    return "\n".join(str(v) for v in row.values() if isinstance(v, str))
++
++
++def _iter_texts(args, tokenizer) -> Iterator[str]:
++    for spec in args.dataset:
++        from datasets import load_dataset
++
++        name, _, split = spec.partition(":")
++        ds = load_dataset(name, split=split or "train", streaming=True)
++        for i, row in enumerate(ds):
++            if i >= args.max_docs:
++                break
++            yield _row_text(row, tokenizer)
++    for path in args.text_file:
++        with open(path) as f:
++            if path.endswith(".jsonl"):
++                for line in f:
++                    row = json.loads(line)
++                    yield _row_text(row, tokenizer) if isinstance(row, dict) else row
++            else:
++                yield f.read()
++
++
++def main() -> None:
++    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
++    parser.add_argument("--tokenizer", required=True)
++    parser.add_argument(
++        "--dataset",
++        action="append",
++        default=[],
++        help="HF dataset as name[:split]; may be repeated.",
++    )
++    parser.add_argument(
++        "--text-file",
++        action="append",
++        default=[],
++        help="Plain text, or .jsonl of strings or chat rows; may be repeated.",
++    )
++    parser.add_argument("--max-docs", type=int, default=20000)
++    parser.add_argument("--num-tokens", type=int, default=32768)
++    parser.add_argument(
++        "--id-floor",
++        type=int,
++        default=0,
++        help="Always include ids below this value (BPE merges are roughly "
++        "frequency ordered).",
++    )
++    parser.add_argument("--holdout", type=float, default=0.05)
++    parser.add_argument("--output", required=True, help=".pt or .json")
++    args = parser.parse_args()
++
++    tokenizer = AutoTokenizer.from_pretrained(args.tokenizer)
++    texts = list(_iter_texts(args, tokenizer))
++    if not texts:
++        parser.error("No text: pass --dataset and/or --text-file.")
++    num_held_out = int(len(texts) * args.holdout)
++    train = texts[: len(texts) - num_held_out]
++    held_out = texts[len(texts) - num_held_out :]
++
++    counts: Counter[int] = Counter()
++    for text in train:
++        counts.update(tokenizer.encode(text, add_special_tokens=False))
++
++    keep = set(range(min(args.id_floor, len(tokenizer))))
++    keep.update(tokenizer.all_special_ids)
++    keep.update(tokenizer.get_added_vocab().values())
++    for token_id, _ in counts.most_common():
++        if len(keep) >= args.num_tokens:
++            break
++        keep.add(token_id)
++    ids = sorted(keep)
++
++    if args.output.endswith(".json"):
++        with open(args.output, "w") as f:
++            json.dump(ids, f)
++    else:
++        torch.save(ids, args.output)
++
++    print(
++        f"Wrote {len(ids)} ids ({len(counts)} distinct ids seen in "
++        f"{sum(counts.values())} tokens of {len(train)} documents) to {args.output}"
++    )
++    if held_out:
++        held = [t for text in held_out for t in tokenizer.encode(text)]
++        covered = sum(t in keep for t in held) / max(len(held), 1)
++        print(f"Held-out coverage: {100 * covered:.2f}% of {len(held)} tokens")
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/tests/model_executor/layers/test_draft_vocab.py b/tests/model_executor/layers/test_draft_vocab.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..4df37444eb28ccd70d595ebf5a432f8480ab2803
+--- /dev/null
++++ b/tests/model_executor/layers/test_draft_vocab.py
+@@ -0,0 +1,354 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++
++import json
++import weakref
++
++import pytest
++import torch
++import torch.nn as nn
++
++from vllm.model_executor.layers.draft_vocab import DraftVocab, load_draft_token_ids
++from vllm.model_executor.layers.logits_processor import LogitsProcessor
++from vllm.model_executor.layers.quantization import modelopt
++from vllm.model_executor.layers.quantization.utils.nvfp4_emulation_utils import (
++    dequantize_to_dtype,
++)
++from vllm.model_executor.layers.vocab_parallel_embedding import (
++    ParallelLMHead,
++    UnquantizedEmbeddingMethod,
++    VocabParallelEmbedding,
++)
++from vllm.model_executor.models.interfaces import LocalArgmaxMixin
++
++VOCAB = 200
++HIDDEN = 32
++DRAFT_IDS = [0, 3, 7, 50, 51, 128, 130, 199]
++DEVICES = ["cpu"] + (["cuda"] if torch.cuda.is_available() else [])
++
++
++def _head(vocab: int = VOCAB, device: str = "cpu") -> ParallelLMHead:
++    head = ParallelLMHead(vocab, HIDDEN, disable_tp=True)
++    gen = torch.Generator().manual_seed(0)
++    head.weight.data.copy_(torch.randn(head.weight.shape, generator=gen))
++    head.quant_method.process_weights_after_loading(head)
++    return head.to(device)
++
++
++def _hidden(n: int = 64, device: str = "cpu") -> torch.Tensor:
++    gen = torch.Generator().manual_seed(1)
++    return torch.randn(n, HIDDEN, generator=gen).to(device)
++
++
++@pytest.mark.cpu_test
++@pytest.mark.parametrize("fmt", ["pt_list", "pt_tensor", "json"])
++def test_load_draft_token_ids(tmp_path, fmt):
++    ids = [9, 2, 9, 4]
++    if fmt == "pt_list":
++        path = tmp_path / "map.pt"
++        torch.save(ids, path)
++    elif fmt == "pt_tensor":
++        path = tmp_path / "map.pt"
++        torch.save(torch.tensor(ids), path)
++    else:
++        path = tmp_path / "map.json"
++        path.write_text(json.dumps(ids))
++    token_ids = load_draft_token_ids(str(path), extra_ids=[7, 2])
++    assert token_ids.tolist() == [2, 4, 7, 9]
++    assert token_ids.dtype == torch.int64
++
++
++@pytest.mark.cpu_test
++def test_pruned_head_maps_draft_ids_to_target_ids(default_vllm_config):
++    """EAGLE3/DFlash pruned heads: logits land on their d2t target ids."""
++    head = _head(len(DRAFT_IDS))
++    draft_vocab = DraftVocab(LogitsProcessor(len(DRAFT_IDS)), VOCAB)
++    d2t = draft_vocab.draft_id_to_target_id
++    assert d2t is not None and d2t.shape == (len(DRAFT_IDS),)
++    d2t.data.copy_(torch.tensor(DRAFT_IDS) - torch.arange(len(DRAFT_IDS)))
++
++    hidden = _hidden()
++    draft_logits = draft_vocab.logits_processor(head, hidden)
++    logits = draft_vocab.compute_logits(head, hidden)
++    assert logits.shape == (hidden.shape[0], VOCAB)
++    assert torch.equal(logits[:, DRAFT_IDS], draft_logits)
++    outside = torch.ones(VOCAB, dtype=torch.bool)
++    outside[DRAFT_IDS] = False
++    assert torch.all(logits[:, outside] == float("-inf"))
++    top = draft_vocab.get_top_tokens(head, hidden)
++    assert torch.equal(top, logits.argmax(dim=-1))
++
++    # A full-vocabulary head is a no-op.
++    assert DraftVocab(LogitsProcessor(VOCAB), VOCAB).draft_id_to_target_id is None
++
++
++@pytest.mark.cpu_test
++def test_token_map_drafts_over_listed_rows(default_vllm_config, dist_init):
++    head = _head()
++    draft_vocab = DraftVocab(LogitsProcessor(VOCAB), VOCAB)
++    full = draft_vocab.compute_logits(head, _hidden())
++    draft_vocab.load_token_map(head, torch.tensor(DRAFT_IDS))
++
++    logits = draft_vocab.compute_logits(head, _hidden())
++    expected = torch.full_like(full, float("-inf"))
++    expected[:, DRAFT_IDS] = full[:, DRAFT_IDS]
++    torch.testing.assert_close(logits, expected)
++    top = draft_vocab.get_top_tokens(head, _hidden())
++    assert torch.equal(top, logits.argmax(dim=-1))
++
++
++@pytest.mark.parametrize("device", DEVICES)
++@pytest.mark.parametrize("num_rows", [VOCAB - len(DRAFT_IDS), 16])
++@pytest.mark.parametrize("rank", [4, HIDDEN])
++def test_dynamic_rows_draft_over_list_plus_picked_rows(
++    default_vllm_config, dist_init, device, num_rows, rank
++):
++    """Each token drafts over the list plus `num_rows` picked rows, with the
++    exact logits of the full head on all of them."""
++    head = _head(device=device)
++    hidden = _hidden(device=device)
++    draft_vocab = DraftVocab(LogitsProcessor(VOCAB), VOCAB)
++    full = draft_vocab.compute_logits(head, hidden).float()
++    draft_vocab.load_token_map(head, torch.tensor(DRAFT_IDS), num_rows, rank)
++
++    logits = draft_vocab.compute_logits(head, hidden).float()
++    kept = logits.isfinite()
++    assert torch.all(kept[:, DRAFT_IDS])
++    assert torch.all(kept.sum(dim=-1) == len(DRAFT_IDS) + num_rows)
++    torch.testing.assert_close(logits[kept], full[kept], atol=1e-4, rtol=1e-4)
++    top = draft_vocab.get_top_tokens(head, hidden)
++    assert torch.equal(top, logits.argmax(dim=-1))
++
++
++@pytest.mark.cpu_test
++def test_local_argmax_mixin_without_draft_vocab(default_vllm_config):
++    """Target architectures (e.g. Llama, Qwen3) mix it in without a DraftVocab."""
++
++    class _Model(LocalArgmaxMixin, nn.Module):
++        def __init__(self):
++            super().__init__()
++            self.lm_head = _head()
++            self.logits_processor = LogitsProcessor(VOCAB)
++
++    model = _Model()
++    logits = model.logits_processor(model.lm_head, _hidden())
++    assert torch.equal(model.get_top_tokens(_hidden()), logits.argmax(dim=-1))
++
++
++class _FakeTPHead(VocabParallelEmbedding):
++    """One TP rank of a vocab-parallel lm_head, without a process group."""
++
++    def __init__(self, full_weight: torch.Tensor, tp_rank: int, tp_size: int):
++        nn.Module.__init__(self)
++        self.tp_rank, self.tp_size = tp_rank, tp_size
++        self.org_vocab_size = self.num_embeddings = full_weight.shape[0]
++        self.org_vocab_size_padded = self.num_embeddings_padded = 256
++        self.shard_indices = self._get_indices(256, 256, VOCAB, VOCAB, tp_rank, tp_size)
++        rows = 256 // tp_size
++        padded = torch.cat([full_weight, full_weight.new_zeros(256 - VOCAB, HIDDEN)])
++        self.weight = nn.Parameter(padded[tp_rank * rows : (tp_rank + 1) * rows])
++        self.quant_method = UnquantizedEmbeddingMethod()
++
++
++@pytest.mark.cpu_test
++@pytest.mark.parametrize(
++    "draft_ids",
++    # Rank 0 owns ids [0, 128), rank 1 owns [128, 200).
++    [DRAFT_IDS, [0, 3, 7, 50, 51]],
++    ids=["uneven", "empty_rank"],
++)
++def test_tensor_parallel_ranks_keep_their_listed_rows(
++    default_vllm_config, dist_init, draft_ids
++):
++    full_w = torch.randn(VOCAB, HIDDEN, generator=torch.Generator().manual_seed(2))
++    hidden = _hidden()
++    rank_logits = []
++    for rank in (0, 1):
++        draft_vocab = DraftVocab(LogitsProcessor(VOCAB), VOCAB)
++        draft_vocab.load_token_map(
++            _FakeTPHead(full_w, rank, 2), torch.tensor(draft_ids)
++        )
++        assert draft_vocab.rows is not None
++        rank_logits.append(draft_vocab.rows(hidden))
++    # The all-gather of each rank's logits, then the padding columns dropped.
++    gathered = torch.cat(rank_logits, dim=-1)
++    valid_cols = draft_vocab.valid_cols
++    assert valid_cols is not None
++    torch.testing.assert_close(gathered[:, valid_cols], hidden @ full_w[draft_ids].t())
++
++
++@pytest.mark.skipif(not torch.cuda.is_available(), reason="quantized rows need CUDA")
++@pytest.mark.parametrize(
++    ("quantization", "max_rel_err", "min_top1"),
++    [("fp8", 0.05, 0.9), ("nvfp4", 0.15, 0.75)],
++)
++def test_quantized_rows_track_bf16_rows(
++    default_vllm_config, dist_init, quantization, max_rel_err, min_top1
++):
++    """Listed and dynamic rows in fp8/nvfp4 stay close to the bf16 head."""
++    vocab, hidden_size, num_rows = 4000, 512, 256
++    head = ParallelLMHead(vocab, hidden_size, disable_tp=True)
++    gen = torch.Generator().manual_seed(0)
++    head.weight.data.copy_(torch.randn(head.weight.shape, generator=gen) * 0.02)
++    head = head.to("cuda", torch.bfloat16)
++    token_ids = torch.arange(0, vocab, 4)
++    hidden = torch.randn(512, hidden_size, device="cuda", dtype=torch.bfloat16)
++
++    def draft(quantization):
++        draft_vocab = DraftVocab(LogitsProcessor(vocab), vocab)
++        draft_vocab.load_token_map(head, token_ids, num_rows, 64, quantization)
++        return draft_vocab.compute_logits(head, hidden).float()
++
++    full = LogitsProcessor(vocab)(head, hidden).float()
++    out = draft(quantization)
++    kept = out.isfinite()
++    assert torch.all(kept.sum(dim=-1) == token_ids.numel() + num_rows)
++    assert (out[kept] - full[kept]).norm() / full[kept].norm() < max_rel_err
++    top1 = (out.argmax(-1) == draft(None).argmax(-1)).float().mean()
++    assert top1 > min_top1
++
++
++def _nvfp4_checkpoint(vocab: int, hidden: int) -> dict[str, torch.Tensor]:
++    """A ModelOpt NVFP4 lm_head as stored in the checkpoint."""
++    gen = torch.Generator().manual_seed(3)
++    return {
++        "weight": torch.randint(
++            0, 256, (vocab, hidden // 2), dtype=torch.uint8, generator=gen
++        ),
++        "weight_scale": (torch.rand(vocab, hidden // 16, generator=gen) + 0.5).to(
++            torch.float8_e4m3fn
++        ),
++        "weight_scale_2": torch.tensor(0.01),
++    }
++
++
++def _dequant(packed, scales, global_scale) -> torch.Tensor:
++    return dequantize_to_dtype(
++        packed, scales, global_scale, torch.float32, swizzle=False
++    )
++
++
++class _DequantKernel:
++    """Stands in for the NVFP4 kernel, which needs CUDA."""
++
++    def input_quant_key(self):
++        return None
++
++    def process_weights_after_loading(self, layer):
++        pass
++
++    def apply_weights(self, layer, x, bias=None):
++        w = _dequant(layer.weight, layer.weight_scale, layer.weight_global_scale)
++        return x @ w.t().to(x.dtype)
++
++
++def _nvfp4_head(
++    weights: dict[str, torch.Tensor], quant_method: str, device: str = "cpu"
++) -> ParallelLMHead:
++    quant_config = modelopt.ModelOptNvFp4Config(
++        quant_method=quant_method, is_checkpoint_nvfp4_serialized=True
++    )
++    vocab, hidden = weights["weight"].shape[0], weights["weight"].shape[1] * 2
++    with torch.device(device):
++        head = ParallelLMHead(
++            vocab,
++            hidden,
++            params_dtype=torch.bfloat16,
++            quant_config=quant_config,
++            prefix="lm_head",
++            disable_tp=True,
++        )
++    params = dict(head.named_parameters())
++    for name, weight in weights.items():
++        params[name].weight_loader(params[name], weight.to(device))
++    head.quant_method.process_weights_after_loading(head)
++    return head
++
++
++def _keep(draft_vocab: DraftVocab, checkpoint, head) -> None:
++    weights = [("lm_head." + n, w) for n, w in checkpoint.items()]
++    weights.append(("model.fc.weight", torch.zeros(1)))
++    assert list(draft_vocab.keep_head_weights(weights, head)) == weights
++
++
++@pytest.mark.cpu_test
++def test_quantized_head_drafts_over_checkpoint_rows(
++    default_vllm_config, dist_init, monkeypatch
++):
++    """A quantized lm_head drafts over its own checkpoint rows, with the logits
++    of the full head on them, and releases the kept tensors once loaded."""
++    monkeypatch.setattr(
++        modelopt, "select_linear_kernel", lambda *a, **kw: _DequantKernel()
++    )
++    checkpoint = _nvfp4_checkpoint(VOCAB, HIDDEN)
++    head = _nvfp4_head(checkpoint, "W4A16_NVFP4")
++    hidden = _hidden().bfloat16()
++    full = LogitsProcessor(VOCAB)(head, hidden)
++
++    draft_vocab = DraftVocab(LogitsProcessor(VOCAB), VOCAB, keep_quantized_head=True)
++    # Serving sets head_dtype to the model dtype.
++    draft_vocab.logits_processor.head_dtype = torch.bfloat16
++    _keep(draft_vocab, checkpoint, head)
++    kept = [weakref.ref(w) for w in draft_vocab.head_weights.values()]
++    assert len(kept) == len(checkpoint)
++    draft_vocab.load_token_map(head, torch.tensor(DRAFT_IDS))
++    assert not draft_vocab.head_weights
++    assert all(ref() is None for ref in kept)
++
++    logits = draft_vocab.compute_logits(head, hidden)
++    expected = torch.full_like(full, float("-inf"))
++    expected[:, DRAFT_IDS] = full[:, DRAFT_IDS]
++    torch.testing.assert_close(logits, expected)
++
++    def load(checkpoint, **kwargs):
++        draft_vocab = DraftVocab(LogitsProcessor(VOCAB), VOCAB, True)
++        _keep(draft_vocab, checkpoint, head)
++        draft_vocab.load_token_map(head, torch.tensor(DRAFT_IDS), **kwargs)
++
++    with pytest.raises(ValueError, match="quantized in the checkpoint"):
++        load(checkpoint, quantization="fp8")
++    # 128x128 block scales are not indexed by output row.
++    with pytest.raises(ValueError, match="not indexed by output row"):
++        load({**checkpoint, "weight_scale": torch.ones(2, 1)})
++    with pytest.raises(ValueError, match="keep_head_weights"):
++        DraftVocab(LogitsProcessor(VOCAB), VOCAB).load_token_map(
++            head, torch.tensor(DRAFT_IDS)
++        )
++
++
++@pytest.mark.skipif(not torch.cuda.is_available(), reason="NVFP4 kernels need CUDA")
++@pytest.mark.parametrize("quant_method", ["W4A16_NVFP4", "NVFP4"])
++def test_nvfp4_checkpoint_head_rows_match_full_head(
++    default_vllm_config, dist_init, quant_method
++):
++    """Listed and dynamic rows of an NVFP4 checkpoint head on the real kernels."""
++    vocab, hidden_size, num_rows = 4096, 512, 256
++    checkpoint = _nvfp4_checkpoint(vocab, hidden_size)
++    if quant_method == "NVFP4":
++        checkpoint["input_scale"] = torch.tensor(0.01)
++    head = _nvfp4_head(checkpoint, quant_method, "cuda")
++    hidden = torch.randn(64, hidden_size, device="cuda", dtype=torch.bfloat16)
++    token_ids = torch.arange(0, vocab, 4)
++    full = LogitsProcessor(vocab)(head, hidden).float()
++    weight = _dequant(
++        checkpoint["weight"], checkpoint["weight_scale"], checkpoint["weight_scale_2"]
++    )
++    reference = hidden.float() @ weight.cuda().t()
++
++    def draft(dynamic_rows):
++        draft_vocab = DraftVocab(LogitsProcessor(vocab), vocab, True)
++        _keep(draft_vocab, checkpoint, head)
++        draft_vocab.load_token_map(head, token_ids, dynamic_rows, 64)
++        return draft_vocab.compute_logits(head, hidden).float()
++
++    logits = draft(0)
++    kept = logits.isfinite()
++    assert torch.all(kept.sum(dim=-1) == token_ids.numel())
++    torch.testing.assert_close(logits[kept], full[kept], atol=1e-2, rtol=1e-2)
++
++    logits = draft(num_rows)
++    kept = logits.isfinite()
++    assert torch.all(kept.sum(dim=-1) == token_ids.numel() + num_rows)
++    # The dynamic rows run with unquantized activations.
++    rel_err = (logits[kept] - reference[kept]).norm() / reference[kept].norm()
++    assert rel_err < (0.02 if quant_method == "W4A16_NVFP4" else 0.2)
+diff --git a/tests/model_executor/test_eagle_quantization.py b/tests/model_executor/test_eagle_quantization.py
+index a9622b3261d307d32425f90d13579251d7456f26..f9149927197994f3881ac4dc189f81b65039d45b 100644
+--- a/tests/model_executor/test_eagle_quantization.py
++++ b/tests/model_executor/test_eagle_quantization.py
+@@ -141,6 +141,7 @@ def test_eagle3_lm_head_receives_quant_config():
+         patch("vllm.model_executor.models.llama_eagle3.LlamaModel") as MockModel,
+         patch("vllm.model_executor.models.llama_eagle3.ParallelLMHead") as MockLMHead,
+         patch("vllm.model_executor.models.llama_eagle3.LogitsProcessor"),
++        patch("vllm.model_executor.models.llama_eagle3.DraftVocab"),
+         patch(
+             "vllm.model_executor.models.llama_eagle3.get_draft_quant_config",
+             return_value=mock_quant_config,
+diff --git a/tests/v1/e2e/spec_decode/mtp/qwen3_5/test_draft_vocab.py b/tests/v1/e2e/spec_decode/mtp/qwen3_5/test_draft_vocab.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..0e332a52d3ba5b7faccb01708676b77eadca777f
+--- /dev/null
++++ b/tests/v1/e2e/spec_decode/mtp/qwen3_5/test_draft_vocab.py
+@@ -0,0 +1,50 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++import json
++
++import pytest
++
++from tests.evals.gsm8k.gsm8k_eval import evaluate_gsm8k_offline
++from tests.utils import single_gpu_only
++from vllm.config import CompilationConfig
++
++from ...utils import compute_acceptance_len
++
++MODEL = "Qwen/Qwen3.5-0.8B-Base"
++# Low ids of a BPE vocabulary are roughly the most frequent tokens.
++NUM_DRAFT_TOKENS = 32768
++
++
++@single_gpu_only
++def test_mtp_draft_token_map(monkeypatch: pytest.MonkeyPatch, tmp_path, vllm_runner):
++    """MTP with a draft token map keeps GSM8K above the stock-MTP reference
++    threshold, and its acceptance length within 10% of stock MTP."""
++    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
++    token_map = tmp_path / "draft_vocab.json"
++    token_map.write_text(json.dumps(list(range(NUM_DRAFT_TOKENS))))
++
++    acceptance_lens = []
++    for draft_token_map in (None, str(token_map)):
++        with vllm_runner(
++            MODEL,
++            max_model_len=2048,
++            block_size=None,
++            enable_chunked_prefill=None,
++            compilation_config=CompilationConfig(),
++            limit_mm_per_prompt={"image": 0, "video": 0},
++            disable_log_stats=False,
++            speculative_config={
++                "method": "mtp",
++                "num_speculative_tokens": 1,
++                "draft_token_map": draft_token_map,
++            },
++        ) as runner:
++            accuracy = evaluate_gsm8k_offline(runner.llm, num_questions=200)["accuracy"]
++            acceptance_lens.append(compute_acceptance_len(runner.llm.get_metrics()))
++        # Stock GSM8K for this model is about 34% (see test_mtp.py).
++        assert accuracy >= 0.20, f"{draft_token_map=}: GSM8K {accuracy:.3f}"
++
++    stock, reduced = acceptance_lens
++    print(f"Acceptance length: stock {stock:.3f}, draft_token_map {reduced:.3f}")
++    assert reduced > 1.0
++    assert reduced >= 0.9 * stock
+diff --git a/vllm/config/speculative.py b/vllm/config/speculative.py
+index 4b63b36bd5f5116e25882ff9e5447002f110f2ef..babf73d087e51f45aabd91a542c4eb93201d6c83 100644
+--- a/vllm/config/speculative.py
++++ b/vllm/config/speculative.py
+@@ -472,6 +472,34 @@ class SpeculativeConfig:
+     draft logits to shared tokens only (TLI algorithm). Requires
+     method='draft_model'."""
+ 
++    draft_token_map: str | None = None
++    """Path to a list of target token ids that the drafter may propose
++    (FR-Spec). The drafter's shared lm_head is restricted to these rows, which
++    cuts its cost per draft token; the target still verifies with the full
++    vocabulary, so outputs follow the usual speculative decoding guarantees.
++    Accepts SGLang's `--speculative-token-map` file (`.pt`) or a JSON list.
++    EOS ids are always included. A quantized lm_head keeps its checkpoint
++    format for the listed rows (any format indexed by output row) and, for
++    dynamic rows, must be ModelOpt NVFP4. Requires an MTP drafter with a
++    full-vocabulary lm_head, and Model Runner V2."""
++
++    draft_token_map_dynamic_rows: int = Field(default=0, ge=0)
++    """Extra draft tokens picked per draft token on top of `draft_token_map`.
++    Rows outside the list are scored with a low-rank projection of the lm_head
++    and the best ones get exact logits, which recovers acceptance on traffic the
++    static list misses (e.g. other languages). 0 disables it. Requires
++    `draft_token_map` and tensor parallel size 1."""
++
++    draft_token_map_dynamic_rank: int = Field(default=256, ge=1)
++    """Rank of the lm_head projection that scores the dynamic draft rows."""
++
++    draft_token_map_quantization: Literal["fp8", "nvfp4"] | None = None
++    """Weight-only quantization of the draft vocabulary's lm_head rows, both
++    the listed and the dynamic ones: "fp8" keeps one scale per row, "nvfp4" one
++    E4M3 scale per 16 weights. The dynamic rows' scorer is then stored in fp8.
++    Only the acceptance length can change. Requires `draft_token_map` and an
++    lm_head that is not quantized in the checkpoint."""
++
+     # Ngram proposer configuration
+     prompt_lookup_max: int | None = Field(default=None, ge=1)
+     """Maximum size of ngram token window when using Ngram proposer, required
+@@ -1876,6 +1904,20 @@ class SpeculativeConfig:
+                 "omit it."
+             )
+ 
++        if self.draft_token_map is None and (
++            self.draft_token_map_dynamic_rows > 0
++            or self.draft_token_map_quantization is not None
++        ):
++            raise ValueError(
++                "draft_token_map_dynamic_rows and draft_token_map_quantization "
++                "require draft_token_map."
++            )
++
++        if self.draft_token_map is not None and self.method != "mtp":
++            raise ValueError(
++                f"draft_token_map requires method 'mtp', got {self.method!r}."
++            )
++
+         if not self.use_heterogeneous_vocab:
+             self.verify_equal_vocab_size_if_draft_model()
+         return self
+diff --git a/vllm/config/vllm.py b/vllm/config/vllm.py
+index d22adbe3b5e2f3a5249beaa21fcfaf27fc5bb76a..df3210808ab95b252ecea179b80b0d3988f77b71 100644
+--- a/vllm/config/vllm.py
++++ b/vllm/config/vllm.py
+@@ -3036,6 +3036,8 @@ class VllmConfig:
+                 unsupported.append("adaptive draft verification")
+             if self.speculative_config.draft_lm_head_quantization is not None:
+                 unsupported.append("draft lm_head quantization")
++            if self.speculative_config.draft_token_map is not None:
++                unsupported.append("speculative draft_token_map")
+ 
+         # Mixed sliding/full DFlash drafts need multiple KV groups (V2 only).
+         if self._dflash_needs_multi_kv_group():
+diff --git a/vllm/model_executor/layers/draft_vocab.py b/vllm/model_executor/layers/draft_vocab.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..c56135431a5615096077b7963726a847ac11c0a4
+--- /dev/null
++++ b/vllm/model_executor/layers/draft_vocab.py
+@@ -0,0 +1,834 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Draft lm_heads that cover a subset of the target vocabulary."""
++
++import json
++from collections.abc import Callable, Iterable, Iterator
++from typing import TYPE_CHECKING
++
++import torch
++import torch.nn as nn
++
++from vllm import _custom_ops as ops
++from vllm.distributed import tensor_model_parallel_all_gather
++from vllm.logger import init_logger
++from vllm.model_executor.layers.linear import ReplicatedLinear, UnquantizedLinearMethod
++from vllm.model_executor.layers.logits_processor import LogitsProcessor
++from vllm.model_executor.layers.quantization.utils.nvfp4_emulation_utils import (
++    FLOAT4_E2M1_MAX,
++    _e2m1_inline,
++    dequantize_to_dtype,
++)
++from vllm.model_executor.layers.quantization.utils.quant_utils import (
++    kFp8DynamicTensorSym,
++    kFp8StaticChannelSym,
++    weight_amax,
++)
++from vllm.model_executor.layers.vocab_parallel_embedding import (
++    ParallelLMHead,
++    UnquantizedEmbeddingMethod,
++    VocabParallelEmbedding,
++)
++from vllm.triton_utils import tl, triton
++from vllm.utils.torch_utils import set_default_torch_dtype
++
++if TYPE_CHECKING:
++    from vllm.config import VllmConfig
++    from vllm.model_executor.kernels.linear import (
++        FP8ScaledMMLinearKernel,
++        NvFp4LinearKernel,
++    )
++
++logger = init_logger(__name__)
++
++_UNQUANTIZED = (UnquantizedEmbeddingMethod, UnquantizedLinearMethod)
++
++
++def load_draft_token_ids(path: str, extra_ids: list[int]) -> torch.Tensor:
++    """Load a draft token map and return its sorted, unique target ids.
++
++    Args:
++        path: SGLang `--speculative-token-map` file (`.pt`) or a JSON list.
++        extra_ids: Ids that are always included, e.g. EOS.
++
++    Returns:
++        int64 CPU tensor of target token ids.
++
++    """
++    if path.endswith(".json"):
++        with open(path) as f:
++            ids = json.load(f)
++    else:
++        ids = torch.load(path, map_location="cpu", weights_only=True)
++        if isinstance(ids, torch.Tensor):
++            ids = ids.flatten().tolist()
++    if not isinstance(ids, (list, tuple)):
++        raise ValueError(f"draft_token_map {path!r} must hold a flat list of ids.")
++
++    token_ids = torch.tensor([int(i) for i in ids] + extra_ids, dtype=torch.int64)
++    if token_ids.numel() == 0:
++        raise ValueError("draft_token_map is empty.")
++    return torch.unique(token_ids, sorted=True)
++
++
++# Rows per step when copying or quantizing lm_head rows, which bounds the
++# temporaries.
++_CHUNK = 16384
++
++
++def _quantize_rows(
++    weight: torch.Tensor, quantization: str, ids: torch.Tensor | None = None
++) -> tuple[torch.Tensor, ...]:
++    """Weight-only quantized `weight[ids]` (all rows by default).
++
++    Returns `(fp8_rows, row_scales)` for "fp8" and
++    `(packed_e2m1, e4m3_block_scales, global_scale)` for "nvfp4". The NVFP4
++    global scale covers all of `weight`, so any subset quantizes the same way.
++    """
++    if ids is None:
++        ids = torch.arange(weight.shape[0], device=weight.device)
++    if quantization == "nvfp4":
++        fp4_fp8_max = FLOAT4_E2M1_MAX * torch.finfo(torch.float8_e4m3fn).max
++        global_scale = fp4_fp8_max / weight_amax(weight).float().clamp(min=1e-12)
++    out: list[torch.Tensor] = []
++    for start in range(0, ids.numel(), _CHUNK):
++        rows = weight[ids[start : start + _CHUNK]]
++        if quantization == "fp8":
++            parts = ops.scaled_fp8_quant(rows, use_per_token_if_dynamic=True)
++        else:
++            parts = ops.scaled_fp4_quant(
++                rows, global_scale, is_sf_swizzled_layout=False
++            )
++        if not out:
++            out = [p.new_empty(ids.numel(), *p.shape[1:]) for p in parts]
++        for dst, part in zip(out, parts):
++            dst[start : start + part.shape[0]] = part
++    return tuple(out) if quantization == "fp8" else (*out, 1.0 / global_scale)
++
++
++class _Rows(ReplicatedLinear):
++    """lm_head rows as a linear layer, optionally weight-only quantized.
++
++    FP8 keeps one scale per row and NVFP4 one E4M3 scale per 16 weights; both
++    run on the platform's weight-only kernel.
++    """
++
++    weight: nn.Parameter
++
++    def __init__(self, weight: torch.Tensor, quantization: str | None):
++        with torch.device(weight.device):
++            super().__init__(
++                weight.shape[1],
++                weight.shape[0],
++                bias=False,
++                params_dtype=weight.dtype,
++                return_bias=False,
++                disable_tp=True,
++            )
++        self.kernel: FP8ScaledMMLinearKernel | NvFp4LinearKernel | None = None
++        if quantization is None:
++            self.weight_loader(self.weight, weight)
++            self.quant_method.process_weights_after_loading(self)
++            return
++        from vllm.model_executor.kernels.linear import (
++            init_nvfp4_linear_kernel,
++            init_wfp8_a16_linear_kernel,
++        )
++
++        # What a quantization scheme sets on its layer in create_weights.
++        self.input_size_per_partition = self.input_size
++        self.output_size_per_partition = self.output_size
++        self.logical_widths = self.output_partition_sizes
++        self.orig_dtype = self.params_dtype
++        quantized = _quantize_rows(weight, quantization)
++        if quantization == "fp8":
++            self.kernel = init_wfp8_a16_linear_kernel(
++                weight_quant_key=kFp8StaticChannelSym,
++                activation_quant_key=kFp8DynamicTensorSym,
++                weight_shape=tuple(weight.shape),
++                input_dtype=weight.dtype,
++                out_dtype=weight.dtype,
++            )
++            # The scaled-mm kernels take the weight as (K, N), tagged as such.
++            self.weight = nn.Parameter(quantized[0].t(), requires_grad=False)
++            self.weight.input_dim = 0
++            self.weight.output_dim = 1
++            self.weight_scale = nn.Parameter(quantized[1], requires_grad=False)
++            self.input_scale = None
++            self.weight_block_size = None
++        else:
++            self.kernel = init_nvfp4_linear_kernel(use_a16=True)
++            self.weight = nn.Parameter(quantized[0], requires_grad=False)
++            self.weight_scale = nn.Parameter(quantized[1], requires_grad=False)
++            self.weight_global_scale = nn.Parameter(quantized[2], requires_grad=False)
++        self.kernel.process_weights_after_loading(self)
++
++    def forward(self, x: torch.Tensor) -> torch.Tensor:  # type: ignore[override]
++        if self.kernel is None:
++            return self.quant_method.apply(self, x)
++        return self.kernel.apply_weights(self, x)
++
++
++def _listed_rows(
++    head: ParallelLMHead, weights: dict[str, torch.Tensor], ids: torch.Tensor
++) -> ParallelLMHead:
++    """The `ids` rows of a quantized lm_head as their own lm_head.
++
++    Parameters indexed by output row are sliced from `weights`, the tensors
++    `head` loaded before repacking, and the others are copied. The rows then
++    go through the head's quantization method like any other loaded layer.
++    """
++    device = next(head.parameters()).device
++    with set_default_torch_dtype(head.params_dtype), torch.device(device):
++        rows = ParallelLMHead(
++            ids.numel(),
++            head.embedding_dim,
++            params_dtype=head.params_dtype,
++            quant_config=head.quant_config,
++            prefix=head.prefix,
++            disable_tp=head.tp_size == 1,
++        )
++    params = dict(rows.named_parameters())
++    for name, weight in weights.items():
++        param = params.get(name)
++        output_dim = getattr(param, "output_dim", None)
++        if output_dim == 0 and getattr(param, "packed_dim", None) != 0:
++            if weight.shape[0] != head.org_vocab_size:
++                raise ValueError(
++                    f"lm_head.{name} of shape {tuple(weight.shape)} is not "
++                    "indexed by output row."
++                )
++            weight = weight.index_select(0, ids)
++        elif param is None or output_dim is not None:
++            raise ValueError(
++                f"draft_token_map cannot take rows of lm_head.{name} for "
++                f"{type(rows.quant_method).__name__}."
++            )
++        param.weight_loader(param, weight.to(device))  # type: ignore[union-attr]
++    rows.quant_method.process_weights_after_loading(rows)
++    return rows
++
++
++# Weights per E4M3 scale in NVFP4.
++_NVFP4_GROUP = 16
++
++
++def _nvfp4_head(
++    weights: dict[str, torch.Tensor], hidden_size: int
++) -> tuple[torch.Tensor, ...]:
++    """`(packed, block_scales, global_scale)` of a ModelOpt NVFP4 lm_head."""
++    packed = weights.get("weight")
++    scales = weights.get("weight_scale")
++    global_scale = weights.get("weight_scale_2")
++    if (
++        packed is None
++        or scales is None
++        or global_scale is None
++        or packed.dtype != torch.uint8
++        or packed.shape[1] * 2 != hidden_size
++        or scales.dtype != torch.float8_e4m3fn
++        or scales.shape[1] * _NVFP4_GROUP != hidden_size
++    ):
++        raise ValueError(
++            "draft_token_map_dynamic_rows supports quantized lm_heads only in "
++            "the ModelOpt NVFP4 format."
++        )
++    return packed, scales, global_scale.float().reshape(1)
++
++
++@triton.jit
++def _gather_rows_gemv_kernel(
++    x_ptr,
++    weight_ptr,
++    scale_ptr,
++    ids_ptr,
++    out_ptr,
++    num_rows,
++    hidden_size,
++    weight_stride,
++    HAS_SCALE: tl.constexpr,
++    BLOCK_ROWS: tl.constexpr,
++    BLOCK_HIDDEN: tl.constexpr,
++):
++    token = tl.program_id(0)
++    rows = tl.program_id(1) * BLOCK_ROWS + tl.arange(0, BLOCK_ROWS)
++    row_mask = rows < num_rows
++    ids = tl.load(ids_ptr + token * num_rows + rows, mask=row_mask, other=0)
++    acc = tl.zeros((BLOCK_ROWS,), dtype=tl.float32)
++    for start in range(0, hidden_size, BLOCK_HIDDEN):
++        cols = start + tl.arange(0, BLOCK_HIDDEN)
++        col_mask = cols < hidden_size
++        x = tl.load(x_ptr + token * hidden_size + cols, mask=col_mask, other=0.0)
++        w = tl.load(
++            weight_ptr + ids[:, None].to(tl.int64) * weight_stride + cols[None, :],
++            mask=row_mask[:, None] & col_mask[None, :],
++            other=0.0,
++        )
++        acc += tl.sum(w.to(tl.float32) * x[None, :].to(tl.float32), axis=1)
++    if HAS_SCALE:
++        acc *= tl.load(scale_ptr + ids, mask=row_mask, other=0.0)
++    tl.store(
++        out_ptr + token * num_rows + rows,
++        acc.to(out_ptr.dtype.element_ty),
++        mask=row_mask,
++    )
++
++
++@triton.jit
++def _gather_rows_gemv_nvfp4_kernel(
++    x_ptr,
++    packed_ptr,
++    scale_ptr,
++    global_scale_ptr,
++    ids_ptr,
++    out_ptr,
++    num_rows,
++    hidden_size,
++    packed_stride,
++    scale_stride,
++    BLOCK_ROWS: tl.constexpr,
++    BLOCK_BYTES: tl.constexpr,
++):
++    token = tl.program_id(0)
++    rows = tl.program_id(1) * BLOCK_ROWS + tl.arange(0, BLOCK_ROWS)
++    row_mask = rows < num_rows
++    ids = tl.load(ids_ptr + token * num_rows + rows, mask=row_mask, other=0)
++    ids = ids.to(tl.int64)
++    acc = tl.zeros((BLOCK_ROWS,), dtype=tl.float32)
++    num_bytes = hidden_size // 2
++    for start in range(0, num_bytes, BLOCK_BYTES):
++        bcols = start + tl.arange(0, BLOCK_BYTES)
++        bmask = bcols < num_bytes
++        mask = row_mask[:, None] & bmask[None, :]
++        b = tl.load(
++            packed_ptr + ids[:, None] * packed_stride + bcols[None, :],
++            mask=mask,
++            other=0,
++        ).to(tl.int32)
++        sc = tl.load(
++            scale_ptr + ids[:, None] * scale_stride + (bcols // 8)[None, :],
++            mask=mask,
++            other=0.0,
++        ).to(tl.float32)
++        x_ptrs = x_ptr + token * hidden_size + 2 * bcols
++        x_lo = tl.load(x_ptrs, mask=bmask, other=0.0).to(tl.float32)
++        x_hi = tl.load(x_ptrs + 1, mask=bmask, other=0.0).to(tl.float32)
++        v_lo = _e2m1_inline(b & 15)
++        v_hi = _e2m1_inline((b >> 4) & 15)
++        acc += tl.sum((v_lo * x_lo[None, :] + v_hi * x_hi[None, :]) * sc, axis=1)
++    acc *= tl.load(global_scale_ptr)
++    tl.store(
++        out_ptr + token * num_rows + rows,
++        acc.to(out_ptr.dtype.element_ty),
++        mask=row_mask,
++    )
++
++
++def gather_rows_gemv(
++    x: torch.Tensor, rows: tuple[torch.Tensor, ...], ids: torch.Tensor
++) -> torch.Tensor:
++    """`out[n, j] = x[n] @ weight[ids[n, j]]` without materializing the rows.
++
++    Args:
++        x: Activations, shape `(N, H)`.
++        rows: `(weight,)` in the activation dtype, `(fp8_weight, row_scale)`
++            or `(nvfp4_packed, block_scales, global_scale)`.
++        ids: Row ids per token, shape `(N, J)`.
++
++    """
++    if not x.is_cuda:
++        assert len(rows) == 1, "quantized rows need CUDA"
++        return torch.einsum("nd,njd->nj", x, rows[0][ids])
++    num_tokens, num_rows = ids.shape
++    out = x.new_empty(num_tokens, num_rows)
++    grid = (num_tokens, triton.cdiv(num_rows, 64))
++    if len(rows) == 3:
++        packed, scales, global_scale = rows
++        _gather_rows_gemv_nvfp4_kernel[grid](
++            x.contiguous(),
++            packed,
++            scales,
++            global_scale,
++            ids.contiguous(),
++            out,
++            num_rows,
++            x.shape[-1],
++            packed.stride(0),
++            scales.stride(0),
++            BLOCK_ROWS=64,
++            BLOCK_BYTES=128,
++        )
++        return out
++    weight = rows[0]
++    _gather_rows_gemv_kernel[grid](
++        x.contiguous(),
++        weight,
++        rows[1] if len(rows) == 2 else weight,
++        ids.contiguous(),
++        out,
++        num_rows,
++        x.shape[-1],
++        weight.stride(0),
++        HAS_SCALE=len(rows) == 2,
++        BLOCK_ROWS=64,
++        BLOCK_HIDDEN=128 if weight.element_size() > 1 else 256,
++    )
++    return out
++
++
++@triton.jit
++def _scatter_draft_logits_kernel(
++    out_ptr,
++    listed_ptr,
++    token_ids_ptr,
++    picked_ptr,
++    picks_ptr,
++    candidate_ids_ptr,
++    vocab_size,
++    num_listed,
++    num_picked,
++    BLOCK: tl.constexpr,
++):
++    token = tl.program_id(0)
++    cols = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
++    is_listed = cols < num_listed
++    is_picked = (cols >= num_listed) & (cols < num_listed + num_picked)
++    pcols = tl.where(is_picked, cols - num_listed, 0)
++    listed_id = tl.load(token_ids_ptr + cols, mask=is_listed, other=0)
++    listed = tl.load(listed_ptr + token * num_listed + cols, mask=is_listed, other=0.0)
++    pick = tl.load(picks_ptr + token * num_picked + pcols, mask=is_picked, other=0)
++    picked_id = tl.load(candidate_ids_ptr + pick, mask=is_picked, other=0)
++    picked = tl.load(picked_ptr + token * num_picked + pcols, mask=is_picked, other=0.0)
++    ids = tl.where(is_listed, listed_id, picked_id).to(tl.int64)
++    tl.store(
++        out_ptr + token * vocab_size + ids,
++        tl.where(is_listed, listed, picked),
++        mask=is_listed | is_picked,
++    )
++
++
++def scatter_draft_logits(
++    vocab_size: int,
++    listed: torch.Tensor,
++    token_ids: torch.Tensor,
++    picked: torch.Tensor,
++    picks: torch.Tensor,
++    candidate_ids: torch.Tensor,
++) -> torch.Tensor:
++    """Target-vocabulary logits, `-inf` outside the listed and picked rows.
++
++    `out[n, token_ids] = listed[n]` and `out[n, candidate_ids[picks[n]]] =
++    picked[n]`, in one kernel on CUDA.
++    """
++    out = listed.new_full((listed.shape[0], vocab_size), float("-inf"))
++    if not listed.is_cuda:
++        out[:, token_ids] = listed
++        out.scatter_(1, candidate_ids[picks], picked)
++        return out
++    num_listed, num_picked = listed.shape[1], picked.shape[1]
++    block = 1024
++    grid = (listed.shape[0], triton.cdiv(num_listed + num_picked, block))
++    _scatter_draft_logits_kernel[grid](
++        out,
++        listed.contiguous(),
++        token_ids,
++        picked.contiguous(),
++        picks.contiguous(),
++        candidate_ids,
++        vocab_size,
++        num_listed,
++        num_picked,
++        BLOCK=block,
++    )
++    return out
++
++
++class DraftVocab:
++    """Draft logits over a subset of the target vocabulary.
++
++    The subset is either a pruned draft lm_head with `draft_id_to_target_id`
++    offsets (EAGLE3 and DFlash checkpoints), or the rows of the drafter's full
++    lm_head listed in `speculative_config.draft_token_map` (see
++    `load_token_map`). `compute_logits` always returns target-vocabulary
++    logits that are `-inf` outside the subset, so speculators need no special
++    handling.
++
++    Args:
++        logits_processor: Logits processor of the draft lm_head.
++        vocab_size: Target vocabulary size. A smaller draft vocabulary gets a
++            `draft_id_to_target_id` parameter for the model to register and
++            load.
++        keep_quantized_head: Keep a quantized lm_head's loaded tensors in
++            `keep_head_weights`, for `speculative_config.draft_token_map`.
++
++    """
++
++    def __init__(
++        self,
++        logits_processor: LogitsProcessor,
++        vocab_size: int,
++        keep_quantized_head: bool = False,
++    ):
++        self.logits_processor = logits_processor
++        self.vocab_size = vocab_size
++        self.draft_id_to_target_id: nn.Parameter | None = None
++        if logits_processor.vocab_size < vocab_size:
++            self.draft_id_to_target_id = nn.Parameter(
++                torch.zeros(logits_processor.vocab_size, dtype=torch.long),
++                requires_grad=False,
++            )
++        self.keep_quantized_head = keep_quantized_head
++        # Loaded tensors of a quantized lm_head, see keep_head_weights.
++        self.head_weights: dict[str, torch.Tensor] = {}
++        # Set by load_token_map.
++        self.token_ids: torch.Tensor | None = None
++        self.rows: _Rows | ParallelLMHead | None = None
++        self.tp_size = 1
++        self.valid_cols: torch.Tensor | None = None
++        self.num_dynamic_rows = 0
++        self.gather_rows: tuple[torch.Tensor, ...] = ()
++
++    def compute_logits(
++        self, lm_head: VocabParallelEmbedding, hidden_states: torch.Tensor
++    ) -> torch.Tensor:
++        """Target-vocabulary logits, `-inf` outside the draft vocabulary."""
++        if self.token_ids is not None:
++            listed, picked = self._token_map_logits(hidden_states)
++            if picked is not None:
++                return scatter_draft_logits(
++                    self.vocab_size, listed, self.token_ids, *picked, self.candidate_ids
++                )
++            out = listed.new_full((listed.shape[0], self.vocab_size), float("-inf"))
++            out[:, self.token_ids] = listed
++            return out
++
++        logits = self.logits_processor(lm_head, hidden_states)
++        if self.draft_id_to_target_id is None:
++            return logits
++        base = torch.arange(logits.shape[-1], device=logits.device)
++        targets = base + self.draft_id_to_target_id
++        out = logits.new_full((logits.shape[0], self.vocab_size), float("-inf"))
++        out[:, targets] = logits
++        return out
++
++    def get_top_tokens(
++        self, lm_head: VocabParallelEmbedding, hidden_states: torch.Tensor
++    ) -> torch.Tensor:
++        """Greedy target token ids without materializing full logits."""
++        if self.token_ids is not None:
++            listed, picked = self._token_map_logits(hidden_states)
++            listed_max, listed_col = listed.max(dim=-1)
++            top = self.token_ids[listed_col]
++            if picked is None:
++                return top
++            logits, picks = picked
++            picked_max, picked_col = logits.max(dim=-1)
++            pick = picks.gather(1, picked_col.unsqueeze(1)).squeeze(1)
++            # Ties go to the listed row, as an argmax over [listed, picked] would.
++            return torch.where(listed_max >= picked_max, top, self.candidate_ids[pick])
++
++        top = self.logits_processor.get_top_tokens(lm_head, hidden_states)
++        return self.map_draft_to_target(top)
++
++    def map_draft_to_target(self, draft_ids: torch.Tensor) -> torch.Tensor:
++        """Target ids of draft-vocabulary ids from the pruned lm_head."""
++        if self.draft_id_to_target_id is None:
++            return draft_ids
++        return draft_ids + self.draft_id_to_target_id[draft_ids]
++
++    def keep_head_weights(
++        self,
++        weights: Iterable[tuple[str, torch.Tensor]],
++        lm_head: nn.Module,
++        prefix: str = "lm_head.",
++    ) -> Iterator[tuple[str, torch.Tensor]]:
++        """Pass `weights` through, keeping a quantized `lm_head`'s tensors.
++
++        Quantized lm_head kernels repack their weights after loading, so
++        `load_token_map` takes the rows from these tensors instead.
++        """
++        keep = (
++            self.keep_quantized_head
++            and isinstance(lm_head, ParallelLMHead)
++            and not isinstance(lm_head.quant_method, _UNQUANTIZED)
++        )
++        for name, weight in weights:
++            if keep and name.startswith(prefix):
++                self.head_weights[name.removeprefix(prefix)] = weight.to(
++                    "cpu", copy=True
++                )
++            yield name, weight
++
++    def load_token_map(
++        self,
++        lm_head: VocabParallelEmbedding,
++        token_ids: torch.Tensor,
++        dynamic_rows: int = 0,
++        dynamic_rank: int = 256,
++        quantization: str | None = None,
++    ) -> None:
++        """Restrict drafting to the `token_ids` rows of `lm_head`.
++
++        The rows are copied out of `lm_head`, so the drafter keeps sharing it
++        with the target, which verifies with the full vocabulary. A quantized
++        `lm_head` gets its rows from the tensors kept by `keep_head_weights`, in
++        their own quantized format. On a W4A4 head the dynamic rows run with
++        BF16 activations, so only the acceptance length can change.
++
++        Args:
++            lm_head: The drafter's full-vocabulary lm_head.
++            token_ids: Sorted, unique target ids of the listed rows.
++            dynamic_rows: Rows outside the list picked per draft token.
++            dynamic_rank: Rank of the projection that scores those rows.
++            quantization: "fp8" or "nvfp4" for weight-only quantized rows of
++                an unquantized `lm_head`.
++
++        """
++        head = getattr(lm_head, "base_layer", lm_head)
++        lp = self.logits_processor
++        loaded, self.head_weights = self.head_weights, {}
++        quantized = isinstance(head, VocabParallelEmbedding) and not isinstance(
++            head.quant_method, _UNQUANTIZED
++        )
++        if (
++            self.draft_id_to_target_id is not None
++            or not isinstance(head, VocabParallelEmbedding)
++            or getattr(head, "bias", None) is not None
++            or lp.head_dtype
++            not in (None, head.params_dtype if quantized else head.weight.dtype)
++            or lp.scale != 1.0
++            or lp.soft_cap is not None
++        ):
++            raise ValueError(
++                "draft_token_map needs a full-vocabulary lm_head without bias, "
++                "logit scaling or soft capping, run in its weight dtype."
++            )
++        if quantized and not (loaded and isinstance(head, ParallelLMHead)):
++            raise ValueError(
++                f"draft_token_map needs the loaded tensors of the quantized "
++                f"lm_head, which {type(head.quant_method).__name__} repacks; the "
++                "drafter must pass its weights through "
++                "DraftVocab.keep_head_weights."
++            )
++        if quantized and quantization is not None:
++            raise ValueError(
++                "draft_token_map_quantization applies to unquantized lm_heads. "
++                "This lm_head is quantized in the checkpoint and its rows keep "
++                "that format."
++            )
++
++        vocab_size = head.org_vocab_size
++        bad = token_ids[(token_ids < 0) | (token_ids >= vocab_size)]
++        if bad.numel() > 0:
++            raise ValueError(
++                f"draft_token_map has {bad.numel()} ids outside [0, {vocab_size}), "
++                f"e.g. {bad[:5].tolist()}."
++            )
++
++        device = head.weight.device
++        if quantized:
++            assert isinstance(head, ParallelLMHead)
++            # The rows form their own vocab-parallel head, whose gathered
++            # logits end in padding columns.
++            self.rows = _listed_rows(head, loaded, token_ids)
++            tp_size = self.rows.tp_size
++            if self.rows.num_embeddings_padded > token_ids.numel():
++                self.valid_cols = torch.arange(token_ids.numel(), device=device)
++            assert head.quant_config is not None
++            row_format: str = head.quant_config.get_name()
++        else:
++            tp_size = self._load_unquantized_rows(head, token_ids, quantization)
++            row_format = quantization or str(head.weight.dtype)
++        self.token_ids = token_ids.to(device)
++        self.tp_size = tp_size
++
++        self.num_dynamic_rows = dynamic_rows
++        if dynamic_rows > 0:
++            if tp_size > 1:
++                raise ValueError(
++                    "draft_token_map_dynamic_rows does not support tensor "
++                    "parallelism yet."
++                )
++            # Quantized gather rows hold only the candidates and are indexed
++            # by position.
++            if quantized:
++                packed, scales, global_scale = _nvfp4_head(loaded, head.embedding_dim)
++                dtype = head.params_dtype
++
++                def rows_of(ids: torch.Tensor) -> torch.Tensor:
++                    ids = ids.cpu()
++                    return dequantize_to_dtype(
++                        packed[ids].to(device),
++                        scales[ids].to(device),
++                        global_scale.to(device),
++                        dtype,
++                        _NVFP4_GROUP,
++                        swizzle=False,
++                    )
++
++                self._init_dynamic_rows(rows_of, vocab_size, dynamic_rank, True)
++                ids = self.candidate_ids.cpu()
++                self.gather_rows = (
++                    packed[ids].to(device),
++                    scales[ids].to(device),
++                    global_scale.to(device),
++                )
++            else:
++                weight = head.weight[:vocab_size]
++                self._init_dynamic_rows(
++                    lambda ids: weight[ids],
++                    vocab_size,
++                    dynamic_rank,
++                    quantization is not None,
++                )
++                self.gather_rows = (
++                    (weight,)
++                    if quantization is None
++                    else _quantize_rows(weight, quantization, self.candidate_ids)
++                )
++        logger.info(
++            "Draft vocabulary: %d of %d tokens plus %d dynamic rows per draft "
++            "token, %s rows.",
++            token_ids.numel(),
++            vocab_size,
++            dynamic_rows,
++            row_format,
++        )
++
++    def _load_unquantized_rows(
++        self,
++        head: VocabParallelEmbedding,
++        token_ids: torch.Tensor,
++        quantization: str | None,
++    ) -> int:
++        """Copy the listed rows out of an unquantized head; returns TP size."""
++        # Each TP rank keeps the listed rows of its own vocab shard, padded to
++        # a common count. The gathered logits drop the padding columns.
++        tp_size, tp_rank = head.tp_size, head.tp_rank
++        rank_ids = []
++        for rank in range(tp_size):
++            shard = type(head)._get_indices(
++                head.num_embeddings_padded,
++                head.org_vocab_size_padded,
++                head.num_embeddings,
++                head.org_vocab_size,
++                rank,
++                tp_size,
++            )
++            in_shard = (token_ids >= shard.org_vocab_start_index) & (
++                token_ids < shard.org_vocab_end_index
++            )
++            rank_ids.append(token_ids[in_shard] - shard.org_vocab_start_index)
++        rows_per_rank = max(ids.numel() for ids in rank_ids)
++        valid = torch.zeros(tp_size, rows_per_rank, dtype=torch.bool)
++        for rank, ids in enumerate(rank_ids):
++            valid[rank, : ids.numel()] = True
++
++        weight = head.weight
++        rows = weight.index_select(0, rank_ids[tp_rank].to(weight.device))
++        pad = rows.new_zeros(rows_per_rank - rows.shape[0], rows.shape[1])
++        self.rows = _Rows(torch.cat([rows, pad]), quantization)
++        if not valid.all():
++            self.valid_cols = valid.flatten().nonzero()[:, 0].to(weight.device)
++        return tp_size
++
++    def _init_dynamic_rows(
++        self,
++        rows_of: Callable[[torch.Tensor], torch.Tensor],
++        vocab_size: int,
++        rank: int,
++        quantize_scorer: bool,
++    ) -> None:
++        """Score the rows outside the list with a rank-`rank` lm_head factor.
++
++        The basis is the top right singular vectors of the lm_head, so
++        `(x @ basis) @ (weight[i] @ basis)` approximates the logit of row `i`.
++        The best `num_dynamic_rows` per token then get exact logits. The rows
++        come from `rows_of(ids)` one chunk at a time.
++        """
++        assert self.token_ids is not None
++        device = self.token_ids.device
++        is_static = torch.zeros(vocab_size, dtype=torch.bool, device=device)
++        is_static[self.token_ids] = True
++        self.candidate_ids = (~is_static).nonzero()[:, 0]
++        if self.num_dynamic_rows > self.candidate_ids.numel():
++            raise ValueError(
++                "draft_token_map_dynamic_rows must be at most "
++                f"{self.candidate_ids.numel()}, got {self.num_dynamic_rows}."
++            )
++
++        gram: torch.Tensor | None = None
++        for ids in torch.arange(vocab_size, device=device).split(_CHUNK):
++            rows = rows_of(ids)
++            dtype = rows.dtype
++            block = rows.float()
++            if gram is None:
++                gram = block.new_zeros(block.shape[1], block.shape[1])
++            gram.addmm_(block.t(), block)
++        assert gram is not None
++        hidden_size = gram.shape[0]
++        if not 0 < rank <= hidden_size:
++            raise ValueError(
++                f"draft_token_map_dynamic_rank must be in [1, {hidden_size}], "
++                f"got {rank}."
++            )
++        basis = torch.linalg.eigh(gram).eigenvectors[:, -rank:].flip(-1)
++        del gram
++        self.basis = basis.to(dtype).contiguous()
++        scores = torch.cat(
++            [
++                (rows_of(ids).float() @ basis).to(dtype)
++                for ids in self.candidate_ids.split(_CHUNK)
++            ]
++        )
++        # The scorer only ranks rows, which FP8 preserves far better than NVFP4.
++        self.scorer = _Rows(scores, "fp8" if quantize_scorer else None)
++
++    def _token_map_logits(
++        self, hidden_states: torch.Tensor
++    ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor] | None]:
++        """Logits of the listed rows, and of the picked rows with the picks as
++        positions in `candidate_ids`."""
++        assert self.rows is not None
++        if isinstance(self.rows, ParallelLMHead):
++            logits = self.rows.quant_method.apply(self.rows, hidden_states)
++        else:
++            logits = self.rows(hidden_states)
++        if self.tp_size > 1:
++            logits = tensor_model_parallel_all_gather(logits)
++        if self.valid_cols is not None:
++            logits = logits.index_select(-1, self.valid_cols)
++        if self.num_dynamic_rows == 0:
++            return logits, None
++        scores = self.scorer(hidden_states @ self.basis)
++        picks = scores.topk(self.num_dynamic_rows, dim=-1, sorted=False).indices
++        gather_ids = self.candidate_ids[picks] if len(self.gather_rows) == 1 else picks
++        picked = gather_rows_gemv(hidden_states, self.gather_rows, gather_ids)
++        return logits, (picked, picks)
++
++
++def load_draft_token_map(model: nn.Module, vllm_config: "VllmConfig") -> None:
++    """Restrict a drafter's `DraftVocab` to `speculative_config.draft_token_map`.
++
++    EOS ids of the target are always included.
++    """
++    spec = vllm_config.speculative_config
++    assert spec is not None and spec.draft_token_map is not None
++    draft_vocab = getattr(model, "draft_vocab", None)
++    if not isinstance(draft_vocab, DraftVocab):
++        raise ValueError(f"draft_token_map is not supported by {type(model).__name__}.")
++    model_config = vllm_config.model_config
++    eos_ids: list[int] = []
++    for eos in (
++        getattr(model_config.hf_text_config, "eos_token_id", None),
++        model_config.try_get_generation_config().get("eos_token_id"),
++    ):
++        if eos is not None:
++            eos_ids.extend(eos if isinstance(eos, (list, tuple)) else [eos])
++    draft_vocab.load_token_map(
++        model.lm_head,
++        load_draft_token_ids(spec.draft_token_map, eos_ids),
++        spec.draft_token_map_dynamic_rows,
++        spec.draft_token_map_dynamic_rank,
++        spec.draft_token_map_quantization,
++    )
+diff --git a/vllm/model_executor/models/deepseek_eagle3.py b/vllm/model_executor/models/deepseek_eagle3.py
+index 9284dd59a09bad0e5e63dabb0f1556bdbc0da079..7cc97d94f319a0cedb198c681a7d511babf42c64 100644
+--- a/vllm/model_executor/models/deepseek_eagle3.py
++++ b/vllm/model_executor/models/deepseek_eagle3.py
+@@ -11,6 +11,7 @@ from transformers import DeepseekV2Config, DeepseekV3Config
+ 
+ from vllm.compilation.decorators import support_torch_compile
+ from vllm.config import VllmConfig, get_current_vllm_config
++from vllm.model_executor.layers.draft_vocab import DraftVocab
+ from vllm.model_executor.layers.layernorm import RMSNorm
+ from vllm.model_executor.layers.linear import ReplicatedLinear
+ from vllm.model_executor.layers.logits_processor import LogitsProcessor
+@@ -304,14 +305,10 @@ class Eagle3DeepseekV2ForCausalLM(LocalArgmaxMixin, DeepseekV2ForCausalLM):
+         self.logits_processor = LogitsProcessor(
+             self.config.draft_vocab_size, scale=logit_scale
+         )
+-        target_vocab_size = vllm_config.model_config.get_vocab_size()
+-        if self.config.draft_vocab_size != target_vocab_size:
+-            self.draft_id_to_target_id = nn.Parameter(
+-                torch.zeros(self.config.draft_vocab_size, dtype=torch.long),
+-                requires_grad=False,
+-            )
+-        else:
+-            self.draft_id_to_target_id = None
++        self.draft_vocab = DraftVocab(
++            self.logits_processor, vllm_config.model_config.get_vocab_size()
++        )
++        self.draft_id_to_target_id = self.draft_vocab.draft_id_to_target_id
+ 
+     def embed_input_ids(
+         self,
+@@ -334,25 +331,7 @@ class Eagle3DeepseekV2ForCausalLM(LocalArgmaxMixin, DeepseekV2ForCausalLM):
+         self,
+         hidden_states: torch.Tensor,
+     ) -> torch.Tensor | None:
+-        logits = self.logits_processor(self.lm_head, hidden_states)
+-        if self.draft_id_to_target_id is None:
+-            assert logits.shape[1] == self.config.vocab_size, (
+-                "Expected logits to have shape "
+-                f"(*, {self.config.vocab_size}), but got {logits.shape}"
+-            )
+-            return logits
+-
+-        base = torch.arange(self.config.draft_vocab_size, device=logits.device)
+-        targets = base + self.draft_id_to_target_id
+-        logits_new = logits.new_full(
+-            (
+-                logits.shape[0],
+-                self.config.vocab_size,
+-            ),
+-            float("-inf"),
+-        )
+-        logits_new[:, targets] = logits
+-        return logits_new
++        return self.draft_vocab.compute_logits(self.lm_head, hidden_states)
+ 
+     def combine_hidden_states(
+         self,
+diff --git a/vllm/model_executor/models/gemma4_dspark.py b/vllm/model_executor/models/gemma4_dspark.py
+index 33b1a1aada231f7367c6656898c8974411749062..27c0ca7af66489df8884a392c44c2f2034f08036 100644
+--- a/vllm/model_executor/models/gemma4_dspark.py
++++ b/vllm/model_executor/models/gemma4_dspark.py
+@@ -11,6 +11,7 @@ import torch.nn.functional as F
+ from vllm import _custom_ops as ops
+ from vllm.compilation.decorators import support_torch_compile
+ from vllm.config import CacheConfig, VllmConfig, get_current_vllm_config
++from vllm.model_executor.layers.draft_vocab import DraftVocab
+ from vllm.model_executor.layers.layernorm import RMSNorm
+ from vllm.model_executor.layers.linear import ColumnParallelLinear, ReplicatedLinear
+ from vllm.model_executor.layers.logits_processor import LogitsProcessor
+@@ -304,7 +305,8 @@ class Gemma4DSparkForCausalLM(Qwen3DSparkForCausalLM):
+             self.config.vocab_size,
+             soft_cap=getattr(self.config, "final_logit_softcapping", None),
+         )
+-        self.draft_id_to_target_id = None
++        self.draft_vocab = DraftVocab(self.logits_processor, self.config.vocab_size)
++        self.draft_id_to_target_id = self.draft_vocab.draft_id_to_target_id
+ 
+     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+         stacked = [("gate_up_proj", "gate_proj", 0), ("gate_up_proj", "up_proj", 1)]
+diff --git a/vllm/model_executor/models/interfaces.py b/vllm/model_executor/models/interfaces.py
+index 272b78da50a45abfadedfb6f2b512fae3b36a81c..780c57c6616d5c1c2131356949127d982ca1089f 100644
+--- a/vllm/model_executor/models/interfaces.py
++++ b/vllm/model_executor/models/interfaces.py
+@@ -50,6 +50,7 @@ if TYPE_CHECKING:
+     from vllm.config.multimodal import VideoPruningMethod
+     from vllm.inputs import PromptType, TokensPrompt
+     from vllm.lora.model_manager import LoRAModelManager
++    from vllm.model_executor.layers.draft_vocab import DraftVocab
+     from vllm.model_executor.layers.fused_moe import MoERunner
+     from vllm.model_executor.layers.logits_processor import LogitsProcessor
+     from vllm.model_executor.layers.mamba.mamba_utils import (
+@@ -1528,6 +1529,7 @@ class LocalArgmaxMixin:
+         ``self.logits_processor``: LogitsProcessor
+         ``self.lm_head``: ParallelLMHead
+         ``self.draft_id_to_target_id`` (optional): nn.Parameter
++        ``self.draft_vocab`` (optional): DraftVocab, used instead when present
+     """
+ 
+     logits_processor: "LogitsProcessor"
+@@ -1535,6 +1537,9 @@ class LocalArgmaxMixin:
+ 
+     def get_top_tokens(self, hidden_states: torch.Tensor) -> torch.Tensor:
+         """Vocab-parallel argmax with optional D2T remapping."""
++        draft_vocab: DraftVocab | None = getattr(self, "draft_vocab", None)
++        if draft_vocab is not None:
++            return draft_vocab.get_top_tokens(self.lm_head, hidden_states)
+         top = self.logits_processor.get_top_tokens(
+             self.lm_head,
+             hidden_states,
+diff --git a/vllm/model_executor/models/llama_eagle3.py b/vllm/model_executor/models/llama_eagle3.py
+index 68e21c9dc284246ee2450494a34e123a23ab8ce9..5ef46805496f57267e7dd15136cc2f0f062dedb7 100644
+--- a/vllm/model_executor/models/llama_eagle3.py
++++ b/vllm/model_executor/models/llama_eagle3.py
+@@ -11,6 +11,7 @@ from transformers import LlamaConfig
+ from vllm.compilation.decorators import support_torch_compile
+ from vllm.config import VllmConfig, get_current_vllm_config
+ from vllm.logger import init_logger
++from vllm.model_executor.layers.draft_vocab import DraftVocab
+ from vllm.model_executor.layers.layernorm import RMSNorm
+ from vllm.model_executor.layers.linear import QKVParallelLinear, ReplicatedLinear
+ from vllm.model_executor.layers.logits_processor import LogitsProcessor
+@@ -335,14 +336,10 @@ class Eagle3LlamaForCausalLM(_Eagle3LlamaForCausalLMBase):
+         self.logits_processor = LogitsProcessor(
+             self.config.draft_vocab_size, scale=logit_scale
+         )
+-        target_vocab_size = vllm_config.model_config.get_vocab_size()
+-        if self.config.draft_vocab_size != target_vocab_size:
+-            self.draft_id_to_target_id = nn.Parameter(
+-                torch.zeros(self.config.draft_vocab_size, dtype=torch.long),
+-                requires_grad=False,
+-            )
+-        else:
+-            self.draft_id_to_target_id = None
++        self.draft_vocab = DraftVocab(
++            self.logits_processor, vllm_config.model_config.get_vocab_size()
++        )
++        self.draft_id_to_target_id = self.draft_vocab.draft_id_to_target_id
+ 
+         self.use_parallel_drafting = speculative_config.parallel_drafting
+ 
+@@ -374,25 +371,7 @@ class Eagle3LlamaForCausalLM(_Eagle3LlamaForCausalLMBase):
+         self,
+         hidden_states: torch.Tensor,
+     ) -> torch.Tensor | None:
+-        logits = self.logits_processor(self.lm_head, hidden_states)
+-        if self.draft_id_to_target_id is None:
+-            assert logits.shape[1] == self.config.vocab_size, (
+-                "Expected logits to have shape "
+-                f"(*, {self.config.vocab_size}), but got {logits.shape}"
+-            )
+-            return logits
+-
+-        base = torch.arange(self.config.draft_vocab_size, device=logits.device)
+-        targets = base + self.draft_id_to_target_id
+-        logits_new = logits.new_full(
+-            (
+-                logits.shape[0],
+-                self.config.vocab_size,
+-            ),
+-            float("-inf"),
+-        )
+-        logits_new[:, targets] = logits
+-        return logits_new
++        return self.draft_vocab.compute_logits(self.lm_head, hidden_states)
+ 
+     def combine_hidden_states(
+         self,
+diff --git a/vllm/model_executor/models/qwen3_5_mtp.py b/vllm/model_executor/models/qwen3_5_mtp.py
+index d7fb1d6e09ea81f4ac5edef90fb70f9d3de94124..680c6899e7a6a83798e467dfb2edf8a3422822e8 100644
+--- a/vllm/model_executor/models/qwen3_5_mtp.py
++++ b/vllm/model_executor/models/qwen3_5_mtp.py
+@@ -11,6 +11,7 @@ from vllm.compilation.decorators import support_torch_compile
+ from vllm.config import VllmConfig
+ from vllm.distributed import get_pp_group, tensor_model_parallel_all_gather
+ from vllm.logger import init_logger
++from vllm.model_executor.layers.draft_vocab import DraftVocab
+ from vllm.model_executor.layers.fused_moe.utils import (
+     is_model_fused_shared_expert_compatible,
+ )
+@@ -248,6 +249,12 @@ class Qwen3_5MTP(LocalArgmaxMixin, nn.Module, SupportsMultiModal, SupportsPP):
+             self.lm_head = PPMissingLayer()
+ 
+         self.logits_processor = LogitsProcessor(config.vocab_size)
++        spec = vllm_config.speculative_config
++        self.draft_vocab = DraftVocab(
++            self.logits_processor,
++            config.vocab_size,
++            keep_quantized_head=spec is not None and spec.draft_token_map is not None,
++        )
+ 
+         self.make_empty_intermediate_tensors = (
+             self.model.make_empty_intermediate_tensors
+@@ -298,7 +305,7 @@ class Qwen3_5MTP(LocalArgmaxMixin, nn.Module, SupportsMultiModal, SupportsPP):
+         hidden_states: torch.Tensor,
+         spec_step_idx: int = 0,
+     ) -> torch.Tensor | None:
+-        return self.logits_processor(self.lm_head, hidden_states)
++        return self.draft_vocab.compute_logits(self.lm_head, hidden_states)
+ 
+     def is_unused_checkpoint_weight(self, name: str) -> bool:
+         return not name.startswith("mtp.") and not any(
+@@ -317,7 +324,11 @@ class Qwen3_5MTP(LocalArgmaxMixin, nn.Module, SupportsMultiModal, SupportsPP):
+                 yield name, weight
+ 
+         loader = AutoWeightsLoader(self)
+-        return loader.load_weights(remap_weight_names(weights))
++        return loader.load_weights(
++            self.draft_vocab.keep_head_weights(
++                remap_weight_names(weights), self.lm_head
++            )
++        )
+ 
+ 
+ class Qwen3_5MoeMTP(Qwen3_5MTP, QwenNextMixtureOfExperts):
+diff --git a/vllm/model_executor/models/qwen3_dflash.py b/vllm/model_executor/models/qwen3_dflash.py
+index 44b7865daaa6286baabbe5bb0968fa3ac6a58b37..e0ecab4cb7c906625d5a449b3db9ec8e3c4828a6 100644
+--- a/vllm/model_executor/models/qwen3_dflash.py
++++ b/vllm/model_executor/models/qwen3_dflash.py
+@@ -19,6 +19,7 @@ from vllm.distributed import (
+ )
+ from vllm.logger import init_logger
+ from vllm.model_executor.layers.attention import Attention
++from vllm.model_executor.layers.draft_vocab import DraftVocab
+ from vllm.model_executor.layers.layernorm import RMSNorm
+ from vllm.model_executor.layers.linear import (
+     QKVParallelLinear,
+@@ -800,14 +801,10 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
+         self.logits_processor = LogitsProcessor(
+             self.config.draft_vocab_size, scale=logit_scale
+         )
+-        target_vocab_size = vllm_config.model_config.get_vocab_size()
+-        if self.config.draft_vocab_size != target_vocab_size:
+-            self.draft_id_to_target_id = nn.Parameter(
+-                torch.zeros(self.config.draft_vocab_size, dtype=torch.long),
+-                requires_grad=False,
+-            )
+-        else:
+-            self.draft_id_to_target_id = None
++        self.draft_vocab = DraftVocab(
++            self.logits_processor, vllm_config.model_config.get_vocab_size()
++        )
++        self.draft_id_to_target_id = self.draft_vocab.draft_id_to_target_id
+ 
+     def embed_input_ids(
+         self,
+@@ -837,18 +834,7 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
+         self,
+         hidden_states: torch.Tensor,
+     ) -> torch.Tensor | None:
+-        logits = self.logits_processor(self.lm_head, hidden_states)
+-        if self.draft_id_to_target_id is None:
+-            return logits
+-
+-        base = torch.arange(self.config.draft_vocab_size, device=logits.device)
+-        targets = base + self.draft_id_to_target_id
+-        logits_new = logits.new_full(
+-            (logits.shape[0], self.config.vocab_size),
+-            float("-inf"),
+-        )
+-        logits_new[:, targets] = logits
+-        return logits_new
++        return self.draft_vocab.compute_logits(self.lm_head, hidden_states)
+ 
+     def precompute_and_store_context_kv(
+         self,
+diff --git a/vllm/model_executor/models/qwen3_dspark.py b/vllm/model_executor/models/qwen3_dspark.py
+index 156f55c373aded15c50c670b0c4cf2a6e8506c69..0df4a9f5a7f491ececa66fd95c605e974f6f7d90 100644
+--- a/vllm/model_executor/models/qwen3_dspark.py
++++ b/vllm/model_executor/models/qwen3_dspark.py
+@@ -22,6 +22,7 @@ import torch.nn as nn
+ 
+ from vllm.config import VllmConfig
+ from vllm.logger import init_logger
++from vllm.model_executor.layers.draft_vocab import DraftVocab
+ from vllm.model_executor.layers.linear import ReplicatedLinear
+ from vllm.model_executor.layers.logits_processor import LogitsProcessor
+ from vllm.model_executor.layers.quantization import QuantizationConfig
+@@ -256,16 +257,10 @@ class Qwen3DSparkForCausalLM(DFlashQwen3ForCausalLM):
+             self.config.draft_vocab_size, scale=logit_scale
+         )
+         self.target_vocab_size = vllm_config.model_config.get_vocab_size()
+-        # Only a pruned draft (subset of the target vocab) needs a d2t mapping to
+-        # scatter ids up. A draft >= the target vocab (e.g. padded to the target's
+-        # physical embedding size) maps identically, so no d2t is needed.
+-        if self.config.draft_vocab_size < self.target_vocab_size:
+-            self.draft_id_to_target_id = nn.Parameter(
+-                torch.zeros(self.config.draft_vocab_size, dtype=torch.long),
+-                requires_grad=False,
+-            )
+-        else:
+-            self.draft_id_to_target_id = None
++        # A draft >= the target vocab (e.g. padded to the target's physical
++        # embedding size) maps identically, so it gets no d2t.
++        self.draft_vocab = DraftVocab(self.logits_processor, self.target_vocab_size)
++        self.draft_id_to_target_id = self.draft_vocab.draft_id_to_target_id
+ 
+     def get_draft_kv_cache_layer_names(self) -> list[str]:
+         return [layer.self_attn.attn.layer_name for layer in self.model.layers]
+@@ -276,10 +271,7 @@ class Qwen3DSparkForCausalLM(DFlashQwen3ForCausalLM):
+         return self.logits_processor(self.lm_head, hidden_states)
+ 
+     def map_draft_to_target(self, draft_ids: torch.Tensor) -> torch.Tensor:
+-        # Map draft-vocab ids to target ids (identity for full-vocab drafts).
+-        if self.draft_id_to_target_id is None:
+-            return draft_ids
+-        return draft_ids + self.draft_id_to_target_id[draft_ids]
++        return self.draft_vocab.map_draft_to_target(draft_ids)
+ 
+     def markov_embed(self, token_ids: torch.Tensor) -> torch.Tensor:
+         return self.model.markov_head.embed(token_ids)
+diff --git a/vllm/model_executor/models/qwen3_eagle3.py b/vllm/model_executor/models/qwen3_eagle3.py
+index 124c1f82cacf0488328d17a9e1d45abf41945b81..f2de475b0b589420cc7787ff56a0119118cd9b84 100644
+--- a/vllm/model_executor/models/qwen3_eagle3.py
++++ b/vllm/model_executor/models/qwen3_eagle3.py
+@@ -10,6 +10,7 @@ from transformers import Qwen3Config
+ from vllm.compilation.decorators import support_torch_compile
+ from vllm.config import VllmConfig, get_current_vllm_config
+ from vllm.logger import init_logger
++from vllm.model_executor.layers.draft_vocab import DraftVocab
+ from vllm.model_executor.layers.layernorm import RMSNorm
+ from vllm.model_executor.layers.linear import QKVParallelLinear, ReplicatedLinear
+ from vllm.model_executor.layers.logits_processor import LogitsProcessor
+@@ -314,14 +315,10 @@ class Eagle3Qwen3ForCausalLM(Qwen3ForCausalLM):
+         self.logits_processor = LogitsProcessor(
+             self.config.draft_vocab_size, scale=logit_scale
+         )
+-        target_vocab_size = vllm_config.model_config.get_vocab_size()
+-        if self.config.draft_vocab_size != target_vocab_size:
+-            self.draft_id_to_target_id = nn.Parameter(
+-                torch.zeros(self.config.draft_vocab_size, dtype=torch.long),
+-                requires_grad=False,
+-            )
+-        else:
+-            self.draft_id_to_target_id = None
++        self.draft_vocab = DraftVocab(
++            self.logits_processor, vllm_config.model_config.get_vocab_size()
++        )
++        self.draft_id_to_target_id = self.draft_vocab.draft_id_to_target_id
+ 
+         self.use_parallel_drafting = speculative_config.parallel_drafting
+ 
+@@ -353,25 +350,7 @@ class Eagle3Qwen3ForCausalLM(Qwen3ForCausalLM):
+         self,
+         hidden_states: torch.Tensor,
+     ) -> torch.Tensor | None:
+-        logits = self.logits_processor(self.lm_head, hidden_states)
+-        if self.draft_id_to_target_id is None:
+-            assert logits.shape[1] == self.config.vocab_size, (
+-                "Expected logits to have shape "
+-                f"(*, {self.config.vocab_size}), but got {logits.shape}"
+-            )
+-            return logits
+-
+-        base = torch.arange(self.config.draft_vocab_size, device=logits.device)
+-        targets = base + self.draft_id_to_target_id
+-        logits_new = logits.new_full(
+-            (
+-                logits.shape[0],
+-                self.config.vocab_size,
+-            ),
+-            float("-inf"),
+-        )
+-        logits_new[:, targets] = logits
+-        return logits_new
++        return self.draft_vocab.compute_logits(self.lm_head, hidden_states)
+ 
+     def combine_hidden_states(
+         self,
+diff --git a/vllm/models/qwen4_exp/amd/mtp.py b/vllm/models/qwen4_exp/amd/mtp.py
+index b6513e802d7383a47b4cc93bbbc0ea5d205b376a..392e905e044b8258b51d1763275b960fe8aa5942 100644
+--- a/vllm/models/qwen4_exp/amd/mtp.py
++++ b/vllm/models/qwen4_exp/amd/mtp.py
+@@ -23,6 +23,7 @@ from transformers import Qwen4ExpTextConfig
+ from vllm.compilation.decorators import support_torch_compile
+ from vllm.config import VllmConfig, replace, set_current_vllm_config
+ from vllm.distributed import get_pp_group
++from vllm.model_executor.layers.draft_vocab import DraftVocab
+ from vllm.model_executor.layers.fused_moe.utils import (
+     is_model_fused_shared_expert_compatible,
+ )
+@@ -415,6 +416,7 @@ class Qwen4ExpMTP(nn.Module, SupportsPP, Qwen4ExpMixtureOfExperts):
+             self.lm_head = PPMissingLayer()
+ 
+         self.logits_processor = LogitsProcessor(config.vocab_size)
++        self.draft_vocab = DraftVocab(self.logits_processor, config.vocab_size)
+         self.make_empty_intermediate_tensors = (
+             self.model.make_empty_intermediate_tensors
+         )
+@@ -445,7 +447,7 @@ class Qwen4ExpMTP(nn.Module, SupportsPP, Qwen4ExpMixtureOfExperts):
+     def compute_logits(
+         self, hidden_states: torch.Tensor, spec_step_idx: int = 0
+     ) -> torch.Tensor | None:
+-        return self.logits_processor(self.lm_head, hidden_states)
++        return self.draft_vocab.compute_logits(self.lm_head, hidden_states)
+ 
+     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+         def remap_weight_names():
+diff --git a/vllm/models/qwen4_exp/nvidia/mtp.py b/vllm/models/qwen4_exp/nvidia/mtp.py
+index 61290617ae750249d6e781153a140f44d83de0ea..cbf8cb8f3604372d973a8bc04856e06ed8e7bd9e 100644
+--- a/vllm/models/qwen4_exp/nvidia/mtp.py
++++ b/vllm/models/qwen4_exp/nvidia/mtp.py
+@@ -22,6 +22,7 @@ from transformers import Qwen4ExpTextConfig
+ 
+ from vllm.config import VllmConfig, replace, set_current_vllm_config
+ from vllm.distributed import get_pp_group
++from vllm.model_executor.layers.draft_vocab import DraftVocab
+ from vllm.model_executor.layers.fused_moe.utils import (
+     is_model_fused_shared_expert_compatible,
+ )
+@@ -395,6 +396,7 @@ class Qwen4ExpMTP(nn.Module, SupportsPP, Qwen4ExpMixtureOfExperts):
+             self.lm_head = PPMissingLayer()
+ 
+         self.logits_processor = LogitsProcessor(config.vocab_size)
++        self.draft_vocab = DraftVocab(self.logits_processor, config.vocab_size)
+         self.make_empty_intermediate_tensors = (
+             self.model.make_empty_intermediate_tensors
+         )
+@@ -425,7 +427,7 @@ class Qwen4ExpMTP(nn.Module, SupportsPP, Qwen4ExpMixtureOfExperts):
+     def compute_logits(
+         self, hidden_states: torch.Tensor, spec_step_idx: int = 0
+     ) -> torch.Tensor | None:
+-        return self.logits_processor(self.lm_head, hidden_states)
++        return self.draft_vocab.compute_logits(self.lm_head, hidden_states)
+ 
+     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+         def remap_weight_names():
+diff --git a/vllm/v1/worker/gpu/spec_decode/eagle/utils.py b/vllm/v1/worker/gpu/spec_decode/eagle/utils.py
+index 63e999b75fbfa7278fece3bf1d80a595376c7cef..37b553feb381ff9871d16a8b446931186f3b0950 100644
+--- a/vllm/v1/worker/gpu/spec_decode/eagle/utils.py
++++ b/vllm/v1/worker/gpu/spec_decode/eagle/utils.py
+@@ -133,6 +133,12 @@ def load_eagle_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mod
+             "draft_lm_head_quantization needs a drafter that shares the target lm_head."
+         )
+ 
++    # Only now does the drafter hold the lm_head it drafts with.
++    if speculative_config.draft_token_map is not None:
++        from vllm.model_executor.layers.draft_vocab import load_draft_token_map
++
++        load_draft_token_map(eagle_model, vllm_config)
++
+     # MTP shares topk_indices_buffer with the target model. We update
+     # every module in the draft that holds a buffer reference so that
+     # the per-layer indexer and sparse-attention backends all point to

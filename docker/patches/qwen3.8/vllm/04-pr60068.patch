@@ -1,0 +1,855 @@
+From f1249ce748701288fac2d2bafb7b6ac223b7ae6e Mon Sep 17 00:00:00 2001
+From: Stefano Castagnetta <scastagnetta@nvidia.com>
+Date: Wed, 7 Oct 2026 20:10:43 +0200
+Subject: [PATCH] [PR #60068] [MRV2][Spec Decode] Opt-in confidence stop for
+ autoregressive drafting
+
+Net diff of #60068, rebased to apply after main, #59958, #59973 and patch 01 (#59740 + #60226). Changes versus the PR branch: upstream main renamed spec_decode/autoregressive to spec_decode/target_dependent_ar (#60335), so the speculator change and its unit test now target vllm/v1/worker/gpu/spec_decode/target_dependent_ar/speculator.py and tests/v1/worker/test_gpu_target_dependent_ar_speculator.py. In tests/v1/e2e/spec_decode/mtp/qwen3_5/test_mtp.py and docs/features/speculative_decoding/mtp.md the additions from #59973 and #60068 are both kept.
+
+Upstream-PR: https://github.com/vllm-project/vllm/pull/60068
+
+diff --git a/docs/features/speculative_decoding/mtp.md b/docs/features/speculative_decoding/mtp.md
+index 2254827d13b54bf8f8f363c12364377446900765..66410e4da75a1e389acac9150882b6409f45c094 100644
+--- a/docs/features/speculative_decoding/mtp.md
++++ b/docs/features/speculative_decoding/mtp.md
+@@ -140,3 +140,10 @@ checkpoint. Dynamic rows on a quantized lm_head need the ModelOpt NVFP4 format.
+   per lm_head weight, e.g. 0.6 or 0.35 GiB for a 248k x 2560 head; it is
+   counted in the model weights, so with `--kv-cache-memory-bytes` leave room
+   for it.
++- `"draft_confidence_threshold": 0.6` with `"draft_confidence_fallback_depth": 3`
++  (Model Runner V2, SM121 GPUs such as DGX Spark) makes `num_speculative_tokens`
++  a maximum depth while one request is decoding: drafting stops once its next
++  draft is not that confident, and only the drafted prefix is verified. With
++  more requests it drafts the fallback depth instead. It waits on the GPU after
++  every draft step, which costs more than it saves on faster GPUs, so it is
++  rejected elsewhere; SM120 (RTX PRO 6000, RTX 5090) is untested.
+diff --git a/tests/v1/core/test_scheduler.py b/tests/v1/core/test_scheduler.py
+index 615dd82a1c7b9f3b9dbe504f0be18ee8c872b1c3..69e2c4b07b4ce958ae1e5ab999482db7f62d64c3 100644
+--- a/tests/v1/core/test_scheduler.py
++++ b/tests/v1/core/test_scheduler.py
+@@ -2051,6 +2051,43 @@ def test_per_request_spec_decode_subtracts_invalid_drafts():
+     assert payload["acceptance_histogram"] == [0, 0, 1, 0]
+ 
+ 
++def test_spec_decode_stats_count_only_verified_drafts():
++    """When the runner verifies fewer drafts than scheduled, only those count
++    as proposed, while the rejection rollback still covers every placeholder."""
++    scheduler = create_scheduler(
++        num_speculative_tokens=3, per_request_spec_decode_metrics="detailed"
++    )
++    [req] = create_requests(num_requests=1, num_tokens=1)
++    scheduler.add_request(req)
++    rid = req.request_id
++
++    def _mk_output(sampled, num_verified=None):
++        return ModelRunnerOutput(
++            req_ids=[rid],
++            req_id_to_index={rid: 0},
++            sampled_token_ids=[sampled],
++            num_verified_spec_tokens=num_verified,
++        )
++
++    scheduler.update_from_output(scheduler.schedule(), _mk_output([0]))
++    scheduler.update_draft_token_ids(DraftTokenIds([rid], [[1, 2, 3]]))
++    output = scheduler.schedule()
++    # 3 scheduled, 2 verified, 1 accepted.
++    engine_core_outputs = scheduler.update_from_output(
++        output, _mk_output([1, 9], num_verified=[2])
++    )
++
++    stats = engine_core_outputs[0].scheduler_stats.spec_decoding_stats
++    assert stats.num_drafts == 1
++    assert stats.num_draft_tokens == 2
++    assert stats.num_accepted_tokens == 1
++    assert stats.num_draft_tokens_per_pos == [1, 1, 0]
++    payload = req.spec_decode_metrics.to_dict()
++    assert payload["per_step_drafted"] == [2]
++    assert payload["per_step_accepted"] == [1]
++    assert req.num_computed_tokens == 1 + 4 - 2
++
++
+ def test_per_request_spec_decode_acceptance_disabled_by_default():
+     scheduler = create_scheduler(num_speculative_tokens=3)
+     assert scheduler.spec_decode_metrics_level == "none"
+diff --git a/tests/v1/e2e/spec_decode/mtp/qwen3_5/test_mtp.py b/tests/v1/e2e/spec_decode/mtp/qwen3_5/test_mtp.py
+index 08f91b3baa799969c29300292eacd9afa6809db2..ad1aeb5d4b83d0b6d85e9c140679c6a56fedf323 100644
+--- a/tests/v1/e2e/spec_decode/mtp/qwen3_5/test_mtp.py
++++ b/tests/v1/e2e/spec_decode/mtp/qwen3_5/test_mtp.py
+@@ -5,10 +5,12 @@ import pytest
+ 
+ from tests.utils import single_gpu_only
+ from vllm import SamplingParams
++from vllm.platforms import current_platform
+ 
+ from ...utils import (
+     assert_request_outputs_match,
+     compute_acceptance_len,
++    get_spec_decode_metric_value,
+     get_test_prompts,
+ )
+ from .._correctness import check_mtp_correctness
+@@ -141,3 +143,58 @@ def test_mtp_draft_lm_head_quantization_survives_sleep_and_reload(
+             context="after weight reload",
+         )
+         assert al == pytest.approx(ref_al, rel=0.03)
++
++
++@single_gpu_only
++@pytest.mark.skipif(
++    not (current_platform.is_cuda() and current_platform.is_device_capability(121)),
++    reason="draft_confidence_threshold is SM121 only",
++)
++def test_mtp_draft_confidence_stop(
++    monkeypatch: pytest.MonkeyPatch,
++    sampling_config: SamplingParams,
++    vllm_runner,
++):
++    """The stop only shortens drafting: greedy outputs match fixed-depth MTP,
++    a deeper capped chain keeps at least 90% of the fixed chain's AL, and the
++    draft counters count only verified drafts. One request at a time, so the
++    stop rather than the fallback is used."""
++    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
++    prompts = get_test_prompts(mm_enabled=False, num_prompts=32)
++    results = {}
++    drafts_per_round = {}
++    for num_spec, threshold in ((3, None), (4, 0.6)):
++        with vllm_runner(
++            "Qwen/Qwen3.5-0.8B-Base",
++            block_size=None,
++            enable_chunked_prefill=None,
++            max_model_len=2048,
++            max_num_seqs=1,
++            limit_mm_per_prompt={"image": 0, "video": 0},
++            speculative_config={
++                "method": "mtp",
++                "num_speculative_tokens": num_spec,
++                "draft_confidence_threshold": threshold,
++                "draft_confidence_fallback_depth": 3 if threshold else None,
++            },
++            disable_log_stats=False,
++        ) as runner:
++            outputs = runner.llm.chat(prompts, sampling_config)
++            metrics = runner.llm.get_metrics()
++            num_drafts, num_draft_tokens = (
++                get_spec_decode_metric_value(metrics, f"vllm:spec_decode_{name}")
++                for name in ("num_drafts", "num_draft_tokens")
++            )
++            results[threshold] = (outputs, compute_acceptance_len(metrics))
++            drafts_per_round[threshold] = num_draft_tokens / num_drafts
++
++    (ref_outputs, ref_al), (outputs, al) = results[None], results[0.6]
++    assert_request_outputs_match(
++        ref_outputs,
++        outputs,
++        required_matches=int(0.8 * len(ref_outputs)) + 1,
++        context="draft_confidence_threshold=0.6",
++    )
++    assert al >= 0.9 * ref_al, f"acceptance length {al:.3f} vs {ref_al:.3f}"
++    assert drafts_per_round[None] == 3
++    assert 1 <= drafts_per_round[0.6] < 4, drafts_per_round
+diff --git a/tests/v1/spec_decode/test_dynamic_sd_cug.py b/tests/v1/spec_decode/test_dynamic_sd_cug.py
+index f3971b34e9c7b7359501ed6c7f1bc33880fbe0b0..346ab1ce8388eb773ad0d4f2079b366f932fd70f 100644
+--- a/tests/v1/spec_decode/test_dynamic_sd_cug.py
++++ b/tests/v1/spec_decode/test_dynamic_sd_cug.py
+@@ -28,6 +28,8 @@ def _create_vllm_config_for_dsd(
+     cudagraph_mode: CUDAGraphMode = CUDAGraphMode.FULL_AND_PIECEWISE,
+     use_dynamic_sd: bool = True,
+     num_spec_per_batch_size: list[tuple[int, int, int]] | None = None,
++    draft_confidence_threshold: float | None = None,
++    draft_confidence_fallback_depth: int | None = None,
+ ) -> MagicMock:
+     """Create a minimal config that exercises DSD cudagraph dispatch.
+ 
+@@ -78,6 +80,8 @@ def _create_vllm_config_for_dsd(
+         )
+     else:
+         speculative_config.num_speculative_tokens_per_batch_size = None
++    speculative_config.draft_confidence_threshold = draft_confidence_threshold
++    speculative_config.draft_confidence_fallback_depth = draft_confidence_fallback_depth
+     vllm_config.speculative_config = speculative_config
+ 
+     return vllm_config
+@@ -426,3 +430,48 @@ def test_dynamic_sd_only_captures_scheduled_query_lengths(monkeypatch):
+                 assert desc.num_tokens == num_tokens
+                 assert desc.num_reqs is None
+             assert desc.num_active_loras == 0
++
++
++@pytest.mark.parametrize(
++    ("decode_query_len", "expected"),
++    [
++        # Target verification with K=4, fallback depth 2: the full and fallback
++        # lengths at every batch size, the other stop lengths for one request.
++        (
++            5,
++            {(5, n) for n in range(1, 9)}
++            | {(3, n) for n in range(1, 9)}
++            | {(2, 1), (4, 1)},
++        ),
++        # Draft decode steps always run one token per request.
++        (1, {(1, n) for n in range(1, 9)}),
++    ],
++)
++def test_confidence_stop_captures_verified_lengths(
++    monkeypatch, decode_query_len, expected
++):
++    """A stopped single request verifies 1..K drafts; larger batches verify the
++    fallback depth, so only those shapes get FULL graphs."""
++    monkeypatch.setattr(
++        gpu_cudagraph_utils,
++        "get_pp_group",
++        lambda: SimpleNamespace(is_first_rank=True, is_last_rank=True),
++    )
++    vllm_config = _create_vllm_config_for_dsd(
++        max_num_seqs=8,
++        max_spec_tokens=4,
++        use_dynamic_sd=False,
++        draft_confidence_threshold=0.6,
++        draft_confidence_fallback_depth=2,
++    )
++    manager = gpu_cudagraph_utils.CudaGraphManager(
++        vllm_config=vllm_config,
++        device=torch.device("cpu"),
++        cudagraph_mode=CUDAGraphMode.FULL_AND_PIECEWISE,
++        decode_query_len=decode_query_len,
++    )
++    shapes = {
++        (desc.uniform_token_count, desc.num_reqs)
++        for desc in manager._capture_descs[CUDAGraphMode.FULL]
++    }
++    assert shapes == expected
+diff --git a/tests/v1/worker/test_gpu_draft_confidence_stop.py b/tests/v1/worker/test_gpu_draft_confidence_stop.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..38c04d98b6367d9efa3a73719beb575e39dfbb43
+--- /dev/null
++++ b/tests/v1/worker/test_gpu_draft_confidence_stop.py
+@@ -0,0 +1,151 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++
++from types import SimpleNamespace
++
++import numpy as np
++import pytest
++import torch
++
++from vllm.platforms import current_platform
++from vllm.v1.worker.gpu.spec_decode.confidence_stop import DraftConfidenceStop
++
++VOCAB = 20000
++NUM_STEPS = 4
++FALLBACK = 2
++THRESHOLD = 0.6
++
++requires_cuda = pytest.mark.skipif(
++    not current_platform.is_cuda(), reason="needs a CUDA device"
++)
++
++
++def _logits(top_probs: list[float]) -> torch.Tensor:
++    """bf16 rows whose top-1 probability is approximately each value."""
++    rows = torch.full((len(top_probs), VOCAB), -30.0)
++    for row, p in enumerate(top_probs):
++        rows[row, 5] = 0.0
++        rows[row, VOCAB - 3] = rows[row, VOCAB - 9000] = float(
++            np.log((1 - p) / (2 * p))
++        )
++    return rows.to(device="cuda", dtype=torch.bfloat16)
++
++
++def _run_step(stop, top_probs, step):
++    stop.update(_logits(top_probs), torch.tensor([step], device="cuda"))
++    stop.step_launched()
++
++
++@requires_cuda
++def test_chain_state_follows_top_probabilities():
++    stop = DraftConfidenceStop(THRESHOLD, FALLBACK, 8, NUM_STEPS, torch.device("cuda"))
++    stop.begin_round(3)
++    # Only the first row is the request; the second is cudagraph padding.
++    _run_step(stop, [0.9, 0.1], 0)
++    assert stop.should_continue()
++    _run_step(stop, [0.7, 0.1], 1)
++    assert stop.should_continue()
++    _run_step(stop, [0.4, 0.99], 2)
++    assert not stop.should_continue()
++    # Steps 0 and 1 cleared the threshold; step 2's draft did not.
++    assert stop.num_verifiable_drafts(np.array([3])).tolist() == [2]
++
++    # A dead chain stays dead within a round, and step 0 starts a new chain.
++    stop.update(_logits([0.99]), torch.tensor([3], device="cuda"))
++    assert not stop.alive.item()
++    stop.begin_round(1)
++    _run_step(stop, [0.99], 0)
++    assert stop.alive.item()
++
++
++@requires_cuda
++@pytest.mark.parametrize(
++    ("first_prob", "expected"),
++    [
++        # Nothing survives the first draft, which is still verified.
++        (0.1, 1),
++        (0.9, 1),
++    ],
++)
++def test_stop_after_first_draft_keeps_it(first_prob, expected):
++    stop = DraftConfidenceStop(THRESHOLD, FALLBACK, 4, NUM_STEPS, torch.device("cuda"))
++    stop.begin_round(0)
++    _run_step(stop, [first_prob], 0)
++    if first_prob >= THRESHOLD:
++        assert stop.should_continue()
++        _run_step(stop, [0.1], 1)
++    assert not stop.should_continue()
++    assert stop.num_verifiable_drafts(np.array([0])).tolist() == [expected]
++
++
++@requires_cuda
++@pytest.mark.parametrize(("last_prob", "expected"), [(0.9, 4), (0.1, 3)])
++def test_full_round_resolves_last_step_lazily(last_prob, expected):
++    stop = DraftConfidenceStop(THRESHOLD, FALLBACK, 4, NUM_STEPS, torch.device("cuda"))
++    stop.begin_round(2)
++    for step in range(NUM_STEPS - 1):
++        _run_step(stop, [0.9], step)
++        assert stop.should_continue()
++    _run_step(stop, [last_prob], NUM_STEPS - 1)
++    stop.end_round()
++    assert stop.num_verifiable_drafts(np.array([2])).tolist() == [expected]
++
++
++@requires_cuda
++def test_fixed_round_verifies_its_depth():
++    """Multi-request rounds draft the fallback depth and skip the stop."""
++    stop = DraftConfidenceStop(THRESHOLD, FALLBACK, 8, NUM_STEPS, torch.device("cuda"))
++    stop.fixed_round(np.array([4, 6]), FALLBACK)
++    assert stop.num_verifiable_drafts(np.array([4, 6])).tolist() == [FALLBACK] * 2
++    # A later single-request round only updates its own slot.
++    stop.begin_round(4)
++    _run_step(stop, [0.1], 0)
++    assert not stop.should_continue()
++    assert stop.num_verifiable_drafts(np.array([4, 6])).tolist() == [1, FALLBACK]
++
++
++@pytest.mark.cpu_test
++@pytest.mark.parametrize(
++    ("is_cuda", "capability", "fallback", "error"),
++    [
++        (True, 121, FALLBACK, None),
++        (True, 120, FALLBACK, "SM121"),
++        (True, 100, FALLBACK, "SM121"),
++        (False, None, FALLBACK, "SM121"),
++        (True, 121, None, "fallback_depth"),
++        (True, 121, NUM_STEPS, "fallback_depth"),
++    ],
++)
++def test_confidence_stop_config(monkeypatch, is_cuda, capability, fallback, error):
++    """SM121 only (the per-step readback stalls faster GPUs), and a fallback
++    depth below num_speculative_tokens is required."""
++    from vllm.config import VllmConfig
++
++    monkeypatch.setattr(
++        "vllm.platforms.current_platform",
++        SimpleNamespace(
++            is_cuda=lambda: is_cuda, is_device_capability=lambda cap: cap == capability
++        ),
++    )
++    spec = SimpleNamespace(
++        draft_confidence_threshold=THRESHOLD,
++        draft_confidence_fallback_depth=fallback,
++        method="mtp",
++        num_speculative_tokens=NUM_STEPS,
++        use_multi_module_mtp=lambda: False,
++        use_gemma4_mtp=lambda: False,
++        uses_dynamic_speculative_decoding=lambda: False,
++        enable_adaptive_verification=False,
++        use_local_argmax_reduction=False,
++        parallel_drafting=False,
++    )
++    config = SimpleNamespace(
++        speculative_config=spec,
++        use_v2_model_runner=True,
++        parallel_config=SimpleNamespace(data_parallel_size=1),
++    )
++    if error is None:
++        VllmConfig._verify_draft_confidence_threshold(config)
++    else:
++        with pytest.raises(ValueError, match=error):
++            VllmConfig._verify_draft_confidence_threshold(config)
+diff --git a/tests/v1/worker/test_gpu_target_dependent_ar_speculator.py b/tests/v1/worker/test_gpu_target_dependent_ar_speculator.py
+index 20e86f4a7827565177f5890701c772b375d87b97..ef9b8475b016e1b9afaa571fd2742eff172c89d5 100644
+--- a/tests/v1/worker/test_gpu_target_dependent_ar_speculator.py
++++ b/tests/v1/worker/test_gpu_target_dependent_ar_speculator.py
+@@ -172,6 +172,7 @@ def test_speculator_uses_draft_model_hidden_size(monkeypatch, hc_mult, expected)
+         use_local_argmax_reduction=False,
+         draft_sample_method="greedy",
+         enable_adaptive_verification=False,
++        draft_confidence_threshold=None,
+     )
+     vllm_config = SimpleNamespace(
+         speculative_config=speculative_config,
+diff --git a/vllm/config/speculative.py b/vllm/config/speculative.py
+index babf73d087e51f45aabd91a542c4eb93201d6c83..8beac6388351f27776e25cefb39312a19b0cd000 100644
+--- a/vllm/config/speculative.py
++++ b/vllm/config/speculative.py
+@@ -586,6 +586,18 @@ class SpeculativeConfig:
+     """Whether to adaptively size the draft-verification budget from per-request
+     confidence. Currently only supported for method="dspark"."""
+ 
++    draft_confidence_threshold: float | None = Field(default=None, gt=0.0, le=1.0)
++    """While a single request is decoding, stop autoregressive drafting once its
++    drafter top-1 probability falls below this threshold, treating
++    num_speculative_tokens as the maximum depth. Requires
++    draft_confidence_fallback_depth. SM121 GPUs, Model Runner V2 and methods
++    'mtp', 'eagle' and 'eagle3' only."""
++
++    draft_confidence_fallback_depth: int | None = Field(default=None, ge=1)
++    """Fixed number of draft tokens used, without the confidence stop, whenever
++    more than one request is decoding. Required with
++    draft_confidence_threshold; usually the best fixed depth for the model."""
++
+     @staticmethod
+     def _acceptance_length_to_rates(length: float, n: int) -> list[float]:
+         """Mean acceptance length to unconditional per-position rates, using
+diff --git a/vllm/config/vllm.py b/vllm/config/vllm.py
+index df3210808ab95b252ecea179b80b0d3988f77b71..31883924e9675147ecdffb094b4809adcc6b2d67 100644
+--- a/vllm/config/vllm.py
++++ b/vllm/config/vllm.py
+@@ -1104,6 +1104,44 @@ class VllmConfig:
+         )
+         speculative_config.num_speculative_tokens_per_batch_size = None
+ 
++    def _verify_draft_confidence_threshold(self) -> None:
++        spec = self.speculative_config
++        if spec is None or spec.draft_confidence_threshold is None:
++            if spec is not None and spec.draft_confidence_fallback_depth is not None:
++                raise ValueError("draft_confidence_fallback_depth needs a threshold.")
++            return
++        from vllm.platforms import current_platform
++
++        fallback = spec.draft_confidence_fallback_depth
++        error = None
++        if spec.method not in ("mtp", "eagle", "eagle3"):
++            error = f"requires method 'mtp', 'eagle' or 'eagle3', got {spec.method!r}"
++        elif spec.use_multi_module_mtp() or spec.use_gemma4_mtp():
++            error = "does not support multi-module or Gemma 4 MTP drafters"
++        elif fallback is None or not 1 <= fallback < spec.num_speculative_tokens:
++            error = (
++                "needs draft_confidence_fallback_depth in [1, num_speculative_tokens)"
++            )
++        elif not self.use_v2_model_runner:
++            error = "requires Model Runner V2"
++        elif self.parallel_config.data_parallel_size > 1:
++            error = "does not support data parallelism"
++        elif spec.uses_dynamic_speculative_decoding():
++            error = "is not compatible with num_speculative_tokens_per_batch_size"
++        elif spec.enable_adaptive_verification:
++            error = "is not compatible with enable_adaptive_verification"
++        elif spec.use_local_argmax_reduction:
++            error = "is not compatible with use_local_argmax_reduction"
++        elif spec.parallel_drafting:
++            error = "is not compatible with parallel_drafting"
++        elif not (
++            current_platform.is_cuda() and current_platform.is_device_capability(121)
++        ):
++            # The per-step readback only pays off where a draft step is long.
++            error = "is only supported on SM121 GPUs"
++        if error:
++            raise ValueError(f"draft_confidence_threshold {error}.")
++
+     def _normalize_piecewise_cudagraph_mode(
+         self, *, breakable_cudagraph_enabled: bool
+     ) -> None:
+@@ -1827,6 +1865,7 @@ class VllmConfig:
+             )
+ 
+         self._maybe_disable_dynamic_sd_for_data_parallel()
++        self._verify_draft_confidence_threshold()
+         self._maybe_override_dynamic_sd_cudagraph_mode()
+ 
+         if (
+diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
+index 0758c6122565ca73cf18dd5e327177712ff0b17b..aa40bfacab9b65647ded190352bdec1e7f3170c7 100644
+--- a/vllm/v1/core/sched/scheduler.py
++++ b/vllm/v1/core/sched/scheduler.py
+@@ -2125,9 +2125,15 @@ class Scheduler(SchedulerInterface):
+                         request.num_computed_tokens -= num_rejected
+                     if request.num_output_placeholders > 0:
+                         request.num_output_placeholders -= num_rejected
++                # Only the verified drafts count as proposed.
++                num_proposed = num_draft_tokens
++                if model_runner_output.num_verified_spec_tokens is not None:
++                    num_proposed = model_runner_output.num_verified_spec_tokens[
++                        req_index
++                    ]
+                 spec_decoding_stats = self.make_spec_decoding_stats(
+                     spec_decoding_stats,
+-                    num_draft_tokens=num_draft_tokens,
++                    num_draft_tokens=num_proposed,
+                     num_accepted_tokens=num_accepted,
+                     num_invalid_spec_tokens=scheduler_output.num_invalid_spec_tokens,
+                     request_id=req_id,
+@@ -2136,7 +2142,7 @@ class Scheduler(SchedulerInterface):
+                     # Exclude grammar-invalidated drafts from the proposed
+                     # count, mirroring make_spec_decoding_stats; the accepted
+                     # bucket (j) is unaffected.
+-                    adj_draft_tokens = num_draft_tokens
++                    adj_draft_tokens = num_proposed
+                     if scheduler_output.num_invalid_spec_tokens:
+                         adj_draft_tokens -= (
+                             scheduler_output.num_invalid_spec_tokens.get(req_id, 0)
+diff --git a/vllm/v1/outputs.py b/vllm/v1/outputs.py
+index 22169b1fda93861db267ea73be64637a3f5bc17e..9334a19504db60a67e211f37fc7ec7a6ca004a5e 100644
+--- a/vllm/v1/outputs.py
++++ b/vllm/v1/outputs.py
+@@ -310,6 +310,10 @@ class ModelRunnerOutput:
+     # ``None`` when ``return_sampling_mask`` is off.
+     sampling_masks: SamplingMaskLists | None = None
+ 
++    # [num_reqs] spec tokens the target verified per request, when the runner
++    # may verify fewer than were scheduled. None means all of them.
++    num_verified_spec_tokens: list[int] | None = None
++
+     @staticmethod
+     def with_kv_conn_output_only(
+         kv_connector_output: KVConnectorOutput | None,
+diff --git a/vllm/v1/worker/gpu/cudagraph_utils.py b/vllm/v1/worker/gpu/cudagraph_utils.py
+index 73be62319a64bfd8e0986811fdfce1a0e3914123..b57141425a16709893fe3797ef7f45cab6af24c1 100644
+--- a/vllm/v1/worker/gpu/cudagraph_utils.py
++++ b/vllm/v1/worker/gpu/cudagraph_utils.py
+@@ -269,6 +269,7 @@ class CudaGraphManager:
+         # draft tokens. The scheduler might use a smaller number so we need
+         # to capture graphs for all possible values during decode.
+         speculative_config = self.vllm_config.speculative_config
++        single_req_only_lens: set[int] = set()
+         if (
+             speculative_config
+             and speculative_config.uses_dynamic_speculative_decoding()
+@@ -291,6 +292,19 @@ class CudaGraphManager:
+                     for num_spec in dense_schedule[1:]
+                 }
+             )
++        elif (
++            speculative_config
++            and speculative_config.draft_confidence_fallback_depth is not None
++            and self.decode_query_len > self.vllm_config.num_speculative_tokens
++        ):
++            # One request may stop after 1..K drafts; larger batches verify the
++            # fallback depth.
++            base = self.decode_query_len - self.vllm_config.num_speculative_tokens
++            decode_query_lens = list(range(base + 1, self.decode_query_len + 1))
++            single_req_only_lens = set(decode_query_lens) - {
++                self.decode_query_len,
++                base + speculative_config.draft_confidence_fallback_depth,
++            }
+         else:
+             decode_query_lens = [self.decode_query_len]
+ 
+@@ -322,6 +336,10 @@ class CudaGraphManager:
+                         rounded_num_tokens > max_decode_tokens
+                         or rounded_num_tokens > max_cg_capture_size
+                         or rounded_num_reqs > self.max_num_reqs
++                        or (
++                            decode_query_len in single_req_only_lens
++                            and rounded_num_reqs > 1
++                        )
+                     ):
+                         continue
+ 
+diff --git a/vllm/v1/worker/gpu/model_runner.py b/vllm/v1/worker/gpu/model_runner.py
+index 227529d56e6e7fac0488c9eafa1a425f78068829..aadbd3c4c8bda79031a2858eec8d81921b1bcf13 100644
+--- a/vllm/v1/worker/gpu/model_runner.py
++++ b/vllm/v1/worker/gpu/model_runner.py
+@@ -1311,6 +1311,21 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+             num_draft_tokens_np = np.fromiter(
+                 num_drafts_iter, dtype=np.int32, count=num_reqs
+             )
++            confidence_stop = getattr(self.speculator, "confidence_stop", None)
++            if (
++                confidence_stop is not None
++                and not scheduler_output.has_structured_output_requests
++            ):
++                # Verify only the last round's drafts; the scheduler rolls back
++                # the trimmed placeholders like rejected tokens.
++                num_verifiable = np.minimum(
++                    num_draft_tokens_np,
++                    confidence_stop.num_verifiable_drafts(idx_mapping_np),
++                )
++                num_scheduled_tokens -= num_draft_tokens_np - num_verifiable
++                num_draft_tokens_np = num_verifiable
++                num_toks = int(num_scheduled_tokens.sum())
++                max_query_len = int(num_scheduled_tokens.max())
+             if self.adaptive_verification is not None:
+                 num_toks = self.adaptive_verification.get_num_tokens(
+                     num_tokens_per_req, draft_tokens
+@@ -1753,6 +1768,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+         )
+         if batch_req_state is not None:
+             num_toks = batch_req_state.num_tokens
++            max_query_len = int(batch_req_state.num_scheduled_tokens.max())
+             if batch_req_state.has_prefill:
+                 # Varlen decode graphs replay decodes only, and their bound
+                 # alone would admit a short prefill.
+@@ -2197,6 +2213,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+             prompt_token_id_logprobs_dict=prompt_token_id_logprobs_dict,
+             cudagraph_stats=cudagraph_stats,
+         )
++        if (
++            getattr(self.speculator, "confidence_stop", None) is not None
++            and input_batch.num_draft_tokens_per_req is not None
++        ):
++            model_runner_output.num_verified_spec_tokens = (
++                input_batch.num_draft_tokens_per_req.tolist()
++            )
+         pending_aux_output = None
+         if self.aux_output_connector is not None:
+             pending_aux_output = self.aux_output_connector.prepare_output(input_batch)
+diff --git a/vllm/v1/worker/gpu/spec_decode/confidence_stop.py b/vllm/v1/worker/gpu/spec_decode/confidence_stop.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..ac762b2b38c4c38d815c16befbc8b7b04afe7f65
+--- /dev/null
++++ b/vllm/v1/worker/gpu/spec_decode/confidence_stop.py
+@@ -0,0 +1,84 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++import math
++
++import numpy as np
++import torch
++
++from vllm.utils.gpu_sync_debug import gpu_sync_allowed
++
++
++class DraftConfidenceStop:
++    """Ends a single request's draft round once a draft's top-1 probability
++    falls below the threshold; the first draft is always kept."""
++
++    def __init__(
++        self,
++        threshold: float,
++        fallback_depth: int,
++        max_num_reqs: int,
++        num_steps: int,
++        device: torch.device,
++    ):
++        self.fallback_depth = fallback_depth
++        self.num_steps = num_steps
++        self.log_threshold = math.log(threshold)
++        self.alive = torch.ones(1, dtype=torch.bool, device=device)
++        self._alive_cpu = torch.ones(1, dtype=torch.bool, pin_memory=True)
++        self._alive_ready = torch.cuda.Event()
++        # Verifiable drafts per request-state slot, from its last draft round.
++        self._num_drafts_np = np.full(max_num_reqs, num_steps, dtype=np.int32)
++        self._slot: int | None = None
++        # A round that ran every step; its last step is read when next needed.
++        self._pending_slot: int | None = None
++        self._steps_launched = 0
++
++    def update(self, logits: torch.Tensor, draft_step: torch.Tensor) -> None:
++        """Fold the first row's draft confidence into the chain (graph-safe)."""
++        row = logits[:1].float()
++        confident = (row.amax(-1) - row.logsumexp(-1)) >= self.log_threshold
++        self.alive.copy_(confident & (self.alive | (draft_step == 0)))
++
++    def begin_round(self, slot: int) -> None:
++        self._resolve_pending()
++        self._slot = slot
++        self._steps_launched = 0
++
++    def fixed_round(self, slots: np.ndarray, num_drafts: int) -> None:
++        self._resolve_pending()
++        self._num_drafts_np[slots] = num_drafts
++        self._slot = None
++
++    def step_launched(self) -> None:
++        self._steps_launched += 1
++        self._alive_cpu.copy_(self.alive, non_blocking=True)
++        self._alive_ready.record()
++
++    def _read_alive(self) -> bool:
++        with gpu_sync_allowed():
++            self._alive_ready.synchronize()
++        return bool(self._alive_cpu[0])
++
++    def should_continue(self) -> bool:
++        """Whether the chain survived the last launched step. Waits for it."""
++        if self._read_alive():
++            return True
++        assert self._slot is not None
++        self._num_drafts_np[self._slot] = max(1, self._steps_launched - 1)
++        self._slot = None
++        return False
++
++    def end_round(self) -> None:
++        """Close a round that launched every step, without waiting for it."""
++        self._pending_slot, self._slot = self._slot, None
++
++    def _resolve_pending(self) -> None:
++        if self._pending_slot is not None:
++            survived = self._read_alive()
++            self._num_drafts_np[self._pending_slot] = self.num_steps - (not survived)
++            self._pending_slot = None
++
++    def num_verifiable_drafts(self, slots: np.ndarray) -> np.ndarray:
++        """Drafts each request may verify, from its slot's last draft round."""
++        self._resolve_pending()
++        return self._num_drafts_np[slots]
+diff --git a/vllm/v1/worker/gpu/spec_decode/speculator.py b/vllm/v1/worker/gpu/spec_decode/speculator.py
+index d07c043de915ca94ece712379180388c383de2c6..c16668f5d4888027c55a1d83f4ac4e130aa88a88 100644
+--- a/vllm/v1/worker/gpu/spec_decode/speculator.py
++++ b/vllm/v1/worker/gpu/spec_decode/speculator.py
+@@ -35,6 +35,7 @@ from vllm.v1.worker.gpu.sample.gumbel import gumbel_sample
+ from vllm.v1.worker.gpu.spec_decode.acceptance_estimator import (
+     OnlineAcceptanceEstimator,
+ )
++from vllm.v1.worker.gpu.spec_decode.confidence_stop import DraftConfidenceStop
+ from vllm.v1.worker.utils import AttentionGroup
+ 
+ if TYPE_CHECKING:
+@@ -103,6 +104,8 @@ class BaseSpeculator(ABC):
+ 
+ 
+ class DraftModelSpeculator(BaseSpeculator):
++    confidence_stop: DraftConfidenceStop | None = None
++
+     def __init__(self, vllm_config: VllmConfig, device: torch.device):
+         self.vllm_config = vllm_config
+         self.device = device
+@@ -208,6 +211,18 @@ class DraftModelSpeculator(BaseSpeculator):
+         self.supports_mm_inputs = False
+         self.pcp_manager: PCPManager | None = None
+ 
++        threshold = self.speculative_config.draft_confidence_threshold
++        if threshold is not None:
++            fallback_depth = self.speculative_config.draft_confidence_fallback_depth
++            assert fallback_depth is not None
++            self.confidence_stop = DraftConfidenceStop(
++                threshold,
++                fallback_depth,
++                self.max_num_reqs,
++                self.num_speculative_steps,
++                device,
++            )
++
+     @abstractmethod
+     def load_draft_model(
+         self, target_model: nn.Module, target_attn_layer_names: set[str]
+@@ -430,6 +445,9 @@ class DraftModelSpeculator(BaseSpeculator):
+             return self.get_draft_top_tokens(hidden_states, spec_step_idx)
+ 
+         logits = self.compute_draft_logits(hidden_states, spec_step_idx)
++        if self.confidence_stop is not None:
++            # Before sampling, which may scale the logits in place.
++            self.confidence_stop.update(logits, draft_step)
+         if draft_logits is not None:
+             sampler = (
+                 gumbel_sample
+diff --git a/vllm/v1/worker/gpu/spec_decode/target_dependent_ar/speculator.py b/vllm/v1/worker/gpu/spec_decode/target_dependent_ar/speculator.py
+index 9a8ed7b8b4cab8a1231e1eeb9608962d8575236b..06223e1616a6656b112dbb8f06ea07df104c6c03 100644
+--- a/vllm/v1/worker/gpu/spec_decode/target_dependent_ar/speculator.py
++++ b/vllm/v1/worker/gpu/spec_decode/target_dependent_ar/speculator.py
+@@ -1,5 +1,6 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++from functools import partial
+ from typing import Any
+ 
+ import torch
+@@ -17,6 +18,7 @@ from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor
+ from vllm.v1.worker.gpu.dp_utils import DPSyncState, dispatch_cg_and_sync_dp
+ from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
+ from vllm.v1.worker.gpu.model_states.interface import ModelState
++from vllm.v1.worker.gpu.spec_decode.confidence_stop import DraftConfidenceStop
+ from vllm.v1.worker.gpu.spec_decode.speculator import DraftModelSpeculator
+ from vllm.v1.worker.gpu.spec_decode.target_dependent_ar.cudagraph_utils import (
+     SpeculatorCudaGraphManager,
+@@ -101,7 +103,8 @@ class TargetDependentARSpeculator(DraftModelSpeculator):
+         self._configure_fused_multi_step_decode()
+ 
+     def _configure_fused_multi_step_decode(self) -> None:
+-        if self.num_speculative_steps == 1:
++        # The confidence stop decides between steps, so each needs its own graph.
++        if self.num_speculative_steps == 1 or self.confidence_stop is not None:
+             self.use_fused_multi_step_decode = False
+             return
+ 
+@@ -329,6 +332,22 @@ class TargetDependentARSpeculator(DraftModelSpeculator):
+             )
+         self.on_prefill_end(num_reqs)
+ 
++        num_draft_steps = num_speculative_tokens
++        confidence_stop = None
++        stop = self.confidence_stop
++        if stop is not None and not (dummy_run or is_profile):
++            if input_batch.has_structured_output_reqs:
++                # Grammar masks cover every scheduled draft, so draft them all.
++                stop.fixed_round(input_batch.idx_mapping_np, num_draft_steps)
++            elif num_reqs > 1:
++                # Past one request the per-step wait does not pay off.
++                num_draft_steps = stop.fallback_depth
++                stop.fixed_round(input_batch.idx_mapping_np, num_draft_steps)
++            else:
++                confidence_stop = stop
++                stop.begin_round(int(input_batch.idx_mapping_np[0]))
++                stop.step_launched()
++
+         if num_speculative_tokens <= 1:
+             if num_speculative_tokens == 0:
+                 self.draft_tokens[:num_reqs].fill_(-1)
+@@ -370,7 +389,7 @@ class TargetDependentARSpeculator(DraftModelSpeculator):
+         )
+         if self.decode_cudagraph_manager is not None:
+             decode_batch_desc = self.decode_cudagraph_manager.specialize_spec_tokens(
+-                decode_batch_desc, num_speculative_tokens
++                decode_batch_desc, num_draft_steps
+             )
+         num_tokens_across_dp = (
+             decode_batch_sync.num_tokens_across_dp
+@@ -383,7 +402,7 @@ class TargetDependentARSpeculator(DraftModelSpeculator):
+         decode_fn = (
+             self._fused_multi_step_decode
+             if self.use_fused_multi_step_decode
+-            else self._multi_step_decode
++            else partial(self._multi_step_decode, confidence_stop=confidence_stop)
+         )
+         decode_fn(
+             num_reqs,
+@@ -391,7 +410,7 @@ class TargetDependentARSpeculator(DraftModelSpeculator):
+             decode_batch_desc,
+             num_tokens_across_dp,
+             input_batch.seq_lens_cpu_upper_bound,
+-            num_speculative_tokens,
++            num_draft_steps,
+         )
+         self.on_multi_step_decode_end(num_reqs)
+ 
+@@ -519,6 +538,7 @@ class TargetDependentARSpeculator(DraftModelSpeculator):
+         num_tokens_across_dp: torch.Tensor | None,
+         seq_lens_cpu_upper_bound: torch.Tensor,
+         num_speculative_steps: int,
++        confidence_stop: DraftConfidenceStop | None = None,
+     ) -> None:
+         positions = self.input_buffers.positions[:num_reqs]
+         query_start_loc = self.input_buffers.query_start_loc[: num_reqs + 1]
+@@ -547,6 +567,10 @@ class TargetDependentARSpeculator(DraftModelSpeculator):
+                     step=step,
+                 )
+ 
++            # Wait only after building this step's metadata.
++            if confidence_stop is not None and not confidence_stop.should_continue():
++                return
++
+             self.current_draft_step.fill_(step)
+ 
+             if batch_desc.cg_mode == CUDAGraphMode.FULL:
+@@ -562,6 +586,11 @@ class TargetDependentARSpeculator(DraftModelSpeculator):
+                     cudagraph_runtime_mode=batch_desc.cg_mode,
+                     num_speculative_steps=num_speculative_steps,
+                 )
++            if confidence_stop is not None:
++                confidence_stop.step_launched()
++
++        if confidence_stop is not None:
++            confidence_stop.end_round()
+ 
+     def _fused_multi_step_decode(
+         self,

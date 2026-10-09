@@ -1,0 +1,831 @@
+From: stecasta
+Subject: [PATCH] [Kernel][Quant][MoE] Per-forward NVFP4 W4A4/W4A16 selection for routed experts on SM12x
+
+Upstream-PR: https://github.com/vllm-project/vllm/pull/54617
+
+diff --git a/tests/kernels/moe/test_flashinfer_cutile_nvfp4_moe.py b/tests/kernels/moe/test_flashinfer_cutile_nvfp4_moe.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..bb58ef9015b5678c21be7faee78073ed67cf6887
+--- /dev/null
++++ b/tests/kernels/moe/test_flashinfer_cutile_nvfp4_moe.py
+@@ -0,0 +1,259 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Per-forward W4A4/W4A16 selection for NVFP4 routed experts on SM12x.
++
++Both precisions must read the same prepared weights, select from the token
++count, and stay correct across the cutoff inside captured CUDA graphs.
++"""
++
++import pytest
++import torch
++
++from vllm.model_executor.layers.fused_moe.activation import MoEActivation
++from vllm.platforms import current_platform
++
++if not current_platform.is_device_capability_family(120):
++    pytest.skip("requires SM120/SM121", allow_module_level=True)
++
++from vllm.model_executor.layers.fused_moe.experts.flashinfer_cutile_moe import (
++    CuTileNvfp4DynamicMoE,
++    has_flashinfer_cutile_nvfp4,
++    prepare_cutile_nvfp4_weights,
++)
++
++if not has_flashinfer_cutile_nvfp4("cutile"):
++    pytest.skip("FlashInfer lacks cuTile NVFP4 W4A4/W4A16", allow_module_level=True)
++
++# (W4A4, W4A16) backend pairs
++BACKENDS = [
++    pytest.param(
++        pair,
++        id="-".join(pair),
++        marks=pytest.mark.skipif(
++            not has_flashinfer_cutile_nvfp4(pair[1], pair[0]),
++            reason=f"FlashInfer lacks the {pair} backends",
++        ),
++    )
++    for pair in (("cutile", "cutile"), ("cutile", "sm12x"), ("sm12x", "sm12x"))
++]
++
++E, TOPK, H, INTER = 8, 2, 256, 128
++CUTOFF = 4
++_E2M1_POS = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0]
++_E2M1 = torch.tensor(_E2M1_POS + [-v for v in _E2M1_POS])
++
++
++def _dequant(w, scale, gscale):
++    codes = torch.stack((w & 0xF, w >> 4), dim=-1).flatten(-2).long()
++    vals = _E2M1.to(w.device)[codes]
++    return vals * scale.float().repeat_interleave(16, dim=-1) * gscale.view(-1, 1, 1)
++
++
++def _weights(activation, seed=0):
++    g = torch.Generator(device="cuda").manual_seed(seed)
++    rows = 2 * INTER if activation == MoEActivation.SILU else INTER
++
++    def codes(*shape):
++        return torch.randint(0, 256, shape, device="cuda", generator=g).to(torch.uint8)
++
++    def scales(*shape):
++        s = torch.rand(shape, device="cuda", generator=g) * 1.5 + 0.25
++        return s.to(torch.float8_e4m3fn)
++
++    w13, w2 = codes(E, rows, H // 2), codes(E, H, INTER // 2)
++    s13, s2 = scales(E, rows, H // 16), scales(E, H, INTER // 16)
++    g13 = torch.rand(E, device="cuda", generator=g) * 0.004 + 0.004
++    g2 = torch.rand(E, device="cuda", generator=g) * 0.02 + 0.02
++    return w13, s13, g13, w2, s2, g2
++
++
++def _reference(x, ids, weights, w13, s13, g13, w2, s2, g2, activation):
++    dw13, dw2 = _dequant(w13, s13, g13), _dequant(w2, s2, g2)
++    out = torch.zeros(x.shape, dtype=torch.float32, device=x.device)
++    for t in range(x.shape[0]):
++        for k in range(TOPK):
++            e = int(ids[t, k])
++            h = x[t].float() @ dw13[e].T
++            if activation == MoEActivation.SILU:
++                a = torch.nn.functional.silu(h[:INTER]) * h[INTER:]
++            else:
++                a = torch.relu(h).square()
++            out[t] += weights[t, k] * (a.bfloat16().float() @ dw2[e].T)
++    return out
++
++
++def _dispatch(
++    activation, a16_max_tokens=CUTOFF, backends=("cutile", "cutile"), max_num_tokens=256
++):
++    raw = _weights(activation)
++    dispatch = CuTileNvfp4DynamicMoE(
++        num_experts=E,
++        top_k=TOPK,
++        intermediate_size=INTER,
++        activation=activation,
++        max_num_tokens=max_num_tokens,
++        a16_max_tokens=a16_max_tokens,
++        w4a16_backend=backends[1],
++        device=torch.device("cuda"),
++        w4a4_backend=backends[0],
++    )
++    view = prepare_cutile_nvfp4_weights(*raw, activation)
++    dispatch.set_weights(view)
++    return dispatch, raw, view
++
++
++def _routing(m, seed):
++    g = torch.Generator(device="cuda").manual_seed(seed)
++    x = torch.randn(m, H, device="cuda", generator=g).bfloat16()
++    logits = torch.randn(m, E, device="cuda", generator=g)
++    vals, ids = torch.topk(logits, TOPK, dim=-1)
++    return x, ids.to(torch.int32), torch.softmax(vals, dim=-1)
++
++
++@pytest.mark.parametrize("backends", BACKENDS)
++def test_selects_by_token_count_over_one_weight_copy(backends):
++    from flashinfer.fused_moe import MoEActivationPack
++
++    dispatch, _, view = _dispatch(MoEActivation.SILU, backends=backends)
++    assert dispatch.select(1) is dispatch.w4a16
++    assert dispatch.select(CUTOFF) is dispatch.w4a16
++    assert dispatch.select(CUTOFF + 1) is dispatch.w4a4
++    x, ids, w = _routing(CUTOFF, 0)
++    act = MoEActivationPack(
++        hidden_states_q=x, hidden_states_scale=None, topk_ids=ids, topk_weights=w
++    )
++    keys = ("w1", "w1_scale", "w1_global_scale", "w2", "w2_scale", "w2_global_scale")
++    expected = [view[k].data_ptr() for k in keys]
++    for path in (dispatch.w4a4, dispatch.w4a16):
++        # Packed inputs are [out, x, ids, weights, *weight view, *extras].
++        inputs = path.runner.pack_inputs(act, dispatch._weights)
++        assert [t.data_ptr() for t in inputs[4:10]] == expected
++
++
++@pytest.mark.parametrize("activation", [MoEActivation.SILU, MoEActivation.RELU2_NO_MUL])
++@pytest.mark.parametrize("m", [1, 3, CUTOFF, CUTOFF + 1, 64])
++@pytest.mark.parametrize("backends", BACKENDS)
++@torch.inference_mode()
++def test_matches_reference_on_both_sides_of_cutoff(activation, m, backends):
++    dispatch, raw, _ = _dispatch(activation, backends=backends)
++    x, ids, w = _routing(m, 1)
++    out = torch.empty_like(x)
++    dispatch.run(out, x, ids, w)
++    w13, s13, g13, w2, s2, g2 = raw
++    ref = _reference(x, ids, w, w13, s13, g13, w2, s2, g2, activation)
++    # W4A4 also quantizes activations to FP4, so its bound is looser.
++    tol = 3e-2 if m <= CUTOFF else 2.5e-1
++    err = (out.float() - ref).abs() / (ref.abs().mean() + 1e-6)
++    assert err.mean() < tol, f"m={m} mean rel err {err.mean():.3e}"
++
++
++@pytest.mark.parametrize("m", [1, CUTOFF, 64])
++@pytest.mark.parametrize("backends", BACKENDS)
++@torch.inference_mode()
++def test_padding_rows_routed_to_invalid_expert(m, backends):
++    """CUDA-graph padding rows carry expert id -1 (VLLM_MOE_SKIP_PADDING); they
++    must not perturb the real rows. With m=1 every row is padding, as in the
++    cudagraph memory-profiling forward."""
++    dispatch, _, _ = _dispatch(MoEActivation.SILU, backends=backends)
++    x, ids, w = _routing(m, 4)
++    valid = m // 2
++    ids[valid:] = -1
++    out = torch.empty_like(x)
++    dispatch.run(out, x, ids, w)
++    assert torch.isfinite(out).all()
++    if valid:
++        clean = torch.empty_like(x[:valid])
++        dispatch.run(clean, x[:valid], ids[:valid], w[:valid])
++        err = (out[:valid].float() - clean.float()).abs().max()
++        assert err <= 1e-2 * clean.float().abs().mean(), f"m={m} max err {err:.3e}"
++
++
++@pytest.mark.parametrize("backends", BACKENDS)
++@torch.inference_mode()
++def test_cuda_graph_replay_across_cutoff(backends):
++    dispatch, _, _ = _dispatch(MoEActivation.SILU, backends=backends)
++    for m in (3, CUTOFF, CUTOFF + 1):
++        x, ids, w = _routing(m, 2)
++        out = torch.empty_like(x)
++        dispatch.run(out, x, ids, w)
++        torch.accelerator.synchronize()
++        graph = torch.cuda.CUDAGraph()
++        with torch.cuda.graph(graph):
++            dispatch.run(out, x, ids, w)
++        new_x, new_ids, new_w = _routing(m, 3)
++        for live, new in ((x, new_x), (ids, new_ids), (w, new_w)):
++            live.copy_(new)
++        expected = torch.empty_like(out)
++        dispatch.run(expected, x, ids, w)
++        out.zero_()
++        graph.replay()
++        torch.accelerator.synchronize()
++        assert torch.equal(out, expected), f"m={m}"
++
++
++def test_zero_cutoff_never_builds_w4a16():
++    dispatch, _, _ = _dispatch(MoEActivation.SILU, a16_max_tokens=0)
++    assert dispatch.w4a16 is None
++    assert dispatch.select(1) is dispatch.w4a4
++
++
++@pytest.mark.parametrize("backends", [p for p in BACKENDS if "sm12x" in p.values[0]])
++@torch.inference_mode()
++def test_tuning_compiles_every_sm12x_token_bucket(backends, monkeypatch):
++    """SM12x kernels compile per token bucket; tuning must cover every bucket
++    so that serving never compiles on the first use of an unseen one."""
++    from flashinfer.autotuner import autotune
++    from flashinfer.fused_moe.utils import get_hybrid_num_tokens_buckets
++
++    from vllm.model_executor.layers.fused_moe.experts import flashinfer_cutile_moe
++
++    max_num_tokens = 32
++    monkeypatch.setattr(flashinfer_cutile_moe, "_WARMED_BUCKETS", set())
++    dispatch, _, _ = _dispatch(
++        MoEActivation.SILU, backends=backends, max_num_tokens=max_num_tokens
++    )
++    seen: dict[str, list[int]] = {}
++    for name in ("w4a4", "w4a16"):
++        runner = getattr(dispatch, name).runner
++        if not runner.backend_key.startswith("sm12x"):
++            continue
++        calls = seen.setdefault(name, [])
++
++        def record(inputs, *args, _forward=runner.forward, _calls=calls, **kwargs):
++            # Packed inputs are [out, x, ids, weights, ...].
++            _calls.append(inputs[1].shape[0])
++            return _forward(inputs, *args, **kwargs)
++
++        monkeypatch.setattr(runner, "forward", record)
++
++    x, ids, w = _routing(1, 0)
++    dispatch.run(torch.empty_like(x), x, ids, w)
++    assert all(calls in ([], [1]) for calls in seen.values())
++
++    with autotune(True):
++        dispatch.run(torch.empty_like(x), x, ids, w)
++    limits = {"w4a4": max_num_tokens, "w4a16": CUTOFF}
++    for name, calls in seen.items():
++        assert set(get_hybrid_num_tokens_buckets(limits[name])) <= set(calls), name
++
++
++@torch.inference_mode()
++def test_sm12x_w4a4_layers_share_bucket_scratch():
++    """SM12x W4A4 rewrites its scratch on every call, so layers of one geometry
++    share it per token bucket instead of holding one copy per layer."""
++    backends = ("sm12x", "sm12x")
++    if not has_flashinfer_cutile_nvfp4(backends[1], backends[0]):
++        pytest.skip("FlashInfer lacks the SM12x backends")
++    first, (w13, s13, g13, w2, s2, g2), _ = _dispatch(
++        MoEActivation.SILU, backends=backends
++    )
++    second, _, _ = _dispatch(MoEActivation.SILU, backends=backends)
++    other, _, _ = _dispatch(MoEActivation.RELU2_NO_MUL, backends=backends)
++    assert first.w4a4.runner._workspaces is second.w4a4.runner._workspaces
++    assert first.w4a4.runner._workspaces is not other.w4a4.runner._workspaces
++    x, ids, w = _routing(CUTOFF + 3, 3)
++    ref = _reference(x, ids, w, w13, s13, g13, w2, s2, g2, MoEActivation.SILU)
++    outs = [d.run(torch.empty_like(x), x, ids, w) for d in (first, second, first)]
++    err = (outs[0].float() - ref).abs() / (ref.abs().mean() + 1e-6)
++    assert err.mean() < 2.5e-1, f"mean rel err {err.mean():.3e}"
++    assert torch.equal(outs[0], outs[2])
+diff --git a/vllm/config/kernel.py b/vllm/config/kernel.py
+index 89280e024023ad05355704b839804fa75c22a9fe..1f187b09f784f8f3d6f46c180f9e5542d43ecc33 100644
+--- a/vllm/config/kernel.py
++++ b/vllm/config/kernel.py
+@@ -131,6 +131,7 @@ MoEBackend = Literal[
+     "flashinfer_cutedsl",
+     "flashinfer_moe_ep_cutedsl",
+     "flashinfer_b12x",
++    "flashinfer_cutile",
+     "b12x",
+     "flashinfer_moe_ep_mega_deep_gemm",
+     "marlin",
+@@ -304,6 +305,17 @@ class KernelConfig:
+     enable_jit_warmup: bool = True
+     """If True, run JIT compile warmup during kernel warmup."""
+ 
++    nvfp4_moe_dynamic_max_tokens: int = Field(default=0, ge=0)
++    """With moe_backend="flashinfer_cutile", run NVFP4 routed experts as W4A16
++    for forwards of at most this many tokens and W4A4 above it. Zero selects
++    W4A4 for every forward. Both paths share one prepared weight copy."""
++
++    nvfp4_moe_dynamic_w4a16_backend: Literal["cutile", "sm12x"] = "cutile"
++    """FlashInfer W4A16 candidate for nvfp4_moe_dynamic_max_tokens."""
++
++    nvfp4_moe_dynamic_w4a4_backend: Literal["cutile", "sm12x"] = "cutile"
++    """FlashInfer W4A4 backend for moe_backend="flashinfer_cutile"."""
++
+     moe_backend: MoEBackend = "auto"
+     """Backend for MoE expert computation kernels. Available options:
+ 
+@@ -322,6 +334,9 @@ class KernelConfig:
+       load); requires Blackwell, expert parallelism, and NVSHMEM
+     - "flashinfer_b12x": Use FlashInfer CuteDSL fused MoE for SM12x
+       (RTX Pro 6000 / DGX Spark)
++    - "flashinfer_cutile": Use FlashInfer unified-MoE cuTile kernels for NVFP4
++      on SM12x, optionally switching to W4A16 per forward (see
++      nvfp4_moe_dynamic_max_tokens)
+     - "b12x": Use b12x FP4 MoE kernels on SM12x
+     - "flashinfer_moe_ep_mega_deep_gemm": Use the FlashInfer moe_ep
+       expert-parallel mega-MoE with the DeepGEMM megakernel, which consumes an
+diff --git a/vllm/model_executor/layers/fused_moe/experts/flashinfer_cutile_moe.py b/vllm/model_executor/layers/fused_moe/experts/flashinfer_cutile_moe.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..61e1ff5e6f934face65d0675f817d3829f845a03
+--- /dev/null
++++ b/vllm/model_executor/layers/fused_moe/experts/flashinfer_cutile_moe.py
+@@ -0,0 +1,423 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""NVFP4 routed experts that pick W4A4 or W4A16 per forward on SM12x.
++
++Both precisions run through FlashInfer's unified MoE runners and read one
++prepared weight view, so switching precision costs no second weight copy.
++The choice is made from the token count before any activation quantization:
++W4A16 (BF16 activations) at or below the cutoff, W4A4 above it.
++"""
++
++from dataclasses import dataclass
++from typing import Any
++
++import torch
++
++import vllm.model_executor.layers.fused_moe.modular_kernel as mk
++from vllm.config import get_current_vllm_config
++from vllm.model_executor.layers.fused_moe.activation import MoEActivation
++from vllm.model_executor.layers.fused_moe.config import (
++    FusedMoEConfig,
++    FusedMoEParallelConfig,
++    FusedMoEQuantConfig,
++)
++from vllm.model_executor.layers.fused_moe.topk_weight_and_reduce import (
++    TopKWeightAndReduceNoOP,
++)
++from vllm.model_executor.layers.quantization.utils.quant_utils import (
++    QuantKey,
++    kNvfp4Dynamic,
++    kNvfp4Static,
++)
++from vllm.platforms import current_platform
++
++# FlashInfer backend config class names. Every candidate must consume the view
++# built by ``CuTileNvfp4Config.prepare_weights`` unchanged.
++W4A4_BACKENDS = {
++    "cutile": "CuTileNvfp4Config",
++    "sm12x": "SM12xNvfp4Config",
++}
++W4A16_BACKENDS = {
++    "cutile": "CuTileNvfp4Bf16Config",
++    "sm12x": "SM12xNvfp4Bf16Config",
++}
++
++# Token-bucket scratch of SM12x W4A4 runners, shared by layers of one geometry.
++_SHARED_W4A4_WORKSPACES: dict[tuple, dict[int, list[torch.Tensor]]] = {}
++
++_ACTIVATIONS = {
++    MoEActivation.SILU: "SwiGLU",
++    MoEActivation.RELU2_NO_MUL: "ReLU2",
++}
++
++
++def _fused_moe():
++    import flashinfer.fused_moe as fused_moe
++
++    return fused_moe
++
++
++def has_flashinfer_cutile_nvfp4(
++    w4a16_backend: str | None = None, w4a4_backend: str = "cutile"
++) -> bool:
++    """Whether FlashInfer exposes the requested unified-MoE NVFP4 backends."""
++    try:
++        fused_moe = _fused_moe()
++        from flashinfer.fused_moe.layer import _BACKEND_RUNNERS
++    except ImportError:
++        return False
++    names = [W4A4_BACKENDS.get(w4a4_backend, "")]
++    if w4a16_backend is not None:
++        names.append(W4A16_BACKENDS.get(w4a16_backend, ""))
++    classes = [getattr(fused_moe, name, None) for name in names]
++    return all(c is not None and c in _BACKEND_RUNNERS for c in classes)
++
++
++def prepare_cutile_nvfp4_weights(
++    w13: torch.Tensor,
++    w13_scale: torch.Tensor,
++    w13_scale_2: torch.Tensor,
++    w2: torch.Tensor,
++    w2_scale: torch.Tensor,
++    w2_scale_2: torch.Tensor,
++    activation: MoEActivation,
++) -> dict[str, torch.Tensor]:
++    """Build the single weight view shared by the W4A4 and W4A16 runners.
++
++    vLLM holds gated w13 as ``[gate; up]`` with linear block scales. FlashInfer
++    takes ``[up; gate]`` and returns ``[gate; up]`` with SM12x-swizzled scales.
++    """
++    num_experts, w13_rows, packed_k = w13.shape
++    intermediate = w2.shape[2] * 2
++    if activation == MoEActivation.SILU:
++        w13 = torch.cat((w13[:, intermediate:], w13[:, :intermediate]), dim=1)
++        w13_scale = torch.cat(
++            (w13_scale[:, intermediate:], w13_scale[:, :intermediate]), dim=1
++        )
++    fused_moe = _fused_moe()
++    return fused_moe.CuTileNvfp4Config.prepare_weights(
++        w13,
++        w13_scale,
++        w13_scale_2.float().reshape(num_experts),
++        w2,
++        w2_scale,
++        w2_scale_2.float().reshape(num_experts),
++        num_local_experts=num_experts,
++        hidden_size=packed_k * 2,
++        intermediate_size=intermediate,
++        activation=getattr(fused_moe, _ACTIVATIONS[activation])(),
++        device=w13.device,
++    )
++
++
++@dataclass
++class _Path:
++    runner: Any
++    op_name: str
++
++
++# (op name, geometry) pairs whose SM12x kernels were compiled for every token
++# bucket in this process; the compiled-kernel cache is shared by all layers.
++_WARMED_BUCKETS: set[tuple] = set()
++
++
++class CuTileNvfp4DynamicMoE:
++    """Token-count dispatch between two unified-MoE runners over one view."""
++
++    def __init__(
++        self,
++        *,
++        num_experts: int,
++        top_k: int,
++        intermediate_size: int,
++        activation: MoEActivation,
++        max_num_tokens: int,
++        a16_max_tokens: int,
++        w4a16_backend: str,
++        device: torch.device,
++        w4a4_backend: str = "cutile",
++    ):
++        fused_moe = _fused_moe()
++        from flashinfer.fused_moe.layer import _BACKEND_RUNNERS
++
++        if activation not in _ACTIVATIONS:
++            raise ValueError(f"unsupported activation {activation!r}")
++        for knob, name, choices in (
++            ("w4a4", w4a4_backend, W4A4_BACKENDS),
++            ("w4a16", w4a16_backend, W4A16_BACKENDS),
++        ):
++            if name not in choices:
++                raise ValueError(
++                    f"nvfp4_moe_dynamic_{knob}_backend={name!r}; "
++                    f"expected one of {sorted(choices)}"
++                )
++        self.a16_max_tokens = a16_max_tokens
++        self.max_num_tokens = max_num_tokens
++        self._geometry = (num_experts, top_k, intermediate_size, activation)
++        self._weights: Any = None
++
++        def build(config_name: str, act_format: Any) -> _Path:
++            config_cls = getattr(fused_moe, config_name)
++            config = fused_moe.MoEConfig(
++                routing=fused_moe.RoutingConfig(num_experts=num_experts, top_k=top_k),
++                quant=fused_moe.QuantConfig(
++                    weight=fused_moe.QuantFormat.NVFP4, activation=act_format
++                ),
++                experts=fused_moe.ExpertConfig(intermediate_size=intermediate_size),
++                activation=getattr(fused_moe, _ACTIVATIONS[activation])(),
++                backend=fused_moe.BackendOptions((config_cls(),)),
++                execution=fused_moe.ExecutionConfig(
++                    enable_pdl=False, tune_max_num_tokens=max_num_tokens
++                ),
++            )
++            runner = _BACKEND_RUNNERS[config_cls](config, device)
++            runner.check_support()
++            runner.build()
++            return _Path(runner, f"vllm_nvfp4_moe_{config_name}")
++
++        self.w4a4 = build(W4A4_BACKENDS[w4a4_backend], fused_moe.QuantFormat.NVFP4)
++        self.w4a16 = (
++            build(W4A16_BACKENDS[w4a16_backend], fused_moe.QuantFormat.BF16)
++            if a16_max_tokens > 0
++            else None
++        )
++        # The cuTile expert sort has no sentinel for padding rows (expert id
++        # -1); the SM12x backends skip ids outside [0, E) themselves.
++        self._remap_padding = w4a4_backend == "cutile" or (
++            self.w4a16 is not None and w4a16_backend == "cutile"
++        )
++
++    def set_weights(self, view: dict[str, torch.Tensor]) -> None:
++        pack = _fused_moe().MoEWeightPack()
++        for path in (self.w4a4, self.w4a16):
++            if path is not None:
++                for key in getattr(
++                    path.runner, "weight_view_keys", (path.runner.backend_key,)
++                ):
++                    pack.prepare_for(key, view)
++        self._weights = pack
++        # SM12x W4A4 rewrites its whole scratch from the inputs on every call
++        # and MoE layers run one after another, so layers with the same
++        # geometry share one workspace per token bucket instead of keeping
++        # num_layers copies (about 5 KB per token per layer).
++        runner = self.w4a4.runner
++        if runner.backend_key == "sm12x_nvfp4" and hasattr(runner, "_workspaces"):
++            key = (str(runner.device), *self._geometry, view["w2"].shape[1])
++            runner._workspaces = _SHARED_W4A4_WORKSPACES.setdefault(key, {})
++
++    def select(self, num_tokens: int) -> _Path:
++        if self.w4a16 is not None and num_tokens <= self.a16_max_tokens:
++            return self.w4a16
++        return self.w4a4
++
++    def _inputs(self, path: _Path, output, hidden_states, topk_ids, topk_weights):
++        act = _fused_moe().MoEActivationPack(
++            hidden_states_q=hidden_states,
++            hidden_states_scale=None,
++            topk_ids=topk_ids,
++            topk_weights=topk_weights,
++        )
++        inputs = path.runner.pack_inputs(act, self._weights)
++        # Write in place when the runner's output buffer has the call's shape;
++        # runners that pad to a token bucket keep their own buffer.
++        if inputs[0].shape == output.shape:
++            inputs[0] = output
++        return inputs
++
++    def run(
++        self,
++        output: torch.Tensor,
++        hidden_states: torch.Tensor,
++        topk_ids: torch.Tensor,
++        topk_weights: torch.Tensor,
++    ) -> torch.Tensor:
++        from flashinfer.autotuner import AutoTuner
++
++        assert self._weights is not None, "set_weights must run before run()"
++        if self._remap_padding:
++            invalid = topk_ids < 0
++            topk_ids = topk_ids.masked_fill(invalid, 0)
++            topk_weights = topk_weights.masked_fill(invalid, 0.0)
++        tuner = AutoTuner.get()
++        if tuner.is_tuning_mode:
++            self._warm_buckets(hidden_states, topk_ids, topk_weights)
++        chosen = self.select(hidden_states.shape[0])
++        paths = [chosen]
++        # Tuning passes run at one token count; tune both precisions there so
++        # decode-sized buckets of the W4A16 path are not left on fallbacks.
++        if tuner.is_tuning_mode:
++            paths = [p for p in (self.w4a4, self.w4a16) if p is not None]
++        tactic: Any = -1
++        for path in paths:
++            inputs = self._inputs(path, output, hidden_states, topk_ids, topk_weights)
++            _, best = tuner.choose_one(
++                path.op_name, [path.runner], path.runner.tuning_config, inputs
++            )
++            if path is chosen:
++                tactic, chosen_inputs = best, inputs
++        result = chosen.runner.forward(chosen_inputs, tactic=tactic)
++        if result.data_ptr() != output.data_ptr():
++            output.copy_(result)
++        return output
++
++    def _warm_buckets(self, hidden_states, topk_ids, topk_weights) -> None:
++        """Compile the SM12x kernels for every token bucket a path can serve.
++
++        They are specialized per token bucket, so an unseen bucket would
++        otherwise compile on its first serving step and stall it.
++        """
++        from flashinfer.fused_moe.utils import get_hybrid_num_tokens_buckets
++
++        if torch.cuda.is_current_stream_capturing():
++            return
++        for path, limit in (
++            (self.w4a4, self.max_num_tokens),
++            (self.w4a16, self.a16_max_tokens),
++        ):
++            if path is None or not path.runner.backend_key.startswith("sm12x"):
++                continue
++            key = (path.op_name, self._geometry, hidden_states.shape[1])
++            if key in _WARMED_BUCKETS:
++                continue
++            _WARMED_BUCKETS.add(key)
++            for bucket in get_hybrid_num_tokens_buckets(
++                min(limit, self.max_num_tokens)
++            ):
++                x = hidden_states[:1].expand(bucket, -1).contiguous()
++                ids = topk_ids[:1].expand(bucket, -1).contiguous()
++                weights = topk_weights[:1].expand(bucket, -1).contiguous()
++                inputs = self._inputs(path, x.new_empty(x.shape), x, ids, weights)
++                path.runner.forward(inputs, tactic=-1)
++
++
++class FlashInferCuTileNvfp4Experts(mk.FusedMoEExpertsModular):
++    """FlashInfer unified-MoE NVFP4 experts with per-forward precision choice.
++
++    ``kernel_config.nvfp4_moe_dynamic_max_tokens`` > 0 runs W4A16 for forwards
++    with at most that many tokens and W4A4 otherwise; 0 always runs W4A4.
++    BF16 hidden states reach the experts unquantized, and both W4A4 backends
++    quantize activations dynamically in-kernel, so calibrated input scales
++    are not used.
++    """
++
++    def __init__(
++        self,
++        moe_config: FusedMoEConfig,
++        quant_config: FusedMoEQuantConfig,
++    ):
++        super().__init__(moe_config=moe_config, quant_config=quant_config)
++        kernel_config = get_current_vllm_config().kernel_config
++        self.dispatch = CuTileNvfp4DynamicMoE(
++            num_experts=moe_config.num_local_experts,
++            top_k=moe_config.experts_per_token,
++            intermediate_size=moe_config.intermediate_size_per_partition,
++            activation=moe_config.activation,
++            max_num_tokens=moe_config.max_num_tokens,
++            a16_max_tokens=kernel_config.nvfp4_moe_dynamic_max_tokens,
++            w4a16_backend=kernel_config.nvfp4_moe_dynamic_w4a16_backend,
++            device=torch.device(moe_config.device),
++            w4a4_backend=kernel_config.nvfp4_moe_dynamic_w4a4_backend,
++        )
++
++    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
++        # The oracle already stored the prepared view on the layer.
++        view = {
++            "w1": layer.w13_weight,
++            "w1_scale": layer.w13_weight_scale,
++            "w1_global_scale": layer.w13_weight_scale_2,
++            "w2": layer.w2_weight,
++            "w2_scale": layer.w2_weight_scale,
++            "w2_global_scale": layer.w2_weight_scale_2,
++        }
++        input_scales = getattr(layer, "cutile_input_global_scales", None)
++        if input_scales is not None:
++            view["w1_input_global_scale"], view["w2_input_global_scale"] = input_scales
++        elif self.dispatch.w4a16 is not None:
++            # No calibrated activation scales (e.g. a W4A16 checkpoint such as
++            # an MTP drafter): W4A4 would quantize with a unit global scale,
++            # so run every forward as W4A16.
++            self.dispatch.a16_max_tokens = self.dispatch.max_num_tokens
++        self.dispatch.set_weights(view)
++
++    @staticmethod
++    def activation_format() -> mk.FusedMoEActivationFormat:
++        return mk.FusedMoEActivationFormat.Standard
++
++    @staticmethod
++    def _supports_current_device() -> bool:
++        return (
++            current_platform.is_cuda()
++            and current_platform.is_device_capability_family(120)
++            and has_flashinfer_cutile_nvfp4()
++        )
++
++    @staticmethod
++    def _supports_no_act_and_mul() -> bool:
++        return True
++
++    @staticmethod
++    def _supports_quant_scheme(
++        weight_key: QuantKey | None,
++        activation_key: QuantKey | None,
++    ) -> bool:
++        return (weight_key, activation_key) in (
++            (kNvfp4Static, kNvfp4Dynamic),
++            (kNvfp4Static, None),
++        )
++
++    @staticmethod
++    def _supports_activation(activation: MoEActivation) -> bool:
++        return activation in _ACTIVATIONS
++
++    @staticmethod
++    def _supports_parallel_config(moe_parallel_config: FusedMoEParallelConfig) -> bool:
++        return not moe_parallel_config.use_ep
++
++    def supports_expert_map(self) -> bool:
++        return False
++
++    def finalize_weight_and_reduce_impl(self) -> mk.TopKWeightAndReduce:
++        return TopKWeightAndReduceNoOP()
++
++    @property
++    def expects_unquantized_inputs(self) -> bool:
++        return True
++
++    def workspace_shapes(
++        self,
++        M: int,
++        N: int,
++        K: int,
++        topk: int,
++        global_num_experts: int,
++        local_num_experts: int,
++        expert_tokens_meta: mk.ExpertTokensMetadata | None,
++        activation: MoEActivation,
++    ) -> tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...]]:
++        return (0,), (0,), (M, K)
++
++    def apply(
++        self,
++        output: torch.Tensor,
++        hidden_states: torch.Tensor,
++        w1: torch.Tensor,
++        w2: torch.Tensor,
++        topk_weights: torch.Tensor,
++        topk_ids: torch.Tensor,
++        activation: MoEActivation,
++        global_num_experts: int,
++        expert_map: torch.Tensor | None,
++        a1q_scale: torch.Tensor | None,
++        a2_scale: torch.Tensor | None,
++        workspace13: torch.Tensor | None,
++        workspace2: torch.Tensor | None,
++        expert_tokens_meta: mk.ExpertTokensMetadata | None,
++        apply_router_weight_on_input: bool | None,
++    ):
++        assert expert_map is None and not apply_router_weight_on_input
++        self.dispatch.run(
++            output,
++            hidden_states.contiguous(),
++            topk_ids.to(torch.int32).contiguous(),
++            topk_weights.float().contiguous(),
++        )
+diff --git a/vllm/model_executor/layers/fused_moe/oracle/nvfp4.py b/vllm/model_executor/layers/fused_moe/oracle/nvfp4.py
+index 80aa9122f447b30867f449855b7e7362c498aaec..2a72aedd075aeea3660b0c1b523ae68c1b185b59 100644
+--- a/vllm/model_executor/layers/fused_moe/oracle/nvfp4.py
++++ b/vllm/model_executor/layers/fused_moe/oracle/nvfp4.py
+@@ -35,6 +35,7 @@ from vllm.model_executor.layers.quantization.utils.nvfp4_emulation_utils import
+ )
+ from vllm.model_executor.layers.quantization.utils.quant_utils import (
+     QuantKey,
++    amax_for_moe_activation_quant,
+ )
+ 
+ logger = init_logger(__name__)
+@@ -47,6 +48,7 @@ class NvFp4MoeBackend(Enum):
+     FLASHINFER_CUTEDSL = "FLASHINFER_CUTEDSL"
+     FLASHINFER_CUTEDSL_BATCHED = "FLASHINFER_CUTEDSL_BATCHED"
+     FLASHINFER_B12X = "FLASHINFER_B12X"
++    FLASHINFER_CUTILE = "FLASHINFER_CUTILE"
+     VLLM_CUTLASS = "VLLM_CUTLASS"
+     MARLIN = "MARLIN"
+     HUMMING = "HUMMING"
+@@ -119,6 +121,13 @@ def backend_to_kernel_cls(
+ 
+         return [FlashInferB12xExperts]
+ 
++    elif backend == NvFp4MoeBackend.FLASHINFER_CUTILE:
++        from vllm.model_executor.layers.fused_moe.experts.flashinfer_cutile_moe import (  # noqa: E501
++            FlashInferCuTileNvfp4Experts,
++        )
++
++        return [FlashInferCuTileNvfp4Experts]
++
+     elif backend == NvFp4MoeBackend.VLLM_CUTLASS:
+         from vllm.model_executor.layers.fused_moe.experts.cutlass_moe import (
+             CutlassExpertsFp4,
+@@ -170,6 +179,7 @@ def map_nvfp4_backend(runner_backend: MoEBackend) -> NvFp4MoeBackend:
+         "flashinfer_cutedsl": NvFp4MoeBackend.FLASHINFER_CUTEDSL,
+         "flashinfer_moe_ep_cutedsl": NvFp4MoeBackend.FLASHINFER_MOE_EP_CUTEDSL,
+         "flashinfer_b12x": NvFp4MoeBackend.FLASHINFER_B12X,
++        "flashinfer_cutile": NvFp4MoeBackend.FLASHINFER_CUTILE,
+         "marlin": NvFp4MoeBackend.MARLIN,
+         "humming": NvFp4MoeBackend.HUMMING,
+         "emulation": NvFp4MoeBackend.EMULATION,
+@@ -346,7 +356,35 @@ def convert_to_nvfp4_moe_kernel_format(
+     torch.Tensor,
+ ]:
+     use_a16 = _use_a16(nvfp4_backend, use_a16)
+-    if nvfp4_backend == NvFp4MoeBackend.B12X:
++
++    if nvfp4_backend == NvFp4MoeBackend.FLASHINFER_CUTILE:
++        from vllm.model_executor.layers.fused_moe.experts.flashinfer_cutile_moe import (  # noqa: E501
++            prepare_cutile_nvfp4_weights,
++        )
++
++        activation = layer.moe_config.activation
++        view = prepare_cutile_nvfp4_weights(
++            w13, w13_scale, w13_scale_2, w2, w2_scale, w2_scale_2, activation
++        )
++        w13, w13_scale, w13_scale_2 = (
++            view["w1"],
++            view["w1_scale"],
++            view["w1_global_scale"],
++        )
++        w2, w2_scale, w2_scale_2 = view["w2"], view["w2_scale"], view["w2_global_scale"]
++        # W4A4 quantizes activations in-kernel. The SM12x backend takes one
++        # activation global scale per GEMM; without it the E4M3 block scales of
++        # small activations underflow, so pass the calibrated one as the
++        # FlashInfer CUTLASS path does (shared by all experts).
++        if a13_scale is not None and a2_scale is not None:
++            enable_eplb = layer.moe_config.moe_parallel_config.enable_eplb
++            layer.cutile_input_global_scales = tuple(
++                (1.0 / amax_for_moe_activation_quant(s, enable_eplb)).reshape(1)
++                for s in (a13_scale, a2_scale)
++            )
++        a13_scale = None
++        a2_scale = None
++    elif nvfp4_backend == NvFp4MoeBackend.B12X:
+         if a13_scale is None or a2_scale is None:
+             if not use_a16:
+                 raise ValueError("b12x NVFP4 MoE requires activation scales")
+@@ -551,8 +589,10 @@ def make_nvfp4_moe_quant_config(
+             gemm1_beta=getattr(layer, "swiglu_beta", None),
+             gemm1_clamp_limit=swiglu_limit,
+         )
+-    elif backend == NvFp4MoeBackend.MARLIN or (
+-        backend == NvFp4MoeBackend.B12X and use_a16
++    elif (
++        backend == NvFp4MoeBackend.MARLIN
++        or (backend == NvFp4MoeBackend.B12X and use_a16)
++        or (backend == NvFp4MoeBackend.FLASHINFER_CUTILE and a13_scale is None)
+     ):
+         return nvfp4_w4a16_moe_quant_config(
+             g1_alphas=w13_scale_2,

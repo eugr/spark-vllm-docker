@@ -780,6 +780,7 @@ test_flashinfer_ref_forwards_selected_ref() {
     assert_log_contains '^docker build --target flashinfer-export .*--build-arg FLASHINFER_REF=0123456789abcdef'
     assert_log_contains '^docker build -t vllm-node .*--build-context flashinfer_wheels=\./\.wheel-cache/flashinfer/custom --build-context vllm_wheels=\./\.wheel-cache/vllm/regular '
     assert_output_contains 'Rebuilding FlashInfer wheels \(--flashinfer-ref specified\)\.\.\.'
+    assert_log_contains '^docker build --target flashinfer-export .*FLASHINFER_APPLY_REGULAR_PATCHES=0'
     pass "--flashinfer-ref forwards selected ref"
 }
 
@@ -789,6 +790,7 @@ test_requested_flashinfer_prs_apply_to_selected_ref() {
     assert_log_contains '^docker build --target flashinfer-export .*--build-arg FLASHINFER_REF=0123456789abcdef .*--build-arg FLASHINFER_PRS=12345'
     assert_output_contains 'Rebuilding FlashInfer wheels \(--flashinfer-ref and --apply-flashinfer-pr specified\)\.\.\.'
     assert_output_contains 'Applying FlashInfer PRs: 12345'
+    assert_log_contains '^docker build --target flashinfer-export .*FLASHINFER_APPLY_REGULAR_PATCHES=0'
     pass "--apply-flashinfer-pr applies requested PRs to selected ref"
 }
 
@@ -807,6 +809,14 @@ test_rebuild_vllm_applies_preset_prs_by_default() {
     assert_log_contains '^docker build --target vllm-export .*--build-arg VLLM_REF=main .*--build-arg VLLM_APPLY_PRESET_PRS=1'
     assert_output_contains 'Applying preset vLLM PRs from the Dockerfile by default\.'
     pass "ordinary main source rebuild enables configured preset vLLM PRs by default"
+}
+
+test_regular_rebuild_enables_flashinfer_patch_series() {
+    setup_fixture
+    run_build --rebuild-vllm --rebuild-flashinfer || fail "regular source rebuild failed"
+    assert_log_contains '^docker build --target flashinfer-export .*FLASHINFER_APPLY_REGULAR_PATCHES=1'
+    assert_log_contains '^docker build --target vllm-export .*VLLM_APPLY_PRESET_PRS=1'
+    pass "regular source rebuild enables both checked-in patch series"
 }
 
 test_apply_vllm_pr_skips_preset_prs_by_default() {
@@ -973,6 +983,8 @@ test_exp_b12x_rebuild_vllm_uses_preset_source_build() {
     assert_log_not_contains 'B12X_(FROM_PYPI|REPO|REF|CACHEBUST)='
     assert_log_not_contains '^curl .*prebuilt-flashinfer'
     assert_log_not_contains 'Dockerfile\.mxfp4'
+    assert_log_contains '^docker build --target flashinfer-export .*FLASHINFER_APPLY_REGULAR_PATCHES=0'
+    assert_log_not_contains 'FLASHINFER_APPLY_REGULAR_PATCHES=1|VLLM_APPLY_PRESET_PRS=1'
     assert_output_contains 'Rebuilding vLLM wheels \(--exp-b12x preset\)\.\.\.'
     pass "--exp-b12x --rebuild-vllm uses the B12X source-build profile"
 }
@@ -1867,6 +1879,7 @@ test_build_only_flags_warn_on_prebuilt
 test_flashinfer_ref_forwards_selected_ref
 test_requested_flashinfer_prs_apply_to_selected_ref
 test_rebuild_vllm_applies_preset_prs_by_default
+test_regular_rebuild_enables_flashinfer_patch_series
 test_vllm_ref_skips_preset_prs_by_default
 test_apply_vllm_pr_skips_preset_prs_by_default
 test_apply_vllm_pr_url_is_forwarded_to_source_build

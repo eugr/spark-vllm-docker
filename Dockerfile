@@ -163,6 +163,12 @@ RUN --mount=type=cache,id=repo-cache,target=/repo-cache \
 
 WORKDIR /workspace/flashinfer
 
+ARG FLASHINFER_APPLY_REGULAR_PATCHES=0
+COPY docker/apply_patch_series.sh /tmp/apply_patch_series.sh
+COPY docker/patches/qwen3.8/flashinfer/ /tmp/regular-flashinfer/
+RUN bash /tmp/apply_patch_series.sh flashinfer "$FLASHINFER_REPO" \
+    "$FLASHINFER_APPLY_REGULAR_PATCHES" /tmp/regular-flashinfer
+
 ARG FLASHINFER_PRS=""
 
 # PR refs include the branch history they were developed on. Use upstream main
@@ -273,8 +279,10 @@ ENV CARGO_HOME=/opt/cargo
 ENV PATH=/opt/cargo/bin:$PATH
 ENV PROTOC_INCLUDE=/usr/include
 
+# DeepGEMM's DeepJIT headers include elfutils/libdwfl.h (provided by libdw-dev).
 RUN apt update && \
-    apt install -y --no-install-recommends ca-certificates pkg-config protobuf-compiler libprotobuf-dev && \
+    apt install -y --no-install-recommends \
+        ca-certificates pkg-config protobuf-compiler libprotobuf-dev libdw-dev && \
     rm -rf /var/lib/apt/lists/* && \
     curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
       sh -s -- -y --profile minimal --default-toolchain ${RUSTUP_TOOLCHAIN} --no-modify-path && \
@@ -295,10 +303,9 @@ ARG VLLM_REF=main
 ARG VLLM_SOURCE_MODE=remote
 ARG VLLM_SOURCE_COMMIT=""
 
-# Pinned while investigating an SM121 DeepSeek-V4 MXFP4 grouped scale-factor
-# regression first observed at nv_dev f8e8fb5 (PR #384); last known good.
-ARG DEEPGEMM_REPO=https://github.com/deepseek-ai/DeepGEMM.git
-ARG DEEPGEMM_REF=a6b593d2826719dcf4892609af7b84ee23aaf32a
+# Empty overrides select DeepGEMM to match the patched vLLM source below.
+ARG DEEPGEMM_REPO=""
+ARG DEEPGEMM_REF=""
 ENV DEEPGEMM_SRC_DIR=/workspace/DeepGEMM
 
 # The upstream repository uses the shared checkout cache. Custom repositories
@@ -364,27 +371,6 @@ RUN --mount=type=cache,id=repo-cache,target=/repo-cache \
         cp -a /repo-cache/vllm "$VLLM_BASE_DIR/"; \
     fi
 
-RUN --mount=type=cache,id=repo-cache,target=/repo-cache \
-    set -eux; \
-    cd /repo-cache; \
-    if [ ! -d "deepgemm" ]; then \
-        echo "Cache miss: Cloning DeepGEMM from scratch..."; \
-        git clone --recursive "$DEEPGEMM_REPO" deepgemm; \
-    else \
-        echo "Cache hit: Fetching DeepGEMM updates..."; \
-        cd deepgemm; \
-        git fetch origin; \
-        git fetch origin --tags --force; \
-        cd ..; \
-    fi; \
-    cd deepgemm; \
-    git checkout --detach "$DEEPGEMM_REF" 2>/dev/null || git checkout --detach "origin/$DEEPGEMM_REF"; \
-    git reset --hard; \
-    git submodule update --init --recursive; \
-    git clean -fdx; \
-    rm -rf "$DEEPGEMM_SRC_DIR"; \
-    cp -a /repo-cache/deepgemm "$DEEPGEMM_SRC_DIR"
-
 WORKDIR $VLLM_BASE_DIR/vllm
 
 ARG VLLM_PRESET_PRS=""
@@ -393,26 +379,33 @@ ARG VLLM_PRS=""
 ARG VLLM_PRESERVE_SM12X_TARGET=0
 ARG VLLM_PATCH_B12X_C128A_ALIGNMENT=0
 
+COPY docker/apply_patch_series.sh /tmp/apply_patch_series.sh
+COPY docker/patches/qwen3.8/vllm/ /tmp/regular-vllm/
+
 # Numeric PR refs are resolved from vllm-project/vllm. Full GitHub PR URLs are
 # downloaded from the named repository, preserving that PR's own base range.
 # In both cases, apply only the resulting patch to VLLM_REF.
 RUN set -eux; \
     VLLM_ALL_PRS=""; \
     VLLM_SELECTED_PRESET_PRS=""; \
+    VLLM_APPLY_REGULAR_PATCHES=0; \
     VLLM_REQUESTED_HEAD="$(git rev-parse HEAD)"; \
     case "$VLLM_APPLY_PRESET_PRS" in \
-        1|true|TRUE|yes|YES) VLLM_SELECTED_PRESET_PRS="$VLLM_PRESET_PRS";; \
+        1|true|TRUE|yes|YES) VLLM_SELECTED_PRESET_PRS="$VLLM_PRESET_PRS"; VLLM_APPLY_REGULAR_PATCHES=1;; \
         0|false|FALSE|no|NO) VLLM_SELECTED_PRESET_PRS="";; \
         ""|auto|AUTO) \
             if [ -z "$VLLM_PRS" ]; then \
                 if [ "$VLLM_REF" = "main" ]; then \
                     VLLM_SELECTED_PRESET_PRS="$VLLM_PRESET_PRS"; \
+                    VLLM_APPLY_REGULAR_PATCHES=1; \
                 else \
                     echo "Skipping preset vLLM PRs in auto mode because VLLM_REF=$VLLM_REF is not main."; \
                 fi; \
             fi;; \
         *) echo "Invalid VLLM_APPLY_PRESET_PRS value: $VLLM_APPLY_PRESET_PRS"; exit 1;; \
     esac; \
+    bash /tmp/apply_patch_series.sh vllm "$VLLM_REPO" \
+        "$VLLM_APPLY_REGULAR_PATCHES" /tmp/regular-vllm; \
     for pr in $VLLM_SELECTED_PRESET_PRS $VLLM_PRS; do \
         case " $VLLM_ALL_PRS " in \
             *" $pr "*) ;; \
@@ -540,6 +533,7 @@ RUN python3 /tmp/vllm-patches/patch_vllm_api_key_auth.py .
 # path and restore the smallest-block fallback. Remove once supported refs
 # contain an equivalent upstream fix; unexpected source layouts fail closed.
 # Supports both the original selector and #53175's per-layer KV-spec API.
+# Recognizes #60252's divisor-aware replacement from the regular patch series.
 RUN python3 /tmp/vllm-patches/patch_vllm_swa_block_size.py .
 
 # TEMPORARY PATCH: vLLM PR #53306 added a preliminary CUDA-graph memory
@@ -690,6 +684,13 @@ RUN --mount=type=cache,id=uv-cache,target=/root/.cache/uv \
 # RUN curl -L https://patch-diff.githubusercontent.com/raw/vllm-project/vllm/pull/34758.diff | patch -p1 -R || echo "Cannot revert PR #34758, skipping"
 # RUN curl -L https://patch-diff.githubusercontent.com/raw/vllm-project/vllm/pull/34302.diff | patch -p1 -R || echo "Cannot revert PR #34302, skipping"
 
+# Resolve after PRs and source patches: stable-ABI vLLM requires its declared
+# DeepGEMM fork/pin; older refs retain the SM121 regression workaround.
+COPY docker/prepare_deepgemm.py /tmp/prepare_deepgemm.py
+RUN --mount=type=cache,id=repo-cache,target=/repo-cache,sharing=locked \
+    python3 /tmp/prepare_deepgemm.py . /repo-cache "$DEEPGEMM_SRC_DIR" \
+        --repo "$DEEPGEMM_REPO" --ref "$DEEPGEMM_REF"
+
 # Final Compilation
 RUN --mount=type=cache,id=ccache,target=/root/.ccache \
     --mount=type=cache,id=uv-cache,target=/root/.cache/uv \
@@ -752,13 +753,14 @@ ENV UV_LINK_MODE=copy
 
 # Mount additional packages from base builder image
 # Install runtime dependencies
+# DeepJIT dynamically loads libdw.so.1 for source locations in C++ stack traces.
 RUN --mount=type=bind,from=base,source=/workspace/vllm/nccl/build/pkg/deb,target=/workspace/nccl-pkg \
     apt update && \
     apt install -y --no-install-recommends \
     python3 python3-pip python3-dev vim curl git wget \
     libcudnn9-cuda-13 \
     libibverbs1 libibverbs-dev rdma-core \
-    libxcb1 earlyoom liburing-dev pkg-config \
+    libxcb1 earlyoom liburing-dev pkg-config libdw1t64 \
     && cd /workspace/nccl-pkg && apt install -y --no-install-recommends --allow-downgrades --allow-change-held-packages ./*.deb \
     && rm -rf /var/lib/apt/lists/* \
     && pip install uv

@@ -1,0 +1,5104 @@
+From: stecasta
+Subject: [PATCH] feat(gemm): add SM12x MXFP8 support to the CuTe DSL mm_mxfp8 backend
+
+Upstream-PR: https://github.com/flashinfer-ai/flashinfer/pull/5943
+
+diff --git a/benchmarks/routines/flashinfer_benchmark_utils.py b/benchmarks/routines/flashinfer_benchmark_utils.py
+index 4dadfb48507125d0f5e4f85f62050a9f55872781..de919eb296fb99403e2cc3bdcb41a0d149b81b87 100644
+--- a/benchmarks/routines/flashinfer_benchmark_utils.py
++++ b/benchmarks/routines/flashinfer_benchmark_utils.py
+@@ -626,8 +626,8 @@ routine_cc_to_supported_backends = {
+         "10.3": ["cutlass", "cute-dsl", "trtllm", "cudnn"],
+         "10.7": ["cutlass", "cute-dsl", "trtllm"],
+         "11.0": ["cutlass", "cudnn"],
+-        "12.0": ["cutlass", "cudnn"],
+-        "12.1": ["cutlass", "cudnn"],
++        "12.0": ["cutlass", "cute-dsl", "cudnn", "b12x"],
++        "12.1": ["cutlass", "cute-dsl", "cudnn", "b12x"],
+     },
+     "tinygemm_bf16": {
+         "7.5": [],
+diff --git a/benchmarks/routines/gemm.py b/benchmarks/routines/gemm.py
+index 78c9cfb7fe4d1207533490cf736a80b4247c7607..cca034eba444aa97c8eac439d96167a61a42a087 100644
+--- a/benchmarks/routines/gemm.py
++++ b/benchmarks/routines/gemm.py
+@@ -1850,6 +1850,7 @@ def testMmMxfp8(args):
+         "cute-dsl",
+         "trtllm",
+         "cudnn",
++        "b12x",
+         "auto",
+     ]
+     res = []
+@@ -1924,7 +1925,7 @@ def testMmMxfp8(args):
+         backend: str,
+         inputs: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
+     ) -> torch.Tensor:
+-        assert backend in ["cutlass", "trtllm", "cute-dsl", "cudnn", "auto"], (
++        assert backend in ["cutlass", "trtllm", "cute-dsl", "cudnn", "b12x", "auto"], (
+             f"Unsupported backend: {backend}"
+         )
+         input_mxfp8, mat2_mxfp8, input_scale, mat2_scale = inputs
+diff --git a/flashinfer/autotuner/autotuner.py b/flashinfer/autotuner/autotuner.py
+index 7902ab5d6b356e0d0c98eb5a9e3dcc306786724f..83b67a5ad0afc5d8fe322e17149a6495b6ed9e97 100644
+--- a/flashinfer/autotuner/autotuner.py
++++ b/flashinfer/autotuner/autotuner.py
+@@ -525,6 +525,16 @@ class TuningConfig:
+             lane views in the reusable A/B profiling arenas. Their contents are
+             staged once per profile even when they are not value-aware. Shared
+             read-only tensors may be omitted and retain one pointer.
++        timer (str | None): Per-operation timing implementation. ``"cupti"``
++            times each profiled call by its CUPTI kernel span (the
++            ``bench_gpu_time`` measurement), which ranks microsecond-scale
++            kernels that CUDA-event windows cannot resolve. Falls back to CUDA
++            events when cupti-python is unavailable. A ``MeasurementPolicy``
++            that pins a timer or eager execution takes precedence. ``None``
++            keeps the default.
++        first_tactic_margin (float): Keep the first tactic of ``runners[0]``
++            (by convention its untuned default) unless another candidate is
++            faster by more than this fraction. ``0.0`` selects the minimum.
+     """
+ 
+     dynamic_tensor_specs: tuple[DynamicTensorSpec, ...] = ()
+@@ -544,6 +554,8 @@ class TuningConfig:
+     # for inputs whose default tensor_initializer would be random
+     # (e.g. token_selected_experts in MoE workloads).
+     inputs_pre_hook: Callable | None = None
++    timer: str | None = None
++    first_tactic_margin: float = 0.0
+ 
+ 
+ class ValueProfileArena:
+@@ -2407,6 +2419,9 @@ class AutoTuner:
+                         min_time = float("inf")
+                         # Initialize runner and tactic as None in case of no valid tactic or runners are found
+                         runner_id, tactic = None, None
++                        first_choice = (
++                            None  # (time, tactic) of runners[0]'s first tactic
++                        )
+                         skipped_count = 0
+                         for r_id, r in enumerate(runners):
+                             runner_preparation_oom = False
+@@ -2528,10 +2543,21 @@ class AutoTuner:
+                                     # Set time_measured to inf to notify the failure of the tactic. This can happen when `get_valid_tactics` mistakenly return wrong tactics
+                                     # or some runtime error occurs during profiling.
+                                     time_measured = float("inf")
++                                if r_id == 0 and first_choice is None:
++                                    first_choice = (time_measured, tac)
+                                 if time_measured < min_time:
+                                     min_time = time_measured
+                                     runner_id, tactic = r_id, tac
+ 
++                        margin = tuning_config.first_tactic_margin
++                        if (
++                            margin > 0
++                            and first_choice is not None
++                            and first_choice[0] < float("inf")
++                            and min_time > first_choice[0] * (1.0 - margin)
++                        ):
++                            runner_id, tactic = 0, first_choice[1]
++
+                         if skipped_count > 0:
+                             logger.info(
+                                 f"[Autotuner]: Skipped {skipped_count} unsupported tactic(s) for {custom_op} "
+@@ -3033,9 +3059,17 @@ class AutoTuner:
+             # any other.  A CUPTI *infrastructure* failure (single-subscriber
+             # conflict) is not a tactic failure: fall back to the CUDA-event
+             # path for this and all later measurements.
++            # The op's timer applies unless the policy pins one (explicit
++            # timer or eager execution, which must include host cost).
++            requested_timer = tuning_config.timer
++            if measure_policy is not None and (
++                requested_timer is None
++                or measure_policy._timer != "auto"
++                or measure_policy.execution_mode == "eager"
++            ):
++                requested_timer = measure_policy.timer
+             use_cupti = (
+-                measure_policy is not None
+-                and measure_policy.timer == "cupti"
++                requested_timer == "cupti"
+                 and not self._cupti_disabled
+                 and _load_cupti() is not None
+             )
+@@ -3217,7 +3251,9 @@ class AutoTuner:
+                     runner(inputs, tactic=tactic, **kwargs)
+ 
+             spans_ms = _cupti_measure_spans(
+-                run_iteration, self.repeat, prologue=prologue
++                run_iteration,
++                self._get_profiling_repeat(tuning_config),
++                prologue=prologue,
+             )
+ 
+         # Median, not mean: robust to first-iteration instrumentation
+diff --git a/flashinfer/gemm/gemm_base.py b/flashinfer/gemm/gemm_base.py
+index 2e15e44a626f4c6499c9fe58bffd756a2288f053..654f31a2048ee3180d085dd87f404cbba4c49630 100644
+--- a/flashinfer/gemm/gemm_base.py
++++ b/flashinfer/gemm/gemm_base.py
+@@ -6009,12 +6009,14 @@ def _check_mm_mxfp8_problem_size(
+             f"K dimension mismatch in mm_mxfp8. got {a.shape[1]=}, {b.shape[0]=}"
+         )
+ 
+-    # The output may contain NaN/Inf if the dimensions are too small
+-    min_n = 128
++    # The output may contain NaN/Inf if the dimensions are too small. The SM12x
++    # cute-dsl kernels have no minimum N.
++    sm12x_cute_dsl = backend == "cute-dsl" and is_sm12x_supported(a.device)
++    min_n = 1 if sm12x_cute_dsl else 128
+     min_k = 128
+     if b.shape[1] < min_n or a.shape[1] < min_k:
+         raise ValueError(
+-            f"MXFP8 requires n >= {min_n} and k >= {min_k} for CUTLASS MXFP8. "
++            f"mm_mxfp8 requires n >= {min_n} and k >= {min_k}. "
+             f"got m={a.shape[0]}, n={b.shape[1]}, k={a.shape[1]}."
+         )
+ 
+@@ -6164,17 +6166,30 @@ def _trtllm_gemm_mxfp8_requirement(
+     return True
+ 
+ 
+-@supported_compute_capability([100, 103, 107])
++@supported_compute_capability([100, 103, 107, 120, 121])
+ def _cute_dsl_gemm_mxfp8_requirement(
+-    a: torch.Tensor,  # unused
+-    b: torch.Tensor,  # unused
++    a: torch.Tensor,
++    b: torch.Tensor,
+     a_descale: torch.Tensor,
+     b_descale: torch.Tensor,
+-    out: Optional[torch.Tensor] = None,  # unused
+-    out_dtype: torch.dtype = torch.bfloat16,  # unused
+-    use_8x4_sf_layout: bool = True,  # unused
+-    backend: Literal["cutlass", "cute-dsl", "auto"] = "auto",  # unused
++    out: Optional[torch.Tensor] = None,
++    out_dtype: torch.dtype = torch.bfloat16,
++    use_8x4_sf_layout: bool = True,
++    backend: Literal["cutlass", "cute-dsl", "auto"] = "auto",
+ ):
++    if is_sm12x_supported(a.device):
++        from .kernels.sm12x_mxfp8.runner import check_requirement
++
++        try:
++            _check_cute_dsl_availability()
++            _check_cute_dsl_arch(a.device)
++            return check_requirement(
++                a, b, a_descale, b_descale, out, out_dtype, use_8x4_sf_layout
++            )
++        except ValueError:
++            if backend != "cute-dsl":
++                return False
++            raise
+     # CuTe DSL MXFP8 path currently expects swizzled 1D block scales
+     # in F8_128x4 layout for both A and B.
+     if a_descale.ndim != 1 or b_descale.ndim != 1:
+@@ -6385,6 +6400,11 @@ def _cute_dsl_gemm_mxfp8_runner(
+     enable_pdl: bool,
+     out_dtype: torch.dtype,
+ ):
++    if sm_major == 12:
++        from .kernels.sm12x_mxfp8.runner import get_runner
++
++        return get_runner()
++
+     import cutlass
+ 
+     from .kernels.dense_blockscaled_gemm_sm100 import (
+@@ -6854,7 +6874,8 @@ def mm_mxfp8(
+ 
+     out: Optional[torch.Tensor]
+         Out tensor, shape (m, n), bf16 or fp16. If provided, the result is written
+-        into it (supported by the CUTLASS, cuDNN, b12x, and cutedsl_low_latency backends).
++        into it (supported by the CUTLASS, cuDNN, b12x, cutedsl_low_latency, and SM12x
++        cute-dsl backends).
+         Defaults to ``None``.
+ 
+     out_dtype: torch.dtype
+@@ -6873,7 +6894,17 @@ def mm_mxfp8(
+           small-M decode tiles. It requires CUDA 13+, nvidia-cutlass-dsl >=
+           4.6.0, 1D swizzled 128x4 scales, and K divisible by 128.
+         - The ``"cute-dsl"`` backend currently requires swizzled 1D scales
+-          (``mxfp8_quantize(..., is_sf_swizzled_layout=True)``).
++          (``mxfp8_quantize(..., is_sf_swizzled_layout=True)``). On
++          SM120/SM121 it requires CUDA 13+, ``K >= 128``, ``K % 32 == 0``, a
++          row-major ``a``, a column-major ``b`` (a contiguous [N, K] weight
++          transposed), 16-byte aligned tensors and BF16 or FP16 output; any
++          N >= 1 is accepted. It selects among GEMV, stream-K, persistent and
++          ping-pong kernels by M, N and K, or by the autotuner when tuning is
++          enabled. Calls on one device share a stream-K scratch buffer and
++          must be ordered on one stream. The kernels use programmatic
++          dependent launch and may read ``b`` and ``b_descale`` before waiting
++          on the previous kernel, so these must not be written by the kernel
++          launched immediately before on the same stream.
+         - The ``"cutedsl_low_latency"`` backend requires SM100/SM103, ``M <= 8``,
+           ``K % 128 == 0``, and swizzled 1D scales in the 128x4 layout.
+         - The ``"trtllm"`` requires b to be quantized with 128x4 swizzle layout and shuffled.
+@@ -6966,11 +6997,12 @@ def mm_mxfp8(
+ 
+     tuner = AutoTuner.get()
+ 
+-    tuning_config = (
+-        _MM_MXFP8_CUTE_DSL_TUNING_CONFIG
+-        if backends in (["cute-dsl"], ["cutedsl_low_latency"])
+-        else _MM_MXFP8_TUNING_CONFIG
+-    )
++    if backends == ["cute-dsl"] and major == 12:
++        tuning_config = _MM_MXFP8_SM12X_CUTE_DSL_TUNING_CONFIG
++    elif backends in (["cute-dsl"], ["cutedsl_low_latency"]):
++        tuning_config = _MM_MXFP8_CUTE_DSL_TUNING_CONFIG
++    else:
++        tuning_config = _MM_MXFP8_TUNING_CONFIG
+ 
+     inputs = [
+         a,
+@@ -8971,6 +9003,17 @@ _MM_MXFP8_CUTE_DSL_TUNING_CONFIG = replace(
+     use_cold_l2_cache=True,
+ )
+ 
++# The SM12x cute-dsl candidates include kernels of a few microseconds, which a
++# CUDA-event window around one graph replay cannot rank. Time them by CUPTI
++# kernel span instead, and keep the runner's feature default (listed first)
++# unless a candidate is clearly faster.
++_MM_MXFP8_SM12X_CUTE_DSL_TUNING_CONFIG = replace(
++    _MM_MXFP8_CUTE_DSL_TUNING_CONFIG,
++    timer="cupti",
++    profiling_repeat=30,
++    first_tactic_margin=0.03,
++)
++
+ 
+ @backend_requirement(
+     {
+diff --git a/flashinfer/gemm/kernels/sm12x_mxfp8/__init__.py b/flashinfer/gemm/kernels/sm12x_mxfp8/__init__.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..624a232a6dbef4ee33897a83f4af7e961c9b1f29
+--- /dev/null
++++ b/flashinfer/gemm/kernels/sm12x_mxfp8/__init__.py
+@@ -0,0 +1 @@
++"""SM120 / SM121 MXFP8 GEMM kernels behind ``mm_mxfp8(..., backend="cute-dsl")``."""
+diff --git a/flashinfer/gemm/kernels/sm12x_mxfp8/common.py b/flashinfer/gemm/kernels/sm12x_mxfp8/common.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..0a320a0361e06b5e156ce17d6907186b2a94f0c8
+--- /dev/null
++++ b/flashinfer/gemm/kernels/sm12x_mxfp8/common.py
+@@ -0,0 +1,33 @@
++# SPDX-FileCopyrightText: Copyright (c) 2026 by FlashInfer team.
++# SPDX-License-Identifier: Apache-2.0
++"""Layout arithmetic shared by the SM12x MXFP8 kernels and their host code."""
++
++# Bytes of one 128-row x 4-k32-block chunk of the F8_128x4 scale layout.
++SF_CHUNK = 512
++
++# Shared memory available to one CTA on SM120 / SM121.
++SMEM_BYTES = 99 * 1024
++
++
++def ceil_div(a, b):
++    return (a + b - 1) // b
++
++
++def sf_offset(row, kb, kt):
++    """Byte offset of the UE8M0 scale of (row, k32 block) in the F8_128x4 layout.
++
++    ``kt`` is the number of 4-block chunks per 128-row group (``ceil(K / 128)``).
++    Works on Python ints and on CuTe DSL integers.
++    """
++    return (
++        (row >> 7) * (kt * SF_CHUNK)
++        + (kb >> 2) * SF_CHUNK
++        + (row & 31) * 16
++        + ((row >> 5) & 3) * 4
++        + (kb & 3)
++    )
++
++
++def sf_bytes(rows, k):
++    """Size of the F8_128x4 scale buffer of a [rows, k] MXFP8 tensor."""
++    return ceil_div(rows, 128) * 128 * ceil_div(k // 32, 4) * 4
+diff --git a/flashinfer/gemm/kernels/sm12x_mxfp8/gemv.py b/flashinfer/gemm/kernels/sm12x_mxfp8/gemv.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..7f958efcb8bba680a656bf3eed6860f57360da55
+--- /dev/null
++++ b/flashinfer/gemm/kernels/sm12x_mxfp8/gemv.py
+@@ -0,0 +1,352 @@
++# SPDX-FileCopyrightText: Copyright (c) 2026 by FlashInfer team.
++# SPDX-License-Identifier: Apache-2.0
++"""CUDA-core MXFP8 GEMV for very small M on SM12x.
++
++out[M, N] = A[M, K] @ B[N, K]^T for M <= MB. Each CTA issues its first weight
++loads, then dequantizes A into shared memory as BF16. That is exact: an E4M3
++value times a power of two has at most four significant bits, so every
++product is exact in FP32 and the result matches an FP32-accumulated MXFP8
++GEMM up to summation order.
++
++A group of LPR lanes owns one weight row; each lane loads 16 contiguous bytes
++per step and every pair of lanes covers one 32-element scale block. Rows are
++dealt to warps round-robin and the next row group is in flight while the
++current one is consumed. With KSPL > 1, KSPL warps split one row group's K
++and sum their partials in shared memory in a fixed order. The first weight
++loads are issued before ``griddepcontrol.wait`` (programmatic dependent
++launch), so they overlap the kernel that produced A.
++"""
++
++import cutlass
++import cutlass.cute as cute
++import cutlass.utils
++
++from . import ptx
++from .common import sf_offset
++
++I32 = cutlass.Int32
++U32 = cutlass.Uint32
++F32 = cutlass.Float32
++
++
++@cute.jit
++def _load_rows(
++    rg,
++    i,
++    lane,
++    ksl,
++    mB,
++    mSFB,
++    wbuf,
++    sbuf,
++    N: cutlass.Constexpr,
++    K: cutlass.Constexpr,
++    LPR: cutlass.Constexpr,
++    KS: cutlass.Constexpr,
++    KSPL: cutlass.Constexpr,
++):
++    KT = (K // 32 + 3) // 4
++    KSL = K // KSPL
++    n = rg * (32 // LPR) + lane // LPR
++    if cutlass.const_expr(N % (32 // LPR) != 0):
++        n = ptx.imin(n, I32(N - 1))
++    lr = lane % LPR
++    for s in cutlass.range_constexpr(KS):
++        k = ksl * KSL + s * (LPR * 16) + lr * 16
++        live = True
++        if cutlass.const_expr(KSL % (LPR * 16) != 0 and s == KS - 1):
++            live = s * (LPR * 16) + lr * 16 < KSL
++        if live:
++            v0, v1, v2, v3 = ptx.ldg_nc_v4_stream(mB.iterator + (n * K + k))
++            wbuf[i, s, 0] = v0
++            wbuf[i, s, 1] = v1
++            wbuf[i, s, 2] = v2
++            wbuf[i, s, 3] = v3
++            sbuf[i, s] = ptx.ldg_nc_u8(mSFB.iterator + sf_offset(n, k // 32, KT))
++        else:
++            for v in cutlass.range_constexpr(4):
++                wbuf[i, s, v] = U32(0)
++            sbuf[i, s] = U32(0)
++
++
++@cute.jit
++def _consume_rows(
++    rg,
++    i,
++    lane,
++    warp,
++    ksl,
++    M,
++    sXv,
++    sR,
++    wbuf,
++    sbuf,
++    acc,
++    mC,
++    N: cutlass.Constexpr,
++    K: cutlass.Constexpr,
++    MB: cutlass.Constexpr,
++    LPR: cutlass.Constexpr,
++    KS: cutlass.Constexpr,
++    KSPL: cutlass.Constexpr,
++    F16: cutlass.Constexpr,
++    live_rg,
++):
++    KSL = K // KSPL
++    lr = lane % LPR
++    for m in cutlass.range_constexpr(MB):
++        acc[m] = F32(0.0)
++    wf = cute.make_rmem_tensor(cute.make_layout((16,)), F32)
++    xw = cute.make_rmem_tensor(cute.make_layout((8,)), I32)
++    for s in cutlass.range_constexpr(KS):
++        k = ksl * KSL + s * (LPR * 16) + lr * 16
++        live = True
++        if cutlass.const_expr(KSL % (LPR * 16) != 0 and s == KS - 1):
++            live = s * (LPR * 16) + lr * 16 < KSL
++        if live:
++            for v in cutlass.range_constexpr(4):
++                f0, f1, f2, f3 = ptx.e4m3x4_to_f32(wbuf[i, s, v])
++                wf[v * 4] = f0
++                wf[v * 4 + 1] = f1
++                wf[v * 4 + 2] = f2
++                wf[v * 4 + 3] = f3
++            wsc = ptx.pow2_e8m0(sbuf[i, s])
++            for m in cutlass.range_constexpr(MB):
++                cute.autovec_copy(sXv[(m * K + k) // 16, None], xw)
++                p0 = F32(0.0)
++                p1 = F32(0.0)
++                for z in cutlass.range_constexpr(4):
++                    a0 = ptx.bf16_lo(xw[z])
++                    a1 = ptx.bf16_hi(xw[z])
++                    b0 = ptx.bf16_lo(xw[4 + z])
++                    b1 = ptx.bf16_hi(xw[4 + z])
++                    p0 = p0 + wf[2 * z] * a0
++                    p0 = p0 + wf[2 * z + 1] * a1
++                    p1 = p1 + wf[8 + 2 * z] * b0
++                    p1 = p1 + wf[8 + 2 * z + 1] * b1
++                acc[m] = acc[m] + (p0 + p1) * wsc
++    n = rg * (32 // LPR) + lane // LPR
++    for m in cutlass.range_constexpr(MB):
++        v = acc[m]
++        for o in cutlass.range_constexpr(LPR.bit_length() - 1):
++            v = v + cute.arch.shuffle_sync_bfly(v, 1 << o)
++        acc[m] = v
++    if cutlass.const_expr(KSPL == 1):
++        if lr == 0 and n < N and live_rg:
++            for m in cutlass.range_constexpr(MB):
++                if m < M:
++                    ptx.stg_half(mC.iterator + (m * N + n), acc[m], F16)
++    else:
++        RG = 32 // LPR
++        if lr == 0:
++            for m in cutlass.range_constexpr(MB):
++                sR[(warp * RG + lane // LPR) * MB + m] = acc[m]
++        cute.arch.barrier()
++        if ksl == 0 and lr == 0 and n < N and live_rg:
++            for m in cutlass.range_constexpr(MB):
++                tot = F32(0.0)
++                for q in cutlass.range_constexpr(KSPL):
++                    tot = tot + sR[((warp + q) * RG + lane // LPR) * MB + m]
++                if m < M:
++                    ptx.stg_half(mC.iterator + (m * N + n), tot, F16)
++        cute.arch.barrier()
++
++
++@cute.jit
++def _stage_a(
++    q,
++    tidx,
++    M,
++    mA,
++    mSFA,
++    sXv,
++    d,
++    pk,
++    K: cutlass.Constexpr,
++    MB: cutlass.Constexpr,
++    W: cutlass.Constexpr,
++):
++    """Dequantize half a scale block (16 values) of A into shared memory."""
++    KB = K // 32
++    KT = (KB + 3) // 4
++    nh = MB * KB * 2
++    bi = q * (W * 32) + tidx
++    blk = bi // 2
++    half = bi % 2
++    m = blk // KB
++    kb = blk - m * KB
++    if bi < nh:
++        if m < M:
++            sx = ptx.ldg_nc_u8(mSFA.iterator + sf_offset(m, kb, KT))
++            u0, u1, u2, u3 = ptx.ldg_nc_v4(mA.iterator + (m * K + kb * 32 + half * 16))
++            for e, u in enumerate((u0, u1, u2, u3)):
++                f0, f1, f2, f3 = ptx.e4m3x4_to_f32(u)
++                d[e * 4] = f0
++                d[e * 4 + 1] = f1
++                d[e * 4 + 2] = f2
++                d[e * 4 + 3] = f3
++            sc = ptx.pow2_e8m0(sx)
++            for z2 in cutlass.range_constexpr(8):
++                pk[z2] = ptx.pack_half2(d[2 * z2] * sc, d[2 * z2 + 1] * sc)
++        else:
++            for z2 in cutlass.range_constexpr(8):
++                pk[z2] = I32(0)
++        r0 = (m * K + kb * 32) // 16 + half
++        for z in cutlass.range_constexpr(8):
++            sXv[r0, z] = pk[z]
++
++
++@cute.kernel
++def _gemv_kernel(
++    mA: cute.Tensor,
++    mSFA: cute.Tensor,
++    mB: cute.Tensor,
++    mSFB: cute.Tensor,
++    mC: cute.Tensor,
++    M: cutlass.Int32,
++    N: cutlass.Constexpr,
++    K: cutlass.Constexpr,
++    MB: cutlass.Constexpr,
++    LPR: cutlass.Constexpr,
++    W: cutlass.Constexpr,
++    G: cutlass.Constexpr,
++    KSPL: cutlass.Constexpr,
++    F16: cutlass.Constexpr,
++):
++    RG = 32 // LPR
++    NRG = (N + RG - 1) // RG
++    KS = (K // KSPL + LPR * 16 - 1) // (LPR * 16)
++    KB = K // 32
++    WG = W // KSPL
++    TW = G * WG
++
++    tidx, _, _ = cute.arch.thread_idx()
++    bx, _, _ = cute.arch.block_idx()
++    warp = tidx // 32
++    lane = tidx % 32
++    gw = bx * WG + warp // KSPL
++    ksl = warp % KSPL
++
++    smem = cutlass.utils.SmemAllocator()
++    sXp = smem.allocate_array(I32, MB * K // 2, byte_alignment=16)
++    sXv = cute.make_tensor(sXp, cute.make_layout((MB * K // 16, 8), stride=(8, 1)))
++    sRp = smem.allocate_array(F32, W * RG * MB, byte_alignment=16)
++    sR = cute.make_tensor(sRp, cute.make_layout((W * RG * MB,)))
++
++    wbuf = cute.make_rmem_tensor(cute.make_layout((2, KS, 4)), U32)
++    sbuf = cute.make_rmem_tensor(cute.make_layout((2, KS)), U32)
++    acc = cute.make_rmem_tensor(cute.make_layout((MB,)), F32)
++
++    if gw < NRG:
++        _load_rows(gw, 0, lane, ksl, mB, mSFB, wbuf, sbuf, N, K, LPR, KS, KSPL)
++    # Programmatic dependent launch: the weights above do not depend on the
++    # previous kernel; activations and outputs do.
++    cute.arch.griddepcontrol_wait()
++
++    nh = MB * KB * 2
++    d = cute.make_rmem_tensor(cute.make_layout((16,)), F32)
++    pk = cute.make_rmem_tensor(cute.make_layout((8,)), I32)
++    NQ = (nh + W * 32 - 1) // (W * 32)
++    if cutlass.const_expr(NQ <= 2):
++        for q in cutlass.range_constexpr(NQ):
++            _stage_a(q, tidx, M, mA, mSFA, sXv, d, pk, K, MB, W)
++    else:
++        for q in cutlass.range(NQ, unroll=1):
++            _stage_a(q, tidx, M, mA, mSFA, sXv, d, pk, K, MB, W)
++    cute.arch.barrier()
++    cute.arch.griddepcontrol_launch_dependents()
++
++    # With a K split the trip count must be uniform across the CTA (the
++    # reduction has barriers); otherwise each warp walks only its own rows.
++    if cutlass.const_expr(KSPL > 1):
++        # imin hides the constant from the compiler: with a compile-time trip
++        # count the loop below is fully unrolled despite unroll=1, and spills.
++        nloc = ptx.imin(I32((NRG + TW - 1) // TW), I32((NRG + TW - 1) // TW))
++    else:
++        nloc = (NRG - gw + TW - 1) // TW
++    for it2 in cutlass.range((nloc + 1) // 2, unroll=1):
++        for hb in cutlass.range_constexpr(2):
++            it = it2 * 2 + hb
++            if it < nloc:
++                rg = gw + it * TW
++                if rg + TW < NRG:
++                    _load_rows(
++                        rg + TW,
++                        1 - hb,
++                        lane,
++                        ksl,
++                        mB,
++                        mSFB,
++                        wbuf,
++                        sbuf,
++                        N,
++                        K,
++                        LPR,
++                        KS,
++                        KSPL,
++                    )
++                _consume_rows(
++                    rg,
++                    hb,
++                    lane,
++                    warp,
++                    ksl,
++                    M,
++                    sXv,
++                    sR,
++                    wbuf,
++                    sbuf,
++                    acc,
++                    mC,
++                    N,
++                    K,
++                    MB,
++                    LPR,
++                    KS,
++                    KSPL,
++                    F16,
++                    rg < NRG,
++                )
++
++
++class Sm12xMxfp8Gemv:
++    """Host wrapper; ``__call__(a, sfa, b, sfb, c)`` with runtime M <= ``mb``."""
++
++    def __init__(self, n, k, mb, lpr, warps, grid, k_split, out_f16=False):
++        self.n, self.k = n, k
++        self.mb, self.lpr, self.warps, self.grid = mb, lpr, warps, grid
++        self.k_split = k_split
++        self.out_f16 = out_f16
++
++    @cute.jit
++    def __call__(
++        self,
++        mA: cute.Tensor,
++        mSFA: cute.Tensor,
++        mB: cute.Tensor,
++        mSFB: cute.Tensor,
++        mC: cute.Tensor,
++        stream,
++    ):
++        m = cute.size(mA, mode=[0])
++        _gemv_kernel(
++            mA,
++            mSFA,
++            mB,
++            mSFB,
++            mC,
++            m,
++            self.n,
++            self.k,
++            self.mb,
++            self.lpr,
++            self.warps,
++            self.grid,
++            self.k_split,
++            self.out_f16,
++        ).launch(
++            grid=[self.grid, 1, 1],
++            block=[32 * self.warps, 1, 1],
++            stream=stream,
++            use_pdl=True,
++        )
+diff --git a/flashinfer/gemm/kernels/sm12x_mxfp8/persistent.py b/flashinfer/gemm/kernels/sm12x_mxfp8/persistent.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..3f7aaabde5e8b0adb58afb4171cdef050b40b25d
+--- /dev/null
++++ b/flashinfer/gemm/kernels/sm12x_mxfp8/persistent.py
+@@ -0,0 +1,960 @@
++# SPDX-FileCopyrightText: Copyright (c) 2026 by FlashInfer team.
++# SPDX-License-Identifier: Apache-2.0
++"""Persistent warp-specialized MXFP8 GEMM for SM12x (small and mid M).
++
++out[M, N] = A[M, K] @ B[N, K]^T, both K-major E4M3 with UE8M0 scales in the
++F8_128x4 layout, read as given.
++
++- One producer thread. A and B have separate shared-memory rings (SA and SB
++  stages) with their own full/empty mbarriers, so the DRAM-streamed weights
++  can run further ahead than the activations, which the producers first pull
++  into L2 with bulk prefetches split over the grid. Launched with
++  programmatic dependent launch: launch and barrier setup overlap the previous
++  kernel (typically the activation quantization), and all global memory
++  traffic follows ``griddepcontrol.wait``. Operands use TMA with 128B
++  swizzle; each stage's 512-byte scale chunks use a 1D bulk copy.
++- WM x WN consumer warps: ldmatrix + ``mma.sync.m16n8k32`` block-scaled. A
++  32-bit scale word holds the four k32 scales of one row of a 128-wide chunk.
++  The next stage's scales and first fragments are loaded before the current
++  stage's last MMAs.
++- Persistent schedule: data-parallel tiles, then an optional stream-K region
++  of ``sk_tiles`` tiles whose K iterations are split evenly over the grid.
++  Every contributor stores its partial tile to its own FP32 slot; the CTA that
++  completes the tile's K iterations sums the slots in CTA order (deterministic)
++  and stores the result.
++
++M, the grid size and ``sk_tiles`` are runtime values; N, K and the tile
++configuration are compile-time. The stream-K decomposition follows the CUTLASS
++stream-K scheduler (data-parallel waves plus a split remainder).
++"""
++
++import cutlass
++import cutlass.cute as cute
++from cutlass import Float32, Int32, Int64
++from cutlass.cute.nvgpu import cpasync
++from cutlass.utils import SmemAllocator
++
++from . import ptx
++from .common import SF_CHUNK, SMEM_BYTES, ceil_div
++
++# Per stage: full and empty mbarriers (counted at 16 bytes each). Fixed: the
++# stream-K flag and alignment slack.
++_STAGE_BARRIER_BYTES = 32
++_FIXED_BYTES = 16 + 2048
++
++
++def scale_chunks(bn):
++    """128-row weight scale chunks of a BN-row tile (BN divides or is a
++    multiple of 128, so a tile never straddles two chunks)."""
++    assert 128 % bn == 0 or bn % 128 == 0
++    return max(1, bn // 128)
++
++
++def stage_bytes(bm, bn, ks, kw):
++    """(A stage, B stage) shared-memory bytes."""
++    return ks * (bm * kw + SF_CHUNK), ks * (bn * kw + SF_CHUNK * scale_chunks(bn))
++
++
++def smem_bytes(bm, bn, ks, kw, sa, sb):
++    a, b = stage_bytes(bm, bn, ks, kw)
++    return sa * a + sb * b + _STAGE_BARRIER_BYTES * (sa + sb) + _FIXED_BYTES
++
++
++def max_b_stages(bm, bn, ks, kw, sa):
++    """Most weight stages that fit next to ``sa`` activation stages."""
++    a, b = stage_bytes(bm, bn, ks, kw)
++    free = SMEM_BYTES - _FIXED_BYTES - sa * (a + _STAGE_BARRIER_BYTES)
++    return free // (b + _STAGE_BARRIER_BYTES)
++
++
++class Sm12xMxfp8Persistent:
++    """Host wrapper; ``__call__(a, b, sfa, sfb, c, partials, counters, grid, sk_tiles)``.
++
++    BM x BN CTA tile, WM x WN consumer warps, KW the K box width in bytes
++    (128), KS boxes per stage, SB weight stages and SA activation stages.
++    """
++
++    def __init__(self, n, k, bm, bn, wm, wn, ks, sb, kw, sa, streamk, out_f16=False):
++        self.N, self.K = n, k
++        self.out_f16 = out_f16
++        # Data-parallel kernels are compiled without the stream-K fixup.
++        self.streamk = streamk
++        self.BM, self.BN, self.WM, self.WN, self.KS = bm, bn, wm, wn, ks
++        self.SB, self.SA, self.KW = sb, sa, kw
++        assert kw == 128
++        assert 1 <= sa <= sb
++        self.CW = wm * wn
++        self.CT = self.CW * 32
++        self.TM = bm // wm
++        self.TN = bn // wn
++        assert self.TM % 16 == 0 and self.TN % 16 == 0
++        assert bm in (32, 64, 128) and bn % 16 == 0 and 32 <= bn <= 256
++        self.MI = self.TM // 16
++        self.NI = self.TN // 8
++        self.NK = kw // 32
++        self.Kc = ceil_div(k, 128)
++        self.Kb = ceil_div(k, kw)
++        self.KI = ceil_div(self.Kb, ks)
++        self.NBC = scale_chunks(bn)
++        self.n_sf_rows_b = ceil_div(n, 128)
++        self.tiles_n = ceil_div(n, bn)
++        self.B_BYTES = bn * kw
++        self.A_BYTES = bm * kw
++        self.ACC = self.MI * self.NI * 4
++        self.threads = (self.CW + 1) * 32
++        self.smem_bytes = smem_bytes(bm, bn, ks, kw, sa, sb)
++        assert self.smem_bytes <= SMEM_BYTES
++
++    # ------------------------------------------------------------------ host
++    @cute.jit
++    def __call__(
++        self,
++        a: cute.Tensor,
++        b: cute.Tensor,
++        sfa: cute.Tensor,
++        sfb: cute.Tensor,
++        out: cute.Tensor,
++        ws: cute.Tensor,
++        cnt: cute.Tensor,
++        grid: Int32,
++        sk_tiles: Int32,
++        stream,
++    ):
++        KW = self.KW
++        m = cute.size(a, mode=[0])
++        lb = cute.make_composed_layout(
++            self.swizzle(), 0, cute.make_layout((self.BN, KW), stride=(KW, 1))
++        )
++        atom_b, tb = cpasync.make_tiled_tma_atom(
++            cpasync.CopyBulkTensorTileG2SOp(), b, lb, (self.BN, KW)
++        )
++        la = cute.make_composed_layout(
++            self.swizzle(), 0, cute.make_layout((self.BM, KW), stride=(KW, 1))
++        )
++        atom_a, ta = cpasync.make_tiled_tma_atom(
++            cpasync.CopyBulkTensorTileG2SOp(), a, la, (self.BM, KW)
++        )
++        self.kernel(
++            atom_a, ta, atom_b, tb, a, sfa, sfb, out, ws, cnt, m, sk_tiles
++        ).launch(
++            grid=(grid, 1, 1),
++            block=(self.threads, 1, 1),
++            smem=self.smem_bytes,
++            stream=stream,
++            use_pdl=True,
++        )
++
++    def swizzle(self):
++        return cute.make_swizzle(3, 4, 3)
++
++    def swz_row(self, row):
++        """16-byte chunk XOR term of the 128B TMA swizzle for a K-major row."""
++        return row % 8
++
++    # ---------------------------------------------------------------- device
++    @cute.kernel
++    def kernel(
++        self,
++        atom_a: cute.CopyAtom,
++        ta: cute.Tensor,
++        atom_b: cute.CopyAtom,
++        tb: cute.Tensor,
++        a: cute.Tensor,
++        sfa: cute.Tensor,
++        sfb: cute.Tensor,
++        out: cute.Tensor,
++        ws: cute.Tensor,
++        cnt: cute.Tensor,
++        M: Int32,
++        sk_tiles: Int32,
++    ):
++        BM, BN, KS, SA, SB, KW = self.BM, self.BN, self.KS, self.SA, self.SB, self.KW
++        tx, _, _ = cute.arch.thread_idx()
++        bid, _, _ = cute.arch.block_idx()
++        G, _, _ = cute.arch.grid_dim()
++        warp = tx // 32
++        lane = tx % 32
++
++        smem = SmemAllocator()
++        sA = smem.allocate_tensor(
++            cutlass.Uint8,
++            cute.make_layout((SA * KS * self.A_BYTES,)),
++            byte_alignment=1024,
++        )
++        sB = smem.allocate_tensor(
++            cutlass.Uint8,
++            cute.make_layout((SB * KS * self.B_BYTES,)),
++            byte_alignment=1024,
++        )
++        sSA = smem.allocate_tensor(
++            cutlass.Uint8, cute.make_layout((SA * KS * SF_CHUNK,)), byte_alignment=128
++        )
++        sSB = smem.allocate_tensor(
++            cutlass.Uint8,
++            cute.make_layout((SB * KS * self.NBC * SF_CHUNK,)),
++            byte_alignment=128,
++        )
++        fullA = smem.allocate_array(cutlass.Int64, SA, byte_alignment=8)
++        emptyA = smem.allocate_array(cutlass.Int64, SA, byte_alignment=8)
++        fullB = smem.allocate_array(cutlass.Int64, SB, byte_alignment=8)
++        emptyB = smem.allocate_array(cutlass.Int64, SB, byte_alignment=8)
++        flag = smem.allocate_tensor(Int32, cute.make_layout((4,)), byte_alignment=16)
++
++        swz = self.swizzle()
++        b_view = cute.make_tensor(
++            cute.recast_ptr(sB.iterator, swz, dtype=cutlass.Uint8),
++            cute.make_layout((BN, KW, SB * KS), stride=(KW, 1, self.B_BYTES)),
++        )
++        gB = cute.local_tile(tb, (BN, KW), (None, None))
++        tBs, tBg = cpasync.tma_partition(
++            atom_b,
++            0,
++            cute.make_layout(1),
++            cute.group_modes(b_view, 0, 2),
++            cute.group_modes(gB, 0, 2),
++        )
++        a_view = cute.make_tensor(
++            cute.recast_ptr(sA.iterator, swz, dtype=cutlass.Uint8),
++            cute.make_layout((BM, KW, SA * KS), stride=(KW, 1, self.A_BYTES)),
++        )
++        gA = cute.local_tile(ta, (BM, KW), (None, None))
++        tAs, tAg = cpasync.tma_partition(
++            atom_a,
++            0,
++            cute.make_layout(1),
++            cute.group_modes(a_view, 0, 2),
++            cute.group_modes(gA, 0, 2),
++        )
++
++        if tx == 0:
++            for s in cutlass.range_constexpr(SA):
++                cute.arch.mbarrier_init(fullA + s, 1)
++                cute.arch.mbarrier_init(emptyA + s, self.CW)
++            for s in cutlass.range_constexpr(SB):
++                cute.arch.mbarrier_init(fullB + s, 1)
++                cute.arch.mbarrier_init(emptyB + s, self.CW)
++            cute.arch.mbarrier_init_fence()
++            cpasync.prefetch_descriptor(atom_a)
++            cpasync.prefetch_descriptor(atom_b)
++        cute.arch.sync_threads()
++
++        tiles_m = (M + BM - 1) // BM
++        T = tiles_m * self.tiles_n
++        dp_tiles = T - sk_tiles
++        SI = sk_tiles * self.KI
++        sk_a = (bid * SI) // G
++        sk_b = ((bid + 1) * SI) // G
++        n_dp = Int32(0)
++        if bid < dp_tiles:
++            n_dp = (dp_tiles - bid + G - 1) // G
++        total = n_dp * self.KI + (sk_b - sk_a)
++
++        if warp == self.CW:
++            if lane == 0:
++                self.producer(
++                    a,
++                    M,
++                    atom_a,
++                    tAs,
++                    tAg,
++                    atom_b,
++                    tBs,
++                    tBg,
++                    sfa,
++                    sfb,
++                    sSA,
++                    sSB,
++                    fullA,
++                    emptyA,
++                    fullB,
++                    emptyB,
++                    bid,
++                    G,
++                    tiles_m,
++                    dp_tiles,
++                    n_dp,
++                    sk_a,
++                    total,
++                )
++        else:
++            cute.arch.griddepcontrol_wait()
++            self.consumer(
++                sA,
++                sB,
++                sSA,
++                sSB,
++                fullA,
++                emptyA,
++                fullB,
++                emptyB,
++                flag,
++                out,
++                ws,
++                cnt,
++                M,
++                tx,
++                warp,
++                lane,
++                bid,
++                G,
++                tiles_m,
++                dp_tiles,
++                sk_a,
++                sk_b,
++            )
++
++    # ---------------------------------------------------------- schedule
++    @cute.jit
++    def locate(self, q, bid, G, dp_tiles, n_dp, sk_a):
++        """Tile and K iteration of this CTA's q-th pipeline iteration."""
++        tile = bid + (q // self.KI) * G
++        kk = q % self.KI
++        if q >= n_dp * self.KI:
++            it = sk_a + (q - n_dp * self.KI)
++            tile = dp_tiles + it // self.KI
++            kk = it % self.KI
++        return tile, kk
++
++    @cute.jit
++    def next_piece(self, t, it, G, dp_tiles, sk_b):
++        """Advance the per-CTA piece iterator. Returns (tile, k0, k1, t, it)."""
++        tile = t
++        k0 = Int32(0)
++        k1 = Int32(self.KI)
++        if t < dp_tiles:
++            t = t + G
++        else:
++            tl = it // self.KI
++            k0 = it - tl * self.KI
++            k1 = cutlass.min(Int32(self.KI), k0 + (sk_b - it))
++            tile = dp_tiles + tl
++            it = it + (k1 - k0)
++        return tile, k0, k1, t, it
++
++    @cute.jit
++    def stage_k(self, kk):
++        """(first box, valid boxes) of iteration kk; box i uses scale chunk i."""
++        kc0 = kk * self.KS
++        nkc = cutlass.min(Int32(self.KS), Int32(self.Kb) - kc0)
++        return kc0, nkc
++
++    # ----------------------------------------------------------- producer
++    @cute.jit
++    def issue_b(
++        self,
++        atom_b,
++        tBs,
++        tBg,
++        sfb,
++        sSB,
++        fullB,
++        emptyB,
++        q,
++        bid,
++        G,
++        tiles_m,
++        dp_tiles,
++        n_dp,
++        sk_a,
++    ):
++        KS, SB = self.KS, self.SB
++        s = q % SB
++        if q >= SB:
++            cute.arch.mbarrier_wait(emptyB + s, (q // SB - 1) % 2)
++        tile, kk = self.locate(q, bid, G, dp_tiles, n_dp, sk_a)
++        nt = tile // tiles_m
++        sfb_row = (nt * self.BN) // 128
++        nbc = cutlass.min(Int32(self.NBC), Int32(self.n_sf_rows_b) - sfb_row)
++        kc0, nkc = self.stage_k(kk)
++        cute.arch.mbarrier_arrive_and_expect_tx(
++            fullB + s, nkc * (self.B_BYTES + SF_CHUNK * nbc)
++        )
++        for c in cutlass.range_constexpr(self.NBC):
++            if c < nbc:
++                ptx.bulk_g2s(
++                    (sSB.iterator + (s * self.NBC + c) * KS * SF_CHUNK).toint(),
++                    (sfb.iterator + ((sfb_row + c) * self.Kc + kc0) * SF_CHUNK).toint(),
++                    nkc * SF_CHUNK,
++                    (fullB + s).toint(),
++                )
++        for ks in cutlass.range_constexpr(KS):
++            if ks < nkc:
++                cute.copy(
++                    atom_b,
++                    tBg[None, nt, kc0 + ks],
++                    tBs[None, s * KS + ks],
++                    tma_bar_ptr=fullB + s,
++                )
++
++    @cute.jit
++    def issue_a(
++        self,
++        atom_a,
++        tAs,
++        tAg,
++        sfa,
++        sSA,
++        fullA,
++        emptyA,
++        q,
++        bid,
++        G,
++        tiles_m,
++        dp_tiles,
++        n_dp,
++        sk_a,
++    ):
++        KS, SA = self.KS, self.SA
++        s = q % SA
++        if q >= SA:
++            cute.arch.mbarrier_wait(emptyA + s, (q // SA - 1) % 2)
++        tile, kk = self.locate(q, bid, G, dp_tiles, n_dp, sk_a)
++        mt = tile % tiles_m
++        kc0, nkc = self.stage_k(kk)
++        sfa_row = (mt * self.BM) // 128
++        cute.arch.mbarrier_arrive_and_expect_tx(
++            fullA + s, nkc * (self.A_BYTES + SF_CHUNK)
++        )
++        ptx.bulk_g2s(
++            (sSA.iterator + s * KS * SF_CHUNK).toint(),
++            (sfa.iterator + (sfa_row * self.Kc + kc0) * SF_CHUNK).toint(),
++            nkc * SF_CHUNK,
++            (fullA + s).toint(),
++        )
++        for ks in cutlass.range_constexpr(KS):
++            if ks < nkc:
++                cute.copy(
++                    atom_a,
++                    tAg[None, mt, kc0 + ks],
++                    tAs[None, s * KS + ks],
++                    tma_bar_ptr=fullA + s,
++                )
++
++    @cute.jit
++    def prefetch_a(self, a, sfa, M, bid, G):
++        """Pull the activations and their scales into L2, split over the grid.
++
++        The activation ring is only SA stages deep, so with A still in DRAM
++        every refill would expose a full DRAM round trip.
++        """
++        nbytes = M * self.K
++        step = ((nbytes + G - 1) // G + 15) // 16 * 16
++        lo = bid * step
++        if lo < nbytes:
++            ptx.bulk_prefetch_l2(
++                (a.iterator + lo).toint(), cutlass.min(step, nbytes - lo)
++            )
++        sf_bytes = cutlass.min(
++            ((M + 127) // 128) * self.Kc * SF_CHUNK, cute.size(sfa) // 16 * 16
++        )
++        if bid == G - 1 and sf_bytes > 0:
++            ptx.bulk_prefetch_l2(sfa.iterator.toint(), sf_bytes)
++
++    @cute.jit
++    def producer(
++        self,
++        a,
++        M,
++        atom_a,
++        tAs,
++        tAg,
++        atom_b,
++        tBs,
++        tBg,
++        sfa,
++        sfb,
++        sSA,
++        sSB,
++        fullA,
++        emptyA,
++        fullB,
++        emptyB,
++        bid,
++        G,
++        tiles_m,
++        dp_tiles,
++        n_dp,
++        sk_a,
++        total,
++    ):
++        """Single thread. Weight stages run SB - SA iterations ahead of activations.
++
++        Everything waits for the previous grid (``griddepcontrol.wait``), and
++        the activation prefetch is issued before the first weight load:
++        weight traffic queued ahead of it would delay the first MMA.
++        """
++        cute.arch.griddepcontrol_wait()
++        self.prefetch_a(a, sfa, M, bid, G)
++        L = self.SB - self.SA
++        for qb in range(cutlass.min(Int32(L), total)):
++            self.issue_b(
++                atom_b,
++                tBs,
++                tBg,
++                sfb,
++                sSB,
++                fullB,
++                emptyB,
++                qb,
++                bid,
++                G,
++                tiles_m,
++                dp_tiles,
++                n_dp,
++                sk_a,
++            )
++        for q in range(total):
++            if q + L < total:
++                self.issue_b(
++                    atom_b,
++                    tBs,
++                    tBg,
++                    sfb,
++                    sSB,
++                    fullB,
++                    emptyB,
++                    q + L,
++                    bid,
++                    G,
++                    tiles_m,
++                    dp_tiles,
++                    n_dp,
++                    sk_a,
++                )
++            self.issue_a(
++                atom_a,
++                tAs,
++                tAg,
++                sfa,
++                sSA,
++                fullA,
++                emptyA,
++                q,
++                bid,
++                G,
++                tiles_m,
++                dp_tiles,
++                n_dp,
++                sk_a,
++            )
++        cute.arch.griddepcontrol_launch_dependents()
++
++    # ----------------------------------------------------------- consumer
++    @cute.jit
++    def wait_stage(self, fullA, fullB, q):
++        cute.arch.mbarrier_wait(fullB + q % self.SB, (q // self.SB) % 2)
++        cute.arch.mbarrier_wait(fullA + q % self.SA, (q // self.SA) % 2)
++
++    @cute.jit
++    def release_stage(self, emptyA, emptyB, q, lane):
++        cute.arch.sync_warp()
++        if lane == 0:
++            cute.arch.mbarrier_arrive(emptyA + q % self.SA)
++            cute.arch.mbarrier_arrive(emptyB + q % self.SB)
++
++    @cute.jit
++    def load_sf(self, sfa_w, sfb_w, sSA, sSB, q, ks, moff, noff, wm, wn, g, lane):
++        KS = self.KS
++        MI, NI, TM, TN = self.MI, self.NI, self.TM, self.TN
++        sa = q % self.SA
++        sb = q % self.SB
++        for mi in cutlass.range_constexpr(MI):
++            r = moff + wm * TM + mi * 16 + g + (lane % 2) * 8
++            sfa_w[mi] = ptx.lds_u32(
++                sSA.iterator.toint()
++                + (sa * KS + ks) * SF_CHUNK
++                + ((r % 32) * 4 + r // 32) * 4
++            )
++        for ni in cutlass.range_constexpr(NI):
++            r = noff + wn * TN + ni * 8 + g
++            sfb_w[ni] = ptx.lds_u32(
++                sSB.iterator.toint()
++                + ((sb * self.NBC + r // 128) * KS + ks) * SF_CHUNK
++                + (((r % 32) * 4 + (r % 128) // 32) * 4)
++            )
++
++    def load_frags(self, a_st, b_st, kb, a_row0, a_ch, b_row0, b_ch):
++        KW = self.KW
++        af = []
++        for mi in range(self.MI):
++            row = a_row0 + mi * 16
++            ch = (kb * 2 + a_ch) ^ self.swz_row(row)
++            af.append(ptx.ldsm_x4(a_st + row * KW + ch * 16))
++        bf = []
++        for nj in range(self.NI // 2):
++            row = b_row0 + nj * 16
++            ch = (kb * 2 + b_ch) ^ self.swz_row(row)
++            bf.append(ptx.ldsm_x4(b_st + row * KW + ch * 16))
++        return af, bf
++
++    def mma_step(self, acc, af, bf, sfa_w, sfb_w, kb):
++        MI, NI = self.MI, self.NI
++        for mi in range(MI):
++            for ni in range(NI):
++                bb = bf[ni // 2]
++                b0 = bb[0] if ni % 2 == 0 else bb[2]
++                b1 = bb[1] if ni % 2 == 0 else bb[3]
++                i = (mi * NI + ni) * 4
++                d0, d1, d2, d3 = ptx.mma_mxf8(
++                    af[mi][0],
++                    af[mi][1],
++                    af[mi][2],
++                    af[mi][3],
++                    b0,
++                    b1,
++                    acc[i],
++                    acc[i + 1],
++                    acc[i + 2],
++                    acc[i + 3],
++                    sfa_w[mi],
++                    sfb_w[ni],
++                    kb,
++                    kb,
++                )
++                acc[i] = d0
++                acc[i + 1] = d1
++                acc[i + 2] = d2
++                acc[i + 3] = d3
++
++    def frags_to_reg(self, fr, af, bf):
++        n = 0
++        for t in af + bf:
++            for v in t:
++                fr[n] = v
++                n += 1
++
++    def frags_from_reg(self, fr):
++        af = [tuple(fr[4 * mi + j] for j in range(4)) for mi in range(self.MI)]
++        o = 4 * self.MI
++        bf = [tuple(fr[o + 4 * nj + j] for j in range(4)) for nj in range(self.NI // 2)]
++        return af, bf
++
++    def unit_addr(self, sA, sB, q, ks):
++        a_st = sA.iterator.toint() + ((q % self.SA) * self.KS + ks) * self.A_BYTES
++        b_st = sB.iterator.toint() + ((q % self.SB) * self.KS + ks) * self.B_BYTES
++        return a_st, b_st
++
++    @cute.jit
++    def mainloop(
++        self,
++        acc,
++        sfa_w,
++        sfb_w,
++        sfa_n,
++        sfb_n,
++        fr,
++        sA,
++        sB,
++        sSA,
++        sSB,
++        fullA,
++        emptyA,
++        fullB,
++        emptyB,
++        q,
++        k0,
++        k1,
++        moff,
++        noff,
++        wm,
++        wn,
++        g,
++        lane,
++        a_row0,
++        a_ch,
++        b_row0,
++        b_ch,
++    ):
++        """Iterations [k0, k1) of one tile."""
++        KS, NK = self.KS, self.NK
++        self.wait_stage(fullA, fullB, q)
++        self.load_sf(sfa_w, sfb_w, sSA, sSB, q, 0, moff, noff, wm, wn, g, lane)
++        a0, b0 = self.unit_addr(sA, sB, q, 0)
++        af0, bf0 = self.load_frags(a0, b0, 0, a_row0, a_ch, b_row0, b_ch)
++        self.frags_to_reg(fr, af0, bf0)
++        for kk in range(k0, k1):
++            for ks in cutlass.range_constexpr(KS):
++                a_st, b_st = self.unit_addr(sA, sB, q, ks)
++                if cutlass.const_expr(ks > 0):
++                    self.load_sf(
++                        sfa_w, sfb_w, sSA, sSB, q, ks, moff, noff, wm, wn, g, lane
++                    )
++                    af, bf = self.load_frags(a_st, b_st, 0, a_row0, a_ch, b_row0, b_ch)
++                else:
++                    af, bf = self.frags_from_reg(fr)
++                for kb in cutlass.range_constexpr(NK):
++                    last = (ks == KS - 1) and (kb == NK - 1)
++                    if cutlass.const_expr(kb + 1 < NK):
++                        naf, nbf = self.load_frags(
++                            a_st, b_st, kb + 1, a_row0, a_ch, b_row0, b_ch
++                        )
++                    if cutlass.const_expr(last):
++                        self.release_stage(emptyA, emptyB, q, lane)
++                        if kk + 1 < k1:
++                            self.wait_stage(fullA, fullB, q + 1)
++                            self.load_sf(
++                                sfa_n,
++                                sfb_n,
++                                sSA,
++                                sSB,
++                                q + 1,
++                                0,
++                                moff,
++                                noff,
++                                wm,
++                                wn,
++                                g,
++                                lane,
++                            )
++                            pa, pb = self.unit_addr(sA, sB, q + 1, 0)
++                            paf, pbf = self.load_frags(
++                                pa, pb, 0, a_row0, a_ch, b_row0, b_ch
++                            )
++                            self.frags_to_reg(fr, paf, pbf)
++                    if cutlass.const_expr(ks == 0 or self.Kb % KS == 0):
++                        self.mma_step(acc, af, bf, sfa_w, sfb_w, kb)
++                    else:
++                        if kk * KS + ks < self.Kb:
++                            self.mma_step(acc, af, bf, sfa_w, sfb_w, kb)
++                    if cutlass.const_expr(kb + 1 < NK):
++                        af, bf = naf, nbf
++            if kk + 1 < k1:
++                for mi in cutlass.range_constexpr(self.MI):
++                    sfa_w[mi] = sfa_n[mi]
++                for ni in cutlass.range_constexpr(self.NI):
++                    sfb_w[ni] = sfb_n[ni]
++            q = q + 1
++        return q
++
++    @cute.jit
++    def consumer(
++        self,
++        sA,
++        sB,
++        sSA,
++        sSB,
++        fullA,
++        emptyA,
++        fullB,
++        emptyB,
++        flag,
++        out,
++        ws,
++        cnt,
++        M,
++        tx,
++        warp,
++        lane,
++        bid,
++        G,
++        tiles_m,
++        dp_tiles,
++        sk_a,
++        sk_b,
++    ):
++        BM, BN = self.BM, self.BN
++        MI, NI, TM, TN = self.MI, self.NI, self.TM, self.TN
++        wm = warp // self.WN
++        wn = warp % self.WN
++        g = lane // 4
++        tq = lane % 4
++        acc = cute.make_rmem_tensor((self.ACC,), Float32)
++        sfa_w = cute.make_rmem_tensor((MI,), Int32)
++        sfb_w = cute.make_rmem_tensor((NI,), Int32)
++        sfa_n = cute.make_rmem_tensor((MI,), Int32)
++        sfb_n = cute.make_rmem_tensor((NI,), Int32)
++        fr = cute.make_rmem_tensor((4 * MI + 4 * (NI // 2),), Int32)
++        # ldmatrix row and 16-byte chunk (before swizzling) of this lane
++        a_row0 = wm * TM + lane % 16
++        a_ch = lane // 16
++        b_row0 = wn * TN + lane % 8 + (lane // 16) * 8
++        b_ch = (lane // 8) % 2
++        q = Int32(0)
++        t = bid
++        it = sk_a
++        while (t < dp_tiles) | (it < sk_b):
++            tile, k0, k1, t, it = self.next_piece(t, it, G, dp_tiles, sk_b)
++            mt = tile % tiles_m
++            nt = tile // tiles_m
++            moff = (mt * BM) % 128
++            noff = (nt * BN) % 128
++            acc.fill(0.0)
++            q = self.mainloop(
++                acc,
++                sfa_w,
++                sfb_w,
++                sfa_n,
++                sfb_n,
++                fr,
++                sA,
++                sB,
++                sSA,
++                sSB,
++                fullA,
++                emptyA,
++                fullB,
++                emptyB,
++                q,
++                k0,
++                k1,
++                moff,
++                noff,
++                wm,
++                wn,
++                g,
++                lane,
++                a_row0,
++                a_ch,
++                b_row0,
++                b_ch,
++            )
++            m0 = mt * BM
++            n0 = nt * BN
++            if cutlass.const_expr(self.streamk):
++                if k0 == 0 and k1 == self.KI:
++                    self.store_tile(acc, out, M, m0, n0, wm, wn, g, tq)
++                else:
++                    # Each contributor stores its partial in its own slot; the CTA
++                    # completing the tile's K iterations sums them in CTA order.
++                    tl = tile - dp_tiles
++                    SI = (tiles_m * self.tiles_n - dp_tiles) * self.KI
++                    first_it = tl * self.KI
++                    c_lo = ((first_it + 1) * G + SI - 1) // SI - 1
++                    c_hi = ((first_it + self.KI) * G + SI - 1) // SI - 1
++                    maxc = (self.KI * G + SI - 1) // SI + 1
++                    self.write_slot(acc, ws, tl * maxc + (bid - c_lo), tx)
++                    ptx.bar_sync(1, self.CT)
++                    if tx == 0:
++                        # The counter accumulates K iterations; the CTA completing KI stores.
++                        old = ptx.atom_add_acq_rel_gpu(
++                            (cnt.iterator + tl).toint(), k1 - k0
++                        )
++                        last = Int32(0)
++                        if old + (k1 - k0) == self.KI:
++                            last = Int32(1)
++                            cnt[tl] = Int32(0)
++                        flag[0] = last
++                    ptx.bar_sync(1, self.CT)
++                    if flag[0] == 1:
++                        acc.fill(0.0)
++                        for c in range(c_lo, c_hi + 1):
++                            if (c * SI) // G < ((c + 1) * SI) // G:
++                                self.add_slot(acc, ws, tl * maxc + (c - c_lo), tx)
++                        self.store_tile(acc, out, M, m0, n0, wm, wn, g, tq)
++                    ptx.bar_sync(1, self.CT)
++            else:
++                self.store_tile(acc, out, M, m0, n0, wm, wn, g, tq)
++
++    # ----------------------------------------------------------- epilogue
++    @cute.jit
++    def write_slot(self, acc, ws, slot, tx):
++        base = ws.iterator.toint() + Int64(slot) * Int64(self.BM * self.BN * 4)
++        for j in cutlass.range_constexpr(self.ACC // 4):
++            ptx.stg_v4_f32(
++                base + ((j * self.CT + tx) * 16),
++                acc[4 * j],
++                acc[4 * j + 1],
++                acc[4 * j + 2],
++                acc[4 * j + 3],
++            )
++
++    @cute.jit
++    def add_slot(self, acc, ws, slot, tx):
++        base = ws.iterator.toint() + Int64(slot) * Int64(self.BM * self.BN * 4)
++        for j in cutlass.range_constexpr(self.ACC // 4):
++            v0, v1, v2, v3 = ptx.ldg_cg_v4_f32(base + ((j * self.CT + tx) * 16))
++            acc[4 * j] = acc[4 * j] + v0
++            acc[4 * j + 1] = acc[4 * j + 1] + v1
++            acc[4 * j + 2] = acc[4 * j + 2] + v2
++            acc[4 * j + 3] = acc[4 * j + 3] + v3
++
++    @cute.jit
++    def store_tile(self, acc, out, M, m0, n0, wm, wn, g, tq):
++        if cutlass.const_expr(self.N % 8 == 0 and self.NI % 4 == 0):
++            self.store_tile_v4(acc, out, M, m0, n0, wm, wn, g, tq)
++        else:
++            self.store_tile_b32(acc, out, M, m0, n0, wm, wn, g, tq)
++
++    @cute.jit
++    def store_tile_v4(self, acc, out, M, m0, n0, wm, wn, g, tq):
++        """16-byte stores: a 4x4 word transpose inside each lane quad turns the
++        MMA C fragments (2 columns x 4 n8 tiles per lane) into 8 consecutive
++        columns per lane."""
++        N = self.N
++        obase = out.iterator.toint()
++        lane_q0 = (cute.arch.lane_idx() // 4) * 4
++        for mi in cutlass.range_constexpr(self.MI):
++            for h in cutlass.range_constexpr(2):
++                row = m0 + wm * self.TM + mi * 16 + g + h * 8
++                for nb in cutlass.range_constexpr(self.NI // 4):
++                    w = [
++                        ptx.pack_half2(
++                            acc[(mi * self.NI + nb * 4 + j) * 4 + 2 * h],
++                            acc[(mi * self.NI + nb * 4 + j) * 4 + 2 * h + 1],
++                            self.out_f16,
++                        )
++                        for j in range(4)
++                    ]
++                    # Round r: lane t sends its word for n8 tile (t + r) % 4 and
++                    # receives the word lane (t - r) % 4 holds for n8 tile t.
++                    rec = []
++                    for r in cutlass.range_constexpr(4):
++                        sel = (tq + r) % 4
++                        send = cutlass.select_(
++                            sel == 1,
++                            w[1],
++                            cutlass.select_(
++                                sel == 2, w[2], cutlass.select_(sel == 3, w[3], w[0])
++                            ),
++                        )
++                        if cutlass.const_expr(r == 0):
++                            rec.append(send)
++                        else:
++                            rec.append(ptx.shfl_idx(send, lane_q0 + (tq + 4 - r) % 4))
++                    v = []
++                    for j in cutlass.range_constexpr(4):
++                        r = (tq + 4 - j) % 4  # round in which lane j's word arrived
++                        v.append(
++                            cutlass.select_(
++                                r == 1,
++                                rec[1],
++                                cutlass.select_(
++                                    r == 2,
++                                    rec[2],
++                                    cutlass.select_(r == 3, rec[3], rec[0]),
++                                ),
++                            )
++                        )
++                    col = n0 + wn * self.TN + (nb * 4 + tq) * 8
++                    if (row < M) & (col < N):
++                        ptx.stg_v4_b32(
++                            obase + (Int64(row) * N + Int64(col)) * 2,
++                            v[0],
++                            v[1],
++                            v[2],
++                            v[3],
++                        )
++
++    @cute.jit
++    def store_tile_b32(self, acc, out, M, m0, n0, wm, wn, g, tq):
++        N = self.N
++        obase = out.iterator.toint()
++        for mi in cutlass.range_constexpr(self.MI):
++            for ni in cutlass.range_constexpr(self.NI):
++                i = (mi * self.NI + ni) * 4
++                col = n0 + wn * self.TN + ni * 8 + tq * 2
++                for h in cutlass.range_constexpr(2):
++                    row = m0 + wm * self.TM + mi * 16 + g + h * 8
++                    if row < M:
++                        addr = obase + (Int64(row) * N + Int64(col)) * 2
++                        p = ptx.pack_half2(
++                            acc[i + 2 * h], acc[i + 2 * h + 1], self.out_f16
++                        )
++                        if cutlass.const_expr(N % 2 == 0):
++                            if col < N:
++                                ptx.stg_b32(addr, p)
++                        else:
++                            if col < N:
++                                ptx.stg_b16(addr, p & 0xFFFF)
++                            if col + 1 < N:
++                                ptx.stg_b16(addr + 2, (p >> 16) & 0xFFFF)
+diff --git a/flashinfer/gemm/kernels/sm12x_mxfp8/pingpong.py b/flashinfer/gemm/kernels/sm12x_mxfp8/pingpong.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..f72a26fff9dd5f9a8ea2a89f0504a991a45907bd
+--- /dev/null
++++ b/flashinfer/gemm/kernels/sm12x_mxfp8/pingpong.py
+@@ -0,0 +1,982 @@
++# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
++# SPDX-License-Identifier: BSD-3-Clause
++
++# Redistribution and use in source and binary forms, with or without
++# modification, are permitted provided that the following conditions are met:
++
++# 1. Redistributions of source code must retain the above copyright notice, this
++# list of conditions and the following disclaimer.
++
++# 2. Redistributions in binary form must reproduce the above copyright notice,
++# this list of conditions and the following disclaimer in the documentation
++# and/or other materials provided with the distribution.
++
++# 3. Neither the name of the copyright holder nor the names of its
++# contributors may be used to endorse or promote products derived from
++# this software without specific prior written permission.
++
++# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
++# AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
++# IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
++# DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
++# FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
++# DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
++# SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
++# CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
++# OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
++# OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
++
++"""Persistent ping-pong MXFP8 GEMM for SM120 / SM121 (large M).
++
++out[M, N] = A[M, K] @ B[N, K]^T, E4M3 operands with UE8M0 scales per 32
++elements in the F8_128x4 layout produced by
++``mxfp8_quantize(..., is_sf_swizzled_layout=True)``; nothing is repacked.
++
++The structure follows the CUTLASS CuTe DSL example
++``examples/python/CuTeDSL/cute/blackwell_geforce/kernel/blockscaled_gemm/
++dense_blockscaled_gemm_persistent_pingpong.py``, which provides the SM120
++block-scaled warp MMA setup, the scale-factor shared-memory layouts and the
++ping-pong warp-group ordering. Changes:
++
++- runtime M (one compile per N, K and configuration), static N and K;
++- grouped tile rasterization with an exact tail decode, sized so the live A
++  panels stay resident in L2;
++- optional K64 stages sharing one K128 scale chunk, doubling the pipeline
++  depth inside the 99 KB shared-memory budget;
++- a 128x64 N tile that reads half of a 128-row scale block;
++- an optional cooperative 256x128 tile (both warp groups share a B tile);
++- a coalesced predicated epilogue for output rows that are not 16-byte
++  aligned (TMA store otherwise);
++- programmatic dependent launch: the first weight stage is loaded before
++  ``griddepcontrol.wait``; activations, later stages and outputs after it.
++"""
++
++import cutlass
++import cutlass.cute as cute
++import cutlass.pipeline as pipeline
++import cutlass.utils as utils
++import cutlass.utils.blackwell_helpers as sm120_utils
++import cutlass.utils.blockscaled_layout as blockscaled_utils
++import cutlass.utils.hopper_helpers as sm90_utils
++from cutlass import Int32
++from cutlass.cute.nvgpu import cpasync
++
++from .common import SF_CHUNK, SMEM_BYTES
++
++SF_VEC = 32
++
++
++class Sm12xMxfp8PingpongGemm:
++    """Host wrapper; ``__call__(a, b, sfa, sfb, c, num_ctas)``.
++
++    Args:
++        n, k: problem size (compile-time).
++        tile_n: 128 or 64. tile_k: 128 or 64.
++        epi_tile: epilogue sub-tile (rows, cols); epi_stages: TMA store stages.
++        group: M tiles per rasterization group (A panels resident in L2).
++        coop: cooperative 256x128 CTA tile (requires tile_n 128, tile_k 64).
++        early_mma: issue the last k-block MMAs of a stage before waiting on
++            the next stage.
++    """
++
++    def __init__(
++        self,
++        n,
++        k,
++        tile_n=128,
++        tile_k=128,
++        epi_tile=(64, 32),
++        epi_stages=None,
++        group=8,
++        coop=False,
++        early_mma=False,
++        out_dtype=cutlass.BFloat16,
++    ):
++        assert tile_k in (64, 128) and tile_n in (64, 128)
++        assert not coop or (tile_n == 128 and tile_k == 64)
++        self.n = n
++        self.k = k
++        self.tile_k = tile_k
++        self.tile_n = tile_n
++        self.epi_tile = tuple(epi_tile)
++        self.epi_stages_cfg = epi_stages
++        self.group = group
++        self.coop = coop
++        self.early_mma = early_mma
++        # Output rows that are not 16-byte aligned cannot use the TMA store.
++        self.direct_epilogue = (n * 2) % 16 != 0
++        self.acc_dtype = cutlass.Float32
++        self.ab_dtype = cutlass.Float8E4M3FN
++        self.sf_dtype = cutlass.Float8E8M0FNU
++        self.c_dtype = out_dtype
++        # tile_shape_mnk is the per-warp-group MMA tile; cta_m the CTA's M extent.
++        self.tile_shape_mnk = (128, tile_n, tile_k)
++        self.cta_m = 256 if coop else 128
++        self.sf_shared = tile_k == 64
++        self.num_mma_warps = 8
++        self.tma_load_warp_id = self.num_mma_warps
++        self.threads_per_cta = ((self.num_mma_warps + 1) * 32 + 127) // 128 * 128
++        self.buffer_align_bytes = 1024
++        self.epilog_sync_barrier = pipeline.NamedBarrier(barrier_id=2, num_threads=128)
++        self.epilog_sync_barrier_wg1 = pipeline.NamedBarrier(
++            barrier_id=3, num_threads=128
++        )
++        self.load_register_requirement = 40
++        self.mma_register_requirement = 232
++        self.num_n_tiles = (n + tile_n - 1) // tile_n
++        self.k_tile_cnt = (k + tile_k - 1) // tile_k
++
++    # ------------------------------------------------------------------ setup
++    def _setup_attributes(self):
++        mma_op = cute.nvgpu.warp.MmaMXF8Op(self.ab_dtype, self.acc_dtype, self.sf_dtype)
++        perm = sm120_utils.get_permutation_mnk(self.tile_shape_mnk, SF_VEC, True)
++        self.tiled_mma = cute.make_tiled_mma(
++            mma_op, cute.make_layout((2, 2, 1)), permutation_mnk=perm
++        )
++        sfa_tile = (self.cta_m, 128, 128)
++        sf_tile = (128, 128, 128)
++        sfa_1 = blockscaled_utils.sm120_make_smem_layout_sfa(
++            self.tiled_mma, sfa_tile, SF_VEC, 1
++        )
++        sfb_1 = blockscaled_utils.sm120_make_smem_layout_sfb(
++            self.tiled_mma, sf_tile, SF_VEC, 1
++        )
++        tm, tn, tk = self.tile_shape_mnk
++        ab_bytes = self.cta_m * tk + tn * tk
++        sf_bytes = cute.size(cute.filter_zeros(sfa_1).shape) + cute.size(
++            cute.filter_zeros(sfb_1).shape
++        )
++        if self.direct_epilogue:
++            epi_stage = 2
++        else:
++            epi_max = (tn // self.epi_tile[1]) * (tm // self.epi_tile[0])
++            epi_stage = min(epi_max, self.epi_stages_cfg or 4)
++        epi_bytes = self.epi_tile[0] * self.epi_tile[1] * 2 * epi_stage
++        if self.coop:
++            epi_bytes *= 2  # one set of epilogue buffers per warp group
++        ab_stage = (SMEM_BYTES - 1024 - 1024 - epi_bytes) // (ab_bytes + sf_bytes)
++        assert ab_stage >= 2
++        self.ab_stage = ab_stage
++        self.epi_stage = epi_stage
++
++        a_atom = cute.nvgpu.warpgroup.make_smem_layout_atom(
++            sm90_utils.get_smem_layout_atom(
++                utils.LayoutEnum.ROW_MAJOR, self.ab_dtype, tk
++            ),
++            self.ab_dtype,
++        )
++        self.a_smem_layout_staged = cute.tile_to_shape(
++            a_atom, (self.cta_m, tk, ab_stage), order=(0, 1, 2)
++        )
++        self.b_smem_layout_staged = cute.tile_to_shape(
++            a_atom, (tn, tk, ab_stage), order=(0, 1, 2)
++        )
++        self.sfa_smem_layout_staged = blockscaled_utils.sm120_make_smem_layout_sfa(
++            self.tiled_mma, sfa_tile, SF_VEC, ab_stage
++        )
++        # Per-warp-group view of a 256-row SFA block: one 128-row sub-block
++        # (byte offset SF_CHUNK * warp group), same strides.
++        self.sfa_mma_layout_staged = self.sfa_smem_layout_staged
++        if self.coop:
++
++            def one_block(x):
++                if isinstance(x, tuple):
++                    if len(x) == 2 and x[0] == (32, 4) and x[1] == 2:
++                        return ((32, 4), 1)
++                    return tuple(one_block(v) for v in x)
++                return x
++
++            lay = self.sfa_smem_layout_staged
++            self.sfa_mma_layout_staged = cute.make_layout(
++                one_block(lay.shape), stride=lay.stride
++            )
++        self.sfb_smem_layout_staged = blockscaled_utils.sm120_make_smem_layout_sfb(
++            self.tiled_mma, sf_tile, SF_VEC, ab_stage
++        )
++        # The SFB TMA always fills a 128-row scale block. A 64-wide N tile reads
++        # one half of it: rows 32 * j + i for j in {2h, 2h + 1} sit at byte
++        # offset 8 * h with the 4-row interleave narrowed from 4 to 2.
++        self.sfb_mma_layout_staged = self.sfb_smem_layout_staged
++        if tn == 64:
++
++            def narrow(x):
++                if isinstance(x, tuple):
++                    if x == (32, 4):
++                        return (32, 2)
++                    return tuple(narrow(v) for v in x)
++                return x
++
++            lay = self.sfb_smem_layout_staged
++            self.sfb_mma_layout_staged = cute.make_layout(
++                narrow(lay.shape), stride=lay.stride
++            )
++        c_atom = cute.nvgpu.warpgroup.make_smem_layout_atom(
++            sm90_utils.get_smem_layout_atom(
++                utils.LayoutEnum.ROW_MAJOR, self.c_dtype, self.epi_tile[1]
++            ),
++            self.c_dtype,
++        )
++        self.epi_smem_layout_staged = cute.tile_to_shape(
++            c_atom, (*self.epi_tile, self.epi_stage), order=(0, 1, 2)
++        )
++        self.epi_cosize = cute.cosize(self.epi_smem_layout_staged)
++
++    # --------------------------------------------------------------- host jit
++    @cute.jit
++    def __call__(
++        self,
++        a: cute.Tensor,
++        b: cute.Tensor,
++        sfa: cute.Tensor,
++        sfb: cute.Tensor,
++        c: cute.Tensor,
++        num_ctas: Int32,
++        stream,
++    ):
++        """a: [M, K] E4M3, b: [N, K] E4M3, sfa / sfb: flat UE8M0 bytes, c: [M, N]."""
++        self._setup_attributes()
++        m = cute.size(a, mode=[0])
++        n, k = self.n, self.k
++        a3 = cute.make_tensor(
++            a.iterator, cute.make_layout((m, k, 1), stride=(k, 1, m * k))
++        )
++        b3 = cute.make_tensor(
++            b.iterator, cute.make_layout((n, k, 1), stride=(k, 1, n * k))
++        )
++        c3 = cute.make_tensor(
++            c.iterator, cute.make_layout((m, n, 1), stride=(n, 1, m * n))
++        )
++        c3_tma = c3
++        if cutlass.const_expr(self.direct_epilogue):
++            # The TMA store is unused here, but its descriptor is still encoded
++            # and needs a 16-byte row pitch.
++            n_pad = (n + 7) // 8 * 8
++            c3_tma = cute.make_tensor(
++                c.iterator,
++                cute.make_layout((m, n_pad, 1), stride=(n_pad, 1, m * n_pad)),
++            )
++        sfa_ptr = cute.recast_ptr(sfa.iterator, dtype=self.sf_dtype)
++        sfb_ptr = cute.recast_ptr(sfb.iterator, dtype=self.sf_dtype)
++        sfa3 = cute.make_tensor(
++            sfa_ptr, blockscaled_utils.tile_atom_to_shape_SF(a3.shape, SF_VEC)
++        )
++        sfb3 = cute.make_tensor(
++            sfb_ptr, blockscaled_utils.tile_atom_to_shape_SF(b3.shape, SF_VEC)
++        )
++
++        _, tn, tk = self.tile_shape_mnk
++        a_smem = cute.slice_(self.a_smem_layout_staged, (None, None, 0))
++        b_smem = cute.slice_(self.b_smem_layout_staged, (None, None, 0))
++        tma_atom_a, tma_a = cpasync.make_tiled_tma_atom(
++            cpasync.CopyBulkTensorTileG2SOp(), a3, a_smem, (self.cta_m, tk)
++        )
++        tma_atom_b, tma_b = cpasync.make_tiled_tma_atom(
++            cpasync.CopyBulkTensorTileG2SOp(), b3, b_smem, (tn, tk)
++        )
++        sfa_smem = cute.slice_(self.sfa_smem_layout_staged, (None, None, 0))
++        sfb_smem = cute.slice_(self.sfb_smem_layout_staged, (None, None, 0))
++        tma_atom_sfa, tma_sfa = cpasync.make_tiled_tma_atom(
++            cpasync.CopyBulkTensorTileG2SOp(),
++            sfa3,
++            sfa_smem,
++            (self.cta_m, 128),
++            internal_type=cutlass.Int16,
++        )
++        tma_atom_sfb, tma_sfb = cpasync.make_tiled_tma_atom(
++            cpasync.CopyBulkTensorTileG2SOp(),
++            sfb3,
++            sfb_smem,
++            (128, 128),
++            internal_type=cutlass.Int16,
++        )
++        epi_smem = cute.slice_(self.epi_smem_layout_staged, (None, None, 0))
++        tma_atom_c, tma_c = cpasync.make_tiled_tma_atom(
++            cpasync.CopyBulkTensorTileS2GOp(), c3_tma, epi_smem, self.epi_tile
++        )
++
++        num_m_tiles = (m + self.cta_m - 1) // self.cta_m
++
++        @cute.struct
++        class SharedStorage:
++            mainloop_pipeline_array_ptr: cute.struct.MemRange[
++                cutlass.Int64, self.ab_stage * 2
++            ]
++            # PipelineOrder(depth=2, length=2): depth * length mbarriers.
++            order_barrier_ptr: cute.struct.MemRange[cutlass.Int64, 4]
++            sA: cute.struct.Align[
++                cute.struct.MemRange[
++                    self.ab_dtype, cute.cosize(self.a_smem_layout_staged)
++                ],
++                self.buffer_align_bytes,
++            ]
++            sB: cute.struct.Align[
++                cute.struct.MemRange[
++                    self.ab_dtype, cute.cosize(self.b_smem_layout_staged)
++                ],
++                self.buffer_align_bytes,
++            ]
++            sSFA: cute.struct.Align[
++                cute.struct.MemRange[
++                    self.sf_dtype, cute.cosize(self.sfa_smem_layout_staged)
++                ],
++                self.buffer_align_bytes,
++            ]
++            sSFB: cute.struct.Align[
++                cute.struct.MemRange[
++                    self.sf_dtype, cute.cosize(self.sfb_smem_layout_staged)
++                ],
++                self.buffer_align_bytes,
++            ]
++            sC: cute.struct.Align[
++                cute.struct.MemRange[
++                    self.c_dtype, self.epi_cosize * (2 if self.coop else 1)
++                ],
++                self.buffer_align_bytes,
++            ]
++
++        self.shared_storage = SharedStorage
++        self.kernel(
++            tma_atom_a,
++            tma_a,
++            tma_atom_b,
++            tma_b,
++            tma_atom_sfa,
++            tma_sfa,
++            tma_atom_sfb,
++            tma_sfb,
++            tma_atom_c,
++            tma_c,
++            c3,
++            self.tiled_mma,
++            self.a_smem_layout_staged,
++            self.b_smem_layout_staged,
++            self.sfa_smem_layout_staged,
++            self.sfb_smem_layout_staged,
++            self.sfb_mma_layout_staged,
++            self.sfa_mma_layout_staged,
++            self.epi_smem_layout_staged,
++            num_m_tiles,
++        ).launch(
++            grid=[num_ctas, 1, 1],
++            block=[self.threads_per_cta, 1, 1],
++            stream=stream,
++            min_blocks_per_mp=1,
++            use_pdl=True,
++        )
++
++    # ------------------------------------------------------------ scheduling
++    @cute.jit
++    def tile_coord(self, linear: Int32, num_m_tiles: Int32):
++        """Grouped rasterization with exact tail handling (no padded tiles).
++
++        ``group`` is the largest group whose A panels fit the L2 budget; it is
++        clamped to the runtime tile count so small M forms a single group.
++        """
++        # Overshooting the L2 budget by up to 25% beats a lone trailing group,
++        # which would stream all of B from DRAM again for one M-tile row.
++        gmax = max(1, self.group * 128 // self.cta_m)
++        g = cutlass.min(num_m_tiles, gmax)
++        if num_m_tiles <= gmax * 5 // 4:
++            g = num_m_tiles
++        # Groups of g M tiles; sweep N inside a group (A panels stay in L2).
++        per_group = g * self.num_n_tiles
++        gid = linear // per_group
++        first_m = gid * g
++        gsz = cutlass.min(num_m_tiles - first_m, g)
++        r = linear - gid * per_group
++        m_idx = first_m + r % gsz
++        n_idx = r // gsz
++        return m_idx, n_idx
++
++    @cute.jit
++    def advance(self, state: pipeline.PipelineState, iterations):
++        if iterations < state.stages and ((state._index + iterations) >= state.stages):
++            state._phase ^= 1
++        if (
++            iterations >= state.stages
++            and (((state._index + iterations) // state.stages) % 2) == 1
++        ):
++            state._phase ^= 1
++        state._index = (state._index + iterations) % state.stages
++        state._count += iterations
++        return state
++
++    # ---------------------------------------------------------------- kernel
++    @cute.kernel
++    def kernel(
++        self,
++        tma_atom_a: cute.CopyAtom,
++        mA: cute.Tensor,
++        tma_atom_b: cute.CopyAtom,
++        mB: cute.Tensor,
++        tma_atom_sfa: cute.CopyAtom,
++        mSFA: cute.Tensor,
++        tma_atom_sfb: cute.CopyAtom,
++        mSFB: cute.Tensor,
++        tma_atom_c: cute.CopyAtom,
++        mC_tma: cute.Tensor,
++        mC: cute.Tensor,
++        tiled_mma: cute.TiledMma,
++        a_smem_layout_staged: cute.ComposedLayout,
++        b_smem_layout_staged: cute.ComposedLayout,
++        sfa_smem_layout_staged: cute.Layout,
++        sfb_smem_layout_staged: cute.Layout,
++        sfb_mma_layout_staged: cute.Layout,
++        sfa_mma_layout_staged: cute.Layout,
++        epi_smem_layout_staged: cute.ComposedLayout,
++        num_m_tiles: Int32,
++    ):
++        tidx, _, _ = cute.arch.thread_idx()
++        warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
++        bidx, _, _ = cute.arch.block_idx()
++        gdim, _, _ = cute.arch.grid_dim()
++
++        if warp_idx == 0:
++            cpasync.prefetch_descriptor(tma_atom_a)
++            cpasync.prefetch_descriptor(tma_atom_b)
++            cpasync.prefetch_descriptor(tma_atom_sfa)
++            cpasync.prefetch_descriptor(tma_atom_sfb)
++            if cutlass.const_expr(not self.direct_epilogue):
++                cpasync.prefetch_descriptor(tma_atom_c)
++
++        tm, tn, tk = self.tile_shape_mnk
++        a_smem_layout = cute.slice_(a_smem_layout_staged, (None, None, 0))
++        b_smem_layout = cute.slice_(b_smem_layout_staged, (None, None, 0))
++        sfa_smem_layout = cute.slice_(sfa_smem_layout_staged, (None, None, 0))
++        sfb_smem_layout = cute.slice_(sfb_smem_layout_staged, (None, None, 0))
++        tma_copy_bytes = (
++            cute.size_in_bytes(self.ab_dtype, a_smem_layout)
++            + cute.size_in_bytes(self.ab_dtype, b_smem_layout)
++            + cute.size_in_bytes(self.sf_dtype, sfa_smem_layout)
++            + cute.size_in_bytes(self.sf_dtype, sfb_smem_layout)
++        )
++
++        smem = cutlass.utils.SmemAllocator()
++        storage = smem.allocate(self.shared_storage)
++        mainloop_pipeline = pipeline.PipelineTmaAsync.create(
++            num_stages=self.ab_stage,
++            producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread),
++            consumer_group=pipeline.CooperativeGroup(
++                pipeline.Agent.Thread,
++                self.num_mma_warps if self.coop else self.num_mma_warps // 2,
++            ),
++            tx_count=tma_copy_bytes,
++            barrier_storage=storage.mainloop_pipeline_array_ptr.data_ptr(),
++            cta_layout_vmnk=cute.make_layout((1, 1, 1, 1)),
++        )
++        warp_group_idx = cute.arch.make_warp_uniform(tidx // 128)
++        order_barrier = pipeline.PipelineOrder.create(
++            barrier_storage=storage.order_barrier_ptr.data_ptr(),
++            depth=2,
++            length=2,
++            group_id=warp_group_idx,
++            producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, 128),
++            defer_sync=True,
++        )
++        cute.arch.mbarrier_init_fence()
++        order_state = order_barrier.state
++
++        sA = storage.sA.get_tensor(
++            a_smem_layout_staged.outer, swizzle=a_smem_layout_staged.inner
++        )
++        sB = storage.sB.get_tensor(
++            b_smem_layout_staged.outer, swizzle=b_smem_layout_staged.inner
++        )
++        sC = storage.sC.get_tensor(
++            epi_smem_layout_staged.outer, swizzle=epi_smem_layout_staged.inner
++        )
++        if cutlass.const_expr(self.coop):
++            sC = cute.make_tensor(
++                sC.iterator
++                + cute.assume(warp_group_idx * self.epi_cosize, divby=self.epi_cosize),
++                sC.layout,
++            )
++        sSFA = storage.sSFA.get_tensor(sfa_smem_layout_staged)
++        sSFB = storage.sSFB.get_tensor(sfb_smem_layout_staged)
++        sSFB_mma = cute.make_tensor(sSFB.iterator, sfb_mma_layout_staged)
++
++        # (bM, bK, loopM, loopK, loopL)
++        gA = cute.local_tile(mA, (self.cta_m, tk), (None, None, None))
++        gB = cute.local_tile(mB, (tn, tk), (None, None, None))
++        gSFA = cute.local_tile(mSFA, (self.cta_m, 128), (None, None, None))
++        gSFB = cute.local_tile(mSFB, (128, 128), (None, None, None))
++        gC_tma = cute.local_tile(mC_tma, (tm, tn), (None, None, None))
++
++        thr_mma = tiled_mma.get_slice(tidx % 128)
++        one = cute.make_layout(1)
++        tAsA, tAgA = cpasync.tma_partition(
++            tma_atom_a, 0, one, cute.group_modes(sA, 0, 2), cute.group_modes(gA, 0, 2)
++        )
++        tBsB, tBgB = cpasync.tma_partition(
++            tma_atom_b, 0, one, cute.group_modes(sB, 0, 2), cute.group_modes(gB, 0, 2)
++        )
++        tAsSFA, tAgSFA = cpasync.tma_partition(
++            tma_atom_sfa,
++            0,
++            one,
++            cute.group_modes(sSFA, 0, 2),
++            cute.group_modes(gSFA, 0, 2),
++        )
++        tAsSFA = cute.filter_zeros(tAsSFA)
++        tAgSFA = cute.filter_zeros(tAgSFA)
++        tBsSFB, tBgSFB = cpasync.tma_partition(
++            tma_atom_sfb,
++            0,
++            one,
++            cute.group_modes(sSFB, 0, 2),
++            cute.group_modes(gSFB, 0, 2),
++        )
++        tBsSFB = cute.filter_zeros(tBsSFB)
++        tBgSFB = cute.filter_zeros(tBgSFB)
++
++        # Operand views for this warp group's MMA rows.
++        sA_mma = sA
++        sSFA_mma = sSFA
++        if cutlass.const_expr(self.coop):
++            sA_mma = cute.local_tile(
++                sA, (128, tk, self.ab_stage), (warp_group_idx, 0, 0)
++            )
++            sSFA_mma = cute.make_tensor(
++                sSFA.iterator + warp_group_idx * SF_CHUNK, sfa_mma_layout_staged
++            )
++        tCsA = thr_mma.partition_A(sA_mma)
++        tCsB = thr_mma.partition_B(sB)
++        tCrA = tiled_mma.make_fragment_A(tCsA[None, None, None, 0])
++        tCrB = tiled_mma.make_fragment_B(tCsB[None, None, None, 0])
++        tCrSFA = sm120_utils.partition_fragment_SFA(
++            sSFA_mma[None, None, 0], thr_mma, tidx
++        )
++        tCrSFB = sm120_utils.partition_fragment_SFB(
++            sSFB_mma[None, None, 0], thr_mma, tidx
++        )
++        tCgC = thr_mma.partition_C(gC_tma[None, None, 0, 0, 0])
++        accumulators = cute.make_rmem_tensor(tCgC.shape, self.acc_dtype)
++
++        cute.arch.sync_threads()
++
++        k_tile_cnt = self.k_tile_cnt
++        total_units = num_m_tiles * self.num_n_tiles
++
++        prod_state = pipeline.make_pipeline_state(
++            pipeline.PipelineUserType.Producer, self.ab_stage
++        )
++        cons_state = pipeline.make_pipeline_state(
++            pipeline.PipelineUserType.Consumer, self.ab_stage
++        )
++
++        if warp_idx >= self.tma_load_warp_id:
++            cute.arch.setmaxregister_decrease(self.load_register_requirement)
++            if warp_idx == self.tma_load_warp_id:
++                linear = bidx
++                while linear < total_units:
++                    m_idx, n_idx = self.tile_coord(linear, num_m_tiles)
++                    tAgA_t = tAgA[(None, m_idx, None, 0)]
++                    tBgB_t = tBgB[(None, n_idx, None, 0)]
++                    tAgSFA_t = tAgSFA[(None, m_idx, None, 0)]
++                    tBgSFB_t = tBgSFB[(None, n_idx // (128 // tn), None, 0)]
++                    prod_state.reset_count()
++                    for kt in cutlass.range(k_tile_cnt, unroll=1):
++                        mainloop_pipeline.producer_acquire(prod_state)
++                        bar = mainloop_pipeline.producer_get_barrier(prod_state)
++                        cute.copy(
++                            tma_atom_b,
++                            tBgB_t[(None, kt)],
++                            tBsB[(None, prod_state.index)],
++                            tma_bar_ptr=bar,
++                        )
++                        kt_sf = kt
++                        if cutlass.const_expr(self.sf_shared):
++                            kt_sf = kt // 2
++                        cute.copy(
++                            tma_atom_sfb,
++                            tBgSFB_t[(None, kt_sf)],
++                            tBsSFB[(None, prod_state.index)],
++                            tma_bar_ptr=bar,
++                        )
++                        # Returns at once after the first call.
++                        cute.arch.griddepcontrol_wait()
++                        cute.copy(
++                            tma_atom_sfa,
++                            tAgSFA_t[(None, kt_sf)],
++                            tAsSFA[(None, prod_state.index)],
++                            tma_bar_ptr=bar,
++                        )
++                        cute.copy(
++                            tma_atom_a,
++                            tAgA_t[(None, kt)],
++                            tAsA[(None, prod_state.index)],
++                            tma_bar_ptr=bar,
++                        )
++                        mainloop_pipeline.producer_commit(prod_state)
++                        prod_state.advance()
++                    linear += gdim
++                cute.arch.griddepcontrol_launch_dependents()
++                mainloop_pipeline.producer_tail(prod_state)
++        else:
++            cute.arch.setmaxregister_increase(self.mma_register_requirement)
++            cute.arch.griddepcontrol_wait()
++            num_k_blocks = cute.size(tCrA, mode=[2])
++
++            smem_copy_A = cute.make_tiled_copy_A(
++                cute.make_copy_atom(
++                    cute.nvgpu.warp.LdMatrix8x8x16bOp(False, 4), self.ab_dtype
++                ),
++                tiled_mma,
++            )
++            smem_copy_B = cute.make_tiled_copy_B(
++                cute.make_copy_atom(
++                    cute.nvgpu.warp.LdMatrix8x8x16bOp(False, 4), self.ab_dtype
++                ),
++                tiled_mma,
++            )
++            sf_atom = cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), self.sf_dtype)
++            smem_copy_SFA = cute.make_tiled_copy(
++                sf_atom,
++                sm120_utils.get_layoutSFA_TV(tiled_mma),
++                (
++                    cute.size(tiled_mma.permutation_mnk[0]),
++                    cute.size(tiled_mma.permutation_mnk[2]),
++                ),
++            )
++            smem_copy_SFB = cute.make_tiled_copy(
++                sf_atom,
++                sm120_utils.get_layoutSFB_TV(tiled_mma),
++                (
++                    cute.size(tiled_mma.permutation_mnk[1]),
++                    cute.size(tiled_mma.permutation_mnk[2]),
++                ),
++            )
++            thr_copy_A = smem_copy_A.get_slice(tidx % 128)
++            thr_copy_B = smem_copy_B.get_slice(tidx % 128)
++            tCsA_v = thr_copy_A.partition_S(sA_mma)
++            tCrA_v = thr_copy_A.retile(tCrA)
++            tCsB_v = thr_copy_B.partition_S(sB)
++            tCrB_v = thr_copy_B.retile(tCrB)
++            thr_copy_SFA = smem_copy_SFA.get_slice(tidx % 128)
++            thr_copy_SFB = smem_copy_SFB.get_slice(tidx % 128)
++            tCsSFA_v = cute.filter_zeros(thr_copy_SFA.partition_S(sSFA_mma))
++            tCrSFA_v = cute.filter_zeros(thr_copy_SFA.retile(tCrSFA))
++            tCsSFB_v0 = cute.filter_zeros(thr_copy_SFB.partition_S(sSFB_mma))
++            tCrSFB_v = cute.filter_zeros(thr_copy_SFB.retile(tCrSFB))
++
++            linear = bidx
++            if cutlass.const_expr(not self.coop):
++                if warp_group_idx == 1:
++                    linear += gdim
++                    cons_state = self.advance(cons_state, k_tile_cnt)
++
++            while linear < total_units:
++                m_idx, n_idx = self.tile_coord(linear, num_m_tiles)
++                tCsSFB_v = tCsSFB_v0
++                if cutlass.const_expr(tn == 64):
++                    tCsSFB_v = cute.make_tensor(
++                        tCsSFB_v0.iterator + (n_idx % 2) * 8, tCsSFB_v0.layout
++                    )
++                accumulators.fill(0.0)
++                cons_state.reset_count()
++                if cutlass.const_expr(not self.coop):
++                    order_barrier.wait(order_state)
++
++                # Software-pipelined mainloop: the shared-to-register copy of
++                # k-block kb + 1 (possibly from the next stage) overlaps the MMAs
++                # of kb. With early_mma the MMAs of a stage's last k-block are
++                # issued before blocking on the next stage's TMA barrier.
++                mainloop_pipeline.consumer_wait(cons_state)
++                self._load_kblock(
++                    smem_copy_A,
++                    smem_copy_B,
++                    smem_copy_SFA,
++                    smem_copy_SFB,
++                    tCsA_v,
++                    tCrA_v,
++                    tCsB_v,
++                    tCrB_v,
++                    tCsSFA_v,
++                    tCrSFA_v,
++                    tCsSFB_v,
++                    tCrSFB_v,
++                    cons_state.index,
++                    0,
++                    0,
++                    self._sf_off(0, num_k_blocks),
++                )
++                for kt in cutlass.range(k_tile_cnt - 1, unroll=1):
++                    sf_off = self._sf_off(kt, num_k_blocks)
++                    sf_off_next = self._sf_off(kt + 1, num_k_blocks)
++                    for kb in cutlass.range_constexpr(num_k_blocks):
++                        if kb == num_k_blocks - 1:
++                            mainloop_pipeline.consumer_release(cons_state)
++                            cons_state.advance()
++                            if cutlass.const_expr(self.early_mma):
++                                self._mma_kblock(
++                                    tiled_mma,
++                                    accumulators,
++                                    tCrA,
++                                    tCrSFA,
++                                    tCrB,
++                                    tCrSFB,
++                                    kb,
++                                )
++                            mainloop_pipeline.consumer_wait(cons_state)
++                            self._load_kblock(
++                                smem_copy_A,
++                                smem_copy_B,
++                                smem_copy_SFA,
++                                smem_copy_SFB,
++                                tCsA_v,
++                                tCrA_v,
++                                tCsB_v,
++                                tCrB_v,
++                                tCsSFA_v,
++                                tCrSFA_v,
++                                tCsSFB_v,
++                                tCrSFB_v,
++                                cons_state.index,
++                                0,
++                                0,
++                                sf_off_next,
++                            )
++                            if cutlass.const_expr(not self.early_mma):
++                                self._mma_kblock(
++                                    tiled_mma,
++                                    accumulators,
++                                    tCrA,
++                                    tCrSFA,
++                                    tCrB,
++                                    tCrSFB,
++                                    kb,
++                                )
++                        else:
++                            self._load_kblock(
++                                smem_copy_A,
++                                smem_copy_B,
++                                smem_copy_SFA,
++                                smem_copy_SFB,
++                                tCsA_v,
++                                tCrA_v,
++                                tCsB_v,
++                                tCrB_v,
++                                tCsSFA_v,
++                                tCrSFA_v,
++                                tCsSFB_v,
++                                tCrSFB_v,
++                                cons_state.index,
++                                kb + 1,
++                                kb + 1,
++                                sf_off,
++                            )
++                            self._mma_kblock(
++                                tiled_mma, accumulators, tCrA, tCrSFA, tCrB, tCrSFB, kb
++                            )
++                sf_off_last = self._sf_off(k_tile_cnt - 1, num_k_blocks)
++                for kb in cutlass.range_constexpr(num_k_blocks):
++                    if kb == num_k_blocks - 1:
++                        mainloop_pipeline.consumer_release(cons_state)
++                        cons_state.advance()
++                    else:
++                        self._load_kblock(
++                            smem_copy_A,
++                            smem_copy_B,
++                            smem_copy_SFA,
++                            smem_copy_SFB,
++                            tCsA_v,
++                            tCrA_v,
++                            tCsB_v,
++                            tCrB_v,
++                            tCsSFA_v,
++                            tCrSFA_v,
++                            tCsSFB_v,
++                            tCrSFB_v,
++                            cons_state.index,
++                            kb + 1,
++                            kb + 1,
++                            sf_off_last,
++                        )
++                    self._mma_kblock(
++                        tiled_mma, accumulators, tCrA, tCrSFA, tCrB, tCrSFB, kb
++                    )
++
++                if cutlass.const_expr(not self.coop):
++                    order_state = order_barrier.arrive(order_state)
++                    order_barrier.wait(order_state)
++                    cons_state = self.advance(cons_state, k_tile_cnt)
++
++                m_epi = m_idx
++                if cutlass.const_expr(self.coop):
++                    m_epi = m_idx * 2 + warp_group_idx
++                self._epilogue(
++                    tiled_mma,
++                    accumulators,
++                    sC,
++                    tma_atom_c,
++                    gC_tma,
++                    m_epi,
++                    n_idx,
++                    tidx,
++                    warp_idx,
++                    warp_group_idx,
++                    mC[None, None, 0],
++                )
++                if cutlass.const_expr(self.coop):
++                    linear += gdim
++                else:
++                    linear += 2 * gdim
++                    order_state = order_barrier.arrive(order_state)
++
++    @cute.jit
++    def _sf_off(self, kt, num_k_blocks: cutlass.Constexpr):
++        """K64 stages read the half of the shared K128 scale chunk they cover."""
++        off = 0
++        if cutlass.const_expr(self.sf_shared):
++            off = (kt % 2) * num_k_blocks
++        return off
++
++    @cute.jit
++    def _load_kblock(
++        self,
++        copy_a,
++        copy_b,
++        copy_sfa,
++        copy_sfb,
++        tCsA_v,
++        tCrA_v,
++        tCsB_v,
++        tCrB_v,
++        tCsSFA_v,
++        tCrSFA_v,
++        tCsSFB_v,
++        tCrSFB_v,
++        stage,
++        src_kb: cutlass.Constexpr,
++        dst_kb: cutlass.Constexpr,
++        sf_off,
++    ):
++        cute.copy(copy_a, tCsA_v[None, None, src_kb, stage], tCrA_v[None, None, dst_kb])
++        cute.copy(copy_b, tCsB_v[None, None, src_kb, stage], tCrB_v[None, None, dst_kb])
++        cute.copy(
++            copy_sfa,
++            tCsSFA_v[None, None, src_kb + sf_off, stage],
++            tCrSFA_v[None, None, dst_kb],
++        )
++        cute.copy(
++            copy_sfb,
++            tCsSFB_v[None, None, src_kb + sf_off, stage],
++            tCrSFB_v[None, None, dst_kb],
++        )
++
++    @cute.jit
++    def _mma_kblock(
++        self, tiled_mma, acc, tCrA, tCrSFA, tCrB, tCrSFB, kb: cutlass.Constexpr
++    ):
++        cute.gemm(
++            tiled_mma,
++            acc,
++            [tCrA[None, None, kb], tCrSFA[None, None, kb]],
++            [tCrB[None, None, kb], tCrSFB[None, None, kb]],
++            acc,
++        )
++
++    @cute.jit
++    def _epilogue(
++        self,
++        tiled_mma,
++        accumulators,
++        sC,
++        tma_atom_c,
++        gC_tma,
++        m_idx,
++        n_idx,
++        tidx,
++        warp_idx,
++        warp_group_idx,
++        mC,
++    ):
++        """Registers -> swizzled shared sub-tiles (stmatrix) -> global, by TMA
++        store or, for row pitches that are not 16-byte aligned, by coalesced
++        predicated stores from all 128 threads of the warp group."""
++        tm, tn, _ = self.tile_shape_mnk
++        copy_atom_r2s = sm120_utils.sm120_get_smem_store_op(
++            utils.LayoutEnum.ROW_MAJOR,
++            elem_ty_d=self.c_dtype,
++            elem_ty_acc=self.acc_dtype,
++        )
++        copy_atom_C = cute.make_copy_atom(
++            cute.nvgpu.warp.StMatrix8x8x16bOp(False, 2), self.c_dtype
++        )
++        tiled_copy_C_atom = cute.make_tiled_copy_C_atom(copy_atom_C, tiled_mma)
++        tiled_copy_r2s = cute.make_tiled_copy_S(copy_atom_r2s, tiled_copy_C_atom)
++        thr_copy_r2s = tiled_copy_r2s.get_slice(tidx % 128)
++        tRS_sD = thr_copy_r2s.partition_D(sC)
++        tRS_rAcc = tiled_copy_r2s.retile(accumulators)
++        rD_shape = cute.shape(thr_copy_r2s.partition_S(sC))
++        tRS_rD_layout = cute.make_layout(rD_shape[:3])
++        tRS_rD = cute.make_rmem_tensor(tRS_rD_layout.shape, self.acc_dtype)
++
++        gC_tile = gC_tma[(None, None, m_idx, n_idx, 0)]
++        bSG_sD, bSG_gD = cpasync.tma_partition(
++            tma_atom_c,
++            0,
++            cute.make_layout(1),
++            cute.group_modes(sC, 0, 2),
++            cute.zipped_divide(gC_tile, self.epi_tile),
++        )
++        tma_store_pipeline = pipeline.PipelineTmaStore.create(
++            num_stages=self.epi_stage,
++            producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, 128),
++        )
++
++        epi_rest_m = bSG_gD.shape[1][0]
++        epi_rest_n = bSG_gD.shape[1][1]
++        mma_tile_m = tm // cute.size(tRS_rAcc, mode=[1])
++        mma_tile_n = tn // cute.size(tRS_rAcc, mode=[2])
++        mm_per_epi = self.epi_tile[0] // mma_tile_m
++        nn_per_epi = self.epi_tile[1] // mma_tile_n
++        for epi_m in cutlass.range_constexpr(epi_rest_m):
++            for epi_n in cutlass.range_constexpr(epi_rest_n):
++                for mn in cutlass.range_constexpr(nn_per_epi):
++                    for mm in cutlass.range_constexpr(mm_per_epi):
++                        dst = tRS_rD[(None, mm, mn)]
++                        src = tRS_rAcc[
++                            (None, epi_m * mm_per_epi + mm, epi_n * nn_per_epi + mn)
++                        ]
++                        for e in cutlass.range_constexpr(cute.size(dst)):
++                            dst[e] = src[e]
++                tRS_rD_out = cute.make_rmem_tensor(tRS_rD_layout.shape, self.c_dtype)
++                tRS_rD_out.store(tRS_rD.load().to(self.c_dtype))
++                epi_buffer = (epi_m * epi_rest_n + epi_n) % self.epi_stage
++                self._epi_barrier(warp_group_idx)
++                cute.copy(
++                    tiled_copy_r2s, tRS_rD_out, tRS_sD[(None, None, None, epi_buffer)]
++                )
++                cute.arch.fence_proxy("async.shared", space="cta")
++                self._epi_barrier(warp_group_idx)
++                if cutlass.const_expr(self.direct_epilogue):
++                    em, en = self.epi_tile
++                    m = cute.size(mC, mode=[0])
++                    t = tidx % 128
++                    row0 = m_idx * tm + epi_m * em
++                    col0 = n_idx * tn + epi_n * en
++                    for i in cutlass.range_constexpr(em * en // 128):
++                        idx = i * 128 + t
++                        r = idx // en
++                        cc = idx - r * en
++                        if row0 + r < m and col0 + cc < self.n:
++                            mC[row0 + r, col0 + cc] = sC[r, cc, epi_buffer]
++                elif warp_idx % 4 == 0:
++                    cute.copy(
++                        tma_atom_c,
++                        bSG_sD[(None, epi_buffer)],
++                        bSG_gD[(None, (epi_m, epi_n))],
++                    )
++                    tma_store_pipeline.producer_commit()
++                    tma_store_pipeline.producer_acquire()
++        if cutlass.const_expr(not self.direct_epilogue):
++            if warp_idx % 4 == 0:
++                tma_store_pipeline.producer_tail()
++
++    @cute.jit
++    def _epi_barrier(self, warp_group_idx):
++        if warp_group_idx == 0:
++            self.epilog_sync_barrier.arrive_and_wait()
++        else:
++            self.epilog_sync_barrier_wg1.arrive_and_wait()
+diff --git a/flashinfer/gemm/kernels/sm12x_mxfp8/policy.py b/flashinfer/gemm/kernels/sm12x_mxfp8/policy.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..e5cc5d6eb775d1fba11c12e41fea69dcc06a943e
+--- /dev/null
++++ b/flashinfer/gemm/kernels/sm12x_mxfp8/policy.py
+@@ -0,0 +1,405 @@
++# SPDX-FileCopyrightText: Copyright (c) 2026 by FlashInfer team.
++# SPDX-License-Identifier: Apache-2.0
++"""Tactics of the SM12x MXFP8 ``cute-dsl`` backend.
++
++A tactic is a flat tuple ``(family, schedule, *config)``:
++
++- ``("gemv", "rows", mb, lpr, warps, ctas_per_sm, k_split)``: CUDA-core
++  GEMV for M <= mb (gemv.py).
++- ``("skinny", "streamk", nt, rt, ku, p, warps, ctas_per_sm, min_units,
++  cta_wide)``: stream-K over the weight with warp-level block-scaled MMA
++  (skinny.py).
++- ``("persistent", "dp" | "streamk", bm, bn, wm, wn, ks, kw, sa)``:
++  warp-specialized persistent kernel (persistent.py); ``streamk`` splits the
++  K iterations of the last partial wave over the grid.
++- ``("pingpong", "dp", tile_n, tile_k, epi_n, epi_stages, group, coop, early)``:
++  persistent ping-pong kernel (pingpong.py).
++
++Every schedule is deterministic. M is a runtime value for all kernels; each
++candidate list is built for one autotuner bucket and stays valid for every M
++that maps to it. There are no per-shape tables: candidates and the default
++tactic are derived from (M, N, K) and the device (SM count, L2 size).
++"""
++
++from typing import NamedTuple
++
++from .common import SMEM_BYTES, ceil_div
++from .persistent import max_b_stages
++
++VERSION = "sm12x_mxfp8_v1"
++
++# Largest M served by the skinny family (the GEMV serves M <= its mb).
++SKINNY_MAX_M = 32
++
++
++class Device(NamedTuple):
++    sms: int
++    l2_bytes: int
++
++
++# ------------------------------------------------------------------ gemv
++def _gemv_lanes(k):
++    """Widest lane group that still gives every lane one 16-byte step."""
++    lpr = 32
++    while lpr > 8 and k < 16 * lpr:
++        lpr //= 2
++    return lpr
++
++
++def gemv(mb, k, warps=8, ctas_per_sm=4, k_split=1):
++    return ("gemv", "rows", mb, _gemv_lanes(k), warps, ctas_per_sm, k_split)
++
++
++def gemv_valid(tactic, n, k):
++    _, _, mb, lpr, warps, _, ks = tactic
++    if warps % ks or k % (16 * ks):
++        return False
++    steps = ceil_div(k // ks, 16 * lpr)
++    return steps <= 16 and mb * k * 2 <= 96 * 1024
++
++
++def gemv_grid(tactic, n, dev):
++    _, _, _, lpr, warps, cps, ks = tactic
++    row_groups = ceil_div(n, 32 // lpr)
++    return max(1, min(dev.sms * cps, ceil_div(row_groups, warps // ks)))
++
++
++def _gemv_default(mb, n, k):
++    """Split one row's K over warps when there are few rows per SM and enough
++    K per lane: small N, larger M. Never below 320 K elements per warp."""
++    ks = 1
++    if k >= 1024:
++        cap = 12288 if mb >= 4 else (1280 if mb == 2 else 256)
++        while ks < 8 and n * ks * 2 <= cap and k // (ks * 2) >= 320:
++            ks *= 2
++    if ks >= 8:
++        return gemv(mb, k, 16, 2, ks)
++    return gemv(mb, k, 8, 4, ks)
++
++
++# ---------------------------------------------------------------- skinny
++def skinny(tm, rt, warps=4, ctas_per_sm=4, min_units=1, cta_wide=False, ku=4, p=1):
++    nt = max(1, tm // 8)
++    return ("skinny", "streamk", nt, rt, ku, p, warps, ctas_per_sm, min_units, cta_wide)
++
++
++def skinny_smem(tactic):
++    _, _, nt, rt, ku, _, warps, _, _, cta_wide = tactic
++    if cta_wide:
++        return 2 * 8 * nt * (ku * 33 + 16) + 16
++    return warps * 2 * rt * nt * 512
++
++
++def skinny_valid(tactic, n, k):
++    _, _, nt, _, ku, _, warps, _, _, cta_wide = tactic
++    if cta_wide and warps * 32 < 8 * nt * ku:
++        return False
++    return skinny_smem(tactic) <= SMEM_BYTES
++
++
++def skinny_grid(tactic, n, k, dev):
++    _, _, _, rt, ku, _, warps, cps, min_units, cta_wide = tactic
++    rows = 16 * rt * (warps if cta_wide else 1)
++    units = ceil_div(n, rows) * ceil_div(k // 32, ku)
++    per_cta = min_units if cta_wide else warps * min_units
++    return min(dev.sms * cps, max(1, units // per_cta), units)
++
++
++def _bucket(m):
++    return 1 << max(0, (m - 1).bit_length())
++
++
++def _decode_default(m, n, k):
++    """GEMV / skinny default for M <= SKINNY_MAX_M.
++
++    M <= 4 is a pure weight stream: the CUDA-core GEMV. M 5..8 on large
++    weights with K <= 2560: the 8-token GEMV. Otherwise the stream-K MMA
++    kernel, with 32-token tiles for large weights and M 17..32.
++    """
++    b = _bucket(m)
++    big = n * k >= 8 * 1024 * 1024
++    if b <= 4:
++        for t in (_gemv_default(b, n, k), gemv(b, k)):
++            if gemv_valid(t, n, k):
++                return t
++        return skinny(8, 2)
++    if b == 8:
++        if big and k <= 2560:
++            t = gemv(8, k)
++            if gemv_valid(t, n, k):
++                return t
++        return skinny(8, 1) if big else skinny(8, 2 if n >= 512 else 1)
++    if b == 16:
++        if big:
++            return skinny(32, 2, min_units=2)
++        if (k // 32) % 4 and n >= 512:
++            # K % 128 != 0: two-block units avoid a half-empty last unit per row tile.
++            return skinny(16, 2, min_units=2, ku=2, p=4)
++        return skinny(16, 2 if n >= 512 else 1)
++    if n <= 256:
++        return skinny(32, 1)
++    if k <= 1024:
++        t = skinny(32, 1, warps=8, ctas_per_sm=1)
++        if skinny_valid(t, n, k):
++            return t
++    if big:
++        return skinny(32, 2, min_units=2)
++    return skinny(32, 1, ctas_per_sm=2, min_units=2)
++
++
++def _decode_candidates(m, n, k):
++    b = _bucket(m)
++    out = [_decode_default(m, n, k)]
++    if b <= 4:
++        out += [
++            gemv(b, k),
++            gemv(b, k, 4, 8),
++            gemv(b, k, 16, 2, 2),
++            gemv(b, k, 16, 2, 4),
++        ]
++        if k >= 4096:
++            # Deep K: an 8-way split keeps enough rows in flight per SM.
++            out += [gemv(b, k, 8, 4, 8), gemv(b, k, 16, 2, 8)]
++    elif b <= 16:
++        out += [skinny(b, 1), skinny(b, 2)]
++        if (k // 32) % 4:
++            out.append(skinny(b, 2, min_units=2, ku=2, p=4))
++    else:
++        out += [
++            skinny(32, 2, min_units=2),
++            skinny(32, 1, ctas_per_sm=2, min_units=2),
++            skinny(32, 1),
++        ]
++    return out
++
++
++# ------------------------------------------------------------ persistent
++def persistent(bm, bn, wm, wn, ks=1, kw=128, sa=2, sched="dp"):
++    return ("persistent", sched, bm, bn, wm, wn, ks, kw, sa)
++
++
++def persistent_stages(tactic):
++    _, _, bm, bn, _, _, ks, kw, sa = tactic
++    return min(8, max_b_stages(bm, bn, ks, kw, sa))
++
++
++def persistent_schedule(tactic, m, n, k, dev):
++    """(grid, stream-K tiles) of a persistent tactic for this M."""
++    _, sched, bm, bn, _, _, ks, kw, _ = tactic
++    tiles = ceil_div(m, bm) * ceil_div(n, bn)
++    if sched == "dp":
++        return min(tiles, dev.sms), 0
++    k_iters = ceil_div(ceil_div(k, kw), ks)
++    if tiles >= dev.sms:
++        return dev.sms, tiles % dev.sms
++    return min(dev.sms, tiles * k_iters), tiles
++
++
++def _stream_tile(m, n):
++    """Persistent tile for weights that are streamed once at M <= 64.
++
++    A cold weight streams fastest from about 8 to 20 CTAs that each read long
++    contiguous runs of a row: the widest N tile that still leaves about 8
++    tiles, with a K stage of 256 to 512 bytes per row (about 32 KB, double
++    buffered). More CTAs or shorter runs per row lose DRAM locality.
++    """
++    if m > 32:
++        return persistent(64, 128, 2, 4) if n >= 1024 else persistent(64, 64, 2, 2)
++    if n >= 1024:
++        return persistent(32, 128, 1, 4, 2)
++    if n >= 384:
++        return persistent(32, 64, 2, 2, 3)
++    return persistent(32, 32, 2, 1, 4)
++
++
++def _stream_tile_candidates(m, n):
++    out = [_stream_tile(m, n), persistent(32, 128, 1, 4, 2)]
++    out += [persistent(32, 64, 2, 2, 3), persistent(32, 32, 2, 1, 4)]
++    if m > 32:
++        out += [persistent(64, 128, 2, 4), persistent(64, 64, 2, 2)]
++    return out
++
++
++def _persistent_candidates(m, n, k, dev):
++    p, sk = persistent, "streamk"
++    out = [p(32, 64, 1, 4, 2)]
++    if m <= 128:
++        out += [
++            p(64, 64, 2, 2),
++            p(128, 64, 4, 2),
++            p(32, 64, 1, 4, 2, sched=sk),
++            p(32, 64, 2, 4, sched=sk),
++        ]
++    elif m <= 256:
++        out += [p(64, 128, 1, 4), p(32, 64, 1, 4, 2, sched=sk)]
++    else:
++        out += [p(128, 64, 2, 2), p(128, 128, 2, 4, sched=sk)]
++        if m > 512:
++            out.append(p(64, 128, 2, 4))
++    return out
++
++
++# --------------------------------------------------------------- pingpong
++def _group(k, dev, frac):
++    """Largest M group whose A panels (group x 128 x K bytes) fit a fraction of L2."""
++    return max(1, int(dev.l2_bytes * frac) // (128 * k))
++
++
++def _wave_tile_n(m, n, dev):
++    """N tile from the tile count: rounds of tiles over the SMs times the
++    per-tile cost (a 128x64 tile costs about 0.575 of a 128x128 one)."""
++
++    def cost(tn):
++        tiles = ceil_div(m, 128) * ceil_div(n, tn)
++        return ceil_div(tiles, dev.sms) * (1.0 if tn == 128 else 0.575)
++
++    return min((128, 64), key=cost)
++
++
++def pingpong(tile_n, tile_k, epi_n, epi_stages, group, coop=False, early=False):
++    return ("pingpong", "dp", tile_n, tile_k, epi_n, epi_stages, group, coop, early)
++
++
++def _pingpong_default(m, n, k, dev):
++    return pingpong(_wave_tile_n(m, n, dev), 128, 32, 0, _group(k, dev, 0.5))
++
++
++def _pingpong_candidates(m, n, k, dev):
++    direct = (n * 2) % 16 != 0
++    tile_n = _wave_tile_n(m, n, dev)
++    groups = sorted({_group(k, dev, 0.5), _group(k, dev, 0.125)})
++    out = [_pingpong_default(m, n, k, dev)]
++    for g in groups:
++        out.append(pingpong(tile_n, 128, 32, 0, g))
++        if not direct:
++            # Wider epilogue sub-tile: half the barriers per tile, fewer stages.
++            out.append(pingpong(tile_n, 128, 64, 2, g))
++    if not direct:
++        out.append(pingpong(tile_n, 64, 64, 2, groups[-1]))
++        # Cooperative 256x128 tile: both warp groups share one B tile (less
++        # L2-to-SM traffic per MAC), epilogue not overlapped.
++        for early in (False, True):
++            out.append(pingpong(128, 64, 64, 1, groups[-1], coop=True, early=early))
++    return out
++
++
++# ------------------------------------------------------------------ policy
++def check_shape(m, n, k):
++    if m < 0 or n <= 0 or k <= 0:
++        raise ValueError("SM12x cute-dsl mm_mxfp8 requires positive N and K")
++    if k % 32:
++        raise ValueError(f"SM12x cute-dsl mm_mxfp8 requires K % 32 == 0, got K={k}")
++    if max(m * k, n * k, m * n) >= 2**31:
++        raise ValueError("SM12x cute-dsl mm_mxfp8 requires element offsets below 2**31")
++
++
++def _dedup(tactics, n, k):
++    seen, out = set(), []
++    for t in tactics:
++        if t in seen:
++            continue
++        if t[0] == "gemv" and not gemv_valid(t, n, k):
++            continue
++        if t[0] == "skinny" and not skinny_valid(t, n, k):
++            continue
++        seen.add(t)
++        out.append(t)
++    return out
++
++
++def valid_tactics(m, n, k, dev):
++    """Candidates for the autotuner bucket whose representative M is ``m``.
++
++    Every candidate is compiled before the bucket is profiled, so the lists
++    only keep configurations that won or tied a bucket in sweeps of all
++    configurations on SM120 and SM121.
++    """
++    check_shape(m, n, k)
++    out = [default_tactic(m, n, k, dev)]
++    if m <= SKINNY_MAX_M:
++        out += _decode_candidates(m, n, k)
++    if 2 < m <= 64:
++        out += _stream_tile_candidates(m, n)
++    if 4 < m <= 16 or 32 < m <= 64:
++        out.append(persistent(32, 64, 1, 4, 2))
++    if 16 < m <= 32:
++        out.append(persistent(32, 64, 2, 2))
++    if 32 < m <= 64:
++        out.append(persistent(32, 128, 1, 4))
++    if m > 64:
++        out += _persistent_candidates(m, n, k, dev)
++        out += _pingpong_candidates(m, n, k, dev)
++    return _dedup(out, n, k)
++
++
++def default_tactic(m, n, k, dev):
++    """Feature-based tactic used when the autotuner has no entry for this M.
++
++    Chosen from CUPTI kernel timings (CUDA graphs, cold L2) on DGX Spark (GB10)
++    over dense layers of recent LLMs (N 96..16384, K 384..8192):
++
++    - Tiny or very large weights at M <= 32: GEMV / stream-K kernels.
++    - Weights under 4M elements: the streaming persistent tile up to M = 64,
++      except the GEMV at M <= 4 for rows up to 2048 elements.
++    - M <= 4 otherwise: GEMV. M 5..32: the streaming tile below 8M elements,
++      then the stream-K kernel.
++    - Up to M = 64 (M = 256 for tiny weights): 32- or 64-row persistent tiles.
++    - Larger M: the 128-row ping-pong kernel.
++    """
++    nk = n * k
++    tiny = nk < 1 << 20
++    small = not tiny and nk < 4 << 20
++    if m <= SKINNY_MAX_M:
++        if tiny or nk > 64 << 20:
++            return _decode_default(m, n, k)
++        if small and (m > 4 or k > 2048):
++            return _stream_tile(m, n)
++        if m <= 4:
++            return _decode_default(m, n, k)
++        if nk < 8 << 20:
++            return _stream_tile(m, n)
++        if m <= 8:
++            return _decode_default(m, n, k)
++        t = skinny(32, 1, warps=8, ctas_per_sm=1)
++        if skinny_valid(t, n, k):
++            return t
++        return persistent(32, 64, 1, 4, 2)
++    if tiny and m <= 256:
++        return persistent(32, 64, 2, 2, 2)
++    if m <= 64:
++        if small:
++            return _stream_tile(m, n)
++        if 2048 <= n <= 8192:
++            return persistent(64, 64, 2, 2)
++        return persistent(32, 64, 1, 4, 2)
++    return _pingpong_default(m, n, k, dev)
++
++
++def resolve(tactic, m):
++    """Runtime adjustment of a tuned tactic to the actual M.
++
++    A cooperative 256-row tile whose last tile would be mostly padding (a
++    tactic tuned at the top of its bucket, run at the bottom) falls back to
++    the 128-row ping-pong tile.
++    """
++    if tactic[0] == "pingpong" and tactic[7] and (-m) % 256 * 8 > m:
++        return pingpong(128, 128, 64, 2, tactic[6])
++    return tactic
++
++
++FAMILIES = ("gemv", "skinny", "persistent", "pingpong")
++
++
++def supports_m(tactic, m):
++    """Whether ``tactic`` is a tactic of this backend that can serve this M.
++
++    Anything else (for example a tactic cached by another backend or an older
++    version) makes the runner fall back to the default tactic.
++    """
++    if not isinstance(tactic, tuple) or not tactic or tactic[0] not in FAMILIES:
++        return False
++    if tactic[0] == "gemv":
++        return m <= tactic[2]
++    if tactic[0] == "skinny":
++        return m <= SKINNY_MAX_M
++    return True
+diff --git a/flashinfer/gemm/kernels/sm12x_mxfp8/ptx.py b/flashinfer/gemm/kernels/sm12x_mxfp8/ptx.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..7c7436e8263ae0faf54550021713fef228eda9a6
+--- /dev/null
++++ b/flashinfer/gemm/kernels/sm12x_mxfp8/ptx.py
+@@ -0,0 +1,485 @@
++# SPDX-FileCopyrightText: Copyright (c) 2026 by FlashInfer team.
++# SPDX-License-Identifier: Apache-2.0
++"""Inline PTX shared by the SM12x MXFP8 GEMM kernels.
++
++Fragment coordinates of ``mma.sync.m16n8k32`` follow the PTX ISA tables for
++``kind::mxf8f6f4`` and CUTLASS ``include/cute/atom/mma_traits_sm120.hpp``.
++Addresses may be CuTe pointers or integers (64-bit global, 32-bit shared).
++"""
++
++from cutlass import Float32, Int32, Uint32
++from cutlass._mlir.dialects import llvm
++from cutlass.cutlass_dsl import dsl_user_op
++
++
++def _v(x, loc=None, ip=None):
++    if hasattr(x, "toint"):
++        x = x.toint(loc=loc, ip=ip)
++    return x.ir_value(loc=loc, ip=ip) if hasattr(x, "ir_value") else x
++
++
++def _asm(ret, args, text, cons, side=False, loc=None, ip=None):
++    return llvm.inline_asm(
++        ret,
++        [_v(a, loc, ip) for a in args],
++        text,
++        cons,
++        has_side_effects=side,
++        is_align_stack=False,
++        asm_dialect=llvm.AsmDialect.AD_ATT,
++        loc=loc,
++        ip=ip,
++    )
++
++
++def _unpack(res, ty, n, loc=None, ip=None):
++    return tuple(
++        ty(llvm.extractvalue(ty.mlir_type, res, [i], loc=loc, ip=ip)) for i in range(n)
++    )
++
++
++def _struct(ty, n):
++    return llvm.StructType.get_literal([ty.mlir_type] * n)
++
++
++# --------------------------------------------------------------------- MMA
++@dsl_user_op
++def mma_mxf8(
++    a0,
++    a1,
++    a2,
++    a3,
++    b0,
++    b1,
++    c0,
++    c1,
++    c2,
++    c3,
++    sfa,
++    sfb,
++    bida=0,
++    bidb=0,
++    *,
++    loc=None,
++    ip=None,
++):
++    """D = A(16x32 e4m3) * B(32x8 e4m3) * 2^(sfa, sfb) + C, FP32 accumulate.
++
++    ``sfa`` / ``sfb`` hold four UE8M0 bytes; ``bida`` / ``bidb`` select the byte
++    (one scale per row of A / column of B for this k32 block).
++    """
++    text = (
++        "mma.sync.aligned.m16n8k32.row.col.kind::mxf8f6f4.block_scale."
++        "scale_vec::1X.f32.e4m3.e4m3.f32.ue8m0 "
++        "{$0,$1,$2,$3}, {$4,$5,$6,$7}, {$8,$9}, {$10,$11,$12,$13}, "
++        f"$14, {{{bida}, 0}}, $15, {{{bidb}, 0}};"
++    )
++    res = _asm(
++        _struct(Float32, 4),
++        [a0, a1, a2, a3, b0, b1, c0, c1, c2, c3, sfa, sfb],
++        text,
++        "=f,=f,=f,=f,r,r,r,r,r,r,f,f,f,f,r,r",
++        loc=loc,
++        ip=ip,
++    )
++    return _unpack(res, Float32, 4, loc, ip)
++
++
++# ------------------------------------------------------------ global loads
++@dsl_user_op
++def ldg_nc_v4_stream(addr, *, loc=None, ip=None):
++    """16-byte read-only load that skips L1 allocation (data read once)."""
++    res = _asm(
++        _struct(Uint32, 4),
++        [addr],
++        "ld.global.nc.L1::no_allocate.v4.u32 {$0,$1,$2,$3}, [$4];",
++        "=r,=r,=r,=r,l",
++        side=True,
++        loc=loc,
++        ip=ip,
++    )
++    return _unpack(res, Uint32, 4, loc, ip)
++
++
++@dsl_user_op
++def ldg_nc_v4(addr, *, loc=None, ip=None):
++    res = _asm(
++        _struct(Uint32, 4),
++        [addr],
++        "ld.global.nc.v4.u32 {$0,$1,$2,$3}, [$4];",
++        "=r,=r,=r,=r,l",
++        side=True,
++        loc=loc,
++        ip=ip,
++    )
++    return _unpack(res, Uint32, 4, loc, ip)
++
++
++@dsl_user_op
++def ldg_nc_v2(addr, *, loc=None, ip=None):
++    res = _asm(
++        _struct(Uint32, 2),
++        [addr],
++        "ld.global.nc.v2.u32 {$0,$1}, [$2];",
++        "=r,=r,l",
++        side=True,
++        loc=loc,
++        ip=ip,
++    )
++    return _unpack(res, Uint32, 2, loc, ip)
++
++
++@dsl_user_op
++def ldg_nc_u32(addr, *, loc=None, ip=None):
++    return Uint32(
++        _asm(
++            Uint32.mlir_type,
++            [addr],
++            "ld.global.nc.u32 $0, [$1];",
++            "=r,l",
++            side=True,
++            loc=loc,
++            ip=ip,
++        )
++    )
++
++
++@dsl_user_op
++def ldg_nc_u16(addr, *, loc=None, ip=None):
++    return Uint32(
++        _asm(
++            Uint32.mlir_type,
++            [addr],
++            "ld.global.nc.u16 $0, [$1];",
++            "=r,l",
++            side=True,
++            loc=loc,
++            ip=ip,
++        )
++    )
++
++
++@dsl_user_op
++def ldg_nc_u8(addr, *, loc=None, ip=None):
++    return Uint32(
++        _asm(
++            Uint32.mlir_type,
++            [addr],
++            "ld.global.nc.u8 $0, [$1];",
++            "=r,l",
++            side=True,
++            loc=loc,
++            ip=ip,
++        )
++    )
++
++
++@dsl_user_op
++def ldg_cg_v4_f32(addr, *, loc=None, ip=None):
++    """L2-coherent 16-byte load (data written by other CTAs of this launch)."""
++    res = _asm(
++        _struct(Float32, 4),
++        [addr],
++        "ld.global.cg.v4.f32 {$0,$1,$2,$3}, [$4];",
++        "=f,=f,=f,=f,l",
++        side=True,
++        loc=loc,
++        ip=ip,
++    )
++    return _unpack(res, Float32, 4, loc, ip)
++
++
++# ----------------------------------------------------------- global stores
++@dsl_user_op
++def stg_v4_f32(addr, x, y, z, w, *, loc=None, ip=None):
++    _asm(
++        None,
++        [addr, x, y, z, w],
++        "st.global.v4.f32 [$0], {$1,$2,$3,$4};",
++        "l,f,f,f,f",
++        side=True,
++        loc=loc,
++        ip=ip,
++    )
++
++
++@dsl_user_op
++def stg_v4_b32(addr, x, y, z, w, *, loc=None, ip=None):
++    _asm(
++        None,
++        [addr, x, y, z, w],
++        "st.global.v4.b32 [$0], {$1,$2,$3,$4};",
++        "l,r,r,r,r",
++        side=True,
++        loc=loc,
++        ip=ip,
++    )
++
++
++@dsl_user_op
++def stg_b32(addr, v, *, loc=None, ip=None):
++    _asm(None, [addr, v], "st.global.b32 [$0], $1;", "l,r", side=True, loc=loc, ip=ip)
++
++
++@dsl_user_op
++def stg_b16(addr, v, *, loc=None, ip=None):
++    _asm(
++        None,
++        [addr, v],
++        "{ .reg .b16 t; cvt.u16.u32 t, $1; st.global.b16 [$0], t; }",
++        "l,r",
++        side=True,
++        loc=loc,
++        ip=ip,
++    )
++
++
++@dsl_user_op
++def stg_half(addr, v, f16: bool = False, *, loc=None, ip=None):
++    """Round an FP32 value to BF16 (or FP16) with RNE and store it."""
++    ty = "f16" if f16 else "bf16"
++    _asm(
++        None,
++        [addr, v],
++        f"{{ .reg .b16 h; cvt.rn.{ty}.f32 h, $1; st.global.b16 [$0], h; }}",
++        "l,f",
++        side=True,
++        loc=loc,
++        ip=ip,
++    )
++
++
++# ------------------------------------------------- atomics and ordering
++@dsl_user_op
++def atom_add_acq_rel_gpu(addr, v, *, loc=None, ip=None):
++    return Int32(
++        _asm(
++            Int32.mlir_type,
++            [addr, v],
++            "atom.add.acq_rel.gpu.global.s32 $0, [$1], $2;",
++            "=r,l,r",
++            side=True,
++            loc=loc,
++            ip=ip,
++        )
++    )
++
++
++@dsl_user_op
++def st_relaxed_gpu_s32(addr, v, *, loc=None, ip=None):
++    _asm(
++        None,
++        [addr, v],
++        "st.relaxed.gpu.global.s32 [$0], $1;",
++        "l,r",
++        side=True,
++        loc=loc,
++        ip=ip,
++    )
++
++
++@dsl_user_op
++def fence_acq_rel_gpu(*, loc=None, ip=None):
++    _asm(None, [], "fence.acq_rel.gpu;", "", side=True, loc=loc, ip=ip)
++
++
++@dsl_user_op
++def bar_sync(bar_id, nthreads, *, loc=None, ip=None):
++    _asm(
++        None,
++        [Int32(bar_id), Int32(nthreads)],
++        "bar.sync $0, $1;",
++        "r,r",
++        side=True,
++        loc=loc,
++        ip=ip,
++    )
++
++
++# ------------------------------------------------------------ shared memory
++@dsl_user_op
++def ldsm_x4(addr, *, loc=None, ip=None):
++    """ldmatrix x4 (b16 8x8) from a 32-bit shared address."""
++    res = _asm(
++        _struct(Int32, 4),
++        [addr],
++        "ldmatrix.sync.aligned.x4.m8n8.shared.b16 {$0,$1,$2,$3}, [$4];",
++        "=r,=r,=r,=r,r",
++        side=True,
++        loc=loc,
++        ip=ip,
++    )
++    return _unpack(res, Int32, 4, loc, ip)
++
++
++@dsl_user_op
++def lds_u32(addr, *, loc=None, ip=None):
++    return Int32(
++        _asm(
++            Int32.mlir_type,
++            [addr],
++            "ld.shared.b32 $0, [$1];",
++            "=r,r",
++            side=True,
++            loc=loc,
++            ip=ip,
++        )
++    )
++
++
++@dsl_user_op
++def bulk_g2s(dst_smem, src_gmem, nbytes, bar_smem, *, loc=None, ip=None):
++    """1D ``cp.async.bulk`` global -> shared, completing on an mbarrier."""
++    _asm(
++        None,
++        [dst_smem, src_gmem, nbytes, bar_smem],
++        "cp.async.bulk.shared::cta.global.mbarrier::complete_tx::bytes "
++        "[$0], [$1], $2, [$3];",
++        "r,l,r,r",
++        side=True,
++        loc=loc,
++        ip=ip,
++    )
++
++
++@dsl_user_op
++def bulk_prefetch_l2(src_gmem, nbytes, *, loc=None, ip=None):
++    """``cp.async.bulk.prefetch.L2``: pull ``nbytes`` (multiple of 16) into L2."""
++    _asm(
++        None,
++        [src_gmem, nbytes],
++        "cp.async.bulk.prefetch.L2.global [$0], $1;",
++        "l,r",
++        side=True,
++        loc=loc,
++        ip=ip,
++    )
++
++
++# ------------------------------------------------------- register helpers
++@dsl_user_op
++def shfl_bfly(v, lane_mask: int, *, loc=None, ip=None):
++    return Uint32(
++        _asm(
++            Uint32.mlir_type,
++            [v],
++            f"shfl.sync.bfly.b32 $0, $1, {lane_mask}, 0x1f, 0xffffffff;",
++            "=r,r",
++            side=True,
++            loc=loc,
++            ip=ip,
++        )
++    )
++
++
++@dsl_user_op
++def shfl_idx(v, src, *, loc=None, ip=None):
++    return Int32(
++        _asm(
++            Int32.mlir_type,
++            [v, src],
++            "shfl.sync.idx.b32 $0, $1, $2, 0x1f, 0xffffffff;",
++            "=r,r,r",
++            side=True,
++            loc=loc,
++            ip=ip,
++        )
++    )
++
++
++@dsl_user_op
++def sel(p, a, b, *, loc=None, ip=None):
++    """``p ? a : b`` on 32-bit words (``p`` is 0 or 1)."""
++    return Uint32(
++        _asm(
++            Uint32.mlir_type,
++            [p, a, b],
++            "{ .reg .pred q; setp.ne.u32 q, $1, 0; selp.b32 $0, $2, $3, q; }",
++            "=r,r,r,r",
++            loc=loc,
++            ip=ip,
++        )
++    )
++
++
++@dsl_user_op
++def imin(a, b, *, loc=None, ip=None):
++    return Int32(
++        _asm(Int32.mlir_type, [a, b], "min.s32 $0, $1, $2;", "=r,r,r", loc=loc, ip=ip)
++    )
++
++
++@dsl_user_op
++def pack_half2(lo, hi, f16: bool = False, *, loc=None, ip=None):
++    """Two FP32 -> BF16x2 (or FP16x2), ``lo`` in the low half, RNE."""
++    ty = "f16x2" if f16 else "bf16x2"
++    return Int32(
++        _asm(
++            Int32.mlir_type,
++            [lo, hi],
++            f"cvt.rn.{ty}.f32 $0, $2, $1;",
++            "=r,f,f",
++            loc=loc,
++            ip=ip,
++        )
++    )
++
++
++@dsl_user_op
++def bf16_lo(u, *, loc=None, ip=None):
++    return Float32(
++        _asm(Float32.mlir_type, [u], "shl.b32 $0, $1, 16;", "=f,r", loc=loc, ip=ip)
++    )
++
++
++@dsl_user_op
++def bf16_hi(u, *, loc=None, ip=None):
++    return Float32(
++        _asm(
++            Float32.mlir_type,
++            [u],
++            "and.b32 $0, $1, 0xffff0000;",
++            "=f,r",
++            loc=loc,
++            ip=ip,
++        )
++    )
++
++
++@dsl_user_op
++def e4m3x4_to_f32(u, *, loc=None, ip=None):
++    """Four E4M3 bytes (byte 0 first) -> four FP32 values (exact)."""
++    res = _asm(
++        _struct(Float32, 4),
++        [u],
++        "{ .reg .b16 lo, hi, a, b, c, d; .reg .b32 h0, h1;\n"
++        "mov.b32 {lo, hi}, $4;\n"
++        "cvt.rn.f16x2.e4m3x2 h0, lo;\n"
++        "cvt.rn.f16x2.e4m3x2 h1, hi;\n"
++        "mov.b32 {a, b}, h0;\n"
++        "mov.b32 {c, d}, h1;\n"
++        "cvt.f32.f16 $0, a; cvt.f32.f16 $1, b;\n"
++        "cvt.f32.f16 $2, c; cvt.f32.f16 $3, d; }",
++        "=f,=f,=f,=f,r",
++        loc=loc,
++        ip=ip,
++    )
++    return _unpack(res, Float32, 4, loc, ip)
++
++
++@dsl_user_op
++def pow2_e8m0(s, *, loc=None, ip=None):
++    """2^(s - 127) as FP32 for a UE8M0 byte ``s`` (``s == 0`` gives 2^-127,
++    ``s == 255`` is NaN as in the block-scaled MMA)."""
++    return Float32(
++        _asm(
++            Float32.mlir_type,
++            [s],
++            "{ .reg .pred p, q; .reg .b32 e; shl.b32 e, $1, 23;\n"
++            "setp.eq.u32 p, $1, 0; setp.eq.u32 q, $1, 255;\n"
++            "selp.b32 e, 4194304, e, p; selp.b32 $0, 0x7fffffff, e, q; }",
++            "=f,r",
++            loc=loc,
++            ip=ip,
++        )
++    )
+diff --git a/flashinfer/gemm/kernels/sm12x_mxfp8/runner.py b/flashinfer/gemm/kernels/sm12x_mxfp8/runner.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..f9d9c8b23c4502b6a49e3752af574a3ef462856a
+--- /dev/null
++++ b/flashinfer/gemm/kernels/sm12x_mxfp8/runner.py
+@@ -0,0 +1,279 @@
++# SPDX-FileCopyrightText: Copyright (c) 2026 by FlashInfer team.
++# SPDX-License-Identifier: Apache-2.0
++"""SM120 / SM121 implementation of ``mm_mxfp8(..., backend="cute-dsl")``.
++
++Inputs follow the ``mm_mxfp8`` convention: ``a`` [M, K] E4M3 row-major,
++``b`` [K, N] E4M3 column-major (the [N, K] weight transposed), 1D UE8M0
++scales in the F8_128x4 layout. The output is BF16 or FP16.
++"""
++
++import functools
++import threading
++
++import torch
++
++from ....autotuner import TunableRunner
++from ....utils import get_compute_capability, get_device_index
++from . import policy
++from .common import sf_bytes
++
++_COMPILED: dict = {}
++_LOCK = threading.Lock()
++
++
++@functools.cache
++def _device(index):
++    props = torch.cuda.get_device_properties(index)
++    return policy.Device(props.multi_processor_count, props.L2_cache_size)
++
++
++def check_requirement(a, b, a_descale, b_descale, out, out_dtype, use_8x4_sf_layout):
++    """Raise ``ValueError`` with a reason if the inputs are not supported."""
++    if out_dtype not in (torch.bfloat16, torch.float16):
++        raise ValueError("SM12x cute-dsl mm_mxfp8 supports BF16 and FP16 output only")
++    if use_8x4_sf_layout or a_descale.ndim != 1 or b_descale.ndim != 1:
++        raise ValueError("SM12x cute-dsl mm_mxfp8 requires 1D 128x4-swizzled scales")
++    if torch.version.cuda is None or int(torch.version.cuda.split(".")[0]) < 13:
++        raise ValueError("SM12x cute-dsl mm_mxfp8 requires CUDA 13 or newer")
++    m, k = a.shape
++    n = b.shape[1]
++    policy.check_shape(m, n, k)
++    if a.stride() != (k, 1) or b.stride() != (1, k):
++        raise ValueError(
++            "SM12x cute-dsl mm_mxfp8 requires a row-major A [M, K] and a "
++            "column-major B [K, N] (the transpose of a contiguous [N, K] weight)"
++        )
++    if out is not None and out.stride() != (n, 1):
++        raise ValueError("SM12x cute-dsl mm_mxfp8 requires a contiguous output")
++    tensors = (a, b, a_descale, b_descale) + (() if out is None else (out,))
++    if any(t.data_ptr() % 16 for t in tensors):
++        raise ValueError("SM12x cute-dsl mm_mxfp8 requires 16-byte aligned tensors")
++    if not a_descale.is_contiguous() or not b_descale.is_contiguous():
++        raise ValueError("SM12x cute-dsl mm_mxfp8 requires contiguous scale tensors")
++    return True
++
++
++class _Workspace:
++    """Per-device stream-K scratch: FP32 partials and Int32 arrival counters.
++
++    Counters are zero between launches (every kernel resets the ones it
++    used). Buffers only grow; a replaced buffer stays alive because captured
++    CUDA graphs may still reference it. Launches that share a device must be
++    ordered on one stream.
++    """
++
++    def __init__(self, device):
++        self.device = device
++        self.partials = torch.empty(0, dtype=torch.float32, device=device)
++        self.counters = torch.zeros(0, dtype=torch.int32, device=device)
++        self._retired = []
++
++    def get(self, n_partials, n_counters):
++        if self.partials.numel() < n_partials or self.counters.numel() < n_counters:
++            if torch.cuda.is_current_stream_capturing():
++                raise RuntimeError(
++                    "SM12x cute-dsl mm_mxfp8 needs a larger stream-K workspace during "
++                    "CUDA graph capture; run the same shape once before capturing"
++                )
++            self._retired += [self.partials, self.counters]
++            self.partials = torch.empty(
++                max(n_partials, 2 * self.partials.numel()),
++                dtype=torch.float32,
++                device=self.device,
++            )
++            self.counters = torch.zeros(
++                max(n_counters, 2 * self.counters.numel(), 1024),
++                dtype=torch.int32,
++                device=self.device,
++            )
++        return self.partials, self.counters
++
++
++@functools.cache
++def _workspace(index):
++    return _Workspace(torch.device("cuda", index))
++
++
++def _workspace_need(tactic, m, n, k, dev):
++    """Scratch (partials, counters) a tactic needs for any M it can serve."""
++    if tactic[0] == "skinny":
++        from .skinny import Sm12xMxfp8Skinny
++
++        _, _, nt, rt, _, _, warps, _, _, cta_wide = tactic
++        grid = policy.skinny_grid(tactic, n, k, dev)
++        return Sm12xMxfp8Skinny.workspace_size(
++            policy.SKINNY_MAX_M, n, nt, rt, warps, grid, cta_wide
++        )
++    if tactic[0] == "persistent" and tactic[1] == "streamk":
++        # sk_tiles * (ceil(grid / sk_tiles) + 1) <= 3 * SMs for any M.
++        return 3 * dev.sms * tactic[2] * tactic[3], dev.sms
++    return 0, 0
++
++
++def _compile(n, k, tactic, dev, out_f16):
++    import cutlass
++    import cutlass.cute as cute
++
++    from ....jit.cute_dsl_core import build_and_load_cute_dsl_kernel
++    from . import common, gemv, persistent, pingpong, ptx, skinny
++
++    family = tactic[0]
++    m_sym = cute.sym_int()
++
++    def fake(dtype, shape, align=16):
++        return cute.runtime.make_fake_compact_tensor(
++            dtype,
++            shape,
++            stride_order=tuple(range(len(shape) - 1, -1, -1)),
++            assumed_align=align,
++        )
++
++    fp8 = cutlass.Float8E4M3FN
++    a = fake(fp8, (m_sym, k))
++    b = fake(fp8, (n, k))
++    sfa = fake(cutlass.Uint8, (cute.sym_int(),))
++    sfb = fake(cutlass.Uint8, (sf_bytes(n, k),))
++    out_dtype = cutlass.Float16 if out_f16 else cutlass.BFloat16
++    c = fake(out_dtype, (m_sym, n), 16 if (n * 2) % 16 == 0 else 2)
++    part = fake(cutlass.Float32, (cute.sym_int(),))
++    cnt = fake(cutlass.Int32, (cute.sym_int(),))
++    stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
++
++    if family == "gemv":
++        _, _, mb, lpr, warps, _, ks = tactic
++        grid = policy.gemv_grid(tactic, n, dev)
++        op = gemv.Sm12xMxfp8Gemv(n, k, mb, lpr, warps, grid, ks, out_f16)
++        args = (a, sfa, b, sfb, c, stream)
++        source = gemv
++    elif family == "skinny":
++        _, _, nt, rt, ku, p, warps, _, _, cta_wide = tactic
++        grid = policy.skinny_grid(tactic, n, k, dev)
++        op = skinny.Sm12xMxfp8Skinny(
++            n, k, nt, rt, ku, p, warps, grid, cta_wide, out_f16
++        )
++        args = (a, sfa, b, sfb, c, part, cnt, stream)
++        source = skinny
++    elif family == "persistent":
++        _, _, bm, bn, wm, wn, ks, kw, sa = tactic
++        sb = policy.persistent_stages(tactic)
++        op = persistent.Sm12xMxfp8Persistent(
++            n, k, bm, bn, wm, wn, ks, sb, kw, sa, tactic[1] == "streamk", out_f16
++        )
++        args = (
++            a,
++            b,
++            sfa,
++            sfb,
++            c,
++            part,
++            cnt,
++            cutlass.Int32(1),
++            cutlass.Int32(0),
++            stream,
++        )
++        grid = 0
++        source = persistent
++    else:
++        _, _, tile_n, tile_k, epi_n, epi_stages, group, coop, early = tactic
++        op = pingpong.Sm12xMxfp8PingpongGemm(
++            n, k, tile_n, tile_k, (64, epi_n), epi_stages, group, coop, early, out_dtype
++        )
++        args = (a, b, sfa, sfb, c, cutlass.Int32(1), stream)
++        grid = 0
++        source = pingpong
++
++    name = "_".join(str(int(x)) if isinstance(x, bool) else str(x) for x in tactic[1:])
++    return build_and_load_cute_dsl_kernel(
++        f"{policy.VERSION}_{family}",
++        f"n{n}_k{k}_{name}_g{grid}_{'f16' if out_f16 else 'bf16'}",
++        lambda: cute.compile(op, *args, options="--enable-tvm-ffi"),
++        extra_key_files=(
++            __file__,
++            policy.__file__,
++            common.__file__,
++            ptx.__file__,
++            source.__file__,
++        ),
++    )
++
++
++def _get_compiled(index, n, k, tactic, out_f16):
++    key = (index, n, k, tactic, out_f16)
++    fn = _COMPILED.get(key)
++    if fn is None:
++        with _LOCK:
++            fn = _COMPILED.get(key)
++            if fn is None:
++                if torch.cuda.is_current_stream_capturing():
++                    raise RuntimeError(
++                        "SM12x cute-dsl mm_mxfp8 compiles kernels on first use; run the "
++                        "same shape once before CUDA graph capture"
++                    )
++                with torch.cuda.device(index):
++                    fn = _compile(n, k, tactic, _device(index), out_f16)
++                _COMPILED[key] = fn
++    return fn
++
++
++def launch(tactic, a, b, a_descale, b_descale, out):
++    """Run one tactic: out[M, N] = a[M, K] @ b[K, N] with block scales."""
++    m, k = a.shape
++    n = b.shape[1]
++    if m == 0:
++        return out
++    index = get_device_index(a.device)
++    dev = _device(index)
++    fn = _get_compiled(index, n, k, tactic, out.dtype == torch.float16)
++    w = b.T
++    family = tactic[0]
++    if family == "gemv":
++        fn(a, a_descale, w, b_descale, out)
++    elif family == "skinny":
++        part, cnt = _workspace(index).get(*_workspace_need(tactic, m, n, k, dev))
++        fn(a, a_descale, w, b_descale, out, part, cnt)
++    elif family == "persistent":
++        part, cnt = _workspace(index).get(*_workspace_need(tactic, m, n, k, dev))
++        grid, sk_tiles = policy.persistent_schedule(tactic, m, n, k, dev)
++        fn(a, w, a_descale, b_descale, out, part, cnt, grid, sk_tiles)
++    else:
++        cta_m = 256 if tactic[7] else 128
++        tiles = -(-m // cta_m) * -(-n // tactic[2])
++        fn(a, w, a_descale, b_descale, out, min(dev.sms, tiles))
++    return out
++
++
++class Sm12xMxfp8GemmRunner(TunableRunner):
++    """``TunableRunner`` over every SM12x MXFP8 kernel family (see policy.py)."""
++
++    def get_cache_key_extras(self, inputs):
++        a, _, _, _, _, out, _ = inputs
++        return (policy.VERSION, get_compute_capability(a.device), str(out.dtype))
++
++    def get_valid_tactics(self, inputs, profile):
++        a, b = inputs[:2]
++        dev = _device(get_device_index(a.device))
++        return policy.valid_tactics(a.shape[0], b.shape[1], a.shape[1], dev)
++
++    def forward(self, inputs, tactic=-1, do_preparation=False, **kwargs):
++        a, b, a_descale, b_descale, _, out, _ = inputs
++        m, k = a.shape
++        n = b.shape[1]
++        index = get_device_index(a.device)
++        dev = _device(index)
++        if do_preparation:
++            for choice in policy.valid_tactics(m, n, k, dev):
++                _get_compiled(index, n, k, choice, out.dtype == torch.float16)
++                _workspace(index).get(*_workspace_need(choice, m, n, k, dev))
++                if choice[0] == "pingpong" and choice[7]:
++                    # The 128-row fallback of policy.resolve for smaller M.
++                    fallback = policy.resolve(choice, 1)
++                    _get_compiled(index, n, k, fallback, out.dtype == torch.float16)
++            return out
++        if tactic is None or tactic == -1 or not policy.supports_m(tactic, m):
++            tactic = policy.default_tactic(m, n, k, dev)
++        return launch(policy.resolve(tactic, m), a, b, a_descale, b_descale, out)
++
++
++@functools.cache
++def get_runner():
++    return Sm12xMxfp8GemmRunner()
+diff --git a/flashinfer/gemm/kernels/sm12x_mxfp8/skinny.py b/flashinfer/gemm/kernels/sm12x_mxfp8/skinny.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..54c659f6d22d17066876fa2631e4f755c5ec001d
+--- /dev/null
++++ b/flashinfer/gemm/kernels/sm12x_mxfp8/skinny.py
+@@ -0,0 +1,868 @@
++# SPDX-FileCopyrightText: Copyright (c) 2026 by FlashInfer team.
++# SPDX-License-Identifier: Apache-2.0
++"""Stream-K block-scaled MXFP8 GEMM for skinny M on SM12x.
++
++out[M, N] = A[M, K] @ B[N, K]^T with UE8M0 scales in the F8_128x4 layout.
++
++The weight is cut into units of (16 * RT rows) x (32 * KU K columns). Units are
++ordered row-tile-major; the flat unit range is split evenly over the G CTAs
++(stream-K) and each CTA's range evenly over its W warps, so every warp streams
++the same number of weight bytes for any N and K. A warp that owns a whole row
++tile writes the output directly. Row tiles shared by warps of a CTA are summed
++in shared memory; row tiles shared by several CTAs are finished by the
++last-arriving CTA from FP32 partials in global scratch. Every reduction runs
++in a fixed order, so results do not depend on scheduling.
++
++The MMA is m16n8k32 block-scaled with A and B swapped: weight rows are the
++MMA M dimension and tokens the N dimension (TM = 8 * NT tokens per grid row).
++
++Weight loads: lane t of a quad loads 8 * KU contiguous bytes of its row
++(KU = 4 or 2 k32 blocks per unit). The K order inside one MMA is free as long
++as A and B agree and the 32 values stay inside one scale block, so an in-quad
++transpose hands every lane its piece of each block.
++
++In the CTA-wide variant all warps work on the same K unit of a W * 16 * RT row
++block and share one activation tile staged in shared memory one unit ahead.
++"""
++
++import cutlass
++import cutlass.cute as cute
++import cutlass.utils
++
++from . import ptx
++from .common import sf_offset
++
++I32 = cutlass.Int32
++U32 = cutlass.Uint32
++F32 = cutlass.Float32
++
++
++def _quad_transpose4(R, i, r, h, b1, b0):
++    """In-quad transpose of 4 x 64-bit slots: slot s of lane l <- slot l of lane s."""
++    for k in range(2):
++        for w in range(2):
++            a = R[i, r, h, k, w]
++            c = R[i, r, h, 2 + k, w]
++            rc = ptx.shfl_bfly(ptx.sel(b1, a, c), 2)
++            R[i, r, h, k, w] = ptx.sel(b1, rc, a)
++            R[i, r, h, 2 + k, w] = ptx.sel(b1, c, rc)
++    for k in range(2):
++        for w in range(2):
++            a = R[i, r, h, 2 * k, w]
++            c = R[i, r, h, 2 * k + 1, w]
++            rc = ptx.shfl_bfly(ptx.sel(b0, a, c), 1)
++            R[i, r, h, 2 * k, w] = ptx.sel(b0, rc, a)
++            R[i, r, h, 2 * k + 1, w] = ptx.sel(b0, c, rc)
++
++
++def _quad_transpose2(R, i, r, h, lane, t):
++    """KU = 2: lane t holds pieces 2t, 2t+1 (block t // 2); afterwards slot j
++    holds piece t of block j (from lane 2j + t // 2 of the quad)."""
++    qbase = lane - t
++    par = U32(t & 1)
++    new = [[None, None], [None, None]]
++    for j in range(2):
++        src = qbase + 2 * j + (t >> 1)
++        for w in range(2):
++            v0 = ptx.shfl_idx(R[i, r, h, 0, w], src)
++            v1 = ptx.shfl_idx(R[i, r, h, 1, w], src)
++            new[j][w] = ptx.sel(par, v1, v0)
++    for j in range(2):
++        for w in range(2):
++            R[i, r, h, j, w] = new[j][w]
++
++
++def _range(lo, n, parts, idx):
++    return lo + (idx * n) // parts, lo + ((idx + 1) * n) // parts
++
++
++@cute.jit
++def _load_unit(
++    u,
++    i,
++    g,
++    t,
++    m0,
++    M,
++    mB,
++    mSFB,
++    mA,
++    mSFA,
++    abuf,
++    sabuf,
++    xbuf,
++    xsbuf,
++    N: cutlass.Constexpr,
++    K: cutlass.Constexpr,
++    RT: cutlass.Constexpr,
++    NT: cutlass.Constexpr,
++    KU: cutlass.Constexpr,
++    LX: cutlass.Constexpr,
++    CLAMP: cutlass.Constexpr = None,
++):
++    """Load unit u of the weight (and, with LX, the matching activation slice)."""
++    KB = K // 32
++    KBU = (KB + KU - 1) // KU
++    KT = (KB + 3) // 4
++    TAIL = KB % KU != 0
++    st = u // KBU
++    kb0 = (u - st * KBU) * KU
++    for r in cutlass.range_constexpr(RT):
++        for h in cutlass.range_constexpr(2):
++            n = st * (16 * RT) + r * 16 + g + 8 * h
++            if cutlass.const_expr(N % (16 * RT) != 0 if CLAMP is None else CLAMP):
++                n = ptx.imin(n, I32(N - 1))
++            live = True
++            if cutlass.const_expr(TAIL):
++                live = kb0 + (t * KU) // 4 < KB
++            for q in cutlass.range_constexpr(KU // 2):
++                if live:
++                    v0, v1, v2, v3 = ptx.ldg_nc_v4_stream(
++                        mB.iterator + (n * K + kb0 * 32 + t * (8 * KU) + q * 16)
++                    )
++                    abuf[i, r, h, 2 * q, 0] = v0
++                    abuf[i, r, h, 2 * q, 1] = v1
++                    abuf[i, r, h, 2 * q + 1, 0] = v2
++                    abuf[i, r, h, 2 * q + 1, 1] = v3
++                else:
++                    abuf[i, r, h, 2 * q, 0] = U32(0)
++                    abuf[i, r, h, 2 * q, 1] = U32(0)
++                    abuf[i, r, h, 2 * q + 1, 0] = U32(0)
++                    abuf[i, r, h, 2 * q + 1, 1] = U32(0)
++        ns = st * (16 * RT) + r * 16 + g + 8 * (t & 1)
++        if cutlass.const_expr(CLAMP if CLAMP is not None else False):
++            ns = ptx.imin(ns, I32(N - 1))
++        if cutlass.const_expr(KU == 2):
++            sabuf[i, r] = ptx.ldg_nc_u16(mSFB.iterator + sf_offset(ns, kb0, KT))
++        else:
++            sabuf[i, r] = ptx.ldg_nc_u32(mSFB.iterator + sf_offset(ns, kb0, KT))
++    for j in cutlass.range_constexpr(NT if LX else 0):
++        m = m0 + j * 8 + g
++        if m < M:
++            for b in cutlass.range_constexpr(KU):
++                live = True
++                if cutlass.const_expr(TAIL):
++                    live = kb0 + b < KB
++                if live:
++                    q0, q1 = ptx.ldg_nc_v2(
++                        mA.iterator + (m * K + (kb0 + b) * 32 + t * 8)
++                    )
++                    xbuf[i, j, b, 0] = q0
++                    xbuf[i, j, b, 1] = q1
++                else:
++                    xbuf[i, j, b, 0] = U32(0)
++                    xbuf[i, j, b, 1] = U32(0)
++            if cutlass.const_expr(KU == 2):
++                xsbuf[i, j] = ptx.ldg_nc_u16(mSFA.iterator + sf_offset(m, kb0, KT))
++            else:
++                xsbuf[i, j] = ptx.ldg_nc_u32(mSFA.iterator + sf_offset(m, kb0, KT))
++        else:
++            for b in cutlass.range_constexpr(KU):
++                xbuf[i, j, b, 0] = U32(0)
++                xbuf[i, j, b, 1] = U32(0)
++            xsbuf[i, j] = U32(0x7F7F7F7F)
++
++
++@cute.jit
++def _write_out(
++    vals,
++    st,
++    g,
++    t,
++    m0,
++    M,
++    mC,
++    N: cutlass.Constexpr,
++    RT: cutlass.Constexpr,
++    NT: cutlass.Constexpr,
++    F16: cutlass.Constexpr,
++):
++    for r in cutlass.range_constexpr(RT):
++        for h in cutlass.range_constexpr(2):
++            n = st * (16 * RT) + r * 16 + g + 8 * h
++            if n < N:
++                for j in cutlass.range_constexpr(NT):
++                    m = m0 + j * 8 + 2 * t
++                    if m < M:
++                        ptx.stg_half(mC.iterator + (m * N + n), vals[r, j, 2 * h], F16)
++                    if m + 1 < M:
++                        ptx.stg_half(
++                            mC.iterator + ((m + 1) * N + n), vals[r, j, 2 * h + 1], F16
++                        )
++
++
++@cute.jit
++def _cta_reduce(
++    st,
++    warp,
++    lane,
++    g,
++    t,
++    c0,
++    c1,
++    by,
++    bx,
++    m0,
++    M,
++    red,
++    sP,
++    mC,
++    mP,
++    mCnt,
++    N: cutlass.Constexpr,
++    KBU: cutlass.Constexpr,
++    RT: cutlass.Constexpr,
++    NT: cutlass.Constexpr,
++    U: cutlass.Constexpr,
++    G: cutlass.Constexpr,
++    W: cutlass.Constexpr,
++    STN: cutlass.Constexpr,
++    F16: cutlass.Constexpr,
++):
++    """Sum the CTA's warp pieces of tile st (ascending warp order), then either
++    write the tile or hand the CTA partial to the cross-CTA fixup."""
++    SLOT = RT * NT * 32 * 4
++    tu0 = st * KBU
++    tu1 = tu0 + KBU
++    for r in cutlass.range_constexpr(RT):
++        for j in cutlass.range_constexpr(NT):
++            for v in cutlass.range_constexpr(4):
++                red[r, j, v] = F32(0.0)
++    for w2 in cutlass.range_constexpr(W):
++        a2, b2 = _range(c0, c1 - c0, W, w2)
++        if w2 >= warp and a2 < b2 and a2 < tu1 and b2 > tu0:
++            pc = I32(1)
++            if st == a2 // KBU:
++                pc = I32(0)
++            for r in cutlass.range_constexpr(RT):
++                for j in cutlass.range_constexpr(NT):
++                    off = ((w2 * 2 + pc) * RT * NT + r * NT + j) * 128 + lane * 4
++                    for v in cutlass.range_constexpr(4):
++                        red[r, j, v] = red[r, j, v] + sP[off + v]
++    if tu0 >= c0 and tu1 <= c1:
++        _write_out(red, st, g, t, m0, M, mC, N, RT, NT, F16)
++    else:
++        piece = I32(1)
++        if st == c0 // KBU:
++            piece = I32(0)
++        base = ((by * G + bx) * 2 + piece) * SLOT
++        for r in cutlass.range_constexpr(RT):
++            for j in cutlass.range_constexpr(NT):
++                off = base + ((r * NT + j) * 32 + lane) * 4
++                ptx.stg_v4_f32(
++                    mP.iterator + off,
++                    red[r, j, 0],
++                    red[r, j, 1],
++                    red[r, j, 2],
++                    red[r, j, 3],
++                )
++        cute.arch.sync_warp()
++        cidx = by * STN + st
++        old = I32(0)
++        if lane == 0:
++            old = ptx.atom_add_acq_rel_gpu(mCnt.iterator + cidx, I32(1))
++        old = cute.arch.shuffle_sync(old, 0)
++        cute.arch.sync_warp()
++        cf = ((tu0 + 1) * G - 1) // U
++        cl = (tu1 * G - 1) // U
++        if old == cl - cf:
++            for r in cutlass.range_constexpr(RT):
++                for j in cutlass.range_constexpr(NT):
++                    for v in cutlass.range_constexpr(4):
++                        red[r, j, v] = F32(0.0)
++            for c in cutlass.range(cf, cl + 1, unroll=4):
++                pc = I32(1)
++                if st == ((c * U) // G) // KBU:
++                    pc = I32(0)
++                cbase = ((by * G + c) * 2 + pc) * SLOT
++                for r in cutlass.range_constexpr(RT):
++                    for j in cutlass.range_constexpr(NT):
++                        off = cbase + ((r * NT + j) * 32 + lane) * 4
++                        p0, p1, p2, p3 = ptx.ldg_cg_v4_f32(mP.iterator + off)
++                        red[r, j, 0] = red[r, j, 0] + p0
++                        red[r, j, 1] = red[r, j, 1] + p1
++                        red[r, j, 2] = red[r, j, 2] + p2
++                        red[r, j, 3] = red[r, j, 3] + p3
++            _write_out(red, st, g, t, m0, M, mC, N, RT, NT, F16)
++            if lane == 0:
++                ptx.st_relaxed_gpu_s32(mCnt.iterator + cidx, I32(0))
++
++
++@cute.kernel
++def _rowtile_kernel(
++    mA: cute.Tensor,
++    mSFA: cute.Tensor,
++    mB: cute.Tensor,
++    mSFB: cute.Tensor,
++    mC: cute.Tensor,
++    mP: cute.Tensor,
++    mCnt: cute.Tensor,
++    M: cutlass.Int32,
++    N: cutlass.Constexpr,
++    K: cutlass.Constexpr,
++    RT: cutlass.Constexpr,
++    NT: cutlass.Constexpr,
++    KU: cutlass.Constexpr,
++    P: cutlass.Constexpr,
++    W: cutlass.Constexpr,
++    G: cutlass.Constexpr,
++    F16: cutlass.Constexpr,
++):
++    KBU = (K // 32 + KU - 1) // KU
++    KTAIL = (K // 32) % KU != 0
++    STN = (N + 16 * RT - 1) // (16 * RT)
++    U = STN * KBU
++    TM = NT * 8
++    SLOT = RT * NT * 32 * 4
++
++    tidx, _, _ = cute.arch.thread_idx()
++    bx, by, _ = cute.arch.block_idx()
++    warp = tidx // 32
++    lane = tidx % 32
++    g = lane // 4
++    t = lane % 4
++    tb0 = U32(t & 1)
++    tb1 = U32((t >> 1) & 1)
++    m0 = by * TM
++    c0, c1 = _range(0, U, G, bx)
++    a, b = _range(c0, c1 - c0, W, warp)
++
++    smem = cutlass.utils.SmemAllocator()
++    sPp = smem.allocate_array(F32, W * 2 * SLOT, byte_alignment=16)
++    sP = cute.make_tensor(sPp, cute.make_layout((W * 2 * SLOT,)))
++
++    abuf = cute.make_rmem_tensor(cute.make_layout((P, RT, 2, KU, 2)), U32)
++    sabuf = cute.make_rmem_tensor(cute.make_layout((P, RT)), U32)
++    xbuf = cute.make_rmem_tensor(cute.make_layout((P, NT, KU, 2)), U32)
++    xsbuf = cute.make_rmem_tensor(cute.make_layout((P, NT)), U32)
++    acc = cute.make_rmem_tensor(cute.make_layout((RT, NT, 4)), F32)
++    red = cute.make_rmem_tensor(cute.make_layout((RT, NT, 4)), F32)
++    acc.fill(0.0)
++
++    for i in cutlass.range_constexpr(P):
++        if a + i < b:
++            _load_unit(
++                a + i,
++                i,
++                g,
++                t,
++                m0,
++                M,
++                mB,
++                mSFB,
++                mA,
++                mSFA,
++                abuf,
++                sabuf,
++                xbuf,
++                xsbuf,
++                N,
++                K,
++                RT,
++                NT,
++                KU,
++                True,
++            )
++
++    nsteps = (b - a + P - 1) // P
++    for s in cutlass.range(nsteps, unroll=1):
++        for i in cutlass.range_constexpr(P):
++            u = a + s * P + i
++            if u < b:
++                st = u // KBU
++                kb0u = (u - st * KBU) * KU
++                for r in cutlass.range_constexpr(RT):
++                    for h in cutlass.range_constexpr(2):
++                        if cutlass.const_expr(KU == 4):
++                            _quad_transpose4(abuf, i, r, h, tb1, tb0)
++                        else:
++                            _quad_transpose2(abuf, i, r, h, lane, t)
++                for bb in cutlass.range_constexpr(KU):
++                    blive = True
++                    if cutlass.const_expr(KTAIL):
++                        blive = kb0u + bb < K // 32
++                    if blive:
++                        for r in cutlass.range_constexpr(RT):
++                            for j in cutlass.range_constexpr(NT):
++                                d0, d1, d2, d3 = ptx.mma_mxf8(
++                                    abuf[i, r, 0, bb, 0],
++                                    abuf[i, r, 1, bb, 0],
++                                    abuf[i, r, 0, bb, 1],
++                                    abuf[i, r, 1, bb, 1],
++                                    xbuf[i, j, bb, 0],
++                                    xbuf[i, j, bb, 1],
++                                    acc[r, j, 0],
++                                    acc[r, j, 1],
++                                    acc[r, j, 2],
++                                    acc[r, j, 3],
++                                    sabuf[i, r],
++                                    xsbuf[i, j],
++                                    bida=bb,
++                                    bidb=bb,
++                                )
++                                acc[r, j, 0] = d0
++                                acc[r, j, 1] = d1
++                                acc[r, j, 2] = d2
++                                acc[r, j, 3] = d3
++                un = u + P
++                if un < b:
++                    _load_unit(
++                        un,
++                        i,
++                        g,
++                        t,
++                        m0,
++                        M,
++                        mB,
++                        mSFB,
++                        mA,
++                        mSFA,
++                        abuf,
++                        sabuf,
++                        xbuf,
++                        xsbuf,
++                        N,
++                        K,
++                        RT,
++                        NT,
++                        KU,
++                        True,
++                    )
++                if u - st * KBU == KBU - 1 or u == b - 1:
++                    tu0 = st * KBU
++                    if a <= tu0 and tu0 + KBU <= b:
++                        _write_out(acc, st, g, t, m0, M, mC, N, RT, NT, F16)
++                    else:
++                        pc = I32(1)
++                        if st == a // KBU:
++                            pc = I32(0)
++                        for r in cutlass.range_constexpr(RT):
++                            for j in cutlass.range_constexpr(NT):
++                                off = (
++                                    (warp * 2 + pc) * RT * NT + r * NT + j
++                                ) * 128 + lane * 4
++                                for v in cutlass.range_constexpr(4):
++                                    sP[off + v] = acc[r, j, v]
++                    acc.fill(0.0)
++
++    cute.arch.barrier()
++    sta = a // KBU
++    stb = (b - 1) // KBU
++    head = (
++        a < b
++        and not (a <= sta * KBU and sta * KBU + KBU <= b)
++        and (a == c0 or (a - 1) // KBU != sta)
++    )
++    tail = a < b and stb != sta and not (stb * KBU + KBU <= b)
++    if head:
++        _cta_reduce(
++            sta,
++            warp,
++            lane,
++            g,
++            t,
++            c0,
++            c1,
++            by,
++            bx,
++            m0,
++            M,
++            red,
++            sP,
++            mC,
++            mP,
++            mCnt,
++            N,
++            KBU,
++            RT,
++            NT,
++            U,
++            G,
++            W,
++            STN,
++            F16,
++        )
++    if tail:
++        _cta_reduce(
++            stb,
++            warp,
++            lane,
++            g,
++            t,
++            c0,
++            c1,
++            by,
++            bx,
++            m0,
++            M,
++            red,
++            sP,
++            mC,
++            mP,
++            mCnt,
++            N,
++            KBU,
++            RT,
++            NT,
++            U,
++            G,
++            W,
++            STN,
++            F16,
++        )
++
++
++@cute.jit
++def _cta_stage_load(
++    ku,
++    tidx,
++    m0,
++    M,
++    mA,
++    mSFA,
++    xpre,
++    K: cutlass.Constexpr,
++    TM: cutlass.Constexpr,
++    KU: cutlass.Constexpr,
++):
++    KB = K // 32
++    KT = (KB + 3) // 4
++    if tidx < TM * KU:
++        tk = tidx // KU
++        kb = ku * KU + tidx % KU
++        m = m0 + tk
++        xpre[16] = U32(0)
++        if m < M and kb < KB:
++            xpre[16] = U32(1)
++            for h in cutlass.range_constexpr(2):
++                u0, u1, u2, u3 = ptx.ldg_nc_v4(mA.iterator + (m * K + kb * 32 + h * 16))
++                xpre[h * 4] = u0
++                xpre[h * 4 + 1] = u1
++                xpre[h * 4 + 2] = u2
++                xpre[h * 4 + 3] = u3
++            xpre[8] = ptx.ldg_nc_u8(mSFA.iterator + sf_offset(m, kb, KT))
++
++
++@cute.jit
++def _cta_stage_store(
++    buf,
++    tidx,
++    xpre,
++    sXq,
++    sXs,
++    TM: cutlass.Constexpr,
++    KU: cutlass.Constexpr,
++):
++    XRW = (KU * 32 + 16) // 4
++    if tidx < TM * KU:
++        tk = tidx // KU
++        b = tidx % KU
++        base = (buf * TM + tk) * XRW + b * 8
++        sbase = (buf * TM + tk) * KU + b
++        if xpre[16] != U32(0):
++            for z in cutlass.range_constexpr(8):
++                sXq[base + z] = xpre[z]
++            sXs[sbase] = xpre[8].to(cutlass.Uint8)
++        else:
++            for z in cutlass.range_constexpr(8):
++                sXq[base + z] = U32(0)
++            sXs[sbase] = cutlass.Uint8(127)
++
++
++@cute.kernel
++def _ctawide_kernel(
++    mA: cute.Tensor,
++    mSFA: cute.Tensor,
++    mB: cute.Tensor,
++    mSFB: cute.Tensor,
++    mC: cute.Tensor,
++    mP: cute.Tensor,
++    mCnt: cute.Tensor,
++    M: cutlass.Int32,
++    N: cutlass.Constexpr,
++    K: cutlass.Constexpr,
++    RT: cutlass.Constexpr,
++    NT: cutlass.Constexpr,
++    KU: cutlass.Constexpr,
++    P: cutlass.Constexpr,
++    W: cutlass.Constexpr,
++    G: cutlass.Constexpr,
++    F16: cutlass.Constexpr,
++):
++    KB = K // 32
++    KBU = (KB + KU - 1) // KU
++    KTAIL = KB % KU != 0
++    RB = W * RT * 16
++    STNB = (N + RB - 1) // RB
++    U = STNB * KBU
++    TM = NT * 8
++    SLOT = RT * NT * 32 * 4
++    XRW = (KU * 32 + 16) // 4
++    CLAMP = N % RB != 0
++
++    tidx, _, _ = cute.arch.thread_idx()
++    bx, by, _ = cute.arch.block_idx()
++    warp = tidx // 32
++    lane = tidx % 32
++    g = lane // 4
++    t = lane % 4
++    tb0 = U32(t & 1)
++    tb1 = U32((t >> 1) & 1)
++    m0 = by * TM
++    c0, c1 = _range(0, U, G, bx)
++
++    smem = cutlass.utils.SmemAllocator()
++    sXqp = smem.allocate_array(U32, 2 * TM * XRW, byte_alignment=16)
++    sXq = cute.make_tensor(sXqp, cute.make_layout((2 * TM * XRW,)))
++    sXsp = smem.allocate_array(cutlass.Uint8, 2 * TM * KU, byte_alignment=16)
++    sXs = cute.make_tensor(sXsp, cute.make_layout((2 * TM * KU,)))
++    sFp = smem.allocate_array(I32, 4, byte_alignment=16)
++    sF = cute.make_tensor(sFp, cute.make_layout((4,)))
++
++    abuf = cute.make_rmem_tensor(cute.make_layout((P, RT, 2, KU, 2)), U32)
++    sabuf = cute.make_rmem_tensor(cute.make_layout((P, RT)), U32)
++    xbuf = cute.make_rmem_tensor(cute.make_layout((1, NT, KU, 2)), U32)
++    xsbuf = cute.make_rmem_tensor(cute.make_layout((1, NT)), U32)
++    xpre = cute.make_rmem_tensor(cute.make_layout((17,)), U32)
++    acc = cute.make_rmem_tensor(cute.make_layout((RT, NT, 4)), F32)
++    red = cute.make_rmem_tensor(cute.make_layout((RT, NT, 4)), F32)
++    bq = cute.make_rmem_tensor(cute.make_layout((NT, 2)), U32)
++    sfb = cute.make_rmem_tensor(cute.make_layout((NT,)), U32)
++    acc.fill(0.0)
++
++    for i in cutlass.range_constexpr(P):
++        u = c0 + i
++        if u < c1:
++            blk = u // KBU
++            uw = (blk * W + warp) * KBU + (u - blk * KBU)
++            _load_unit(
++                uw,
++                i,
++                g,
++                t,
++                m0,
++                M,
++                mB,
++                mSFB,
++                mA,
++                mSFA,
++                abuf,
++                sabuf,
++                xbuf,
++                xsbuf,
++                N,
++                K,
++                RT,
++                NT,
++                KU,
++                False,
++                CLAMP,
++            )
++    if c0 < c1:
++        _cta_stage_load(c0 - (c0 // KBU) * KBU, tidx, m0, M, mA, mSFA, xpre, K, TM, KU)
++        _cta_stage_store(0, tidx, xpre, sXq, sXs, TM, KU)
++    cute.arch.barrier()
++
++    nsteps = (c1 - c0 + P - 1) // P
++    for s in cutlass.range(nsteps, unroll=1):
++        for i in cutlass.range_constexpr(P):
++            u = c0 + s * P + i
++            if u < c1:
++                blk = u // KBU
++                ku = u - blk * KBU
++                cur = (u - c0) % 2
++                if u + 1 < c1:
++                    un = u + 1
++                    _cta_stage_load(
++                        un - (un // KBU) * KBU, tidx, m0, M, mA, mSFA, xpre, K, TM, KU
++                    )
++                for r in cutlass.range_constexpr(RT):
++                    for h in cutlass.range_constexpr(2):
++                        if cutlass.const_expr(KU == 4):
++                            _quad_transpose4(abuf, i, r, h, tb1, tb0)
++                        else:
++                            _quad_transpose2(abuf, i, r, h, lane, t)
++                for bb in cutlass.range_constexpr(KU):
++                    blive = True
++                    if cutlass.const_expr(KTAIL):
++                        blive = ku * KU + bb < KB
++                    if blive:
++                        for j in cutlass.range_constexpr(NT):
++                            xo = (cur * TM + j * 8 + g) * XRW + bb * 8 + 2 * t
++                            bq[j, 0] = sXq[xo]
++                            bq[j, 1] = sXq[xo + 1]
++                            sfb[j] = sXs[(cur * TM + j * 8 + g) * KU + bb].to(U32)
++                        for r in cutlass.range_constexpr(RT):
++                            for j in cutlass.range_constexpr(NT):
++                                d0, d1, d2, d3 = ptx.mma_mxf8(
++                                    abuf[i, r, 0, bb, 0],
++                                    abuf[i, r, 1, bb, 0],
++                                    abuf[i, r, 0, bb, 1],
++                                    abuf[i, r, 1, bb, 1],
++                                    bq[j, 0],
++                                    bq[j, 1],
++                                    acc[r, j, 0],
++                                    acc[r, j, 1],
++                                    acc[r, j, 2],
++                                    acc[r, j, 3],
++                                    sabuf[i, r],
++                                    sfb[j],
++                                    bida=bb,
++                                    bidb=0,
++                                )
++                                acc[r, j, 0] = d0
++                                acc[r, j, 1] = d1
++                                acc[r, j, 2] = d2
++                                acc[r, j, 3] = d3
++                up = u + P
++                if up < c1:
++                    blp = up // KBU
++                    uwp = (blp * W + warp) * KBU + (up - blp * KBU)
++                    _load_unit(
++                        uwp,
++                        i,
++                        g,
++                        t,
++                        m0,
++                        M,
++                        mB,
++                        mSFB,
++                        mA,
++                        mSFA,
++                        abuf,
++                        sabuf,
++                        xbuf,
++                        xsbuf,
++                        N,
++                        K,
++                        RT,
++                        NT,
++                        KU,
++                        False,
++                        CLAMP,
++                    )
++                if u + 1 < c1:
++                    _cta_stage_store(1 - cur, tidx, xpre, sXq, sXs, TM, KU)
++                if ku == KBU - 1 or u == c1 - 1:
++                    tu0 = blk * KBU
++                    st = blk * W + warp
++                    if c0 <= tu0 and tu0 + KBU <= c1:
++                        _write_out(acc, st, g, t, m0, M, mC, N, RT, NT, F16)
++                    else:
++                        pc = I32(1)
++                        if blk == c0 // KBU:
++                            pc = I32(0)
++                        base = (((by * G + bx) * 2 + pc) * W + warp) * SLOT
++                        for r in cutlass.range_constexpr(RT):
++                            for j in cutlass.range_constexpr(NT):
++                                off = base + ((r * NT + j) * 32 + lane) * 4
++                                ptx.stg_v4_f32(
++                                    mP.iterator + off,
++                                    acc[r, j, 0],
++                                    acc[r, j, 1],
++                                    acc[r, j, 2],
++                                    acc[r, j, 3],
++                                )
++                        cute.arch.barrier()
++                        cidx = by * STNB + blk
++                        if tidx == 0:
++                            # The barrier orders the CTA's partial stores before
++                            # this release; the acquire pairs with the last CTA.
++                            sF[0] = ptx.atom_add_acq_rel_gpu(
++                                mCnt.iterator + cidx, I32(1)
++                            )
++                        cute.arch.barrier()
++                        old = sF[0]
++                        cf = ((tu0 + 1) * G - 1) // U
++                        cl = ((tu0 + KBU) * G - 1) // U
++                        if old == cl - cf:
++                            ptx.fence_acq_rel_gpu()
++                            for r in cutlass.range_constexpr(RT):
++                                for j in cutlass.range_constexpr(NT):
++                                    for v in cutlass.range_constexpr(4):
++                                        red[r, j, v] = F32(0.0)
++                            for c in cutlass.range(cf, cl + 1, unroll=4):
++                                pcc = I32(1)
++                                if blk == ((c * U) // G) // KBU:
++                                    pcc = I32(0)
++                                cb = (((by * G + c) * 2 + pcc) * W + warp) * SLOT
++                                for r in cutlass.range_constexpr(RT):
++                                    for j in cutlass.range_constexpr(NT):
++                                        off = cb + ((r * NT + j) * 32 + lane) * 4
++                                        p0, p1, p2, p3 = ptx.ldg_cg_v4_f32(
++                                            mP.iterator + off
++                                        )
++                                        red[r, j, 0] = red[r, j, 0] + p0
++                                        red[r, j, 1] = red[r, j, 1] + p1
++                                        red[r, j, 2] = red[r, j, 2] + p2
++                                        red[r, j, 3] = red[r, j, 3] + p3
++                            _write_out(red, st, g, t, m0, M, mC, N, RT, NT, F16)
++                            if tidx == 0:
++                                ptx.st_relaxed_gpu_s32(mCnt.iterator + cidx, I32(0))
++                    acc.fill(0.0)
++                cute.arch.barrier()
++
++
++class Sm12xMxfp8Skinny:
++    """Host wrapper; ``__call__(a, sfa, b, sfb, c, partials, counters)``.
++
++    ``nt`` token groups of 8 per grid row, ``rt`` 16-row MMA tiles per unit,
++    ``ku`` k32 blocks per unit, ``p`` units prefetched per warp, ``warps`` per
++    CTA, ``grid`` stream-K CTAs. ``partials`` (FP32) and
++    ``counters`` (Int32, zero on entry and on exit) are the stream-K scratch;
++    see :meth:`workspace_size`.
++    """
++
++    def __init__(self, n, k, nt, rt, ku, p, warps, grid, cta_wide, out_f16=False):
++        self.n, self.k = n, k
++        self.nt, self.rt, self.ku, self.p = nt, rt, ku, p
++        self.warps, self.grid, self.cta_wide = warps, grid, cta_wide
++        self.out_f16 = out_f16
++
++    @staticmethod
++    def workspace_size(m, n, nt, rt, warps, grid, cta_wide):
++        """(partial floats, counters) needed for ``m`` rows."""
++        rows = 16 * rt * (warps if cta_wide else 1)
++        n_tiles = (n + rows - 1) // rows
++        m_blocks = (m + 8 * nt - 1) // (8 * nt)
++        slot = rt * nt * 32 * 4 * (warps if cta_wide else 1)
++        return m_blocks * grid * 2 * slot, m_blocks * n_tiles
++
++    @cute.jit
++    def __call__(
++        self,
++        mA: cute.Tensor,
++        mSFA: cute.Tensor,
++        mB: cute.Tensor,
++        mSFB: cute.Tensor,
++        mC: cute.Tensor,
++        mP: cute.Tensor,
++        mCnt: cute.Tensor,
++        stream,
++    ):
++        m = cute.size(mA, mode=[0])
++        tm = 8 * self.nt
++        kernel = _ctawide_kernel if self.cta_wide else _rowtile_kernel
++        kernel(
++            mA,
++            mSFA,
++            mB,
++            mSFB,
++            mC,
++            mP,
++            mCnt,
++            m,
++            self.n,
++            self.k,
++            self.rt,
++            self.nt,
++            self.ku,
++            self.p,
++            self.warps,
++            self.grid,
++            self.out_f16,
++        ).launch(
++            grid=[self.grid, (m + tm - 1) // tm, 1],
++            block=[32 * self.warps, 1, 1],
++            stream=stream,
++        )
+diff --git a/tests/autotuner/test_autotuner_core.py b/tests/autotuner/test_autotuner_core.py
+index dbf4501f7454025f63154855984bc009867695f6..17ad8dcd355a7727393002133df793aba414baaa 100644
+--- a/tests/autotuner/test_autotuner_core.py
++++ b/tests/autotuner/test_autotuner_core.py
+@@ -474,6 +474,49 @@ def test_choose_one_tuning_selects_best_tactic_and_populates_cache(monkeypatch):
+     assert tuner.stats.tuned_op_successful_configs["dummy_tune"] >= 1
+ 
+ 
++@pytest.mark.parametrize(
++    "times,expected",
++    [
++        ({0: 1.00, 1: 0.98, 2: 3.0}, 0),  # 2% faster: keep the first tactic
++        ({0: 1.00, 1: 0.95, 2: 3.0}, 1),  # 5% faster: take it
++    ],
++)
++def test_choose_one_first_tactic_margin(monkeypatch, times, expected):
++    """first_tactic_margin keeps runners[0]'s first tactic unless beaten by the margin."""
++    tuner = reset_autotuner()
++    runner = DummyRunner(valid_tactics=(0, 1, 2))
++    inputs = [torch.empty((16, 32), dtype=torch.float32)]
++    config = TuningConfig(first_tactic_margin=0.03)
++
++    def fake_profile(
++        self, runner_obj, prof_inputs, tactic, tuning_config=None, **kwargs
++    ):
++        return times[tactic]
++
++    monkeypatch.setattr(AutoTuner, "_profile_single_kernel", fake_profile)
++    with autotune(tune_mode=True):
++        _, tactic = tuner.choose_one("dummy_margin", [runner], config, inputs)
++    assert tactic == expected
++
++
++def test_tuning_config_timer_routes_to_cupti(monkeypatch):
++    """TuningConfig(timer="cupti") uses the CUPTI span path when it is available."""
++    from flashinfer.autotuner import autotuner as autotuner_module
++
++    tuner = reset_autotuner()
++    runner = DummyRunner()
++    calls = []
++    monkeypatch.setattr(autotuner_module, "_load_cupti", lambda: object())
++    monkeypatch.setattr(
++        AutoTuner,
++        "_profile_single_kernel_cupti",
++        lambda self, r, inputs, tactic, config, **kw: calls.append(tactic) or 1.0,
++    )
++    inputs = [torch.empty((16, 32), dtype=torch.float32)]
++    t = tuner._profile_single_kernel(runner, inputs, 1, TuningConfig(timer="cupti"))
++    assert t == 1.0 and calls == [1]
++
++
+ @pytest.mark.parametrize("phase", ("forward", "precompile"))
+ def test_choose_one_recovers_from_memory_error_during_preparation(monkeypatch, phase):
+     class PreparationMemoryErrorRunner(DummyRunner):
+diff --git a/tests/gemm/test_mm_mxfp8.py b/tests/gemm/test_mm_mxfp8.py
+index a8a58a03a2edbc960f3973dbb4c26f5d0631cde7..8d42a0e8beb327cbbb00278519b986beb38ed123 100644
+--- a/tests/gemm/test_mm_mxfp8.py
++++ b/tests/gemm/test_mm_mxfp8.py
+@@ -172,6 +172,8 @@ def test_mm_mxfp8_cute_dsl_narrow_tiles_only_within_32_tokens():
+     offer them while the kernel-N extent (n, or m when A and B are swapped)
+     is at most 32."""
+     _skip_if_unsupported("cute-dsl")
++    if get_compute_capability(torch.device("cuda"))[0] == 12:
++        pytest.skip("Tests the tactics of the SM100-family tcgen05 kernels")
+     for m, n in ((128, 128), (128, 64), (64, 128)):
+         narrow = [t for t in _mxfp8_cute_dsl_tactics(m, n) if t[0][1] < 64]
+         assert narrow == [], (m, n, narrow)
+diff --git a/tests/gemm/test_mm_mxfp8_sm12x_cute.py b/tests/gemm/test_mm_mxfp8_sm12x_cute.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..5302f65a0e1d969cb8e72435357092edc7221552
+--- /dev/null
++++ b/tests/gemm/test_mm_mxfp8_sm12x_cute.py
+@@ -0,0 +1,341 @@
++"""SM120 / SM121 tests for ``mm_mxfp8(..., backend="cute-dsl")``.
++
++Operands are drawn from a small set of E4M3 values with power-of-two block
++scales, so every product and partial sum is exact in FP32 and the result is
++independent of the summation order. Every kernel, tactic and split of K must
++then reproduce the FP64 reference bit for bit after one rounding to the
++output dtype.
++"""
++
++import pytest
++import torch
++
++from flashinfer import autotune, mm_mxfp8, mxfp8_quantize
++from flashinfer.autotuner import AutoTuner
++from flashinfer.utils import get_compute_capability, version_at_least
++
++
++@pytest.fixture(scope="module", autouse=True)
++def _require_sm12x_cuda13():
++    if not torch.cuda.is_available():
++        pytest.skip("Requires an SM120 or SM121 GPU")
++    cc = get_compute_capability(torch.device("cuda"))
++    if cc not in ((12, 0), (12, 1)):
++        pytest.skip("Requires an SM120 or SM121 GPU")
++    if torch.version.cuda is None or not version_at_least(torch.version.cuda, "13.0"):
++        pytest.skip("SM12x cute-dsl mm_mxfp8 requires CUDA 13 or newer")
++    pytest.importorskip("cutlass.cute")
++    assert mm_mxfp8.is_backend_supported("cute-dsl", cc[0] * 10 + cc[1])
++
++
++def _runner_and_device():
++    from flashinfer.gemm.kernels.sm12x_mxfp8 import runner
++
++    return runner.get_runner(), runner._device(torch.cuda.current_device())
++
++
++# E4M3 encodings of 0, +-0.5, +-1, +-1.5, +-2, +-3.
++_E4M3 = torch.tensor([0x00, 0x30, 0xB0, 0x38, 0xB8, 0x3C, 0xBC, 0x40, 0xC0, 0x44, 0xC4])
++# UE8M0 encodings of 2^-1, 2^0, 2^1.
++_UE8M0 = torch.tensor([126, 127, 128])
++
++
++def _swizzle(sf, rows, kb):
++    """[rows, kb] UE8M0 -> flat F8_128x4 layout (rows padded to 128, kb to 4)."""
++    kt = (kb + 3) // 4
++    out = torch.full(((rows + 127) // 128 * 128 * kt * 4,), 127, dtype=torch.uint8)
++    r = torch.arange(rows).view(-1, 1)
++    c = torch.arange(kb).view(1, -1)
++    idx = (
++        (r >> 7) * (kt * 512)
++        + (c >> 2) * 512
++        + (r & 31) * 16
++        + ((r >> 5) & 3) * 4
++        + (c & 3)
++    )
++    out[idx.reshape(-1)] = sf.reshape(-1)
++    return out
++
++
++def _operands(m, n, k, seed):
++    gen = torch.Generator().manual_seed(seed)
++    a = _E4M3[torch.randint(len(_E4M3), (m, k), generator=gen)].to(torch.uint8)
++    w = _E4M3[torch.randint(len(_E4M3), (n, k), generator=gen)].to(torch.uint8)
++    sfa = _UE8M0[torch.randint(3, (m, k // 32), generator=gen)].to(torch.uint8)
++    sfw = _UE8M0[torch.randint(3, (n, k // 32), generator=gen)].to(torch.uint8)
++    da = a.view(torch.float8_e4m3fn).double() * torch.pow(
++        2.0, sfa.double() - 127
++    ).repeat_interleave(32, dim=1)
++    dw = w.view(torch.float8_e4m3fn).double() * torch.pow(
++        2.0, sfw.double() - 127
++    ).repeat_interleave(32, dim=1)
++    operands = (
++        a.view(torch.float8_e4m3fn).cuda(),
++        w.view(torch.float8_e4m3fn).cuda().T,
++        _swizzle(sfa, m, k // 32).cuda(),
++        _swizzle(sfw, n, k // 32).cuda(),
++    )
++    return operands, (da @ dw.T).cuda()
++
++
++def _assert_exact(out, ref):
++    expected = ref.to(out.dtype)
++    assert torch.isfinite(out).all()
++    assert torch.equal(out.view(torch.int16), expected.view(torch.int16))
++
++
++def _bucket_cases():
++    # (m, n, k): every M range of the policy, N and K tails, N < 128.
++    return [
++        (1, 1, 2080),
++        (1, 256, 512),
++        (2, 129, 384),
++        (3, 7, 160),
++        (3, 96, 2560),
++        (4, 1024, 3200),
++        (7, 640, 2560),
++        (8, 15, 1056),
++        (8, 2688, 1856),
++        (13, 1280, 2944),
++        (16, 33, 2592),
++        (16, 2880, 1024),
++        (17, 1856, 2688),
++        (24, 320, 4096),
++        (24, 640, 2080),
++        (32, 3072, 1536),
++        (48, 1280, 2560),
++        (33, 1024, 1024),
++        (100, 129, 384),
++        (128, 2560, 640),
++        (200, 96, 2560),
++        (256, 1280, 2560),
++        (300, 2688, 1856),
++        (512, 1024, 3200),
++        (600, 129, 384),
++        (1031, 2560, 640),
++        (2149, 1024, 1024),
++    ]
++
++
++@pytest.mark.parametrize("m,n,k", _bucket_cases())
++@pytest.mark.parametrize("out_dtype", [torch.bfloat16, torch.float16])
++def test_default_tactic_exact(m, n, k, out_dtype):
++    (a, b, sfa, sfb), ref = _operands(m, n, k, seed=m + n + k)
++    out = mm_mxfp8(a, b, sfa, sfb, out_dtype=out_dtype, backend="cute-dsl")
++    _assert_exact(out, ref)
++    provided = torch.full((m, n), float("nan"), dtype=out_dtype, device="cuda")
++    assert (
++        mm_mxfp8(a, b, sfa, sfb, out=provided, out_dtype=out_dtype, backend="cute-dsl")
++        is provided
++    )
++    _assert_exact(provided, ref)
++
++
++_BF16, _FP16 = torch.bfloat16, torch.float16
++
++
++@pytest.mark.parametrize(
++    "m,n,k,out_dtype",
++    [(m, n, k, _BF16) for m, n, k in [(1, 640, 2560), (4, 129, 384), (8, 129, 1056)]]
++    + [(m, n, k, _BF16) for m, n, k in [(8, 2688, 1856), (16, 96, 2560)]]
++    + [(m, n, k, _BF16) for m, n, k in [(32, 1856, 2688), (32, 640, 2080)]]
++    + [(m, n, k, _BF16) for m, n, k in [(64, 1024, 3200), (64, 256, 160)]]
++    + [(m, n, k, _BF16) for m, n, k in [(128, 2560, 640), (128, 129, 416)]]
++    + [(m, n, k, _BF16) for m, n, k in [(256, 129, 384), (512, 3072, 1536)]]
++    + [(1024, 1280, 2560, _BF16)]
++    # FP16 output: GEMV and persistent, stream-K, ping-pong (direct and TMA store).
++    + [(4, 129, 384, _FP16), (16, 96, 2560, _FP16), (256, 129, 384, _FP16)]
++    + [(1024, 1280, 2560, _FP16)],
++)
++def test_every_tactic_exact(m, n, k, out_dtype):
++    """Every advertised tactic of an autotuner bucket, at the bucket's M and at
++    the smallest M of the bucket (runtime M tails). Calls the runner directly,
++    so K < 128 (rejected by ``mm_mxfp8``) is covered too."""
++    runner, dev = _runner_and_device()
++    from flashinfer.gemm.kernels.sm12x_mxfp8 import policy
++
++    tactics = policy.valid_tactics(m, n, k, dev)
++    assert tactics
++    for mm in sorted({m, m // 2 + 1}):
++        (a, b, sfa, sfb), ref = _operands(mm, n, k, seed=mm * 7 + n)
++        out = torch.empty((mm, n), dtype=out_dtype, device="cuda")
++        inputs = [a, b, sfa, sfb, out_dtype, out, None]
++        for tactic in tactics:
++            if not policy.supports_m(tactic, mm):
++                continue
++            out.fill_(float("nan"))
++            runner(inputs, tactic=tactic)
++            _assert_exact(out, ref)
++
++
++@pytest.mark.parametrize(
++    "m,n,k", [(1900, 1280, 2720), (951, 1280, 2720), (300, 129, 160)]
++)
++def test_pingpong_tails_exact(m, n, k):
++    """Every ping-pong candidate (including the cooperative 256-row tile, run
++    without the runtime fallback) on M tails and a 16-byte-unaligned N."""
++    _, dev = _runner_and_device()
++    from flashinfer.gemm.kernels.sm12x_mxfp8 import policy, runner
++
++    (a, b, sfa, sfb), ref = _operands(m, n, k, seed=m + k)
++    out = torch.empty((m, n), dtype=torch.bfloat16, device="cuda")
++    for tactic in policy._pingpong_candidates(m, n, k, dev):
++        out.fill_(float("nan"))
++        runner.launch(tactic, a, b, sfa, sfb, out)
++        _assert_exact(out, ref)
++
++
++@pytest.mark.parametrize("extra", [1, -1])
++def test_streamk_sparse_split(extra):
++    """Persistent stream-K with sms + 1 or 2 * sms - 1 tiles: the split region
++    has 1 or sms - 1 tiles over all SMs, so many CTAs get no K iterations."""
++    _, dev = _runner_and_device()
++    from flashinfer.gemm.kernels.sm12x_mxfp8 import policy, runner
++
++    tiles = dev.sms + 1 if extra == 1 else 2 * dev.sms - 1
++    m, n, k = tiles * 128 - 5, 128, 256
++    tactic = policy.persistent(128, 128, 2, 4, sched="streamk")
++    grid, sk_tiles = policy.persistent_schedule(tactic, m, n, k, dev)
++    assert (grid, sk_tiles) == (dev.sms, tiles - dev.sms)
++    (a, b, sfa, sfb), ref = _operands(m, n, k, seed=tiles)
++    out = torch.full((m, n), float("nan"), dtype=torch.bfloat16, device="cuda")
++    runner.launch(tactic, a, b, sfa, sfb, out)
++    _assert_exact(out, ref)
++
++
++@pytest.mark.parametrize("m,n,k", [(2, 256, 512), (2, 4096, 2048), (24, 640, 2560)])
++def test_nan_scale_propagates(m, n, k):
++    """A UE8M0 scale of 0xFF (NaN) makes its output row NaN in every kernel."""
++    runner, dev = _runner_and_device()
++    from flashinfer.gemm.kernels.sm12x_mxfp8 import policy
++
++    (a, b, sfa, sfb), ref = _operands(m, n, k, seed=4)
++    sfa[0] = 255  # row 0, first k32 block
++    out = torch.empty((m, n), dtype=torch.bfloat16, device="cuda")
++    inputs = [a, b, sfa, sfb, torch.bfloat16, out, None]
++    for tactic in policy.valid_tactics(m, n, k, dev):
++        out.zero_()
++        runner(inputs, tactic=tactic)
++        assert torch.isnan(out[0]).all(), tactic
++        _assert_exact(out[1:], ref[1:])
++
++
++@pytest.mark.parametrize("m,n,k", [(1, 2560, 6144), (24, 640, 2560), (96, 2688, 1856)])
++def test_streamk_deterministic(m, n, k):
++    """Stream-K tactics reduce in a fixed order: repeated launches agree bitwise
++    on random (inexact) data."""
++    runner, dev = _runner_and_device()
++    from flashinfer.gemm.kernels.sm12x_mxfp8 import policy
++
++    x = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
++    w = torch.randn(n, k, device="cuda", dtype=torch.bfloat16)
++    a, sfa = mxfp8_quantize(x, is_sf_swizzled_layout=True)
++    wq, sfb = mxfp8_quantize(w, is_sf_swizzled_layout=True)
++    out = torch.empty((m, n), dtype=torch.bfloat16, device="cuda")
++    inputs = [a, wq.T, sfa, sfb, torch.bfloat16, out, None]
++    for tactic in policy.valid_tactics(m, n, k, dev):
++        if "streamk" not in tactic:
++            continue
++        runner(inputs, tactic=tactic)
++        first = out.clone()
++        for _ in range(3):
++            runner(inputs, tactic=tactic)
++            assert torch.equal(out.view(torch.int16), first.view(torch.int16)), tactic
++
++
++@pytest.mark.parametrize("m,n,k", [(1, 2560, 640), (5, 2688, 1856), (24, 1024, 3200)])
++@pytest.mark.parametrize("m2", [0, 1])
++def test_cuda_graph_replay(m, n, k, m2):
++    """Capture after one eager call, change the inputs in place, replay."""
++    m = m + m2 * 300
++    (a, b, sfa, sfb), _ = _operands(m, n, k, seed=1)
++    out = torch.empty((m, n), dtype=torch.bfloat16, device="cuda")
++    mm_mxfp8(a, b, sfa, sfb, out=out, backend="cute-dsl")
++    graph = torch.cuda.CUDAGraph()
++    with torch.cuda.graph(graph):
++        mm_mxfp8(a, b, sfa, sfb, out=out, backend="cute-dsl")
++    for seed in (2, 3):
++        (a2, b2, sfa2, sfb2), ref = _operands(m, n, k, seed=seed)
++        for live, new in zip((a, b, sfa, sfb), (a2, b2, sfa2, sfb2), strict=True):
++            live.copy_(new)
++        out.fill_(float("nan"))
++        graph.replay()
++        _assert_exact(out, ref)
++
++
++@pytest.mark.parametrize("n,k", [(1856, 2688), (129, 384)])
++def test_autotune_then_bucket_tails(n, k):
++    """Tune at the largest M, then run every M of the tuned buckets untuned."""
++    AutoTuner.get().clear_cache()
++    tune_m = 600
++    (a, b, sfa, sfb), ref = _operands(tune_m, n, k, seed=11)
++    with autotune(True):
++        out = mm_mxfp8(a, b, sfa, sfb, backend="cute-dsl")
++    _assert_exact(out, ref)
++    for m in (1, 3, 5, 9, 17, 33, 65, 129, 257, 513, 600):
++        (a, b, sfa, sfb), ref = _operands(m, n, k, seed=m)
++        _assert_exact(mm_mxfp8(a, b, sfa, sfb, backend="cute-dsl"), ref)
++
++
++def test_autotune_cache_file_roundtrip(tmp_path):
++    """Tactics persisted by autotune(cache=...) are reloaded and replayed."""
++    path = str(tmp_path / "mxfp8_sm12x.json")
++    (a, b, sfa, sfb), ref = _operands(64, 1024, 1024, seed=5)
++    AutoTuner.get().clear_cache()
++    with autotune(True, cache=path):
++        _assert_exact(mm_mxfp8(a, b, sfa, sfb, backend="cute-dsl"), ref)
++    AutoTuner.get().clear_cache()
++    with autotune(False, cache=path):
++        _assert_exact(mm_mxfp8(a, b, sfa, sfb, backend="cute-dsl"), ref)
++
++
++def test_foreign_tactic_falls_back_to_default():
++    """A tactic that is not one of this backend's runs the default instead."""
++    runner, _ = _runner_and_device()
++    (a, b, sfa, sfb), ref = _operands(40, 256, 2048, seed=6)
++    out = torch.empty((40, 256), dtype=torch.bfloat16, device="cuda")
++    inputs = [a, b, sfa, sfb, torch.bfloat16, out, None]
++    runner(inputs, tactic=((128, 8), (1, 1), True, False, 1))
++    _assert_exact(out, ref)
++
++
++def test_requirement_rejections():
++    m, n, k = 16, 256, 512
++    (a, b, sfa, sfb), _ = _operands(m, n, k, seed=0)
++    with pytest.raises(ValueError):
++        mm_mxfp8(a, b, sfa, sfb, out_dtype=torch.float32, backend="cute-dsl")
++    from flashinfer.gemm.gemm_base import _cute_dsl_gemm_mxfp8_requirement
++
++    with pytest.raises(ValueError, match="128x4"):
++        _cute_dsl_gemm_mxfp8_requirement(
++            a, b, sfa, sfb, use_8x4_sf_layout=True, backend="cute-dsl"
++        )
++    wide = torch.empty((m, k + 32), dtype=torch.float8_e4m3fn, device="cuda")
++    wide[:, :k] = a
++    with pytest.raises(ValueError, match="row-major"):
++        mm_mxfp8(wide[:, :k], b, sfa, sfb, backend="cute-dsl")
++    offset = torch.empty(m * k + 8, dtype=torch.uint8, device="cuda")
++    unaligned = offset[8:].view(torch.float8_e4m3fn).view(m, k)
++    unaligned.copy_(a)
++    with pytest.raises(ValueError, match="16-byte aligned"):
++        mm_mxfp8(unaligned, b, sfa, sfb, backend="cute-dsl")
++    # Automatic selection skips the backend instead of raising.
++    assert (
++        _cute_dsl_gemm_mxfp8_requirement(
++            a,
++            b,
++            sfa,
++            sfb,
++            out_dtype=torch.float32,
++            use_8x4_sf_layout=False,
++            backend="auto",
++        )
++        is False
++    )
++
++
++def test_k_not_multiple_of_32_rejected():
++    from flashinfer.gemm.kernels.sm12x_mxfp8 import policy
++
++    with pytest.raises(ValueError, match="K % 32"):
++        policy.check_shape(16, 256, 144)

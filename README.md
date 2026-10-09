@@ -1688,6 +1688,13 @@ Building the container manually is no longer supported due to Dockerfile complex
 
 The `build-and-copy.sh` script prepares the runner image and optionally copies it to one or more nodes. By default it pulls `eugr/spark-vllm:latest` and tags it locally. Use `--use-wheels` to build only the runner from downloaded or local precompiled wheels. Source compilation happens only when an explicit source-build flag such as `--rebuild-vllm`, `--vllm-ref`, `--apply-vllm-pr`, `--rebuild-flashinfer`, `--flashinfer-ref`, or `--apply-flashinfer-pr` is supplied.
 
+Source builds select DeepGEMM after applying vLLM patches. vLLM refs that require
+the stable-ABI `deep_gemm/_C.py` interface use the repository and commit declared
+in that ref's CMake configuration. Older refs, including the current B12X fork,
+retain the pinned DeepGEMM SM121 workaround. The build checks required source
+files before compiling and records the selected commit in `.deepgemm-commit`
+alongside the exported wheels.
+
 **Basic usage (prepare local image):**
 
 ```bash
