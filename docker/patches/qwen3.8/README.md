@@ -54,6 +54,16 @@ The October 8, 2026 series was replayed against upstream vLLM
 `fa7c741e0af4493a73352bf240c1bbc802cca288`. These identify the validation bases;
 normal builds still follow their selected refs.
 
+On October 9, the #54614 test hunk was refreshed to preserve the quantized-input
+shape test added by upstream [#59612](https://github.com/vllm-project/vllm/pull/59612).
+Both tests had been inserted at the same location, which caused the October 9
+nightly to stop on a test-file conflict. The complete vLLM series was then
+replayed successfully against the failed nightly's base
+`59ffd73e8597d860730f4a8c4f778f27c75a0dfa` and current main
+`75e3b17c055c609f02c64cd4ad3f8692b8170d8e`. The runtime patch content and lane
+selection are unchanged. A CPU-only regression in
+`tests/test_regular_patch_series.py` checks that both tests survive application.
+
 The supplied conflict resolutions are retained, with adaptations for newer
 upstream Mamba cache-boundary and KV-transfer fixes (#60533 and #59197).
 Lookahead hashing disables the EAGLE block drop while retaining the resolved

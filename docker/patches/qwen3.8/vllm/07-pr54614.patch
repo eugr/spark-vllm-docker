@@ -5,6 +5,7 @@ Subject: [PATCH] [PR #54614] [Kernel] Dynamic NVFP4 W4A4/W4A16 selection with
  shared weights
 
 Rebased onto current main. Preserve round_up=True, retain the full-model BF16 autotune path after #60434, and update the warmup test fixtures for dynamic linear selection.
+Preserve the quantized-input shape test added by #59612 when inserting the dynamic precision test.
 
 Upstream-PR: https://github.com/vllm-project/vllm/pull/54614
 
@@ -525,11 +526,11 @@ index 0000000000000000000000000000000000000000..6b17169b5860ff547fd689ba57b977e3
 +if __name__ == "__main__":
 +    main()
 diff --git a/tests/kernels/quantization/test_flashinfer_nvfp4_scaled_mm.py b/tests/kernels/quantization/test_flashinfer_nvfp4_scaled_mm.py
-index 54dcaa0b97eab2075586f486d500a539371a20e1..d6029a168925106f39fea56d22db70641e3c0bef 100644
+index 47c25d046d2c13df9f5a437d5e0da1c933f2e569..c7622f7a6541093571a139c7179d8cbfe9747238 100644
 --- a/tests/kernels/quantization/test_flashinfer_nvfp4_scaled_mm.py
 +++ b/tests/kernels/quantization/test_flashinfer_nvfp4_scaled_mm.py
-@@ -47,6 +47,114 @@ SEEDS = [42]
- CUDA_DEVICES = ["cuda:0"]
+@@ -99,6 +99,114 @@ def test_flashinfer_nvfp4_preserves_quantized_input_shape(
+     torch.testing.assert_close(actual.reshape(expected.shape), expected)
  
  
 +@pytest.mark.parametrize(

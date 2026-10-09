@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Exercise source-series application and lane guards without Docker or GPUs."""
 
+import ast
 import os
 from pathlib import Path
 import re
@@ -114,6 +115,39 @@ class PatchSeriesTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("README.md", self.git("diff", "--name-only", "--diff-filter=U"))
         self.assertFalse((self.source / "later").exists())
+
+    def test_nvfp4_patch_preserves_upstream_quantized_input_test(self):
+        # #59612 inserted a sibling test where #54614 originally added its test.
+        # Replay the real vendored hunk against that upstream excerpt.
+        path = "tests/kernels/quantization/test_flashinfer_nvfp4_scaled_mm.py"
+        upstream = (
+            PROJECT / "tests/fixtures/qwen38-patch-series/nvfp4_upstream.py"
+        ).read_text()
+        target = self.source / path
+        target.parent.mkdir(parents=True)
+        target.write_text(upstream)
+        self.commit()
+        patch = (PROJECT / "docker/patches/qwen3.8/vllm/07-pr54614.patch").read_text()
+        sections = re.split(r"(?m)(?=^diff --git )", patch)
+        section = next(s for s in sections if s.startswith(f"diff --git a/{path} "))
+        (self.series / "nvfp4.patch").write_text(section)
+        (self.series / "series").write_text("nvfp4.patch\n")
+
+        result = self.apply()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        updated = target.read_text()
+        compile(updated, path, "exec")
+        before = ast.parse(upstream)
+        after = ast.parse(updated)
+        added = "test_dynamic_precision_preserves_canonical_weights"
+        functions = [node for node in after.body if isinstance(node, ast.FunctionDef)]
+        self.assertEqual(sum(node.name == added for node in functions), 1)
+        after.body = [node for node in after.body if not (
+            isinstance(node, ast.FunctionDef) and node.name == added
+        )]
+        # The complete upstream test, its decorators, and helper stay intact.
+        self.assertEqual(ast.dump(before), ast.dump(after))
+        self.assertEqual(self.git("status", "--porcelain"), "")
 
     def test_docker_vllm_selection_respects_presets_and_repository(self):
         self.patch("first.patch", "feature", "first\n")
