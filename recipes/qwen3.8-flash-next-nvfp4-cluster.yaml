@@ -1,11 +1,11 @@
 # Recipe: Qwen3.8-Flash-Next-NVFP4 (dual-node cluster)
 # Two-node configuration using the B12X-optimized serving stack.
 
-recipe_version: "1"
+recipe_version: "2"
 name: Qwen3.8-Flash-Next-NVFP4 (Cluster)
-description: vLLM serving local-inference-lab/Qwen3.8-Flash-Next-NVFP4 on a dual DGX Spark cluster
+description: vLLM serving nvidia/Qwen3.8-Flash-Next-NVFP4 on a dual DGX Spark cluster
 
-model: local-inference-lab/Qwen3.8-Flash-Next-NVFP4
+model: nvidia/Qwen3.8-Flash-Next-NVFP4
 container: vllm-node-b12x
 
 build_args:
@@ -40,7 +40,7 @@ env:
   VLLM_ROCE_ALLREDUCE_MAX_SIZE: "2MB"
 
 command: |
-  vllm serve local-inference-lab/Qwen3.8-Flash-Next-NVFP4 \
+  vllm serve nvidia/Qwen3.8-Flash-Next-NVFP4 \
     --host {host} \
     --port {port} \
     --tensor-parallel-size {tensor_parallel} \
@@ -52,11 +52,11 @@ command: |
     --kv-cache-dtype fp8 \
     --quantization modelopt_mixed \
     --block-size {block_size} \
-    --load-format b12x \
+    --load-format safetensors \
     --max-model-len {max_model_len} \
     --max-num-seqs {max_num_seqs} \
     --max-num-batched-tokens {max_num_batched_tokens} \
-    --speculative-config '{{"method":"mtp","num_speculative_tokens":{num_speculative_tokens}}}' \
+    --speculative-config '{{"method":"mtp","num_speculative_tokens":{num_speculative_tokens},"moe_backend":"triton"}}' \
     --gdn-decode-kernel b12x \
     --linear-backend b12x \
     --moe-backend b12x \
