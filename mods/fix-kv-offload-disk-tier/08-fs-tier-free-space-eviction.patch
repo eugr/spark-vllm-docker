@@ -1,0 +1,365 @@
+diff --git a/vllm/v1/kv_offload/tiering/fs/manager.py b/vllm/v1/kv_offload/tiering/fs/manager.py
+index ef82101..b56a1d2 100644
+--- a/vllm/v1/kv_offload/tiering/fs/manager.py
++++ b/vllm/v1/kv_offload/tiering/fs/manager.py
+@@ -18,6 +18,10 @@ File naming:  <base_path>_r<rank>/<hhh>/<hh>_g<group_idx>/<hash_hex>.bin
+ import functools
+ import json
+ import os
++import queue
++import threading
++import time
++from collections import OrderedDict
+ from collections.abc import Iterable
+ from typing import TYPE_CHECKING, ClassVar
+ 
+@@ -58,6 +62,282 @@ if TYPE_CHECKING:
+ logger = init_logger(__name__)
+ 
+ 
++# FREE-SPACE EVICTION, least recently USED first.
++#
++# The fs tier has no capacity limit; it grows until the filesystem is full
++# (harmless to the engine -- stores just fail with ENOSPC -- but it starves
++# everything else on that disk and stops caching). This keeps a minimum of free
++# space instead of a tier size, because the disk is usually shared.
++#
++# Recency lives in MEMORY, never in file metadata: a hot conversation is
++# served from the GPU/CPU tiers and never reads its files, and writing atime
++# (utime) on every use would add SSD wear. The scheduler's touch() on every
++# lookup, plus stores and loads, keep an LRU of OffloadKeys. At startup the
++# LRU is seeded from the files' atime (read-only stat): a tier kept across
++# restarts is most valuable right after one.
++#
++# Safety: a file that is deleted between a lookup HIT and its load trips the
++# stuck-wave crash (KVWAVE STUCK after 120 s). So a key is never evicted while
++# the async lookup cache still holds it (= some live request looked it up),
++# while a load job reads it, or within EVICT_MIN_AGE_S of its last use; and
++# once chosen it answers MISS to lookups until the unlink is done.
++#
++#   VLLM_OFFLOAD_FS_MIN_FREE_GB     start evicting below this (0/unset = off)
++#   VLLM_OFFLOAD_FS_TARGET_FREE_GB  evict until this much is free (default 1.5x)
++#   VLLM_OFFLOAD_FS_EVICT_MIN_AGE_S never evict anything used this recently (600)
++_GB = 1 << 30
++EVICT_MIN_FREE = int(float(os.environ.get("VLLM_OFFLOAD_FS_MIN_FREE_GB", "0") or 0) * _GB)
++EVICT_TARGET_FREE = int(
++    float(os.environ.get("VLLM_OFFLOAD_FS_TARGET_FREE_GB", "0") or 0) * _GB
++) or int(EVICT_MIN_FREE * 1.5)
++EVICT_MIN_AGE_S = float(os.environ.get("VLLM_OFFLOAD_FS_EVICT_MIN_AGE_S", "600") or 600)
++_TOUCH_RESOLUTION_S = 60.0  # re-order a key at most once a minute
++_EVICT_BATCH = 32  # files handed to the unlink thread per scheduler step
++_SEED_SLICE = 20000  # seeded entries merged per scheduler step
++_STATVFS_PERIOD_S = 30.0
++
++
++class _FreeSpaceEvictor:
++    """LRU of on-disk keys + free-space-driven eviction. Scheduler-thread owned.
++
++    Only ``_io_loop`` and ``_seed_walk`` run on their own threads; they talk to
++    the scheduler thread exclusively through queues and one int (_free).
++    """
++
++    def __init__(self, tier: "FileSystemTierManager", root: str):
++        self._tier = tier
++        self._root = root  # <base>_r<rank>
++        self._lru: OrderedDict[OffloadKey, float] = OrderedDict()
++        self._doomed: set[OffloadKey] = set()
++        self._loading: dict[JobId, list[OffloadKey]] = {}
++        self._load_refs: dict[OffloadKey, int] = {}
++        self._storing: dict[JobId, list[OffloadKey]] = {}
++        self._evicting = False
++        self._free = self._statvfs_free()
++        self._unlink_q: queue.SimpleQueue = queue.SimpleQueue()
++        self._unlinked_q: queue.SimpleQueue = queue.SimpleQueue()
++        self._seed_q: queue.SimpleQueue = queue.SimpleQueue()
++        self._seed_pending: list[tuple[float, OffloadKey]] = []
++        self._seed_received = False
++        self._seeded = False
++        self._stats = {"files": 0, "bytes": 0, "skipped_protected": 0}
++        self._last_warn = 0.0
++        threading.Thread(target=self._io_loop, name="vllm_kvfs_evict", daemon=True).start()
++        threading.Thread(target=self._seed_walk, name="vllm_kvfs_seed", daemon=True).start()
++        logger.info(
++            "KVFS EVICT enabled: min_free=%.0f GB target_free=%.0f GB min_age=%.0f s "
++            "root=%s free_now=%.0f GB",
++            EVICT_MIN_FREE / _GB, EVICT_TARGET_FREE / _GB, EVICT_MIN_AGE_S,
++            root, self._free / _GB,
++        )
++
++    # -- background threads -------------------------------------------------
++    def _statvfs_free(self) -> int:
++        try:
++            st = os.statvfs(self._root if os.path.isdir(self._root) else os.path.dirname(self._root))
++            return st.f_bavail * st.f_frsize
++        except OSError:
++            return 1 << 62  # unknown: never evict on a guess
++
++    def _io_loop(self) -> None:
++        while True:
++            try:
++                batch = self._unlink_q.get(timeout=_STATVFS_PERIOD_S)
++            except queue.Empty:
++                batch = None
++            if batch:
++                done = []
++                for key, path in batch:
++                    try:
++                        size = os.stat(path).st_size
++                        os.unlink(path)
++                        self._stats["files"] += 1
++                        self._stats["bytes"] += size
++                    except FileNotFoundError:
++                        pass
++                    except OSError as e:
++                        logger.warning("KVFS EVICT unlink %s failed: %s", path, e)
++                    done.append(key)
++                self._unlinked_q.put(done)
++            self._free = self._statvfs_free()
++
++    def _seed_walk(self) -> None:
++        """Read-only walk of the tier: (key, atime) for every chunk file."""
++        entries: list[tuple[float, OffloadKey]] = []
++        t0 = time.monotonic()
++        # Tiers of another model/layout live in sibling directories (the name
++        # hashes the layout). This evictor never touches them: say so, loudly.
++        try:
++            parent, own = os.path.split(self._root)
++            own_base = own.rsplit("_r", 1)[0]
++            for d in os.scandir(parent):
++                if d.is_dir() and d.name not in (own, own_base):
++                    logger.warning(
++                        "KVFS SEED unmanaged tier directory %s -- not evicted by this "
++                        "engine; delete it by hand if that layout is gone", d.path,
++                    )
++        except OSError:
++            pass
++        try:
++            for d1 in os.scandir(self._root):
++                if not d1.is_dir():
++                    continue
++                for d2 in os.scandir(d1.path):
++                    if not d2.is_dir() or "_g" not in d2.name:
++                        continue
++                    group = int(d2.name.rsplit("_g", 1)[1]).to_bytes(4, "big")
++                    for f in os.scandir(d2.path):
++                        name = f.name
++                        if not name.endswith(".bin"):
++                            continue
++                        try:
++                            key = OffloadKey(bytes.fromhex(name[:-4]) + group)
++                            entries.append((f.stat().st_atime, key))
++                        except (ValueError, OSError):
++                            continue
++        except FileNotFoundError:
++            pass
++        except Exception as e:  # noqa: BLE001 -- a failed seed must not kill the tier
++            logger.warning("KVFS SEED walk failed after %d files: %s", len(entries), e)
++        # Ascending, so maintain() pops the NEWEST first and prepends it: each
++        # older entry then lands in front of it, leaving the oldest at the cold end.
++        entries.sort()
++        logger.info(
++            "KVFS SEED %d files from %s in %.1f s (oldest atime %s)",
++            len(entries), self._root, time.monotonic() - t0,
++            time.strftime("%Y-%m-%d %H:%M", time.localtime(entries[0][0])) if entries else "-",
++        )
++        self._seed_q.put(entries)
++
++    # -- scheduler-thread hooks ----------------------------------------------
++    def touch(self, keys: Iterable[OffloadKey]) -> None:
++        now = time.time()
++        lru = self._lru
++        for k in keys:
++            t = lru.get(k)
++            if t is not None and now - t > _TOUCH_RESOLUTION_S:
++                lru[k] = now
++                lru.move_to_end(k)
++
++    def _add(self, keys: Iterable[OffloadKey]) -> None:
++        now = time.time()
++        for k in keys:
++            self._lru[k] = now
++            self._lru.move_to_end(k)
++
++    def is_doomed(self, key: OffloadKey) -> bool:
++        return key in self._doomed
++
++    def on_store_submitted(self, job_id: JobId, keys: list[OffloadKey]) -> None:
++        self._storing[job_id] = keys
++
++    def on_load_submitted(self, job_id: JobId, keys: list[OffloadKey]) -> None:
++        self._loading[job_id] = keys
++        for k in keys:
++            self._load_refs[k] = self._load_refs.get(k, 0) + 1
++        self.touch(keys)
++
++    def on_job_finished(self, job_id: JobId, success: bool) -> None:
++        keys = self._storing.pop(job_id, None)
++        if keys is not None:
++            if success:
++                self._add(keys)
++            return
++        for k in self._loading.pop(job_id, ()):
++            n = self._load_refs[k] - 1
++            if n:
++                self._load_refs[k] = n
++            else:
++                del self._load_refs[k]
++
++    def maintain(self) -> None:
++        """Once per scheduler step: merge seed, retire unlinks, pick victims."""
++        if self._seed_received is False:
++            try:
++                self._seed_pending = self._seed_q.get_nowait()
++                self._seed_received = True
++            except queue.Empty:
++                pass
++        if self._seed_pending:
++            # Seeded files go BEHIND everything already tracked: anything this
++            # process stored or touched is more recent than any file's atime.
++            lru = self._lru
++            for _ in range(min(_SEED_SLICE, len(self._seed_pending))):
++                atime, key = self._seed_pending.pop()
++                if key not in lru:
++                    lru[key] = atime
++                    lru.move_to_end(key, last=False)
++        if self._seed_received and not self._seed_pending:
++            self._seeded = True
++        while True:
++            try:
++                for k in self._unlinked_q.get_nowait():
++                    self._doomed.discard(k)
++            except queue.Empty:
++                break
++
++        free = self._free
++        if not self._evicting:
++            if free >= EVICT_MIN_FREE:
++                return
++            self._evicting = True
++            self._round = {"t0": time.time(), "free0": free, "files0": self._stats["files"],
++                           "bytes0": self._stats["bytes"], "oldest": None}
++            logger.info("KVFS EVICT start: free %.1f GB < %.0f GB", free / _GB, EVICT_MIN_FREE / _GB)
++        elif free >= EVICT_TARGET_FREE:
++            self._evicting = False
++            r = self._round
++            logger.info(
++                "KVFS EVICT done: freed %d files / %.1f GB in %.0f s, free %.1f -> %.1f GB, "
++                "oldest evicted last used %s, skipped %d protected",
++                self._stats["files"] - r["files0"], (self._stats["bytes"] - r["bytes0"]) / _GB,
++                time.time() - r["t0"], r["free0"] / _GB, free / _GB,
++                time.strftime("%m-%d %H:%M", time.localtime(r["oldest"])) if r["oldest"] else "-",
++                self._stats["skipped_protected"],
++            )
++            return
++        # Files already queued for unlink count as freed (every chunk file is one
++        # row stride long), so a stale statvfs cannot make it overshoot the target.
++        if free + len(self._doomed) * self._tier._block_size >= EVICT_TARGET_FREE:
++            return
++        if not self._seeded:
++            # Untracked files from before this start are the OLDEST data; evicting
++            # before they are merged would delete this session's files first.
++            return
++        protected = self._tier._lookup_manager._lookup_state
++        now = time.time()
++        batch = []
++        skipped = []
++        mapper = self._tier.file_mapper
++        room = EVICT_TARGET_FREE - free - len(self._doomed) * self._tier._block_size
++        want = min(_EVICT_BATCH, max(1, -(-room // max(1, self._tier._block_size))))
++        while self._lru and len(batch) < want:
++            key, last = next(iter(self._lru.items()))
++            if now - last < EVICT_MIN_AGE_S:
++                if now - self._last_warn > 300:
++                    self._last_warn = now
++                    logger.warning(
++                        "KVFS EVICT stalled: free %.1f GB < %.0f GB but the least recently "
++                        "used chunk was used %.0f s ago (< %.0f s); nothing old enough to delete",
++                        free / _GB, EVICT_MIN_FREE / _GB, now - last, EVICT_MIN_AGE_S,
++                    )
++                break
++            self._lru.popitem(last=False)
++            if key in protected or key in self._load_refs:
++                skipped.append((key, last))
++                continue
++            if self._round["oldest"] is None:
++                self._round["oldest"] = last
++            self._doomed.add(key)
++            batch.append((key, mapper.get_file_name(key)))
++        for key, last in reversed(skipped):  # back to the cold end, not lost
++            self._lru[key] = last
++            self._lru.move_to_end(key, last=False)
++        self._stats["skipped_protected"] += len(skipped)
++        if batch:
++            self._unlink_q.put(batch)
++
++
+ class FsAsyncLookupManager(AsyncLookupManager):
+     """Async lookup manager for FileSystemTierManager."""
+ 
+@@ -176,6 +456,14 @@ class FileSystemTierManager(SecondaryTierManager):
+ 
+         self._lookup_manager = FsAsyncLookupManager(tier=self, tier_type=self.tier_type)
+ 
++        # Free-space eviction; see _FreeSpaceEvictor. Off unless
++        # VLLM_OFFLOAD_FS_MIN_FREE_GB is set.
++        self._evictor: _FreeSpaceEvictor | None = None
++        if EVICT_MIN_FREE > 0:
++            self._evictor = _FreeSpaceEvictor(
++                self, f"{self.file_mapper.base_path}_r{self.file_mapper.rank}"
++            )
++
+         # Zero-task jobs. DualQueueThreadPool reports a job finished only from
+         # task_done() of its LAST task, so a job with zero tasks is never
+         # reported and never leaves _inflight_jobs; the tiering manager then
+@@ -220,13 +508,24 @@ class FileSystemTierManager(SecondaryTierManager):
+ 
+     @override
+     def lookup(self, key: OffloadKey, req_context: ReqContext) -> LookupResult:
++        if self._evictor is not None and self._evictor.is_doomed(key):
++            # Being unlinked right now: never let a load be planned on it.
++            return LookupResult.MISS
+         result = self._lookup_manager.lookup(key, req_context)
+         if result is None:
+             return LookupResult.RETRY
+         return LookupResult.HIT if result else LookupResult.MISS
+ 
++    @override
++    def touch(self, keys, req_context: ReqContext) -> None:
++        # Memory only (the evictor's LRU); never touches file metadata.
++        if self._evictor is not None:
++            self._evictor.touch(keys)
++
+     @override
+     def submit_store(self, job_metadata: JobMetadata) -> None:
++        if self._evictor is not None:
++            self._evictor.on_store_submitted(job_metadata.job_id, list(job_metadata.keys))
+         if self.events is not None:
+             self._store_job_keys[job_metadata.job_id] = list(job_metadata.keys)
+         tasks = (
+@@ -243,6 +542,8 @@ class FileSystemTierManager(SecondaryTierManager):
+ 
+     @override
+     def submit_load(self, job_metadata: JobMetadata) -> None:
++        if self._evictor is not None:
++            self._evictor.on_load_submitted(job_metadata.job_id, list(job_metadata.keys))
+         tasks = (
+             functools.partial(
+                 load_block,
+@@ -266,6 +567,8 @@ class FileSystemTierManager(SecondaryTierManager):
+             finished.extend((jid, True) for jid in self._empty_finished)
+             self._empty_finished.clear()
+         for job_id, success in finished:
++            if self._evictor is not None:
++                self._evictor.on_job_finished(job_id, success)
+             if self.events is not None:
+                 keys = self._store_job_keys.pop(job_id, None)
+                 if success and keys:
+@@ -297,6 +600,8 @@ class FileSystemTierManager(SecondaryTierManager):
+     @override
+     def on_schedule_end(self, context: ScheduleEndContext) -> None:
+         self._lookup_manager.flush()
++        if self._evictor is not None:
++            self._evictor.maintain()
+ 
+     @override
+     def shutdown(self) -> None:
