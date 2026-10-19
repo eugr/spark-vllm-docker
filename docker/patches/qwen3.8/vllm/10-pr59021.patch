@@ -1,0 +1,88 @@
+From: schopde-nvidia
+Subject: [PATCH] [Kernel] Allow steering the unquantized linear backend independently
+
+Upstream-PR: https://github.com/vllm-project/vllm/pull/59021
+Upstream-Commit: 0d1a683a3471ce352ef5a9aa2d7a9616bd1ac4bf
+Integration-Base: 355553ac22dca4080929ea8f88a446f15df1f3ba
+
+diff --git a/vllm/config/kernel.py b/vllm/config/kernel.py
+index 3d6eee04ffc07e72c8526bcc92d81e480e1498ff..dd6fe8282a230f8793b431e3c213643d1c7c34f3 100644
+--- a/vllm/config/kernel.py
++++ b/vllm/config/kernel.py
+@@ -417,6 +417,11 @@ class KernelConfig:
+     precedence over ``linear_backend``; for example,
+     ``{"nvfp4_w4a16": "humming"}``."""
+ 
++    unquantized_linear_backend: LinearBackend = "auto"
++    """Backend override for unquantized linear layers only, decoupled from
++    ``linear_backend`` (which also drives the quantized kernel selector).
++    "auto" (default) falls back to ``linear_backend``."""
++
+     @field_validator("moe_backend", mode="before")
+     @classmethod
+     def _normalize_moe_backend(cls, value: Any) -> Any:
+@@ -424,7 +429,7 @@ class KernelConfig:
+             return value.lower().replace("-", "_")
+         return value
+ 
+-    @field_validator("linear_backend", mode="before")
++    @field_validator("linear_backend", "unquantized_linear_backend", mode="before")
+     @classmethod
+     def _normalize_linear_backend(cls, value: Any) -> Any:
+         if isinstance(value, str):
+diff --git a/vllm/engine/arg_utils.py b/vllm/engine/arg_utils.py
+index 8f285317e04bad2ec4d57fd0b389bdc8a5a4ae1b..a39a4f5795578112616e7154d5857e9eeefba8ed 100644
+--- a/vllm/engine/arg_utils.py
++++ b/vllm/engine/arg_utils.py
+@@ -566,6 +566,9 @@ class EngineArgs:
+     sparse_indexer_topk_backend: SparseIndexerTopkBackend = (
+         KernelConfig.sparse_indexer_topk_backend
+     )
++    unquantized_linear_backend: LinearBackend = (
++        KernelConfig.unquantized_linear_backend
++    )
+     all2all_backend: All2AllBackend = ParallelConfig.all2all_backend
+     enable_elastic_ep: bool = ParallelConfig.enable_elastic_ep
+     elastic_ep_max_dp_size: int = ParallelConfig.elastic_ep_max_dp_size
+@@ -1835,6 +1838,15 @@ class EngineArgs:
+         kernel_group.add_argument(
+             "--sparse-indexer-topk-backend", **sparse_indexer_topk_kwargs
+         )
++        unquantized_linear_backend_kwargs = kernel_kwargs[
++            "unquantized_linear_backend"
++        ]
++        unquantized_linear_backend_kwargs["type"] = lambda s: s.lower().replace(
++            "-", "_"
++        )
++        kernel_group.add_argument(
++            "--unquantized-linear-backend", **unquantized_linear_backend_kwargs
++        )
+ 
+         # vLLM arguments
+         vllm_kwargs = get_kwargs(VllmConfig)
+@@ -2785,6 +2797,10 @@ class EngineArgs:
+             kernel_config.linear_backend = self.linear_backend
+         if self.sparse_indexer_topk_backend != "auto":
+             kernel_config.sparse_indexer_topk_backend = self.sparse_indexer_topk_backend
++        if self.unquantized_linear_backend != "auto":
++            kernel_config.unquantized_linear_backend = (
++                self.unquantized_linear_backend
++            )
+ 
+         # Transfer top-level ir_op_priority into KernelConfig.ir_op_priority
+         for op_name, op_priority in asdict(self.ir_op_priority).items():
+diff --git a/vllm/model_executor/layers/linear.py b/vllm/model_executor/layers/linear.py
+index 5b77caa256d41a828a60ef826e019e9ab4aa014f..deedd9eb62d4943515a623f8dc60b1951c3dedf3 100644
+--- a/vllm/model_executor/layers/linear.py
++++ b/vllm/model_executor/layers/linear.py
+@@ -172,6 +172,10 @@ class UnquantizedLinearMethod(LinearMethodBase):
+         linear_backend = (
+             config.kernel_config.linear_backend if config is not None else "auto"
+         )
++        if config is not None:
++            unquantized_backend = config.kernel_config.unquantized_linear_backend
++            if unquantized_backend != "auto":
++                linear_backend = unquantized_backend
+         self._gemm_impl = dispatch_unquantized_gemm(linear_backend)
+ 
+     def create_weights(

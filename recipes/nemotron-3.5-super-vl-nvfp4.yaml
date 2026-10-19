@@ -1,0 +1,50 @@
+# Recipe: NVIDIA Nemotron 3.5 Super VL 120B-A12B NVFP4
+# Single DGX Spark with the LiLiCorr draft model and DFlash speculation.
+
+recipe_version: "1"
+name: NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4
+description: vLLM serving NVIDIA Nemotron 3.5 Super VL on one DGX Spark with LiLiCorr DFlash speculative decoding
+
+model: nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4
+container: vllm-node
+solo_only: true
+
+defaults:
+  port: 8000
+  host: 0.0.0.0
+  tensor_parallel: 1
+  gpu_memory_utilization: 0.8
+  max_model_len: "auto"
+  max_num_seqs: 8
+  max_num_batched_tokens: 8192
+  num_speculative_tokens: 7
+
+command: |
+  vllm serve nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4 \
+    --host {host} \
+    --port {port} \
+    --tensor-parallel-size {tensor_parallel} \
+    --kv-cache-dtype fp8 \
+    --max-num-seqs {max_num_seqs} \
+    --trust-remote-code \
+    --max-model-len {max_model_len} \
+    --gpu-memory-utilization {gpu_memory_utilization} \
+    --max-num-batched-tokens {max_num_batched_tokens} \
+    --speculative_config.model nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4-LiLiCorr \
+    --speculative_config.method dflash \
+    --speculative_config.num_speculative_tokens {num_speculative_tokens} \
+    --mamba-backend flashinfer \
+    --mamba-ssm-cache-dtype float16 \
+    --enable-mamba-cache-stochastic-rounding \
+    --mamba-cache-philox-rounds 5 \
+    --enable-mamba-shared-prefix-checkpoint \
+    --prefix-match-unit 64 \
+    --block-size 64 \
+    --enable-auto-tool-choice \
+    --tool-call-parser qwen3_coder \
+    --reasoning-parser nemotron_v3 \
+    --mm-processor-cache-gb 0 \
+    --limit-mm-per-prompt '{{"video": 1, "image": 1}}' \
+    --video-pruning-rate 0.5 \
+    --media-io-kwargs '{{"video": {{"fps": 2, "num_frames": 256}}}}' \
+    --load-format instanttensor

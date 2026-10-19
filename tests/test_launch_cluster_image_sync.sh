@@ -124,7 +124,7 @@ run_launch() {
                 --eth-if eth0 \
                 --ib-if ib0 \
                 --no-cache-dirs \
-                -d start
+                -d "$@" start
     ) > "$OUTPUT_LOG" 2>&1
 }
 
@@ -152,6 +152,20 @@ test_matching_images_launch_cluster() {
     assert_output_contains '\[WORKER\] 10\.0\.0\.2: sha256:head \(match\)'
     assert_log_contains '^docker run '
     pass "matching image IDs allow cluster launch"
+}
+
+test_unlimited_memlock_on_every_node() {
+    local mode
+    local mode_args=()
+    for mode in privileged non-privileged; do
+        setup_fixture
+        mode_args=()
+        [[ "$mode" == privileged ]] || mode_args=(--non-privileged)
+        run_launch "${mode_args[@]}" || fail "$mode launch failed"
+        assert_log_contains '^docker run .*--ulimit memlock=-1:-1 '
+        assert_log_contains '^ssh .*docker run .*--ulimit memlock=-1:-1 '
+    done
+    pass "head and workers have unlimited memlock in both privilege modes"
 }
 
 test_mismatched_image_aborts_before_launch() {
@@ -243,6 +257,7 @@ test_missing_head_image_aborts_before_launch() {
 }
 
 test_matching_images_launch_cluster
+test_unlimited_memlock_on_every_node
 test_mismatched_image_aborts_before_launch
 test_missing_worker_image_aborts_before_launch
 test_mixed_image_stores_launch_cluster

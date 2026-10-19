@@ -1,0 +1,1321 @@
+Subject: [PATCH] Flash Next B12X checkpoint loading in the regular lane
+
+Integration-Base: 355553ac22dca4080929ea8f88a446f15df1f3ba
+
+Apply after 16-flash-next-fp4.patch.
+Reference: local-inference-lab/vllm
+3a947437cf1eb734299de91370c9b37fcdbcc42b (B12xModelLoader and transfer hooks).
+
+Adapt the loader to upstream's current Source and _prepare_weights interfaces.
+Reuse patch 16's scoped transfer helpers and FlashInfer's embedded B12X reader.
+Limit this integration to Flash Next and its MTP draft on Spark with TP=1/2;
+GDS, other architectures, EP/DP/PP, and standalone weight reload are excluded.
+Keep regular PLE mmap loading for resident, pinned-host and file-gather tables.
+Finish deferred reads before post-processing, materialize CSF and retained
+quantized draft-head inputs, and skip unrelated checkpoint shards for MTP.
+
+Includes CPU tensor/routing regressions and a Spark native-reader check.
+No inference kernel changes or standalone B12X dependency are introduced.
+
+diff --git a/tests/model_executor/model_loader/test_flash_next_b12x_loader.py b/tests/model_executor/model_loader/test_flash_next_b12x_loader.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..45d2d4813a3654611d8414a67cb0f315f0b19d22
+--- /dev/null
++++ b/tests/model_executor/model_loader/test_flash_next_b12x_loader.py
+@@ -0,0 +1,597 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Real-tensor regressions for the regular Flash Next loader backport.
++
++Extract the production definitions to avoid importing unrelated inference
++kernels. These tests also run against a source checkout with CPU-only Torch:
++pytest --noconftest --import-mode=importlib <this-file>
++"""
++
++from __future__ import annotations
++
++import ast
++import dataclasses
++import heapq
++import json
++import logging
++import math
++import runpy
++import sys
++import time
++from pathlib import Path
++from types import ModuleType, SimpleNamespace
++
++import pytest
++import torch
++from safetensors import safe_open
++from safetensors.torch import save_file
++
++ROOT = Path(__file__).resolve().parents[3]
++
++
++def definitions(path, names, namespace=None, *, owner=None):
++    """Execute actual source definitions with small dependency substitutes."""
++    tree = ast.parse((ROOT / path).read_text())
++    if owner is not None:
++        tree = next(node for node in tree.body if getattr(node, "name", None) == owner)
++    nodes = [node for node in tree.body if getattr(node, "name", None) in names]
++    assert {node.name for node in nodes} == set(names)
++    for node in ast.walk(ast.Module(body=nodes, type_ignores=[])):
++        if isinstance(node, (ast.ClassDef, ast.FunctionDef)):
++            node.decorator_list = [
++                decorator
++                for decorator in node.decorator_list
++                if not (
++                    isinstance(decorator, ast.Call)
++                    and isinstance(decorator.func, ast.Name)
++                    and decorator.func.id == "instrument"
++                )
++            ]
++    ns = dict(globals(), **(namespace or {}))
++    future = ast.parse("from __future__ import annotations").body
++    exec(compile(ast.Module(body=future + nodes, type_ignores=[]), path, "exec"), ns)
++    return SimpleNamespace(**ns)
++
++
++@pytest.fixture
++def transfer(monkeypatch):
++    ns = runpy.run_path(str(ROOT / "vllm/model_executor/weight_transfer.py"))
++    module = ModuleType("vllm.model_executor.weight_transfer")
++    module.__dict__.update(ns)
++    monkeypatch.setitem(sys.modules, "vllm.model_executor.weight_transfer", module)
++    return module
++
++
++class QueuedWriter:
++    """Resolve metadata views to real CPU bytes, deferring destination writes."""
++
++    def __init__(self):
++        self.sources = {}
++        self.pending = []
++        self.reads = []
++
++    def source(self, data):
++        meta = torch.empty(data.shape, dtype=data.dtype, device="meta")
++        # Retain the storage as well as its identity, just as the native reader does.
++        storage = meta.untyped_storage()
++        self.sources[storage._cdata] = (storage, data)
++        return meta
++
++    def materialize(self, source):
++        self.flush()
++        if not source.is_meta:
++            return source.clone()
++        _, data = self.sources[source.untyped_storage()._cdata]
++        return data.as_strided(
++            source.shape, source.stride(), source.storage_offset()
++        ).clone()
++
++    def __call__(self, destination, source):
++        if not source.is_meta:
++            self.flush()
++            return False
++        _, data = self.sources[source.untyped_storage()._cdata]
++        values = data.as_strided(source.shape, source.stride(), source.storage_offset())
++        self.pending.append((destination, values.clone()))
++        return True
++
++    def flush(self):
++        for destination, data in self.pending:
++            destination.copy_(data)
++        self.pending.clear()
++
++    def finish(self):
++        self.flush()
++
++    def weights(self, files, *, index_path, needs_values, skip):
++        with safe_open(files[0], framework="pt", device="cpu") as handle:
++            for name in sorted(handle.keys()):
++                if skip(name):
++                    continue
++                self.reads.append(name)
++                data = handle.get_tensor(name)
++                entry = SimpleNamespace(name=name, shape=data.shape)
++                yield name, data if needs_values(entry) else self.source(data)
++
++
++@pytest.fixture
++def loaders(transfer):
++    logger = logging.getLogger(__name__)
++    logger.info_once = logger.info
++    envs = SimpleNamespace(VLLM_CSF_RESIDENT=False)
++    csf = definitions(
++        "vllm/model_executor/model_loader/csf_scales.py",
++        {"decode_nvfp4_csf_scale", "decode_csf_scale_streams"},
++        dict(
++            logger=logger,
++            materialize_weight=transfer.materialize_weight,
++            CSF_FIXED_SUFFIX=".nvfp4_csf_fixed",
++            CSF_EXCEPTIONS_SUFFIX=".nvfp4_csf_exceptions",
++        ),
++    )
++
++    class Base:
++        def __init__(self, load_config):
++            self.load_config = load_config
++
++    default = definitions(
++        "vllm/model_executor/model_loader/default_loader.py",
++        {"DefaultModelLoader"},
++        dict(
++            BaseModelLoader=Base,
++            logger=logger,
++            nn=torch.nn,
++            finish_weight_transfers=transfer.finish_weight_transfers,
++        ),
++    ).DefaultModelLoader
++    adapter = definitions(
++        "vllm/model_executor/model_loader/b12x_loader.py",
++        {"B12xModelLoader", "_is_ple_weight"},
++        dict(
++            DefaultModelLoader=default,
++            logger=logger,
++            envs=envs,
++            decode_csf_scale_streams=csf.decode_csf_scale_streams,
++            weight_transfer=transfer.weight_transfer,
++            heapq=heapq,
++            math=math,
++            time=time,
++        ),
++    )
++    return SimpleNamespace(
++        adapter=adapter.B12xModelLoader, default=default, envs=envs, csf=csf, base=Base
++    )
++
++
++@dataclasses.dataclass
++class LoadConfig:
++    load_format: str = "b12x"
++    model_loader_extra_config: dict = dataclasses.field(default_factory=dict)
++    safetensors_load_strategy: str | None = None
++    device: str | None = None
++
++
++@pytest.mark.parametrize(
++    "options",
++    [
++        {"io_threads": 0},
++        {"io_threads": 17},
++        {"io_threads": True},
++        {"io_threads": 1.5},
++        {"read_mode": "gds"},
++        {"enable_multithread_load": True},
++        {"unknown": 1},
++    ],
++)
++def test_invalid_options_fail_before_io(loaders, options):
++    with pytest.raises(ValueError):
++        loaders.adapter(LoadConfig(model_loader_extra_config=options))
++
++
++def make_loader(loaders, root, files, *, unused=None, prefix=""):
++    loader = loaders.adapter(LoadConfig())
++    loader._session = QueuedWriter()
++    loader._prepare_weights = lambda *args: (
++        str(root),
++        [str(root / name) for name in files],
++        True,
++        "model.safetensors.index.json",
++    )
++    source = loaders.default.Source(
++        str(root), None, prefix=prefix, is_unused_weight=unused
++    )
++    return loader, source
++
++
++def test_draft_skips_target_files_and_stale_index_entries(tmp_path, loaders):
++    save_file(
++        {"mtp.weight": torch.arange(8), "target.weight": torch.arange(4)},
++        tmp_path / "draft.safetensors",
++    )
++    (tmp_path / "target.safetensors").write_bytes(b"must never be opened")
++    (tmp_path / "model.safetensors.index.json").write_text(
++        json.dumps(
++            {
++                "weight_map": {
++                    "mtp.weight": "draft.safetensors",
++                    "target.weight": "target.safetensors",
++                }
++            }
++        )
++    )
++    loader, source = make_loader(
++        loaders,
++        tmp_path,
++        ["target.safetensors", "draft.safetensors"],
++        unused=lambda name: not name.startswith("mtp."),
++        prefix="draft.",
++    )
++    weights = dict(loader._get_weights_iterator(source))
++    assert list(weights) == ["draft.mtp.weight"]
++    torch.testing.assert_close(
++        loader._session.materialize(weights["draft.mtp.weight"]), torch.arange(8)
++    )
++    assert loader._session.reads == ["mtp.weight"]
++
++
++def test_mixed_file_ple_views_survive_iterator_and_stay_out_of_direct_reader(
++    tmp_path, loaders
++):
++    names = ["a.weight", "model.ple.ngram_embedding.shard_0.weight", "z.weight"]
++    save_file(
++        {name: torch.arange(16).reshape(4, 4) + i for i, name in enumerate(names)},
++        tmp_path / "mixed.safetensors",
++    )
++    loader, source = make_loader(loaders, tmp_path, ["mixed.safetensors"])
++    weights = dict(loader._get_weights_iterator(source))
++    assert list(weights) == names
++    assert loader._session.reads == ["a.weight", "z.weight"]
++    ple = weights[names[1]]
++    assert ple.device.type == "cpu"
++    torch.testing.assert_close(ple, torch.arange(16).reshape(4, 4) + 1)
++    maps = definitions(
++        "vllm/models/qwen4_exp/nvidia/ngram_embedding.py", {"_maps_entry"}
++    )
++    path, offset = maps._maps_entry(ple.data_ptr())
++    assert Path(path) == tmp_path / "mixed.safetensors"
++    with open(path, "rb") as stream:
++        stream.seek(offset)
++        actual = torch.frombuffer(bytearray(stream.read(ple.nbytes)), dtype=ple.dtype)
++    torch.testing.assert_close(actual, ple.flatten())
++
++
++@pytest.mark.parametrize("resident", [False, True])
++def test_csf_modes_preserve_values(tmp_path, loaders, transfer, resident):
++    # Sixteen rows, two columns: base 1, packed codes 2 and 3 => bytes 3 and 4.
++    fixed = torch.cat(
++        (
++            torch.ones(1, 16, dtype=torch.uint8),
++            torch.full((1, 16), 0x32, dtype=torch.uint8),
++        ),
++        dim=1,
++    )
++    exceptions = torch.empty(0, dtype=torch.uint32)
++    prefix = "expert.weight_scale"
++    save_file(
++        {
++            prefix + ".nvfp4_csf_fixed": fixed,
++            prefix + ".nvfp4_csf_exceptions": exceptions,
++        },
++        tmp_path / "csf.safetensors",
++    )
++    loader, source = make_loader(loaders, tmp_path, ["csf.safetensors"])
++    loaders.envs.VLLM_CSF_RESIDENT = resident
++    with transfer.weight_transfer(loader._session):
++        weights = dict(loader._get_weights_iterator(source))
++    if resident:
++        assert all(tensor.is_meta for tensor in weights.values())
++        torch.testing.assert_close(
++            loader._session.materialize(weights[prefix + ".nvfp4_csf_fixed"]), fixed
++        )
++    else:
++        expected = torch.tensor([[3, 4]] * 16, dtype=torch.uint8)
++        torch.testing.assert_close(weights[prefix].view(torch.uint8), expected)
++
++
++@pytest.mark.parametrize("rank", [0, 1])
++def test_parameter_slices_reach_final_destinations(transfer, monkeypatch, rank):
++    platform = ModuleType("vllm.platforms")
++    platform.current_platform = SimpleNamespace(use_sync_weight_loader=lambda: False)
++    monkeypatch.setitem(sys.modules, "vllm.platforms", platform)
++    params = definitions(
++        "vllm/model_executor/parameter.py",
++        {
++            "BasevLLMParameter",
++            "_ColumnvLLMParameter",
++            "RowvLLMParameter",
++            "ModelWeightParameter",
++            "PackedColumnParameter",
++            "PackedvLLMParameter",
++            "_adjust_shard_indexes_for_packing",
++        },
++        dict(
++            Parameter=torch.nn.Parameter,
++            copy_weight=transfer.copy_weight,
++            get_tensor_model_parallel_rank=lambda: rank,
++            get_tensor_model_parallel_world_size=lambda: 2,
++        ),
++    )
++    writer = QueuedWriter()
++    data = torch.arange(32, dtype=torch.float32).reshape(8, 4)
++    column = params.ModelWeightParameter(
++        data=torch.zeros(4, 4),
++        input_dim=1,
++        output_dim=0,
++        weight_loader=lambda *args: None,
++    )
++    row = params.ModelWeightParameter(
++        data=torch.zeros(8, 2),
++        input_dim=1,
++        output_dim=0,
++        weight_loader=lambda *args: None,
++    )
++    with transfer.weight_transfer(writer):
++        column.load_column_parallel_weight(writer.source(data))
++        row.load_row_parallel_weight(writer.source(data))
++        transfer.finish_weight_transfers()
++    torch.testing.assert_close(column, data[rank * 4 : (rank + 1) * 4])
++    torch.testing.assert_close(row, data[:, rank * 2 : (rank + 1) * 2])
++
++
++@pytest.mark.parametrize("rank", [0, 1])
++def test_moe_padded_slices_keep_padding_and_both_gate_shards(transfer, rank):
++    methods = definitions(
++        "vllm/model_executor/layers/fused_moe/routed_experts.py",
++        {"_get_hidden_dim", "_narrow_expert_data_for_padding", "_load_w13", "_load_w2"},
++        dict(copy_weight=transfer.copy_weight),
++        owner="RoutedExperts",
++    )
++    expert = SimpleNamespace(
++        moe_config=SimpleNamespace(
++            is_act_and_mul=True, moe_parallel_config=SimpleNamespace(tp_size=2)
++        ),
++        _get_hidden_dim=methods._get_hidden_dim,
++        _narrow_expert_data_for_padding=methods._narrow_expert_data_for_padding,
++    )
++    gate = torch.arange(32, dtype=torch.float32).reshape(8, 4)
++    down = torch.arange(32, dtype=torch.float32).reshape(4, 8)
++    w13, w2 = torch.full((12, 6), -1.0), torch.full((6, 6), -1.0)
++    writer = QueuedWriter()
++    with transfer.weight_transfer(writer):
++        for shard, values in (("w1", gate), ("w3", gate + 100)):
++            methods._load_w13(expert, w13, 0, shard, writer.source(values), rank)
++        methods._load_w2(expert, w2, 1, writer.source(down), rank)
++        transfer.finish_weight_transfers()
++    expected = torch.full_like(w13, -1)
++    expected[:4, :4] = gate[rank * 4 : (rank + 1) * 4]
++    expected[6:10, :4] = gate[rank * 4 : (rank + 1) * 4] + 100
++    torch.testing.assert_close(w13, expected)
++    expected2 = torch.full_like(w2, -1)
++    expected2[:4, :4] = down[:, rank * 4 : (rank + 1) * 4]
++    torch.testing.assert_close(w2, expected2)
++
++
++def test_gdn_convolution_slices(transfer):
++    loader = definitions(
++        "vllm/model_executor/layers/mamba/mamba_mixer2.py",
++        {"mamba_v2_sharded_weight_loader"},
++        dict(copy_weight=transfer.copy_weight),
++    ).mamba_v2_sharded_weight_loader([(8, 0, 0), (4, 2, 1)], 2, 1)
++    data = torch.arange(20, dtype=torch.float32).reshape(10, 2)
++    writer = QueuedWriter()
++    target = torch.full((6, 2), -1.0)
++    with transfer.weight_transfer(writer):
++        loader(target, writer.source(data))
++        transfer.finish_weight_transfers()
++    torch.testing.assert_close(target, data[4:])
++
++
++def test_composed_loader_flushes_before_transform_and_restores_scope(transfer):
++    funcs = definitions(
++        "vllm/model_executor/model_loader/weight_utils.py",
++        {"default_weight_loader", "composed_weight_loader"},
++        dict(
++            copy_weight=transfer.copy_weight,
++            flush_weight_transfers=transfer.flush_weight_transfers,
++        ),
++    )
++    writer = QueuedWriter()
++    target = torch.zeros(4)
++    load = funcs.composed_weight_loader(funcs.default_weight_loader, lambda p: p + 10)
++    with pytest.raises(RuntimeError), transfer.weight_transfer(writer):
++        load(target, writer.source(torch.arange(4.0)))
++        torch.testing.assert_close(target, torch.arange(4.0) + 10)
++        raise RuntimeError("load failed")
++    funcs.default_weight_loader(target, torch.ones(4))
++    torch.testing.assert_close(target, torch.ones(4))
++
++
++def test_default_loader_finishes_before_weight_tracking(loaders, transfer):
++    writer = QueuedWriter()
++    target = torch.zeros(4)
++    loader = loaders.default(
++        LoadConfig(model_loader_extra_config={"enable_weights_track": True})
++    )
++    loader._init_ep_weight_filter = lambda *args: None
++    loader._init_mm_encoder_only_weight_filter = lambda *args: None
++    loader.get_all_weights = lambda *args: iter(
++        [(None, writer.source(torch.arange(4.0)))]
++    )
++    loader.track_weights_loading = lambda *args, **kwargs: torch.testing.assert_close(
++        target, torch.arange(4.0)
++    )
++
++    def load(weights):
++        transfer.copy_weight(target, next(weights)[1])
++        return {"weight"}
++
++    with transfer.weight_transfer(writer):
++        loader.load_weights(
++            SimpleNamespace(load_weights=load), SimpleNamespace(quantization=None)
++        )
++    assert not writer.pending
++
++
++def test_draft_head_retains_real_values_after_loading(transfer):
++    class Head:
++        quant_method = object()
++
++    method = definitions(
++        "vllm/model_executor/layers/draft_vocab.py",
++        {"keep_head_weights"},
++        dict(ParallelLMHead=Head, _UNQUANTIZED=()),
++        owner="DraftVocab",
++    ).keep_head_weights
++    vocab = SimpleNamespace(keep_quantized_head=True, head_weights={})
++    writer = QueuedWriter()
++    values = torch.arange(16, dtype=torch.uint8).reshape(4, 4)
++    with transfer.weight_transfer(writer):
++        weights = list(
++            method(vocab, [("lm_head.weight", writer.source(values))], Head())
++        )
++    assert not weights[0][1].is_meta
++    torch.testing.assert_close(vocab.head_weights["weight"], values)
++
++
++@pytest.mark.parametrize("shape,values", [((), [2.0]), ((2,), [2.0, 3.0])])
++def test_moe_scalar_and_vector_metadata(transfer, shape, values):
++    method = definitions(
++        "vllm/model_executor/layers/fused_moe/routed_experts.py",
++        {"_load_single_value"},
++        dict(copy_weight=transfer.copy_weight),
++        owner="RoutedExperts",
++    )._load_single_value
++    param = torch.zeros((3, *shape))
++    method(None, param, torch.tensor(values), 1)
++    torch.testing.assert_close(param[1], torch.tensor(values).reshape(shape))
++    assert torch.count_nonzero(param[0]) == torch.count_nonzero(param[2]) == 0
++
++
++def test_registry_registers_b12x_only_when_selected(loaders, monkeypatch):
++    module = ModuleType("vllm.model_executor.model_loader.b12x_loader")
++    module.B12xModelLoader = loaders.adapter
++    monkeypatch.setitem(sys.modules, module.__name__, module)
++    registry = {"safetensors": loaders.default}
++    get_loader = definitions(
++        "vllm/model_executor/model_loader/__init__.py",
++        {"get_model_loader"},
++        dict(_LOAD_FORMAT_TO_MODEL_LOADER=registry),
++    ).get_model_loader
++    assert type(get_loader(LoadConfig(load_format="safetensors"))) is loaders.default
++    assert "b12x" not in registry
++    assert isinstance(get_loader(LoadConfig()), loaders.adapter)
++
++
++def test_mtp_filter_uses_the_model_remapping_rules():
++    remap = definitions(
++        "vllm/models/qwen4_exp/nvidia/mtp.py", {"_remap_mtp_weight_name"}
++    )
++    unused = definitions(
++        "vllm/models/qwen4_exp/nvidia/mtp.py",
++        {"is_unused_checkpoint_weight"},
++        dict(_remap_mtp_weight_name=remap._remap_mtp_weight_name),
++        owner="Qwen4ExpMTP",
++    ).is_unused_checkpoint_weight
++    for name in (
++        "mtp.layers.0.weight",
++        "model.language_model.mtp.layers.0.weight",
++        "model.language_model.embed_tokens.weight",
++        "lm_head.weight",
++        "mtp.shared_head.head.weight",
++    ):
++        assert not unused(name)
++    for name in ("model.language_model.layers.0.weight", "visual.patch_embed.weight"):
++        assert unused(name)
++
++
++def supported_config():
++    parallel = SimpleNamespace(
++        tensor_parallel_size=2,
++        pipeline_parallel_size=1,
++        data_parallel_size=1,
++        prefill_context_parallel_size=1,
++        decode_context_parallel_size=1,
++        enable_expert_parallel=False,
++        enable_eplb=False,
++    )
++    config = SimpleNamespace(
++        parallel_config=parallel, device_config=SimpleNamespace(device="cuda:0")
++    )
++    model = SimpleNamespace(enable_cumem_allocator=False, multimodal_config=None)
++    return config, model
++
++
++@pytest.mark.parametrize(
++    "field,value",
++    [
++        ("tensor_parallel_size", 3),
++        ("pipeline_parallel_size", 2),
++        ("data_parallel_size", 2),
++        ("enable_expert_parallel", True),
++    ],
++)
++def test_unsupported_parallelism_rejected_before_reader_import(loaders, field, value):
++    config, model = supported_config()
++    setattr(config.parallel_config, field, value)
++    with pytest.raises(ValueError, match="TP=1/2"):
++        loaders.adapter(LoadConfig()).load_model(config, model)
++
++
++def test_reader_and_transfer_scope_close_on_load_failure(
++    loaders, transfer, monkeypatch
++):
++    session = QueuedWriter()
++    closed = []
++
++    class SessionContext:
++        def __init__(self, *args, **kwargs):
++            assert kwargs == {"io_threads": 8, "read_mode": "bounce"}
++
++        def __enter__(self):
++            return session
++
++        def __exit__(self, *args):
++            closed.append(True)
++
++    module = ModuleType("b12x.loader")
++    module.DirectWeightSession = SessionContext
++    module.capabilities = lambda index: {"host_page_tables": True}
++    monkeypatch.setitem(sys.modules, "b12x.loader", module)
++
++    def fail(*args):
++        assert transfer.is_weight_transfer_active()
++        raise RuntimeError("model load failed")
++
++    monkeypatch.setattr(loaders.base, "load_model", fail, raising=False)
++    loader = loaders.adapter(LoadConfig())
++    with pytest.raises(RuntimeError, match="model load failed"):
++        loader.load_model(*supported_config())
++    assert loader._session is None
++    assert closed == [True]
++    assert not transfer.is_weight_transfer_active()
++
++
++@pytest.mark.skipif(
++    not torch.cuda.is_available(), reason="requires Spark CUDA and FlashInfer"
++)
++def test_native_reader_gdn_slices(tmp_path, transfer):
++    from b12x.loader import DirectWeightSession, capabilities
++
++    if not capabilities(torch.cuda.current_device())["host_page_tables"]:
++        pytest.skip("requires Spark host page tables")
++    data = torch.arange(20, dtype=torch.float32).reshape(10, 2)
++    path = tmp_path / "conv.safetensors"
++    save_file({"conv.weight": data}, path)
++    loader = definitions(
++        "vllm/model_executor/layers/mamba/mamba_mixer2.py",
++        {"mamba_v2_sharded_weight_loader"},
++        dict(copy_weight=transfer.copy_weight),
++    ).mamba_v2_sharded_weight_loader([(8, 0, 0), (4, 2, 1)], 2, 1)
++    target = torch.empty(6, 2, device="cuda")
++    with (
++        DirectWeightSession(torch.cuda.current_device(), read_mode="bounce") as session,
++        transfer.weight_transfer(session),
++    ):
++        loader(target, dict(session.weights([path]))["conv.weight"])
++        transfer.finish_weight_transfers()
++    torch.testing.assert_close(target.cpu(), data[4:])
+diff --git a/vllm/config/load.py b/vllm/config/load.py
+index d82997be17c33d60d7fe371d38dbd67cf62888e5..b36bd528ec2944dfc14d0e757414806cf4f50619 100644
+--- a/vllm/config/load.py
++++ b/vllm/config/load.py
+@@ -35,6 +35,8 @@ class LoadConfig:
+       back to the pytorch bin format if safetensors format is not available.
+     - "pt" will load the weights in the pytorch bin format.
+     - "safetensors" will load the weights in the safetensors format.
++    - "b12x" loads Flash Next safetensors directly into CUDA parameter slices
++      on Spark using FlashInfer's B12X reader; PLE tables retain mmap loading.
+     - "instanttensor" will load the Safetensors weights on CUDA devices using
+       InstantTensor, which enables distributed loading with pipelined prefetching
+       and fast direct I/O.
+diff --git a/vllm/model_executor/layers/draft_vocab.py b/vllm/model_executor/layers/draft_vocab.py
+index c56135431a5615096077b7963726a847ac11c0a4..1915d9ed5082027da80f9359e2ebc51f2d01ef52 100644
+--- a/vllm/model_executor/layers/draft_vocab.py
++++ b/vllm/model_executor/layers/draft_vocab.py
+@@ -554,6 +554,10 @@ class DraftVocab:
+         )
+         for name, weight in weights:
+             if keep and name.startswith(prefix):
++                if weight.is_meta:
++                    from vllm.model_executor.weight_transfer import materialize_weight
++
++                    weight = materialize_weight(weight)
+                 self.head_weights[name.removeprefix(prefix)] = weight.to(
+                     "cpu", copy=True
+                 )
+diff --git a/vllm/model_executor/layers/fused_moe/routed_experts.py b/vllm/model_executor/layers/fused_moe/routed_experts.py
+index fb13ce2d40b2436cd21b459aef50e2fb68bdf593..6479db42bacfcdd52df47e803989dfb7da12e620 100644
+--- a/vllm/model_executor/layers/fused_moe/routed_experts.py
++++ b/vllm/model_executor/layers/fused_moe/routed_experts.py
+@@ -31,6 +31,7 @@ from vllm.model_executor.layers.quantization.base_config import (
+     QuantizationConfig,
+     resolve_quant_method,
+ )
++from vllm.model_executor.weight_transfer import copy_weight, flush_weight_transfers
+ from vllm.utils.math_utils import cdiv
+ 
+ if TYPE_CHECKING:
+@@ -341,10 +342,10 @@ class RoutedExperts(PluggableLayer):
+             # We have to keep the weight scales of w1 and w3 because
+             # we need to re-quantize w1/w3 weights after weight loading.
+             idx = 0 if shard_id == "w1" else 1
+-            param_data[expert_id][idx] = self._to_scalar(loaded_weight)
++            copy_weight(param_data[expert_id][idx], self._to_scalar(loaded_weight))
+         # If we are in the row parallel case (down_proj)
+         elif shard_id == "w2":
+-            param_data[expert_id] = self._to_scalar(loaded_weight)
++            copy_weight(param_data[expert_id], self._to_scalar(loaded_weight))
+ 
+     def _load_combined_w13_weight_scale(
+         self,
+@@ -360,7 +361,7 @@ class RoutedExperts(PluggableLayer):
+         loaded_weight = loaded_weight.narrow(
+             shard_dim, shard_size * tp_rank, shard_size
+         )
+-        param.copy_(loaded_weight)
++        copy_weight(param, loaded_weight)
+ 
+     def _load_model_weight_or_group_weight_scale(
+         self,
+@@ -442,7 +443,7 @@ class RoutedExperts(PluggableLayer):
+                 hidden_dim=hidden_dim,
+                 shard_dim=shard_dim,
+             )
+-            expert_data.copy_(loaded_weight)
++            copy_weight(expert_data, loaded_weight)
+         elif shard_id in ("w1", "w3"):
+             self._load_w13(
+                 shard_id=shard_id,
+@@ -569,7 +570,7 @@ class RoutedExperts(PluggableLayer):
+             hidden_dim=hidden_dim,
+             shard_dim=shard_dim,
+         )
+-        expert_data.copy_(loaded_weight)
++        copy_weight(expert_data, loaded_weight)
+ 
+     def _load_w2(
+         self,
+@@ -620,17 +621,18 @@ class RoutedExperts(PluggableLayer):
+             ):
+                 dst.copy_(src)
+             return
+-        expert_data.copy_(loaded_weight)
++        copy_weight(expert_data, loaded_weight)
+ 
+     def _load_single_value(
+         self, param: torch.nn.Parameter, loaded_weight: torch.Tensor, expert_id: int
+     ):
+         param_data = param.data
+ 
+-        # Used for both scalar input_scale and the size-2 `weight_shape`
+-        # param (compressed-tensors). Assign directly so both shapes load;
+-        # _to_scalar's reshape(()) would reject the size-2 weight_shape.
+-        param_data[expert_id] = loaded_weight
++        # Preserve assignment's scalar/singleton handling and vector metadata.
++        target = param_data[expert_id]
++        if target.numel() == loaded_weight.numel():
++            loaded_weight = loaded_weight.reshape(target.shape)
++        copy_weight(target, loaded_weight)
+ 
+     def _get_fused_shared_expert_quantizer(
+         self,
+@@ -693,11 +695,11 @@ class RoutedExperts(PluggableLayer):
+             # (FIXME) for gpt-oss all experts are combined
+             if "bias" in weight_name:
+                 dim1 = loaded_weight.shape[1]
+-                param.data[:, :dim1].copy_(loaded_weight)
++                copy_weight(param.data[:, :dim1], loaded_weight)
+             else:
+                 dim1 = loaded_weight.shape[1]
+                 dim2 = loaded_weight.shape[2]
+-                param.data[:, :dim1, :dim2].copy_(loaded_weight)
++                copy_weight(param.data[:, :dim1, :dim2], loaded_weight)
+             return True if return_success else None
+ 
+         from vllm.model_executor.layers.quantization.online.moe_base import (
+@@ -806,7 +808,7 @@ class RoutedExperts(PluggableLayer):
+                     loaded_weight,
+                     hidden_dim=0,
+                 )
+-                expert_data.copy_(loaded_weight)
++                copy_weight(expert_data, loaded_weight)
+             else:
+                 self._load_w13(
+                     shard_id=shard_id,
+@@ -819,8 +821,9 @@ class RoutedExperts(PluggableLayer):
+ 
+         # Case input scale: input_scale loading is only supported for fp8
+         if "input_scale" in weight_name:
+-            # this is needed for compressed-tensors only
+-            loaded_weight = loaded_weight.to(param.data.device)
++            if "compressed" in quant_method_name.lower():
++                flush_weight_transfers()
++                loaded_weight = loaded_weight.to(param.data.device)
+ 
+             # ModelOpt NVFP4 stores w13 input scales as two logical shards.
+             # The generic assignment below would broadcast w1/w3 into the
+@@ -832,8 +835,9 @@ class RoutedExperts(PluggableLayer):
+             ):
+                 scale_expert_id = global_expert_id if use_global_sf else expert_id
+                 scale_shard_id = 0 if shard_id == "w1" else 1
+-                param.data[scale_expert_id][scale_shard_id] = self._to_scalar(
+-                    loaded_weight
++                copy_weight(
++                    param.data[scale_expert_id][scale_shard_id],
++                    self._to_scalar(loaded_weight),
+                 )
+                 return True if return_success else None
+ 
+diff --git a/vllm/model_executor/layers/linear.py b/vllm/model_executor/layers/linear.py
+index deedd9eb62d4943515a623f8dc60b1951c3dedf3..8c7fc51d15aedf849c7d23afb2f994624ed116d0 100644
+--- a/vllm/model_executor/layers/linear.py
++++ b/vllm/model_executor/layers/linear.py
+@@ -42,6 +42,7 @@ from vllm.model_executor.parameter import (
+     RowvLLMParameter,
+ )
+ from vllm.model_executor.utils import set_weight_attrs
++from vllm.model_executor.weight_transfer import copy_weight
+ from vllm.platforms import current_platform
+ 
+ logger = init_logger(__name__)
+@@ -410,7 +411,7 @@ class ReplicatedLinear(LinearBase):
+             f"Tried to load weights of size {loaded_weight.size()}"
+             f"to a parameter of size {param.size()}"
+         )
+-        param.data.copy_(loaded_weight)
++        copy_weight(param.data, loaded_weight)
+ 
+     def forward(
+         self,
+@@ -604,7 +605,7 @@ class ColumnParallelLinear(LinearBase):
+             loaded_weight = loaded_weight.reshape(1)
+ 
+         assert param_data.shape == loaded_weight.shape
+-        param_data.copy_(loaded_weight)
++        copy_weight(param_data, loaded_weight)
+ 
+     def weight_loader_v2(self, param: BasevLLMParameter, loaded_weight: torch.Tensor):
+         # Special case for loading scales off disk, which often do not
+@@ -793,7 +794,7 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
+                     )
+ 
+                 assert param_data.shape == loaded_weight.shape
+-                param_data.copy_(loaded_weight)
++                copy_weight(param_data, loaded_weight)
+                 return
+ 
+             output_sizes = (
+@@ -878,7 +879,7 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
+                 )
+ 
+         assert param_data.shape == loaded_weight.shape
+-        param_data.copy_(loaded_weight)
++        copy_weight(param_data, loaded_weight)
+ 
+     def _load_fused_module_from_checkpoint(
+         self,
+@@ -1233,7 +1234,7 @@ class QKVParallelLinear(ColumnParallelLinear):
+                     )
+ 
+                 assert param_data.shape == loaded_weight.shape
+-                param_data.copy_(loaded_weight)
++                copy_weight(param_data, loaded_weight)
+                 return
+             shard_offsets = [
+                 # (shard_id, shard_offset, shard_size)
+@@ -1335,7 +1336,7 @@ class QKVParallelLinear(ColumnParallelLinear):
+                 )
+ 
+         assert param_data.shape == loaded_weight.shape
+-        param_data.copy_(loaded_weight)
++        copy_weight(param_data, loaded_weight)
+ 
+     def load_weights(
+         self, weights: Iterable[tuple[str, torch.Tensor]]
+@@ -1543,7 +1544,7 @@ class MinimaxM3QKVParallelLinearWithIndexer(QKVParallelLinear):
+             output_dim, shard_rank * shard_size, shard_size
+         )
+         assert param_data.shape == loaded_weight.shape
+-        param_data.copy_(loaded_weight)
++        copy_weight(param_data, loaded_weight)
+ 
+ 
+ class KimiK3MergedQKVGateLinear(MergedColumnParallelLinear):
+@@ -1772,7 +1773,7 @@ class RowParallelLinear(LinearBase):
+             loaded_weight = loaded_weight.reshape(1)
+ 
+         assert param_data.shape == loaded_weight.shape
+-        param_data.copy_(loaded_weight)
++        copy_weight(param_data, loaded_weight)
+ 
+     def weight_loader_v2(self, param: BasevLLMParameter, loaded_weight: torch.Tensor):
+         # Special case for loading scales off disk, which often do not
+diff --git a/vllm/model_executor/layers/mamba/mamba_mixer2.py b/vllm/model_executor/layers/mamba/mamba_mixer2.py
+index e310aaf40f12244e815cfe8c779d54b85b7f081c..8a3b7ef8493f2b2f45a352ae42c8a3b333e8b78c 100644
+--- a/vllm/model_executor/layers/mamba/mamba_mixer2.py
++++ b/vllm/model_executor/layers/mamba/mamba_mixer2.py
+@@ -59,6 +59,7 @@ from vllm.model_executor.model_loader.weight_utils import (
+ )
+ from vllm.model_executor.parameter import BasevLLMParameter
+ from vllm.model_executor.utils import set_weight_attrs
++from vllm.model_executor.weight_transfer import copy_weight
+ from vllm.platforms import current_platform
+ from vllm.utils.torch_utils import (
+     LayerNameType,
+@@ -244,13 +245,12 @@ def mamba_v2_sharded_weight_loader(
+             #   seem to handle slices well.
+             # https://github.com/python/mypy/issues/2410
+             target_slice = param.data[boundary : (boundary + take), ...]
+-            param.data[
+-                boundary : (boundary + take), ...  # type: ignore[misc]
+-            ] = loaded_weight[
+-                loaded_start_idx : (
+-                    loaded_start_idx + take
+-                )  # type: ignore[misc]
+-            ].view_as(target_slice)
++            copy_weight(
++                target_slice,
++                loaded_weight[loaded_start_idx : loaded_start_idx + take].view_as(
++                    target_slice
++                ),
++            )
+ 
+             # move indexing boundaries
+             boundary += shard_size
+diff --git a/vllm/model_executor/layers/vocab_parallel_embedding.py b/vllm/model_executor/layers/vocab_parallel_embedding.py
+index 574aed3090fe422f376075c60bf3c023897f38d9..cd126e811f7f41f9cb7cf7906dd89793fee1e0b9 100644
+--- a/vllm/model_executor/layers/vocab_parallel_embedding.py
++++ b/vllm/model_executor/layers/vocab_parallel_embedding.py
+@@ -31,6 +31,7 @@ from vllm.model_executor.layers.quantization.utils.fp8_utils import is_fp8
+ from vllm.model_executor.layers.utils import dispatch_unquantized_gemm
+ from vllm.model_executor.parameter import BasevLLMParameter
+ from vllm.model_executor.utils import set_weight_attrs
++from vllm.model_executor.weight_transfer import copy_weight
+ from vllm.platforms import current_platform
+ 
+ DEFAULT_VOCAB_PADDING_SIZE = 64
+@@ -491,7 +492,7 @@ class VocabParallelEmbedding(PluggableLayer):
+             ):
+                 loaded_weight = loaded_weight.reshape(1)
+             assert param.data.shape == loaded_weight.shape
+-            param.data.copy_(loaded_weight)
++            copy_weight(param.data, loaded_weight)
+             return
+ 
+         # Shard indexes for loading the weight
+@@ -516,7 +517,7 @@ class VocabParallelEmbedding(PluggableLayer):
+ 
+         # Copy the data. Select chunk corresponding to current shard.
+         loaded_weight = loaded_weight.narrow(output_dim, start_idx, shard_size)
+-        param[: loaded_weight.shape[0]].data.copy_(loaded_weight)
++        copy_weight(param[: loaded_weight.shape[0]].data, loaded_weight)
+         param[loaded_weight.shape[0] :].data.fill_(0)
+ 
+     def forward(self, input_):
+diff --git a/vllm/model_executor/model_loader/__init__.py b/vllm/model_executor/model_loader/__init__.py
+index 226caebe1cd49fac95d9f66ec14e4c7aab71f9c8..fc7fb868d84365c7b8231efbf393012ab548a520 100644
+--- a/vllm/model_executor/model_loader/__init__.py
++++ b/vllm/model_executor/model_loader/__init__.py
+@@ -32,6 +32,7 @@ logger = init_logger(__name__)
+ # if a new load format is added here
+ LoadFormats = Literal[
+     "auto",
++    "b12x",
+     "hf",
+     "dummy",
+     "fastsafetensors",
+@@ -123,6 +124,10 @@ def register_model_loader(load_format: str):
+ def get_model_loader(load_config: LoadConfig) -> BaseModelLoader:
+     """Get a model loader based on the load format."""
+     load_format = load_config.load_format
++    if load_format == "b12x" and load_format not in _LOAD_FORMAT_TO_MODEL_LOADER:
++        from vllm.model_executor.model_loader.b12x_loader import B12xModelLoader
++
++        _LOAD_FORMAT_TO_MODEL_LOADER[load_format] = B12xModelLoader
+     if load_format not in _LOAD_FORMAT_TO_MODEL_LOADER:
+         raise ValueError(f"Load format `{load_format}` is not supported")
+     return _LOAD_FORMAT_TO_MODEL_LOADER[load_format](load_config)
+diff --git a/vllm/model_executor/model_loader/b12x_loader.py b/vllm/model_executor/model_loader/b12x_loader.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..6d256786f34b3f0384a5cf98ed56409ea5de9762
+--- /dev/null
++++ b/vllm/model_executor/model_loader/b12x_loader.py
+@@ -0,0 +1,212 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Flash Next checkpoint loading on Spark through FlashInfer's B12X reader.
++
++Adapted from local-inference-lab/vllm at
++3a947437cf1eb734299de91370c9b37fcdbcc42b. PLE tables retain upstream's mmap
++transport for device, pinned-host and host-file-gather storage. Other weights
++are routed as metadata into their final CUDA parameter slices.
++"""
++
++from __future__ import annotations
++
++import dataclasses
++import heapq
++import json
++import math
++import time
++from pathlib import Path
++
++import torch
++from safetensors import safe_open
++
++import vllm.envs as envs
++from vllm.logger import init_logger
++from vllm.model_executor.model_loader.csf_scales import decode_csf_scale_streams
++from vllm.model_executor.model_loader.default_loader import DefaultModelLoader
++from vllm.model_executor.weight_transfer import weight_transfer
++
++logger = init_logger(__name__)
++
++
++def _is_ple_weight(name: str) -> bool:
++    return ".ngram_embedding." in f".{name}"
++
++
++class B12xModelLoader(DefaultModelLoader):
++    """Opt-in Flash Next loader for Spark, including its embedded MTP draft."""
++
++    def __init__(self, load_config):
++        options = load_config.model_loader_extra_config
++        if not isinstance(options, dict):
++            raise ValueError("b12x model_loader_extra_config must be a dict")
++        options = dict(options)
++        self.io_threads = options.pop("io_threads", 8)
++        if type(self.io_threads) is not int or not 1 <= self.io_threads <= 16:
++            raise ValueError("b12x io_threads must be an integer between 1 and 16")
++        if options.pop("read_mode", "auto") not in ("auto", "bounce"):
++            raise ValueError("the regular b12x loader supports Spark auto/bounce reads")
++        if options.get("enable_multithread_load"):
++            raise ValueError("b12x requires synchronous checkpoint routing")
++        if load_config.safetensors_load_strategy not in (None, "lazy"):
++            raise ValueError("b12x does not use safetensors read strategies")
++        super().__init__(
++            dataclasses.replace(
++                load_config,
++                load_format="safetensors",
++                model_loader_extra_config=options,
++            )
++        )
++        self._session = None
++
++    def load_model(self, vllm_config, model_config, prefix=""):
++        parallel = vllm_config.parallel_config
++        if (
++            parallel.tensor_parallel_size not in (1, 2)
++            or parallel.pipeline_parallel_size != 1
++            or parallel.data_parallel_size != 1
++            or parallel.prefill_context_parallel_size != 1
++            or parallel.decode_context_parallel_size != 1
++            or parallel.enable_expert_parallel
++            or parallel.enable_eplb
++        ):
++            raise ValueError("the regular b12x loader supports Flash Next TP=1/2 only")
++        if model_config.enable_cumem_allocator:
++            raise ValueError("the regular b12x loader does not support sleep mode")
++        if (
++            model_config.multimodal_config is not None
++            and model_config.multimodal_config.mm_encoder_only
++        ):
++            raise ValueError(
++                "the regular b12x loader requires the full Flash Next model"
++            )
++        device = torch.device(
++            self.load_config.device or vllm_config.device_config.device
++        )
++        if device.type != "cuda":
++            raise ValueError("the b12x loader requires a CUDA device")
++        index = torch.cuda.current_device() if device.index is None else device.index
++
++        # Keep FlashInfer optional for every other load format, including CPU use.
++        from b12x.loader import DirectWeightSession, capabilities
++
++        if not capabilities(index)["host_page_tables"]:
++            raise ValueError("the regular b12x loader requires Spark host page tables")
++        with (
++            DirectWeightSession(
++                index, io_threads=self.io_threads, read_mode="bounce"
++            ) as session,
++            weight_transfer(session),
++        ):
++            self._session = session
++            try:
++                model = super().load_model(vllm_config, model_config, prefix)
++                stats = session.stats()
++            finally:
++                self._session = None
++        model._b12x_loader_storage = {
++            "parameter_bytes": sum(p.nbytes for p in model.parameters()),
++            "io": stats,
++        }
++        logger.debug("b12x checkpoint I/O counters (excluding mmap PLE): %s", stats)
++        return model
++
++    def load_weights(self, model, model_config):
++        if self._session is None:
++            raise ValueError(
++                "b12x requires an initial-load session; reload is unsupported"
++            )
++        if type(model).__name__ not in {
++            "Qwen4ExpForCausalLM",
++            "Qwen4ExpForConditionalGeneration",
++            "Qwen4ExpMTP",
++        }:
++            raise ValueError(
++                "the regular b12x loader currently supports Flash Next only"
++            )
++        super().load_weights(model, model_config)
++
++    @staticmethod
++    def _needs_values(entry):
++        return math.prod(entry.shape) == 1 or entry.name.rsplit(".", 1)[-1] in {
++            "layer_multipliers",
++            "ngram_heads_offsets",
++            "ngram_heads_vocab_sizes",
++        }
++
++    def _get_weights_iterator(self, source):
++        session = self._session
++        if session is None:
++            raise RuntimeError("b12x requires an active initial-load session")
++        folder, files, use_safetensors, index_file = self._prepare_weights(
++            source.model_or_path,
++            source.subfolder,
++            source.revision,
++            False,
++            source.allow_patterns_overrides,
++        )
++        if not use_safetensors:
++            raise ValueError("b12x requires safetensors checkpoints")
++        index_path = Path(folder) / index_file
++        weight_map = None
++        if index_path.is_file():
++            weight_map = json.loads(index_path.read_text())["weight_map"]
++        unused = source.is_unused_weight or (lambda name: False)
++        if weight_map is not None:
++            # In particular, an MTP load must not open unrelated target shards.
++            wanted_files = {
++                (index_path.parent / filename).resolve()
++                for name, filename in weight_map.items()
++                if not unused(name)
++            }
++            files = [path for path in files if Path(path).resolve() in wanted_files]
++        if not files:
++            raise ValueError("No checkpoint shards selected for the b12x load")
++
++        def checkpoint_weights():
++            for path in files:
++                resolved_path = Path(path).resolve()
++
++                def selected(name, resolved_path=resolved_path):
++                    if unused(name):
++                        return False
++                    if weight_map is None:
++                        return True
++                    filename = weight_map.get(name)
++                    return (
++                        filename is not None
++                        and (index_path.parent / filename).resolve() == resolved_path
++                    )
++
++                # Only PLE tensors are mmap views. This preserves the regular
++                # file-gather binding and pinned-host loader without staging
++                # the full tables through CUDA allocations.
++                with safe_open(path, framework="pt", device="cpu") as handle:
++                    file_names = handle.keys()
++                    names = sorted(name for name in file_names if selected(name))
++                    ple_names = [name for name in names if _is_ple_weight(name)]
++                    ple_weights = (
++                        (name, handle.get_tensor(name)) for name in ple_names
++                    )
++                    ordinary = (
++                        session.weights(
++                            [path],
++                            index_path=index_path,
++                            needs_values=self._needs_values,
++                            skip=lambda name: (
++                                not selected(name) or _is_ple_weight(name)
++                            ),
++                        )
++                        if len(names) > len(ple_names)
++                        else ()
++                    )
++                    yield from heapq.merge(
++                        ordinary, ple_weights, key=lambda item: item[0]
++                    )
++
++        if self.counter_before_loading_weights == 0.0:
++            self.counter_before_loading_weights = time.perf_counter()
++        weights = checkpoint_weights()
++        if not envs.VLLM_CSF_RESIDENT:
++            weights = decode_csf_scale_streams(weights)
++        yield from ((source.prefix + name, tensor) for name, tensor in weights)
+diff --git a/vllm/model_executor/model_loader/csf_scales.py b/vllm/model_executor/model_loader/csf_scales.py
+index 76f2d055c38ca07abda49bdee5903858fe7221dc..6ccab2971c54ae8dec0fc508f01b47796b8a0f62 100644
+--- a/vllm/model_executor/model_loader/csf_scales.py
++++ b/vllm/model_executor/model_loader/csf_scales.py
+@@ -22,6 +22,7 @@ from collections.abc import Iterable, Iterator
+ import torch
+ 
+ from vllm.logger import init_logger
++from vllm.model_executor.weight_transfer import materialize_weight
+ 
+ logger = init_logger(__name__)
+ 
+@@ -70,6 +71,9 @@ def decode_csf_scale_streams(
+             yield name, tensor
+             continue
+         parts = pending.setdefault(base, {})
++        if tensor.is_meta:
++            # CSF decoding is numerical; metadata views cannot be decoded.
++            tensor = materialize_weight(tensor).cpu()
+         parts[part] = tensor
+         if len(parts) == 2:
+             del pending[base]
+diff --git a/vllm/model_executor/model_loader/default_loader.py b/vllm/model_executor/model_loader/default_loader.py
+index a01daa7bb91d0fe831eb20412641cf917a99ca49..6ed91718129e6f792375bafdd8695e7182d68a97 100644
+--- a/vllm/model_executor/model_loader/default_loader.py
++++ b/vllm/model_executor/model_loader/default_loader.py
+@@ -43,6 +43,7 @@ from vllm.model_executor.model_loader.weight_utils import (
+     resolve_mm_encoder_only_lm_prefixes,
+     safetensors_weights_iterator,
+ )
++from vllm.model_executor.weight_transfer import finish_weight_transfers
+ from vllm.tracing import instrument
+ from vllm.transformers_utils.repo_utils import list_filtered_repo_files
+ 
+@@ -524,6 +525,7 @@ class DefaultModelLoader(BaseModelLoader):
+         self._init_mm_encoder_only_weight_filter(model, model_config)
+ 
+         loaded_weights = model.load_weights(self.get_all_weights(model_config, model))
++        finish_weight_transfers()
+ 
+         self.counter_after_loading_weights = time.perf_counter()
+         logger.info_once(
+diff --git a/vllm/model_executor/model_loader/weight_utils.py b/vllm/model_executor/model_loader/weight_utils.py
+index 3262e9408846d183ca439385cd7d7849de56756c..9e963b98844e9f62ec880b0e963ab0a68c13c348 100644
+--- a/vllm/model_executor/model_loader/weight_utils.py
++++ b/vllm/model_executor/model_loader/weight_utils.py
+@@ -46,6 +46,7 @@ from vllm.model_executor.layers.quantization import (
+ from vllm.model_executor.model_loader.ep_weight_filter import (
+     should_skip_weight,
+ )
++from vllm.model_executor.weight_transfer import copy_weight, flush_weight_transfers
+ from vllm.platforms import current_platform
+ from vllm.tracing import instrument
+ from vllm.transformers_utils.repo_utils import hf_api, hf_fs
+@@ -1484,14 +1485,14 @@ def default_weight_loader(param: torch.Tensor, loaded_weight: torch.Tensor) -> N
+             # Sometimes scalar values aren't considered tensors with shapes
+             # so if both param and loaded_weight are a scalar,
+             # reshape to match before copying
+-            param.data.copy_(loaded_weight.view(param.shape))
++            copy_weight(param.data, loaded_weight.view(param.shape))
+         else:
+             assert param.size() == loaded_weight.size(), (
+                 f"Attempted to load weight ({loaded_weight.size()}) "
+                 f"into parameter ({param.size()})"
+             )
+ 
+-            param.data.copy_(loaded_weight)
++            copy_weight(param.data, loaded_weight)
+     except Exception:
+         # NOTE: This exception is added for the purpose of setting breakpoint to
+         # debug weight loading issues.
+@@ -1565,6 +1566,8 @@ def composed_weight_loader(
+ 
+     def composed_loader(param: torch.Tensor, loaded_weight: torch.Tensor) -> None:
+         loader(param, loaded_weight)
++        if not param.is_meta:
++            flush_weight_transfers()
+         param.data.copy_(fn(param))
+         return
+ 
+diff --git a/vllm/model_executor/parameter.py b/vllm/model_executor/parameter.py
+index de1cc7d218884e4b37eedaa81f83f58e6b6f9ac9..7846665a7c81efd626f05117d10cbc9f61850f85 100644
+--- a/vllm/model_executor/parameter.py
++++ b/vllm/model_executor/parameter.py
+@@ -14,6 +14,7 @@ from vllm.distributed import (
+     get_tensor_model_parallel_world_size,
+ )
+ from vllm.logger import init_logger
++from vllm.model_executor.weight_transfer import copy_weight
+ 
+ __all__ = [
+     "BasevLLMParameter",
+@@ -92,7 +93,7 @@ class BasevLLMParameter(Parameter):
+         assert self.data.shape == loaded_weight.shape or self._is_1d_and_scalar(
+             loaded_weight
+         )
+-        self.data.copy_(loaded_weight)
++        copy_weight(self.data, loaded_weight)
+ 
+     def load_column_parallel_weight(self, loaded_weight: torch.Tensor):
+         self._assert_and_load(loaded_weight)
+@@ -148,7 +149,7 @@ class _ColumnvLLMParameter(BasevLLMParameter):
+             self.output_dim, self.tp_rank * shard_size, shard_size
+         )
+         assert self.data.shape == loaded_weight.shape
+-        self.data.copy_(loaded_weight)
++        copy_weight(self.data, loaded_weight)
+ 
+     def load_merged_column_weight(self, loaded_weight: torch.Tensor, **kwargs):
+         shard_offset: int = kwargs["shard_offset"]
+@@ -170,7 +171,7 @@ class _ColumnvLLMParameter(BasevLLMParameter):
+             self.output_dim, self.tp_rank * shard_size, shard_size
+         )
+         assert param_data.shape == loaded_weight.shape
+-        param_data.copy_(loaded_weight)
++        copy_weight(param_data, loaded_weight)
+ 
+     def load_qkv_weight(self, loaded_weight: torch.Tensor, **kwargs):
+         shard_offset: int = kwargs["shard_offset"]
+@@ -195,7 +196,7 @@ class _ColumnvLLMParameter(BasevLLMParameter):
+         )
+ 
+         assert param_data.shape == loaded_weight.shape
+-        param_data.copy_(loaded_weight)
++        copy_weight(param_data, loaded_weight)
+ 
+ 
+ class RowvLLMParameter(BasevLLMParameter):
+@@ -223,7 +224,7 @@ class RowvLLMParameter(BasevLLMParameter):
+             loaded_weight = loaded_weight.reshape(1)
+ 
+         assert self.data.shape == loaded_weight.shape
+-        self.data.copy_(loaded_weight)
++        copy_weight(self.data, loaded_weight)
+ 
+ 
+ class ModelWeightParameter(_ColumnvLLMParameter, RowvLLMParameter):
+@@ -297,7 +298,7 @@ class PerTensorScaleParameter(BasevLLMParameter):
+ 
+         param_data = param_data[shard_id]
+         assert param_data.shape == loaded_weight.shape
+-        param_data.copy_(loaded_weight)
++        copy_weight(param_data, loaded_weight)
+ 
+ 
+ class PackedColumnParameter(_ColumnvLLMParameter):
+diff --git a/vllm/models/qwen4_exp/nvidia/mtp.py b/vllm/models/qwen4_exp/nvidia/mtp.py
+index c93c3eb64c10783a2fbfe19ff6fc86d1aef066f9..32075701beded9a177c44bbbbde39900586bb273 100644
+--- a/vllm/models/qwen4_exp/nvidia/mtp.py
++++ b/vllm/models/qwen4_exp/nvidia/mtp.py
+@@ -469,6 +469,10 @@ class Qwen4ExpMTP(nn.Module, SupportsHCSP, SupportsPP, Qwen4ExpMixtureOfExperts)
+     ) -> torch.Tensor | None:
+         return self.draft_vocab.compute_logits(self.lm_head, hidden_states)
+ 
++    @staticmethod
++    def is_unused_checkpoint_weight(name: str) -> bool:
++        return _remap_mtp_weight_name(name) is None
++
+     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+         def remap_weight_names():
+             for name, weight in weights:

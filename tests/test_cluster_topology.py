@@ -291,6 +291,16 @@ class IntegrationTests(unittest.TestCase):
             self.assertIn("NCCL_ALGO=Ring", command)
             self.assertIn("NCCL_IB_SUBNET_AWARE_ROUTING=1", command)
 
+    def test_launch_validates_cli_environment_after_saved_defaults(self):
+        self.config.write_text(config() + "CONTAINER_NCCL_ALGO=Tree\n")
+        self.run_script("launch-cluster.sh", "--config", str(self.config), "--no-cache-dirs", "-d",
+                        "-e", "NCCL_ALGO=Ring", "exec", "vllm", "serve", "test", "-tp", "4")
+        self.log.unlink()
+        result = self.run_script("launch-cluster.sh", "--config", str(self.config), "--no-cache-dirs",
+                                 "-e", "NCCL_ALGO=Tree", "exec", "vllm", "serve", "test", "-tp", "4", ok=False)
+        self.assertIn("requires NCCL_ALGO=Ring", result.stdout + result.stderr)
+        self.assertEqual(self.calls(), [])
+
     def test_invalid_launch_never_starts_or_stops_containers(self):
         for order, tp in ((NODES, "4"), (ORDER, "3")):
             self.config.write_text(config(order))
@@ -384,6 +394,32 @@ class RecipeTests(unittest.TestCase):
                                     capture_output=True, text=True, cwd=ROOT)
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("physical ring order", result.stdout)
+
+    def test_recipe_ring_validation_uses_cli_overrides_and_passes_defaults_via_env(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config_file = root / "test.env"
+            config_file.write_text(config() + "CONTAINER_NCCL_ALGO=Tree\n")
+            recipe = root / "recipe.yaml"
+            recipe.write_text('recipe_version: "1"\nname: Test\ncontainer: test-image\n'
+                              'env:\n  NCCL_ALGO: Tree\ncommand: vllm serve test -tp 4\n')
+            argv = [sys.executable, str(ROOT / "run-recipe.py"), str(recipe), "--dry-run",
+                    "--config", str(config_file), "-n", ",".join(ORDER)]
+            result = subprocess.run([*argv, "-e", "NCCL_ALGO=Ring"],
+                                    capture_output=True, text=True, cwd=ROOT)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertIn("-e NCCL_ALGO=Ring", result.stdout)
+            self.assertIn("-e NCCL_IB_SUBNET_AWARE_ROUTING=1", result.stdout)
+            self.assertNotIn("export ", result.stdout)
+            result = subprocess.run([*argv, "-e", "NCCL_ALGO"],
+                                    env={key: value for key, value in os.environ.items() if key != "NCCL_ALGO"},
+                                    capture_output=True, text=True, cwd=ROOT)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertIn("-e NCCL_ALGO=Ring", result.stdout)
+            result = subprocess.run([*argv, "-e", "NCCL_ALGO=Tree"],
+                                    capture_output=True, text=True, cwd=ROOT)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("requires NCCL_ALGO=Ring", result.stdout)
 
     def test_cached_model_is_distributed_to_every_ring_worker(self):
         with tempfile.NamedTemporaryFile(mode="w", suffix=".env") as file:

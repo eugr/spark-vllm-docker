@@ -29,6 +29,27 @@ Recipes provide a **one-click solution** for deploying models with pre-configure
 ./run-recipe.sh minimax-m2-awq --setup
 ```
 
+### Nemotron 3.5 on a Single DGX Spark
+
+These recipes use the standard `vllm-node` image and require `--solo`:
+
+- [Nemotron 3.5 Super VL NVFP4](nemotron-3.5-super-vl-nvfp4.yaml):
+  `nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4`, with image and video input.
+- [Nemotron 3.5 Bolt 24GB](nemotron-3.5-bolt-24gb.yaml):
+  `nvidia/NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB`.
+
+Both use their corresponding LiLiCorr draft model with DFlash and seven
+speculative tokens, FP8 KV cache, InstantTensor loading, automatic context
+length, eight concurrent sequences, and GPU memory utilization of `0.8`.
+
+```bash
+./run-recipe.sh nemotron-3.5-super-vl-nvfp4 --solo --setup
+./run-recipe.sh nemotron-3.5-bolt-24gb --solo --setup
+```
+
+Run one recipe at a time. Omit `--setup` when the image and model are already
+available, or use `--dry-run` instead to inspect the generated command.
+
 ## Cluster Node Discovery
 
 Autodiscovery is the default way to configure cluster nodes:
@@ -260,6 +281,19 @@ Recipe-declared mods are applied first, then command-line `--apply-mod` and
 Both `run-recipe.sh` and `launch-cluster.sh` accept repeatable `-e VAR=VALUE`
 container environment variables and repeatable `-v LOCAL:CONTAINER` Docker
 volume mappings. Put `launch-cluster.sh` options before `exec`.
+
+Recipe `env:` entries are passed to every container using `-e`, so they are also
+available to mods and Ray workers. Explicit `run-recipe.sh -e VAR=VALUE` arguments
+override recipe values; if a variable is repeated, the last CLI value wins.
+These values override saved `CONTAINER_*` settings as well. Put recipe overrides
+before the `--` separator for extra vLLM arguments.
+
+For example, override the Qwen3.8 Flash Next cluster recipe's shared PLE tables:
+
+```bash
+./run-recipe.sh qwen3.8-flash-next-nvfp4-cluster \
+  -e VLLM_PLE_TABLE_MEMORY=disk -e B12X_DISK_BACKEND=io_uring
+```
 
 ```bash
 ./run-recipe.sh my-recipe --solo \
