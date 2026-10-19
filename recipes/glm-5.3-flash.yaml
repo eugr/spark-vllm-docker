@@ -1,11 +1,11 @@
-# Recipe: GLM-5.3-Flash-NVFP4-Spark
+# Recipe: GLM-5.3-Flash-FP4-Local
 # GLM 5.3 Flash using the B12X-optimized serving stack on a dual DGX Spark cluster
 
 recipe_version: "1"
-name: GLM-5.3-Flash-NVFP4-Spark
-description: vLLM serving local-inference-lab/GLM-5.3-Flash-NVFP4-Spark on a dual DGX Spark cluster
+name: GLM-5.3-Flash-FP4-Local
+description: vLLM serving nvidia/GLM-5.3-Flash-FP4-Local on a dual DGX Spark cluster
 
-model: local-inference-lab/GLM-5.3-Flash-NVFP4-Spark
+model: nvidia/GLM-5.3-Flash-FP4-Local
 container: vllm-node-b12x
 
 build_args:
@@ -19,7 +19,6 @@ defaults:
   port: 8000
   host: 0.0.0.0
   tensor_parallel: 2
-  pipeline_parallel: 1
   decode_context_parallel: 1
   block_size: 256
   max_model_len: 500000
@@ -34,6 +33,8 @@ env:
   SAFETENSORS_FAST_GPU: "1"
   VLLM_ENABLE_ROCE_ALLREDUCE: "1"
   VLLM_ROCE_ALLREDUCE_MAX_SIZE: "2MB"
+  NCCL_BUFFSIZE: "1048576"
+  NCCL_MAX_CTAS: "8"
   VLLM_WORKER_MULTIPROC_METHOD: "spawn"
   VLLM_SSM_CONV_STATE_LAYOUT: "DS"
   VLLM_USE_AOT_COMPILE: "1"
@@ -41,18 +42,14 @@ env:
   VLLM_USE_V2_MODEL_RUNNER: "1"
   VLLM_ENABLE_PCIE_ALLREDUCE: "0"
   B12X_POLICY_MODE: "auto"
-  INSTANTTENSOR_BACKEND: "BUFFERED"
-  INSTANTTENSOR_BUFFER_SIZE: "67108864"
-  INSTANTTENSOR_CHUNK_SIZE: "8388608"
-  INSTANTTENSOR_CONCURRENCY: "1"
-  INSTANTTENSOR_IO_DEPTH: "3"
+  VLLM_B12X_MOE_FP4_FORCE_A16: "1"
+  B12X_W4A16_A4_PREFILL: "1"
 
 command: |
-  vllm serve local-inference-lab/GLM-5.3-Flash-NVFP4-Spark \
+  vllm serve nvidia/GLM-5.3-Flash-FP4-Local \
     --host {host} \
     --port {port} \
     --tensor-parallel-size {tensor_parallel} \
-    --pipeline-parallel-size {pipeline_parallel} \
     --decode-context-parallel-size {decode_context_parallel} \
     --mamba-cache-mode align \
     --enable-prefix-caching \

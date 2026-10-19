@@ -60,6 +60,30 @@ LEGACY_CALL = """            sw_block_size = _largest_kernel_block_within(
                 self.attn_backend, sw_per_token, shared_page, block_size
             )
 """
+# #60252 supersedes the fallback with a divisor-aware selector. Validate both
+# its implementation and its use by SWA before accepting it as already fixed.
+DIVISOR_SELECTION = """    if divisor_of is not None:
+        dividing = [b for b in fitting if divisor_of % b == 0]
+        dividing.extend(
+            b
+            for s in sizes
+            if isinstance(s, MultipleOf)
+            for b in range(s.base, max_block_size + 1, s.base)
+            if divisor_of % b == 0
+        )
+        if dividing:
+            return max(dividing)
+"""
+DIVISOR_CALL = """            sw_block_size = _largest_kernel_block_within(
+                self.attn_backend,
+                sw_per_token,
+                page_budget,
+                block_size,
+                kv_cache_spec,
+                divisor_of=None if shared_page else block_size,
+            )
+            return SlidingWindowSpec(
+"""
 
 
 class PatchError(RuntimeError):
@@ -78,6 +102,16 @@ def patch_source(source: str) -> tuple[str, str]:
         return source, "SWA block fallback fix is already present; skipping"
     if "def _largest_kernel_block_within(" not in source:
         return source, "Affected SWA block selector is absent; skipping"
+    if "divisor_of" in source:
+        if (
+            source.count("    divisor_of: int | None = None,") != 1
+            or source.count(DIVISOR_SELECTION) != 1
+            or source.count(DIVISOR_CALL) != 1
+            or anchor_count
+        ):
+            raise PatchError("SWA divisor-aware selection is incomplete or changed")
+        ast.parse(source)
+        return source, "SWA divisor-aware fix from vLLM #60252 is present; skipping"
     if LEGACY_CALL in source and "page_budget = shared_page or" not in source:
         return source, "Pre-#53007 SWA block selection is present; skipping"
     if anchor_count != 1:

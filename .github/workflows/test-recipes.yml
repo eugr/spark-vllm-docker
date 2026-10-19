@@ -9,6 +9,9 @@ on:
       - 'launch-cluster.sh'
       - 'autodiscover.sh'
       - 'cluster_topology.py'
+      - 'setup-cluster.sh'
+      - 'setup-cluster.py'
+      - 'setup_cluster_node.py'
       - 'build-and-copy.sh'
       - 'docker/image_identity.py'
       - 'hf-download.sh'
@@ -25,6 +28,9 @@ on:
       - 'launch-cluster.sh'
       - 'autodiscover.sh'
       - 'cluster_topology.py'
+      - 'setup-cluster.sh'
+      - 'setup-cluster.py'
+      - 'setup_cluster_node.py'
       - 'build-and-copy.sh'
       - 'docker/image_identity.py'
       - 'hf-download.sh'
@@ -73,6 +79,11 @@ jobs:
     - name: Test ring discovery and routed distribution
       run: python3 tests/test_cluster_topology.py
 
+    - name: Test cluster setup and restore without live nodes
+      run: |
+        bash -n setup-cluster.sh
+        python3 tests/test_setup_cluster.py
+
     - name: Test Hugging Face cache management and copies
       run: |
         python3 tests/test_hf_cache_management.py
@@ -85,6 +96,7 @@ jobs:
 
     - name: Run recipe integration tests
       run: |
+        python3 tests/test_run_recipe.py
         ./tests/test_recipes.sh -v
         ./tests/test_launch_cluster_image_sync.sh
         ./tests/test_launch_cluster_vllm_pr.sh

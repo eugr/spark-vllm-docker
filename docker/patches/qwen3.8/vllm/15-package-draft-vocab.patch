@@ -1,0 +1,16 @@
+Subject: Include the Flash Next draft vocabulary in exported vLLM wheels
+
+Integration-Base: 355553ac22dca4080929ea8f88a446f15df1f3ba
+
+diff --git a/setup.py b/setup.py
+index abefefa35bc89df03e163c08158671ab5282dcfc..5793ffcd0aea3796f7d3f884dc66d72e872c45d8 100644
+--- a/setup.py
++++ b/setup.py
+@@ -1600,6 +1600,7 @@ package_data = {
+     "vllm": [
+         "py.typed",
+         "libs/*.so*",
++        "model_executor/layers/draft_vocab_lists/*.json",
+         "model_executor/layers/fused_moe/configs/*.json",
+         "model_executor/layers/quantization/utils/configs/*.json",
+         "entrypoints/serve/instrumentator/static/*.js",

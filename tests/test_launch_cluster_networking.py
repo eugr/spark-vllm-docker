@@ -167,6 +167,34 @@ raise SystemExit(subprocess.run(['bash', '-c', command], env=env).returncode)
         self.assertEqual(env["VLLM_HOST_IP"], "192.0.2.10")
         self.assertEqual(env["NCCL_IB_DISABLE"], "0")
 
+    def test_environment_overrides_and_literal_values_reach_every_container(self):
+        marker = self.fixture / "unexpected-expansion"
+        values = {
+            "VLLM_PLE_TABLE_MEMORY": "disk",
+            "B12X_DISK_BACKEND": "io_uring",
+            "JSON_VALUE": '{"strategy": "SPREAD", "label": "a=b"}',
+            "LITERAL": f"$HOME $(touch {marker}) `touch {marker}`; * 'quoted' \\",
+            "MULTILINE": "first\nsecond\tthird",
+            "EMPTY": "",
+        }
+        config = (CLUSTER_CONFIG + "CONTAINER_VLLM_PLE_TABLE_MEMORY=shared\n"
+                  "CONTAINER_B12X_DISK_BACKEND=mmap\n"
+                  "CONTAINER_SAVED_VALUE='a b=c'\n")
+        for mode in (("--solo",), (), ("--ray",)):
+            with self.subTest(mode=mode):
+                flags = [*mode, "-e", "VLLM_PLE_TABLE_MEMORY=shared"]
+                for key, value in values.items():
+                    flags += ["-e", f"{key}={value}"]
+                calls = self.launch(*flags, config=config)
+                self.assertEqual(len(calls), 1 if mode == ("--solo",) else 2)
+                for call in calls:
+                    env = self.container_env(call)
+                    self.assertEqual(env["SAVED_VALUE"], "a b=c")
+                    for key, value in values.items():
+                        self.assertEqual(env[key], value)
+                    self.assertEqual(call["args"][-3:], ["vllm-node", "sleep", "infinity"])
+                self.assertFalse(marker.exists())
+
     def test_cluster_keeps_per_node_addresses_and_rdma(self):
         for ray in (False, True):
             with self.subTest(ray=ray):

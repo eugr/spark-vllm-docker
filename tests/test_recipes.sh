@@ -961,17 +961,21 @@ test_launch_cmd_env_passthrough() {
     fi
 }
 
-# Test: no -e flags when none specified
+# Test: no -e flags when neither recipe nor CLI specifies environment variables
 test_launch_cmd_no_env_by_default() {
     log_test "Launch command omits -e when no env vars specified"
-    
-    recipe_name=$(find_solo_recipe)
-    if [[ -z "$recipe_name" ]]; then
-        log_skip "No solo-capable recipes found"
-        return
-    fi
-    
-    output=$("$PROJECT_DIR/run-recipe.py" "$recipe_name" --dry-run --solo 2>&1)
+
+    local temp_recipe
+    temp_recipe=$(mktemp)
+    cat > "$temp_recipe" <<'EOF'
+recipe_version: "1"
+name: Empty environment
+container: test-image
+env: {}
+command: echo test
+EOF
+    output=$("$PROJECT_DIR/run-recipe.py" "$temp_recipe" --config /dev/null --dry-run --solo 2>&1)
+    rm -f "$temp_recipe"
     launch_cmd=$(extract_launch_cmd "$output")
     
     if echo "$launch_cmd" | grep -q " -e "; then
@@ -1102,8 +1106,12 @@ test_launch_cmd_earlyoom_passthrough() {
         --earlyoom --earlyoom-args "-M 786432,196608 -s 100 -r 120" 2>&1)
     launch_cmd=$(extract_launch_cmd "$output")
 
-    if echo "$launch_cmd" | grep -q "\-\-earlyoom" && \
-       echo "$launch_cmd" | grep -q "\-\-earlyoom-args -M 786432,196608 -s 100 -r 120"; then
+    if python3 -c '
+import shlex, sys
+args = shlex.split(sys.argv[1])
+sys.exit(not ("--earlyoom" in args and "--earlyoom-args" in args
+              and args[args.index("--earlyoom-args") + 1] == "-M 786432,196608 -s 100 -r 120"))
+' "$launch_cmd"; then
         log_pass "Launch command includes --earlyoom and custom args"
     else
         log_fail "--earlyoom flags not found in launch command"

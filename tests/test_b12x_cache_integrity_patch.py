@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Check build-time installation and run the upstream CPU cache regressions."""
+"""Validate the retained standalone-package patch and its CPU regressions."""
 
 import os
 from pathlib import Path
@@ -88,13 +88,9 @@ class B12xCachePatchTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("Ran 11 tests", result.stderr)
 
-    def test_runner_patches_after_both_b12x_install_paths(self):
+    def test_runner_does_not_patch_the_flashinfer_compatibility_package(self):
         runner = (ROOT / "Dockerfile").read_text().split("FROM ${CUDA_IMAGE} AS runner\n", 1)[1]
-        position = runner.index("RUN python3 /tmp/b12x-patches/patch_b12x_cache_integrity.py --installed")
-        for install in ("uv pip install --reinstall --no-deps /tmp/b12x-source",
-                        "uv pip install --upgrade --refresh-package b12x"):
-            self.assertLess(runner.index(install), position)
-        self.assertIn("COPY docker/patch_b12x_cache_integrity.py docker/b12x-cache-integrity.patch /tmp/b12x-patches/", runner)
+        self.assertNotIn("patch_b12x_cache_integrity.py", runner)
 
 
 if __name__ == "__main__":

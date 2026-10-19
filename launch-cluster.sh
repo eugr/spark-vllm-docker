@@ -8,7 +8,7 @@ CONTAINER_WORKSPACE_DIR="/workspace"
 CONTAINER_EXEC_SCRIPT="$CONTAINER_WORKSPACE_DIR/exec-script.sh"
 # Modify these if you want to pass additional docker args or set VLLM_SPARK_EXTRA_DOCKER_ARGS variable
 DOCKER_ARGS="-e NCCL_IGNORE_CPU_AFFINITY=1"
-DOCKER_ARGS="$DOCKER_ARGS -e PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True"
+# DOCKER_ARGS="$DOCKER_ARGS -e PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True"
 DOCKER_ARGS="$DOCKER_ARGS -v $HF_CACHE_DIR:/root/.cache/huggingface"
 
 # Append additional arguments from environment variable
@@ -56,6 +56,8 @@ SHM_SIZE_GB="64"
 NOFILE_LIMIT="${VLLM_SPARK_NOFILE_LIMIT:-1048576}"
 PORT_MAPPINGS=()
 VOLUME_MAPPINGS=()
+CONTAINER_ENV_ARGS=()
+CLI_ENV_ARGS=()
 ENABLE_EARLYOOM="false"
 EARLYOOM_ARGS="${VLLM_SPARK_EARLYOOM_ARGS:--M 524288,102400 -s 100 -r 60}"
 
@@ -180,7 +182,7 @@ while [[ "$#" -gt 0 ]]; do
         --name) CONTAINER_NAME="$2"; shift ;;
         --eth-if) ETH_IF="$2"; ETH_IF_OVERRIDE="$2"; shift ;;
         --ib-if) IB_IF="$2"; shift ;;
-        -e|--env) DOCKER_ARGS="$DOCKER_ARGS -e $2"; shift ;;
+        -e|--env) CLI_ENV_ARGS+=("-e" "$2"); shift ;;
         -j) BUILD_JOBS="$2"; shift ;;
         --apply-mod) MOD_PATHS+=("$2"); MOD_TYPES+=("path"); shift ;;
         --apply-vllm-pr)
@@ -428,13 +430,13 @@ for env_var in $(compgen -v DOTENV_CONTAINER_); do
     # Extract the actual env var name (remove DOTENV_CONTAINER_ prefix)
     actual_var="${env_var#DOTENV_CONTAINER_}"
     
-    # Properly escape the value for shell using Python
-    escaped_value=$(python3 -c 'import shlex, sys; print(shlex.quote(sys.argv[1]))' "$value")
-    
-    # Add to docker args
-    DOCKER_ARGS="$DOCKER_ARGS -e $actual_var=$escaped_value"
+    CONTAINER_ENV_ARGS+=("-e" "$actual_var=$value")
     echo "Adding container env: $actual_var"
 done
+
+# Explicit -e flags (including recipe defaults supplied by run-recipe.py) win
+# over saved CONTAINER_* settings. Keep each value intact on every node.
+CONTAINER_ENV_ARGS+=("${CLI_ENV_ARGS[@]}")
 
 # Add build job parallelization environment variables if BUILD_JOBS is set
 if [[ -n "$BUILD_JOBS" ]]; then
@@ -650,7 +652,8 @@ if [[ "$SOLO_MODE" != true && -n "${DOTENV_CLUSTER_LINKS:-}" && "$ACTION" != sto
     topology_options=()
     [[ "$NO_RAY_MODE" == true ]] || topology_options+=(--ray)
     topology_nodes=$(IFS=,; echo "$HEAD_IP${PEER_NODES[*]:+,${PEER_NODES[*]}}")
-    topology_env=$(TOPOLOGY_DOCKER_ARGS="$DOCKER_ARGS" python3 "$SCRIPT_DIR/cluster_topology.py" validate \
+    topology_env_args=$(python3 -c 'import shlex, sys; print(shlex.join(sys.argv[1:]))' "${CONTAINER_ENV_ARGS[@]}")
+    topology_env=$(TOPOLOGY_DOCKER_ARGS="$DOCKER_ARGS $topology_env_args" python3 "$SCRIPT_DIR/cluster_topology.py" validate \
         --nodes "$topology_nodes" --command "$topology_command" "${topology_options[@]}") || exit 1
     DOCKER_ARGS="$DOCKER_ARGS $topology_env"
 fi
@@ -687,7 +690,7 @@ if [[ "$CHECK_CONFIG" == "true" ]]; then
     echo "  Image Name: $IMAGE_NAME"
     echo "  ETH Interface: $ETH_IF"
     echo "  IB Interface: $IB_IF"
-    echo "  Docker Args: $DOCKER_ARGS"
+    echo "  Docker Args: $DOCKER_ARGS ${CONTAINER_ENV_ARGS[*]}"
     if [[ ${#PORT_MAPPINGS[@]} -gt 0 ]]; then
         echo "  Docker Network: default bridge with published ports: ${PORT_MAPPINGS[*]}"
     else
@@ -1534,17 +1537,17 @@ start_cluster() {
         done
     fi
 
-    local docker_args_common="--gpus all -d --rm $docker_network_args --name $CONTAINER_NAME $docker_entrypoint_args $DOCKER_ARGS $IMAGE_NAME"
+    local docker_args_common="--gpus all -d --rm $docker_network_args --name $CONTAINER_NAME $docker_entrypoint_args $DOCKER_ARGS"
     local docker_caps_args=""
     local docker_resource_args=""
 
     if [[ "$NON_PRIVILEGED_MODE" == "true" ]]; then
         echo "Running in non-privileged mode..."
         docker_caps_args="--cap-add=IPC_LOCK"
-        docker_resource_args="--ulimit nofile=${NOFILE_LIMIT}:${NOFILE_LIMIT} --shm-size=${SHM_SIZE_GB}g --device=/dev/infiniband --memory ${MEM_LIMIT_GB}g --memory-swap ${MEM_SWAP_LIMIT_GB}g --pids-limit ${PIDS_LIMIT}"
+        docker_resource_args="--ulimit nofile=${NOFILE_LIMIT}:${NOFILE_LIMIT} --ulimit memlock=-1:-1 --shm-size=${SHM_SIZE_GB}g --device=/dev/infiniband --memory ${MEM_LIMIT_GB}g --memory-swap ${MEM_SWAP_LIMIT_GB}g --pids-limit ${PIDS_LIMIT}"
     else
         docker_caps_args="--privileged"
-        docker_resource_args="--ulimit nofile=${NOFILE_LIMIT}:${NOFILE_LIMIT} --ipc=host"
+        docker_resource_args="--ulimit nofile=${NOFILE_LIMIT}:${NOFILE_LIMIT} --ulimit memlock=-1:-1 --ipc=host"
     fi
     local keepalive_cmd=(sleep infinity)
     if [[ "$ENABLE_EARLYOOM" == "true" ]]; then
@@ -1569,7 +1572,8 @@ start_cluster() {
         done
     fi
     docker run $docker_caps_args $docker_resource_args \
-        $(get_env_flags "$HEAD_IP") $docker_args_common "${keepalive_cmd[@]}" || { cleanup; return 1; }
+        $(get_env_flags "$HEAD_IP") $docker_args_common \
+        "${CONTAINER_ENV_ARGS[@]}" "$IMAGE_NAME" "${keepalive_cmd[@]}" || { cleanup; return 1; }
     ensure_container_earlyoom "$HEAD_IP" "true" || { cleanup; return 1; }
 
     # Start Worker Nodes
@@ -1579,9 +1583,9 @@ start_cluster() {
             ssh "$worker" "mkdir -p ${CACHE_DIRS_TO_CREATE[*]}"
         fi
         local docker_run_cmd="docker run $docker_caps_args $docker_resource_args $(get_env_flags "$worker") $docker_args_common"
-        local remote_keepalive_cmd
-        printf -v remote_keepalive_cmd '%q ' "${keepalive_cmd[@]}"
-        ssh "$worker" "$docker_run_cmd $remote_keepalive_cmd" || { cleanup; return 1; }
+        local remote_launch_args
+        printf -v remote_launch_args '%q ' "${CONTAINER_ENV_ARGS[@]}" "$IMAGE_NAME" "${keepalive_cmd[@]}"
+        ssh "$worker" "$docker_run_cmd $remote_launch_args" || { cleanup; return 1; }
         ensure_container_earlyoom "$worker" "false" || { cleanup; return 1; }
     done
 
