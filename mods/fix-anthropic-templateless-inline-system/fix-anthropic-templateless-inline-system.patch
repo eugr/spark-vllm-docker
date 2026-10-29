@@ -1,0 +1,41 @@
+diff --git a/vllm/entrypoints/anthropic/serving.py b/vllm/entrypoints/anthropic/serving.py
+index fe0d752..6ed3e3c 100644
+--- a/vllm/entrypoints/anthropic/serving.py
++++ b/vllm/entrypoints/anthropic/serving.py
+@@ -7,6 +7,7 @@
+ 
+ import json
+ import logging
++import os
+ import time
+ import uuid
+ from collections.abc import AsyncGenerator
+@@ -146,9 +147,27 @@ class AnthropicServingMessages(OpenAIServingChat):
+         Renders a [system, user, system, user] conversation against the
+         template; if it raises (e.g. Qwen's ``loop.first`` guard), the
+         model needs inline system messages merged into the leading block.
++
++        A model with **no** jinja template is not an unknown quantity: it is
++        rendered by a Python encoder selected with ``--tokenizer-mode`` (e.g.
++        ``deepseek_v4``), and those encoders accept inline system messages at
++        their original position. Merging is the destructive answer and must not
++        be the fallback for "I could not check" -- it moves every per-turn
++        system reminder to the FRONT of the prompt, so byte 0 changes on every
++        request and the entire prefix cache is lost. This file already fights
++        that same battle where it strips Claude Code's
++        ``x-anthropic-billing-header`` "which contains a per-request hash that
++        defeats prefix caching"; the merge path reintroduces it wholesale, with
++        the whole reminder text.
++
++        ``VLLM_ANTHROPIC_MERGE_INLINE_SYSTEM=1`` forces the merge back on for a
++        templateless model that genuinely needs it, without a rebuild.
+         """
++        forced = os.environ.get("VLLM_ANTHROPIC_MERGE_INLINE_SYSTEM")
++        if forced is not None:
++            return forced.strip().lower() in ("1", "true", "yes")
+         if not chat_template:
+-            return True
++            return False
+         try:
+             env = jinja2.sandbox.ImmutableSandboxedEnvironment(
+                 trim_blocks=True,
