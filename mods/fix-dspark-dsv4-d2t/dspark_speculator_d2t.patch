@@ -1,0 +1,17 @@
+--- a/vllm/v1/worker/gpu/spec_decode/dspark/speculator.py
++++ b/vllm/v1/worker/gpu/spec_decode/dspark/speculator.py
+@@ -83,8 +83,12 @@
+         # Reduced draft vocab: probabilistic rejection sampling indexes draft
+         # logits by target id, so precompute the draft->target column map and a
+         # scratch buffer to scatter logits into target vocab before sampling.
+-        if self.draft_logits is not None and model.draft_id_to_target_id is not None:
+-            d2t = model.draft_id_to_target_id
++        # DSpark models without a reduced draft vocab (e.g. DeepSeek-V4) do not
++        # define draft_id_to_target_id; guard with getattr so the scatter path
++        # is simply skipped (identity / full-vocab drafting), as the None defaults intend.
++        _d2t = getattr(model, "draft_id_to_target_id", None)
++        if self.draft_logits is not None and _d2t is not None:
++            d2t = _d2t
+             self._d2t_scatter_index = (
+                 torch.arange(d2t.shape[0], device=d2t.device) + d2t
+             )
