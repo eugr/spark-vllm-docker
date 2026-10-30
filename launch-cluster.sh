@@ -35,6 +35,7 @@ MOD_PATHS=()
 MOD_TYPES=()
 VLLM_PRS_REQUESTED="false"
 GENERATED_MOD_ROOT=""
+CLUSTER_EXEC_PIDS=()
 LAUNCH_SCRIPT_PATH=""
 SCRIPT_DIR="$(dirname "$(realpath "$0")")"
 CONFIG_FILE=""  # Will be set to default after argument parsing
@@ -726,11 +727,25 @@ cleanup_generated_mods() {
     GENERATED_MOD_ROOT=""
 }
 
+# These are local Docker/SSH clients started by this invocation, not containers
+# or unrelated host processes. Reap them even when reusing an existing cluster.
+cleanup_exec_clients() {
+    local pid
+    for pid in "${CLUSTER_EXEC_PIDS[@]}"; do
+        kill "$pid" 2>/dev/null || true
+    done
+    for pid in "${CLUSTER_EXEC_PIDS[@]}"; do
+        wait "$pid" 2>/dev/null || true
+    done
+    CLUSTER_EXEC_PIDS=()
+}
+
 # Cleanup Function
 cleanup() {
     # Remove traps to prevent nested cleanup
     trap - EXIT INT TERM HUP
 
+    cleanup_exec_clients
     cleanup_generated_mods
 
     if [[ "$CLUSTER_WAS_RUNNING" == "true" ]]; then
@@ -787,15 +802,17 @@ if [[ "$ACTION" == "status" ]]; then
     exit 0
 fi
 
-# Trap signals
-# Only trap if we are NOT in daemon mode (container should persist in daemon mode)
+# Foreground launches own container cleanup; daemon launches keep them running.
 if [[ "$DAEMON_MODE" == "false" ]]; then
-    trap cleanup EXIT INT TERM HUP
+    trap cleanup EXIT
 else
     # Daemon mode deliberately leaves containers running, but host-side generated
     # PR bundles are always temporary.
-    trap cleanup_generated_mods EXIT INT TERM HUP
+    trap cleanup_generated_mods EXIT
 fi
+trap 'exit 130' INT
+trap 'exit 143' TERM
+trap 'exit 129' HUP
 
 # Check if cluster is already running
 check_cluster_running() {
@@ -1710,12 +1727,53 @@ _exec_on_head() {
     fi
 }
 
+# Keep the head's terminal/stdin while supervising the attached worker clients.
+# Checking container state is insufficient: PID 1 (sleep/earlyoom) can survive
+# a failed vLLM process. SSH propagates docker exec's actual exit status instead.
+exec_head_with_workers() {
+    local cmd="$1" head_pid stdin_fd status=0 worker_status i
+    local exec_flags=(-i)
+    [[ -t 0 ]] && exec_flags=(-it)
+    exec {stdin_fd}<&0
+    docker exec "${exec_flags[@]}" "$CONTAINER_NAME" bash -c "$cmd" <&"$stdin_fd" &
+    head_pid=$!
+    exec {stdin_fd}<&-
+    CLUSTER_EXEC_PIDS+=("$head_pid")
+
+    while kill -0 "$head_pid" 2>/dev/null; do
+        for i in "${!PEER_NODES[@]}"; do
+            if ! kill -0 "${CLUSTER_EXEC_PIDS[$i]}" 2>/dev/null; then
+                # Head and workers can finish together; preserve the head's
+                # status if it has already exited by the time we inspect a peer.
+                kill -0 "$head_pid" 2>/dev/null || break 2
+                worker_status=0
+                wait "${CLUSTER_EXEC_PIDS[$i]}" || worker_status=$?
+                echo "Error: Worker rank $((i + 1)) on ${PEER_NODES[$i]} exited with status $worker_status while the head was still running." >&2
+                # Even a clean worker exit is unexpected while serving continues.
+                status=$worker_status
+                [[ "$status" -ne 0 ]] || status=1
+                break 2
+            fi
+        done
+        sleep 1
+    done
+    if [[ "$status" -eq 0 ]]; then
+        wait "$head_pid" || status=$?
+    fi
+    cleanup_exec_clients
+    if [[ "$status" -ne 0 ]]; then
+        dump_cluster_failure_logs
+    fi
+    return "$status"
+}
+
 # Execute a no-ray multi-node command: workers (background) then head
 exec_no_ray_cluster() {
     local base_cmd="$1"
     local total_nodes=$(( 1 + ${#PEER_NODES[@]} ))
 
-    # Launch workers first (always background)
+    # Foreground launches keep SSH attached so a worker exit reaches the caller.
+    # Daemon launches deliberately detach and have no persistent host supervisor.
     local rank=1
     for worker in "${PEER_NODES[@]}"; do
         local worker_cmd
@@ -1729,8 +1787,16 @@ exec_no_ray_cluster() {
         echo "Launching worker (rank $rank) on $worker..."
         local remote_payload remote_cmd
         remote_payload="$worker_cmd >> /proc/1/fd/1 2>&1"
-        printf -v remote_cmd 'docker exec -d %q bash -c %q' "$CONTAINER_NAME" "$remote_payload"
-        ssh -o BatchMode=yes -o StrictHostKeyChecking=no "$worker" "$remote_cmd"
+        if [[ "$DAEMON_MODE" == "true" ]]; then
+            printf -v remote_cmd 'docker exec -d %q bash -c %q' "$CONTAINER_NAME" "$remote_payload"
+            ssh -o BatchMode=yes -o StrictHostKeyChecking=no "$worker" "$remote_cmd" || return $?
+        else
+            printf -v remote_cmd 'docker exec %q bash -c %q' "$CONTAINER_NAME" "$remote_payload"
+            ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no -o ConnectTimeout=10 \
+                -o ServerAliveInterval=5 -o ServerAliveCountMax=3 \
+                "$worker" "$remote_cmd" &
+            CLUSTER_EXEC_PIDS+=("$!")
+        fi
         (( rank++ ))
     done
 
@@ -1745,7 +1811,11 @@ exec_no_ray_cluster() {
     fi
 
     echo "Executing command on head node (rank 0): $head_cmd"
-    _exec_on_head "$head_cmd"
+    if [[ "$DAEMON_MODE" == "true" ]]; then
+        _exec_on_head "$head_cmd"
+    else
+        exec_head_with_workers "$head_cmd"
+    fi
 }
 
 if [[ "$ACTION" == "exec" && "$SOLO_MODE" == "false" && "$NO_RAY_MODE" == "false" && "$LAUNCH_SCRIPT_MODE" != "true" ]]; then

@@ -2198,9 +2198,16 @@ discovered correctly:
 
 When a foreground `exec` command fails, the launcher prints the last 200
 container-log lines from the head and each worker before cleanup. This includes
-detached worker tracebacks and earlyoom output in the terminal or CI job log.
+worker tracebacks and earlyoom output in the terminal or CI job log.
 Log collection is limited to 15 seconds per node and preserves the command's
 original exit status.
+
+Foreground no-Ray cluster launches also monitor each worker command through
+its SSH connection. If a worker exits while the head is still running, the
+launcher reports its rank, node and exit status, collects logs, and fails
+without waiting for the server startup timeout. SSH keepalives detect lost
+worker connections. Daemon (`-d`) launches remain detached and do not have this
+host-side supervision.
 
 ### Early OOM Monitor
 

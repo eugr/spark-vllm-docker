@@ -1286,7 +1286,7 @@ verify_cluster_args() {
     fi
     
     # Use fake nodes for cluster mode
-    output=$("$PROJECT_DIR/run-recipe.py" "$recipe_name" --dry-run -n "10.0.0.1,10.0.0.2" 2>&1)
+    output=$("$PROJECT_DIR/run-recipe.py" "$recipe_name" --config /dev/null --dry-run -n "10.0.0.1,10.0.0.2" 2>&1)
     vllm_cmd=$(extract_vllm_command "$output")
     
     local all_passed=true
@@ -1662,6 +1662,9 @@ main() {
     test_readme_gpt_oss_cluster
     test_readme_minimax_cluster
     test_readme_glm_flash_cluster
+    verify_cluster_args "qwen3.8-flash-next-nvfp4-cluster" \
+        "$QWEN38_FLASH_NEXT_CLUSTER_TP" \
+        "${QWEN38_FLASH_NEXT_CLUSTER_ARGS[@]}"
     echo ""
     
     # launch-cluster.sh tests

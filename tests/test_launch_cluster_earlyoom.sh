@@ -39,9 +39,9 @@ setup_fixture() {
 if [[ "$(< "$CONTAINER_DIR/mode")" == startup-fail ]]; then
     exit 1
 fi
-printf '%s earlyoom' "$TEST_NODE" >> "$COMMAND_LOG"
-printf ' <%s>' "$@" >> "$COMMAND_LOG"
-printf '\n' >> "$COMMAND_LOG"
+# Docker readiness probes log concurrently; append each record in one write.
+printf -v log_args ' <%s>' "$@"
+printf '%s earlyoom%s\n' "$TEST_NODE" "$log_args" >> "$COMMAND_LOG"
 printf 'earlyoom\n' > "$CONTAINER_DIR/comm"
 exec /bin/sleep 60
 EARLYOOM
@@ -69,9 +69,8 @@ APT
 set -euo pipefail
 export TEST_NODE="${TEST_NODE:-head}"
 export CONTAINER_DIR="$CASE_DIR/containers/$TEST_NODE"
-printf '%s docker' "$TEST_NODE" >> "$COMMAND_LOG"
-printf ' %q' "$@" >> "$COMMAND_LOG"
-printf '\n' >> "$COMMAND_LOG"
+printf -v log_args ' %q' "$@"
+printf '%s docker%s\n' "$TEST_NODE" "$log_args" >> "$COMMAND_LOG"
 
 container_script() {
     local script="$1"
