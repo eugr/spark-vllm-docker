@@ -1771,13 +1771,25 @@ nodes in the cluster and excludes the current node.
 `COPY_HOSTS` from `.env` or autodiscovery; `--copy-parallel` transfers to all
 resolved hosts concurrently.
 
-Hosts with matching image IDs are skipped. If IDs differ, the scripts compare
-the image's platform, ordered filesystem layer hashes, and runtime configuration.
+Distribution compares the image's platform, ordered filesystem layer hashes,
+and runtime configuration, including when image IDs match. An incomplete
+containerd image can have the expected index ID but lack its runnable metadata.
 This recognizes equivalent images across classic Docker and containerd image
 stores, including locally built or saved/loaded images without registry digests.
-The same check runs before cluster launch. It requires Python 3 on the head
-only; workers need Docker. If content cannot be verified, distribution copies
-the image and cluster launch rejects differing IDs.
+Cluster launch also accepts matching IDs or equivalent image content. These
+checks require Python 3 on the head only; workers need Docker. Distribution
+rejects unreadable local metadata and recopies peers whose content cannot be
+verified.
+
+Before loading any peer, distribution validates that the saved archive contains
+every config and layer referenced by its image manifest. Each load is followed
+by another content comparison. Some Docker versions with the containerd image
+store can return success from `docker save` and `docker load` while transferring
+only metadata; see [Moby issue #49473](https://github.com/moby/moby/issues/49473).
+If validation fails, repair the source image's missing layer blobs before
+retrying. An ordinary re-pull on affected Docker versions can reuse existing
+unpacked layers without fetching the missing blobs. The script does not delete
+images or automatically pull replacements, including with `--no-build`.
 
 **Manual host fallback:**
 

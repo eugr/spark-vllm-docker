@@ -268,6 +268,12 @@ copy_to_host() {
     local host_copy_start host_copy_end host_copy_time
     host_copy_start=$(date +%s)
     if cluster_copy_ssh "$host" "docker load" < "$TMP_IMAGE"; then
+        local loaded_fingerprint
+        loaded_fingerprint=$(get_remote_image_fingerprint "$host" "$IMAGE_TAG" 2>/dev/null) || loaded_fingerprint=""
+        if [ "$loaded_fingerprint" != "$LOCAL_IMAGE_FINGERPRINT" ]; then
+            echo "Copy to $host failed: loaded image '$IMAGE_TAG' does not match the local image or has incomplete metadata." >&2
+            return 1
+        fi
         host_copy_end=$(date +%s)
         host_copy_time=$((host_copy_end - host_copy_start))
         printf "Copy to %s completed in %02d:%02d:%02d\n" "$host" $((host_copy_time/3600)) $((host_copy_time%3600/60)) $((host_copy_time%60))
@@ -1483,34 +1489,33 @@ if [ "${#COPY_HOSTS[@]}" -gt 0 ]; then
         exit 1
     fi
 
+    # An index ID can exist even when its platform config/layers are missing.
+    # Require usable metadata before trusting matching IDs, too.
+    if ! LOCAL_IMAGE_FINGERPRINT=$(
+        set -o pipefail
+        docker image inspect "$LOCAL_IMAGE_ID" |
+            python3 "$SCRIPT_DIR/docker/image_identity.py"
+    ) || [ -z "$LOCAL_IMAGE_FINGERPRINT" ]; then
+        echo "Error: Cannot verify runnable metadata for local image '$IMAGE_TAG'." >&2
+        exit 1
+    fi
+
     COPY_TARGETS=()
-    LOCAL_IMAGE_FINGERPRINT=""
-    LOCAL_FINGERPRINT_CHECKED=false
     for host in "${COPY_HOSTS[@]}"; do
         REMOTE_IMAGE_ID=$(get_remote_image_id "$host" "$IMAGE_TAG") || REMOTE_IMAGE_ID=""
-        if [ -n "$REMOTE_IMAGE_ID" ] && [ "$REMOTE_IMAGE_ID" = "$LOCAL_IMAGE_ID" ]; then
-            echo "Image '$IMAGE_TAG' is already up to date on ${SSH_USER}@${host}; skipping."
-            continue
-        fi
         if [ -n "$REMOTE_IMAGE_ID" ]; then
             # Different stores can report different IDs for identical content.
             # Inspect the resolved IDs so a retag cannot change this comparison.
-            if [ "$LOCAL_FINGERPRINT_CHECKED" = false ]; then
-                LOCAL_FINGERPRINT_CHECKED=true
-                LOCAL_IMAGE_FINGERPRINT=$(
-                    set -o pipefail
-                    docker image inspect "$LOCAL_IMAGE_ID" |
-                        python3 "$SCRIPT_DIR/docker/image_identity.py"
-                ) 2>/dev/null || LOCAL_IMAGE_FINGERPRINT=""
-            fi
-            if [ -n "$LOCAL_IMAGE_FINGERPRINT" ]; then
-                REMOTE_IMAGE_FINGERPRINT=$(get_remote_image_fingerprint "$host" "$REMOTE_IMAGE_ID" 2>/dev/null) || REMOTE_IMAGE_FINGERPRINT=""
-                if [ "$REMOTE_IMAGE_FINGERPRINT" = "$LOCAL_IMAGE_FINGERPRINT" ]; then
+            REMOTE_IMAGE_FINGERPRINT=$(get_remote_image_fingerprint "$host" "$REMOTE_IMAGE_ID" 2>/dev/null) || REMOTE_IMAGE_FINGERPRINT=""
+            if [ "$REMOTE_IMAGE_FINGERPRINT" = "$LOCAL_IMAGE_FINGERPRINT" ]; then
+                if [ "$REMOTE_IMAGE_ID" = "$LOCAL_IMAGE_ID" ]; then
+                    echo "Image '$IMAGE_TAG' is already up to date on ${SSH_USER}@${host}; skipping."
+                else
                     echo "Image '$IMAGE_TAG' is already up to date on ${SSH_USER}@${host}; skipping (matching image content)."
-                    continue
                 fi
+                continue
             fi
-            echo "Image '$IMAGE_TAG' differs on ${SSH_USER}@${host}; will copy."
+            echo "Image '$IMAGE_TAG' differs or is incomplete on ${SSH_USER}@${host}; will copy."
         else
             echo "Image '$IMAGE_TAG' not found on ${SSH_USER}@${host}; will copy."
         fi
@@ -1530,6 +1535,11 @@ if [ "${#COPY_HOSTS[@]}" -gt 0 ]; then
         TMP_IMAGE=$(mktemp -t vllm_image.XXXXXX)
         echo "Saving image locally to $TMP_IMAGE..."
         docker save -o "$TMP_IMAGE" "$IMAGE_TAG"
+        if ! python3 "$SCRIPT_DIR/docker/image_archive.py" "$TMP_IMAGE"; then
+            echo "Refusing to copy '$IMAGE_TAG'. Docker's containerd store may be missing exportable layer blobs even though the image runs locally." >&2
+            echo "Repair the source image's missing content, then retry. No remote images were loaded." >&2
+            exit 1
+        fi
 
         if [ "$PARALLEL_COPY" = true ]; then
             PIDS=()

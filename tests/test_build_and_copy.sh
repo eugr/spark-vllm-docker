@@ -175,7 +175,28 @@ if [ "${1:-}" = "save" ]; then
         shift
     done
     if [ -n "$out" ]; then
-        printf 'fake image\n' > "$out"
+        python3 - "$out" <<'PY'
+import io
+import json
+import os
+import sys
+import tarfile
+
+mode = os.environ.get("MOCK_SAVE_MODE", "complete")
+config = {"os": "linux", "architecture": "arm64",
+          "rootfs": {"type": "layers", "diff_ids": ["sha256:" + "1" * 64]}}
+files = {"manifest.json": json.dumps([{"Config": "config.json", "Layers": ["layer.tar"]}]).encode(),
+         "config.json": json.dumps(config).encode(), "layer.tar": b"layer contents"}
+if mode == "missing-config":
+    del files["config.json"]
+elif mode == "missing-layer":
+    del files["layer.tar"]
+with tarfile.open(sys.argv[1], "w") as archive:
+    for name, data in files.items():
+        entry = tarfile.TarInfo(name)
+        entry.size = len(data)
+        archive.addfile(entry, io.BytesIO(data))
+PY
     fi
 fi
 DOCKER
@@ -189,6 +210,14 @@ host="${target#*@}"
 cmd="${*:2}"
 if [[ "$cmd" == *"docker image inspect"* ]]; then
     if [[ "$cmd" != *"--format"* ]]; then
+        if [ -f "$TEST_LOG.loaded-$host" ]; then
+            cat "${MOCK_LOADED_INSPECT_FILE:-$LOCAL_INSPECT_FILE}"
+            exit "${MOCK_LOADED_INSPECT_STATUS:-0}"
+        fi
+        if [ "$host" = samehost ]; then
+            cat "${MOCK_SAMEHOST_INSPECT_FILE:-$LOCAL_INSPECT_FILE}"
+            exit 0
+        fi
         cat "$REMOTE_INSPECT_FILE"
         exit "${REMOTE_INSPECT_STATUS:-0}"
     fi
@@ -209,6 +238,10 @@ fi
 while IFS= read -r _line; do
     :
 done
+if [ "$host" = "${MOCK_LOAD_FAILURE_HOST:-}" ]; then
+    exit 1
+fi
+touch "$TEST_LOG.loaded-$host"
 SSH
 
     cat > "$FAKE_BIN_DIR/curl" <<'CURL'
@@ -655,6 +688,11 @@ test_cleanup_stays_prebuilt() {
     pass "--cleanup is orthogonal and still allows prebuilt path"
 }
 
+test_image_archive_validation() {
+    python3 "$PROJECT_DIR/tests/test_image_archive.py" || fail "saved-image archive regression tests failed"
+    pass "archive validation accepts complete exports and rejects missing or truncated content"
+}
+
 test_prebuilt_copy_parallel() {
     setup_fixture
     run_build -c host1,host2 --copy-parallel || fail "prebuilt copy run failed"
@@ -731,23 +769,100 @@ test_copy_does_not_skip_unreadable_content() {
     for side in local remote; do
         for failure in malformed command; do
             setup_fixture
+            local inspect_status=0
+            [ "$failure" != command ] || inspect_status=1
             if [ "$failure" = malformed ]; then
                 if [ "$side" = local ]; then
                     LOCAL_INSPECT_FILE=/dev/null
                 else
                     REMOTE_INSPECT_FILE=/dev/null
                 fi
-                run_build --no-build -c diffhost || fail "unreadable metadata copy failed"
-            elif [ "$side" = local ]; then
-                LOCAL_INSPECT_STATUS=1 run_build --no-build -c diffhost || fail "local inspect failure copy failed"
-            else
-                REMOTE_INSPECT_STATUS=1 run_build --no-build -c diffhost || fail "remote inspect failure copy failed"
             fi
-            assert_log_contains '^docker save '
-            assert_log_contains '^ssh .*@diffhost docker load$'
+            if [ "$side" = local ]; then
+                if LOCAL_INSPECT_STATUS="$inspect_status" run_build --no-build -c diffhost; then
+                    fail "unreadable local metadata was accepted"
+                fi
+                assert_output_contains 'Cannot verify runnable metadata for local image'
+                assert_log_not_contains '^docker save '
+                assert_log_not_contains '^ssh .* docker load$'
+            else
+                REMOTE_INSPECT_STATUS="$inspect_status" run_build --no-build -c diffhost || fail "unreadable remote metadata copy failed"
+                assert_log_contains '^docker save '
+                assert_log_contains '^ssh .*@diffhost docker load$'
+            fi
         done
     done
-    pass "unreadable metadata or failed inspection cannot skip copying different IDs"
+    pass "unreadable metadata rejects the source or forces a remote copy"
+}
+
+test_copy_repairs_incomplete_image_with_matching_id() {
+    setup_fixture
+    REMOTE_INSPECT_FILE="$CASE_DIR/incomplete.json"
+    printf '[{"Id":"sha256:local","Os":"","Architecture":"","RootFS":{}}]\n' > "$REMOTE_INSPECT_FILE"
+    MOCK_SAMEHOST_INSPECT_FILE="$REMOTE_INSPECT_FILE" run_build --no-build -c samehost || fail "incomplete matching-ID image copy failed"
+    assert_log_contains '^docker save '
+    assert_log_contains '^ssh .*@samehost docker load$'
+    assert_log_contains '^ssh .*@samehost docker image inspect vllm-node$'
+    assert_output_contains 'differs or is incomplete'
+    pass "an incomplete remote image is recopied even when its index ID matches"
+}
+
+test_copy_rejects_incomplete_save() {
+    for mode in missing-config missing-layer; do
+        for parallel in false true; do
+            setup_fixture
+            local args=(--no-build -c host1,host2)
+            [ "$parallel" = false ] || args+=(--copy-parallel)
+            if MOCK_SAVE_MODE="$mode" run_build "${args[@]}"; then
+                fail "incomplete Docker save was accepted ($mode, parallel=$parallel)"
+            fi
+            assert_output_contains 'Saved image archive is incomplete or invalid'
+            assert_output_contains 'No remote images were loaded'
+            assert_output_contains 'Cleaning up temporary image'
+            assert_log_not_contains '^ssh .* docker load$'
+        done
+    done
+    pass "successful but incomplete Docker saves fail before any serial or parallel loads"
+}
+
+test_copy_verifies_loaded_content() {
+    for mode in mismatch incomplete inspect-failure; do
+        for parallel in false true; do
+            setup_fixture
+            local loaded_file="$CASE_DIR/loaded.json" inspect_status=0
+            case "$mode" in
+                mismatch) sed 's/"bash"/"python3"/' "$LOCAL_INSPECT_FILE" > "$loaded_file" ;;
+                incomplete) printf '[{"Os":"","Architecture":"","RootFS":{}}]\n' > "$loaded_file" ;;
+                inspect-failure) cp "$LOCAL_INSPECT_FILE" "$loaded_file"; inspect_status=1 ;;
+            esac
+            local args=(--no-build -c host1,host2)
+            [ "$parallel" = false ] || args+=(--copy-parallel)
+            if MOCK_LOADED_INSPECT_FILE="$loaded_file" MOCK_LOADED_INSPECT_STATUS="$inspect_status" run_build "${args[@]}"; then
+                fail "unverified loaded image was accepted ($mode, parallel=$parallel)"
+            fi
+            assert_output_contains 'loaded image .* does not match the local image or has incomplete metadata'
+            assert_log_contains '^ssh .*@host1 docker load$'
+            if [ "$parallel" = true ]; then
+                assert_log_contains '^ssh .*@host2 docker load$'
+                assert_output_contains 'One or more copies failed'
+            fi
+            if grep -q '^Copy complete\.' "$OUTPUT_LOG"; then
+                fail "failed verification reported copy complete"
+            fi
+        done
+    done
+    pass "serial and parallel copies reject unusable or different content after a successful load"
+}
+
+test_copy_load_failure() {
+    setup_fixture
+    if MOCK_LOAD_FAILURE_HOST=host1 run_build --no-build -c host1,host2 --copy-parallel; then
+        fail "parallel copy ignored a failed Docker load"
+    fi
+    assert_log_contains '^ssh .*@host2 docker image inspect vllm-node$'
+    assert_output_contains 'Copy to host1 failed'
+    assert_output_contains 'One or more copies failed'
+    pass "parallel copy waits for other hosts and reports a failed load"
 }
 
 test_copy_missing_local_image_fails() {
@@ -1901,6 +2016,7 @@ test_use_wheels_never_builds_missing_vllm_implicitly
 test_use_wheels_builds_only_explicit_source_target
 test_use_wheels_builds_only_explicit_flashinfer_target
 test_cleanup_stays_prebuilt
+test_image_archive_validation
 test_prebuilt_copy_parallel
 test_copy_skips_matching_remote_image
 test_copy_only_updates_missing_or_different_hosts
@@ -1908,6 +2024,10 @@ test_copy_skips_matching_content_across_stores
 test_copy_mixed_stores_only_loads_missing_hosts
 test_copy_detects_changed_runtime_config
 test_copy_does_not_skip_unreadable_content
+test_copy_repairs_incomplete_image_with_matching_id
+test_copy_rejects_incomplete_save
+test_copy_verifies_loaded_content
+test_copy_load_failure
 test_copy_missing_local_image_fails
 test_no_build_skips_prebuilt
 test_build_only_flags_warn_on_prebuilt
