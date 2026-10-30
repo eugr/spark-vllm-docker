@@ -1875,11 +1875,13 @@ from `local-inference-lab/vllm@dev/karmic-kraken` and
 ./build-and-copy.sh --exp-b12x --rebuild-vllm
 ```
 
-This builds the fork's FlashInfer wheels when its cache is missing or incomplete.
-Add `--rebuild-flashinfer` to refresh an existing cached set. B12X builds omit
-the `flashinfer-cubin` wheel and retain the Python, JIT-cache, and required
-JIT provider wheels. They never download regular FlashInfer wheels;
-`--force-flashinfer-download` is unsupported for this lane.
+This builds the fork's FlashInfer Python wheel when its cache is missing or
+incomplete. Add `--rebuild-flashinfer` to refresh an existing cached wheel.
+B12X builds skip cubin downloads and produce only `flashinfer-python`, without
+`flashinfer-cubin`, JIT-cache, or JIT provider wheels. Kernels compile on demand
+at runtime. Older B12X caches containing cubin or JIT-cache/provider wheels are
+rebuilt automatically during source builds. B12X builds never download regular
+FlashInfer wheels; `--force-flashinfer-download` is unsupported for this lane.
 
 It can be combined with `--apply-vllm-pr <pr-num>` to build custom vLLM patches.
 The preset preserves selected Blackwell subarchitectures in vLLM's CUDA 13
@@ -1912,7 +1914,7 @@ Wheel profiles are selected automatically:
 ├── flashinfer/
 │   ├── regular/       # upstream FlashInfer
 │   ├── custom/        # upstream with a custom ref/PR or GPU target
-│   ├── b12x/          # local-inference-lab FlashInfer, without cubins
+│   ├── b12x/          # local-inference-lab FlashInfer, Python wheel only
 │   └── b12x-custom/   # fork with a custom ref/PR or GPU target
 └── vllm/
     ├── regular/

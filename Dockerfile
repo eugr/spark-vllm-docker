@@ -123,6 +123,7 @@ WORKDIR $VLLM_BASE_DIR
 ARG FLASHINFER_REPO=https://github.com/flashinfer-ai/flashinfer.git
 ARG FLASHINFER_REF=main
 ARG FLASHINFER_BUILD_CUBIN=1
+ARG FLASHINFER_BUILD_JIT_CACHE=1
 ARG FLASHINFER_BUILD_PYTHON=/usr/bin/python3
 
 # FlashInfer's source checkout may carry a .python-version. Keep no-isolation
@@ -253,12 +254,12 @@ RUN --mount=type=cache,id=uv-cache,target=/root/.cache/uv \
     if [ "$FLASHINFER_BUILD_CUBIN" = "1" ]; then \
         (cd flashinfer-cubin && uv build --python "$FLASHINFER_BUILD_PYTHON" --no-build-isolation --wheel . --out-dir=/workspace/wheels -v); \
     fi && \
-    # flashinfer-jit-cache
-    bash /tmp/build_flashinfer_jit_providers.sh "$FLASHINFER_BUILD_PYTHON" /workspace/wheels && \
-    cd flashinfer-jit-cache && \
-    uv build --python "$FLASHINFER_BUILD_PYTHON" --no-build-isolation --wheel . --out-dir=/workspace/wheels -v && \
+    # B12X uses runtime JIT; skip AOT providers and their cubin downloads too.
+    if [ "$FLASHINFER_BUILD_JIT_CACHE" = "1" ]; then \
+        bash /tmp/build_flashinfer_jit_providers.sh "$FLASHINFER_BUILD_PYTHON" /workspace/wheels && \
+        (cd flashinfer-jit-cache && uv build --python "$FLASHINFER_BUILD_PYTHON" --no-build-isolation --wheel . --out-dir=/workspace/wheels -v); \
+    fi && \
     # dump git ref and target architecture in the wheels dir
-    cd .. && \
     git rev-parse HEAD > /workspace/wheels/.flashinfer-commit && \
     printf '%s\n' "$FLASHINFER_CUDA_ARCH_LIST" > /workspace/wheels/.flashinfer-arch
 

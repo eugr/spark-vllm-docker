@@ -3,18 +3,19 @@ Subject: [PATCH] [PR #54614] [Kernel] Dynamic NVFP4 W4A4/W4A16 selection with sh
 
 Upstream-PR: https://github.com/vllm-project/vllm/pull/54614
 Upstream-Commit: 5feaedcf9b4fa18d9e0b817153d681bededdd4d9
-Refresh-Base: fe5fe8ba5fb9412ac6deafd192ae8b7c466b96c5
-Integration-Base: 355553ac22dca4080929ea8f88a446f15df1f3ba
+Integration-Base: 8084f0624dba24aba6ebac62d8e10cc00730a0fe
 
 Preserve the quantized-input shape and autotune cache-key tests from main.
 Keep round_up=True and full-model autotuning after removal of the obsolete
 BF16-only warmup path.
 
+Retain maybe_fused_act_quant in the non-dynamic Qwen2MoE path.
+
 diff --git a/.buildkite/test_areas/kernels.yaml b/.buildkite/test_areas/kernels.yaml
-index 451cf20fbbf527661f505a6b0a679cb6c9869728..8deee0a8b26746884819482889a226dd0bd6c933 100644
+index 54eb180dad78f1aea844dc5250aa899cc86cf392..31fb2ff3e518086f4e6b61b08a08b45c4b580c80 100644
 --- a/.buildkite/test_areas/kernels.yaml
 +++ b/.buildkite/test_areas/kernels.yaml
-@@ -768,11 +768,16 @@ steps:
+@@ -844,11 +844,16 @@ steps:
  #   - vllm/model_executor/layers/quantization/mxfp4.py
  #   - vllm/model_executor/layers/quantization/utils/b12x_moe.py
  #   - vllm/model_executor/warmup/b12x_warmup.py
@@ -31,7 +32,7 @@ index 451cf20fbbf527661f505a6b0a679cb6c9869728..8deee0a8b26746884819482889a226dd
  #   - tests/kernels/quantization/test_block_fp8.py
  #   - tests/quantization/reference_mxfp4.py
  #   - tests/quantization/test_auto_round.py
-@@ -783,6 +788,13 @@ steps:
+@@ -859,6 +864,13 @@ steps:
  #       kernels/quantization/test_block_fp8.py
  #       kernels/moe/test_b12x.py
  #       quantization/test_auto_round.py -k b12x
@@ -858,7 +859,7 @@ index 74ae494ed8f785230a675c8802f3e6fefa7f33a0..44b6c64812ee0f74288636263f296a64
 +    }
 +    assert not active_buckets
 diff --git a/vllm/config/kernel.py b/vllm/config/kernel.py
-index b50bc32e9a31ab98d9e7097b5410e6b862ba04d0..c1fd3357914bb6a323eb216a037be08b2466bdec 100644
+index 9e40c1528f59cad5c15a8b8f037c717d0f67fb73..9de86bc6f5cc60cba6beeed5d07293f12bc8ed37 100644
 --- a/vllm/config/kernel.py
 +++ b/vllm/config/kernel.py
 @@ -247,6 +247,7 @@ LinearBackend = Literal[
@@ -869,7 +870,7 @@ index b50bc32e9a31ab98d9e7097b5410e6b862ba04d0..c1fd3357914bb6a323eb216a037be08b
      "flashinfer_trtllm",
      "flashinfer_cudnn",
      "flashinfer_b12x",
-@@ -280,6 +281,18 @@ class KernelConfig:
+@@ -283,6 +284,18 @@ class KernelConfig:
      v0.34.0. Kernels will be selected by the platform, as for other custom ops.
      """
  
@@ -889,10 +890,10 @@ index b50bc32e9a31ab98d9e7097b5410e6b862ba04d0..c1fd3357914bb6a323eb216a037be08b
      """Benchmark FlashInfer kernel implementations during warmup and use the
      fastest. Enabled by default except at `-O0`; disable for faster startup."""
 diff --git a/vllm/model_executor/kernels/linear/__init__.py b/vllm/model_executor/kernels/linear/__init__.py
-index ec3059ea7f7e3e16ea10c15a8e6b49e0b94cd6fd..87fb5ccfe361e9a87cb891c430f965e4234dd11a 100644
+index 8301cbe481a32cc00a4a9b4b779cbca26a2115ca..19082592e27dba17a9e8bea460d1ccd6f5df26b4 100644
 --- a/vllm/model_executor/kernels/linear/__init__.py
 +++ b/vllm/model_executor/kernels/linear/__init__.py
-@@ -1190,6 +1190,15 @@ def init_nvfp4_linear_kernel(use_a16: bool = False) -> NvFp4LinearKernel:
+@@ -1250,6 +1250,15 @@ def init_nvfp4_linear_kernel(use_a16: bool = False) -> NvFp4LinearKernel:
          elif not prefers_humming(compute_capability):
              force_kernel = MarlinNvFp4LinearKernel
  
@@ -1307,10 +1308,10 @@ index 0000000000000000000000000000000000000000..15b2a4870acee673cebbe135b74cbe4f
 +        )
 +    return candidate
 diff --git a/vllm/model_executor/models/qwen2_moe.py b/vllm/model_executor/models/qwen2_moe.py
-index 1c095d6f091c8bc932cd4058bfd1e89f6f141b85..020f465cedc33b7fc2607bf8bbfd9a0380494550 100644
+index 46320b2c8eae6dd151ea2988a2a53561bcd1fa95..6680c2c34b261684c0ac008b993faeeee309cc49 100644
 --- a/vllm/model_executor/models/qwen2_moe.py
 +++ b/vllm/model_executor/models/qwen2_moe.py
-@@ -111,11 +111,22 @@ class Qwen2MoeMLP(nn.Module):
+@@ -112,11 +112,22 @@ class Qwen2MoeMLP(nn.Module):
              )
          self.act_fn = SiluAndMul()
          self.expert_gate = expert_gate
@@ -1323,23 +1324,23 @@ index 1c095d6f091c8bc932cd4058bfd1e89f6f141b85..020f465cedc33b7fc2607bf8bbfd9a03
  
      def forward(self, x):
          gate_up, _ = self.gate_up_proj(x)
--        out = self.act_fn(gate_up)
+-        out = maybe_fused_act_quant(self.act_fn, gate_up, self.down_proj)
 -        out, _ = self.down_proj(out)
 +        if self._dynamic_nvfp4:
 +            kernel = getattr(self.down_proj.quant_method, "kernel", None)
 +            assert kernel is not None
 +            out = kernel.apply_silu_or_linear(self.down_proj, gate_up, True)
 +        else:
-+            out = self.act_fn(gate_up)
++            out = maybe_fused_act_quant(self.act_fn, gate_up, self.down_proj)
 +            out, _ = self.down_proj(out)
  
          if self.expert_gate is not None:
              out = F.sigmoid(self.expert_gate(x)[0]) * out
 diff --git a/vllm/model_executor/warmup/kernel_warmup.py b/vllm/model_executor/warmup/kernel_warmup.py
-index b7bf50865fca831c808bb958717da612a2d790b8..bf72e2c32ad14b1f6a294317071fd083142c4a3d 100644
+index 0e706a390541af3b3a15d6ae43df8a36fdbb1588..2b84d0ae3b24ad34c78ddbe32ff4fd2f2234cd0b 100644
 --- a/vllm/model_executor/warmup/kernel_warmup.py
 +++ b/vllm/model_executor/warmup/kernel_warmup.py
-@@ -335,6 +335,19 @@ def _flashinfer_autotune_token_counts(runner: "GPUModelRunner") -> tuple[int, ..
+@@ -342,6 +342,19 @@ def _flashinfer_autotune_token_counts(runner: "GPUModelRunner") -> tuple[int, ..
      max_tokens = runner.scheduler_config.max_num_batched_tokens
      # Tune the widest bucket set first so bounded passes reuse its configs.
      token_counts = [max_tokens]
@@ -1359,7 +1360,7 @@ index b7bf50865fca831c808bb958717da612a2d790b8..bf72e2c32ad14b1f6a294317071fd083
      token_counts.extend(_flashinfer_deferred_moe_token_counts(runner))
      return tuple(dict.fromkeys(token_counts))
  
-@@ -372,13 +385,23 @@ def _run_flashinfer_autotune_dummy_runs(
+@@ -379,13 +392,23 @@ def _run_flashinfer_autotune_dummy_runs(
          # Round M up to match serving-time bucket selection for non-bucket M.
          # See https://github.com/flashinfer-ai/flashinfer/issues/5450
          with fi_utils.autotune(tuning_buckets=tuning_buckets, round_up=True):

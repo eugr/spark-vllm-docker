@@ -41,6 +41,7 @@ EXP_B12X_TORCHVISION_VERSION="0.28.0"
 EXP_B12X_TORCHAUDIO_VERSION="2.11.0"
 FLASHINFER_REPO="https://github.com/flashinfer-ai/flashinfer.git"
 FLASHINFER_BUILD_CUBIN=1
+FLASHINFER_BUILD_JIT_CACHE=1
 FLASHINFER_REF="main"
 FLASHINFER_REF_SET=false
 TMP_IMAGE=""
@@ -117,6 +118,7 @@ generate_build_metadata() {
     local flashinfer_ref="${14}"
     local cutlass_dsl_version="${15}"
     local flashinfer_build_cubin="${16:-1}"
+    local flashinfer_build_jit_cache="${17:-1}"
 
     local base_image
     base_image=$(grep -m1 '^FROM .* AS runner' "$dockerfile" | awk '{print $2}')
@@ -139,6 +141,7 @@ build_args:
   flashinfer_repo: "${flashinfer_repo}"
   flashinfer_ref: "${flashinfer_ref}"
   flashinfer_build_cubin: ${flashinfer_build_cubin}
+  flashinfer_build_jit_cache: ${flashinfer_build_jit_cache}
   transformers_5: ${transformers_5}
   exp_mxfp4: ${exp_mxfp4}
   vllm_prs: "${vllm_prs}"
@@ -574,12 +577,24 @@ validate_flashinfer_wheel_set() {
         echo "       Re-run with --rebuild-flashinfer to rebuild the selected wheel set."
         return 1
     fi
-    if [ "${#jit[@]}" -ne 1 ] || [ ! -f "${jit[0]}" ] || \
-       [ "${#python[@]}" -ne 1 ] || [ ! -f "${python[0]}" ]; then
+    if [ "${#python[@]}" -ne 1 ] || [ ! -f "${python[0]}" ]; then
         echo "Error: FlashInfer profile $wheels_dir does not contain exactly one complete wheel set."
+        echo "       Re-run with --rebuild-flashinfer to rebuild the selected wheel set."
         return 1
     fi
-    python3 ./docker/validate_flashinfer_wheels.py "${jit[0]}" "$GPU_ARCH_LIST"
+    if [ "$FLASHINFER_BUILD_JIT_CACHE" = "1" ]; then
+        if [ "${#jit[@]}" -ne 1 ] || [ ! -f "${jit[0]}" ]; then
+            echo "Error: FlashInfer profile $wheels_dir does not contain exactly one JIT-cache wheel."
+            echo "       Re-run with --rebuild-flashinfer to rebuild the selected wheel set."
+            return 1
+        fi
+        python3 ./docker/validate_flashinfer_wheels.py "${jit[0]}" "$GPU_ARCH_LIST" || return 1
+    elif compgen -G "$wheels_dir/flashinfer_jit_cache*.whl" > /dev/null 2>&1; then
+        echo "Error: B12X FlashInfer profile $wheels_dir must not contain JIT-cache or provider wheels."
+        echo "       Re-run with --rebuild-flashinfer to rebuild the selected wheel set."
+        return 1
+    fi
+    return 0
 }
 
 validate_exported_wheel_set() {
@@ -909,6 +924,7 @@ if [ "$NORMALIZED_VLLM_REPO" = "$NORMALIZED_DEFAULT_VLLM_REPO" ] || \
     if [ "$NORMALIZED_VLLM_REPO" = "$EXP_B12X_VLLM_REPO" ]; then
         FLASHINFER_REPO="$EXP_B12X_FLASHINFER_REPO"
         FLASHINFER_BUILD_CUBIN=0
+        FLASHINFER_BUILD_JIT_CACHE=0
     fi
 fi
 
@@ -1233,7 +1249,7 @@ if [ "$NO_BUILD" = false ]; then
                 echo "       Re-run with --rebuild-flashinfer to explicitly build the fork from source."
                 exit 1
             else
-                echo "Building B12X FlashInfer wheels from $FLASHINFER_REPO ref $FLASHINFER_REF (without cubins)..."
+                echo "Building B12X FlashInfer Python wheel from $FLASHINFER_REPO ref $FLASHINFER_REF (without cubins or JIT-cache)..."
                 BUILD_FLASHINFER=true
                 REBUILD_FLASHINFER=true
             fi
@@ -1257,7 +1273,8 @@ if [ "$NO_BUILD" = false ]; then
                 "${COMMON_BUILD_FLAGS[@]}"
                 "--build-arg" "FLASHINFER_REF=$FLASHINFER_REF"
                 "--build-arg" "FLASHINFER_REPO=$FLASHINFER_REPO"
-                "--build-arg" "FLASHINFER_BUILD_CUBIN=$FLASHINFER_BUILD_CUBIN")
+                "--build-arg" "FLASHINFER_BUILD_CUBIN=$FLASHINFER_BUILD_CUBIN"
+                "--build-arg" "FLASHINFER_BUILD_JIT_CACHE=$FLASHINFER_BUILD_JIT_CACHE")
 
             # The checked-in Qwen stack belongs to the upstream lane only.
             # Custom FlashInfer refs/PRs keep their existing unmodified base.
@@ -1433,7 +1450,7 @@ if [ "$NO_BUILD" = false ]; then
         generate_build_metadata Dockerfile "$VLLM_VERSION" "$VLLM_COMMIT" "$FLASHINFER_COMMIT" \
             "$VLLM_REF" "true" "false" "$VLLM_PRS" "$VLLM_REPO" "$TORCH_VERSION" \
             "${TORCHVISION_VERSION:-resolver-selected}" "${TORCHAUDIO_VERSION:-resolver-selected}" \
-            "$FLASHINFER_REPO" "$FLASHINFER_REF" "$CUTLASS_DSL_VERSION" "$FLASHINFER_BUILD_CUBIN"
+            "$FLASHINFER_REPO" "$FLASHINFER_REF" "$CUTLASS_DSL_VERSION" "$FLASHINFER_BUILD_CUBIN" "$FLASHINFER_BUILD_JIT_CACHE"
 
         RUNNER_CMD=("docker" "build"
             "-t" "$IMAGE_TAG"

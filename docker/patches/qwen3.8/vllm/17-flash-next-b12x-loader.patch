@@ -1,6 +1,6 @@
 Subject: [PATCH] Flash Next B12X checkpoint loading in the regular lane
 
-Integration-Base: 355553ac22dca4080929ea8f88a446f15df1f3ba
+Integration-Base: 8084f0624dba24aba6ebac62d8e10cc00730a0fe
 
 Apply after 16-flash-next-fp4.patch.
 Reference: local-inference-lab/vllm
@@ -10,7 +10,7 @@ Adapt the loader to upstream's current Source and _prepare_weights interfaces.
 Reuse patch 16's scoped transfer helpers and FlashInfer's embedded B12X reader.
 Limit this integration to Flash Next and its MTP draft on Spark with TP=1/2;
 GDS, other architectures, EP/DP/PP, and standalone weight reload are excluded.
-Keep regular PLE mmap loading for resident, pinned-host and file-gather tables.
+Keep regular PLE mmap loading for resident, pinned-host and disk-offloaded tables.
 Finish deferred reads before post-processing, materialize CSF and retained
 quantized draft-head inputs, and skip unrelated checkpoint shards for MTP.
 
@@ -634,10 +634,10 @@ index d82997be17c33d60d7fe371d38dbd67cf62888e5..b36bd528ec2944dfc14d0e757414806c
        InstantTensor, which enables distributed loading with pipelined prefetching
        and fast direct I/O.
 diff --git a/vllm/model_executor/layers/draft_vocab.py b/vllm/model_executor/layers/draft_vocab.py
-index c56135431a5615096077b7963726a847ac11c0a4..1915d9ed5082027da80f9359e2ebc51f2d01ef52 100644
+index ec6e77cb380c183a8ceee4bd2fce9e744eba2d2e..5ec42cef2b378d821e4a413a3e55cb371352ee18 100644
 --- a/vllm/model_executor/layers/draft_vocab.py
 +++ b/vllm/model_executor/layers/draft_vocab.py
-@@ -554,6 +554,10 @@ class DraftVocab:
+@@ -572,6 +572,10 @@ class DraftVocab:
          )
          for name, weight in weights:
              if keep and name.startswith(prefix):
@@ -649,18 +649,18 @@ index c56135431a5615096077b7963726a847ac11c0a4..1915d9ed5082027da80f9359e2ebc51f
                      "cpu", copy=True
                  )
 diff --git a/vllm/model_executor/layers/fused_moe/routed_experts.py b/vllm/model_executor/layers/fused_moe/routed_experts.py
-index fb13ce2d40b2436cd21b459aef50e2fb68bdf593..6479db42bacfcdd52df47e803989dfb7da12e620 100644
+index f818e526d9b73033efe62a36dd594bbd6f1294c8..990853f62a8136ea8d9a3937343f30356051dead 100644
 --- a/vllm/model_executor/layers/fused_moe/routed_experts.py
 +++ b/vllm/model_executor/layers/fused_moe/routed_experts.py
 @@ -31,6 +31,7 @@ from vllm.model_executor.layers.quantization.base_config import (
-     QuantizationConfig,
      resolve_quant_method,
  )
+ from vllm.model_executor.utils import kernel_parameters
 +from vllm.model_executor.weight_transfer import copy_weight, flush_weight_transfers
  from vllm.utils.math_utils import cdiv
  
  if TYPE_CHECKING:
-@@ -341,10 +342,10 @@ class RoutedExperts(PluggableLayer):
+@@ -370,10 +371,10 @@ class RoutedExperts(PluggableLayer):
              # We have to keep the weight scales of w1 and w3 because
              # we need to re-quantize w1/w3 weights after weight loading.
              idx = 0 if shard_id == "w1" else 1
@@ -673,7 +673,7 @@ index fb13ce2d40b2436cd21b459aef50e2fb68bdf593..6479db42bacfcdd52df47e803989dfb7
  
      def _load_combined_w13_weight_scale(
          self,
-@@ -360,7 +361,7 @@ class RoutedExperts(PluggableLayer):
+@@ -389,7 +390,7 @@ class RoutedExperts(PluggableLayer):
          loaded_weight = loaded_weight.narrow(
              shard_dim, shard_size * tp_rank, shard_size
          )
@@ -682,7 +682,7 @@ index fb13ce2d40b2436cd21b459aef50e2fb68bdf593..6479db42bacfcdd52df47e803989dfb7
  
      def _load_model_weight_or_group_weight_scale(
          self,
-@@ -442,7 +443,7 @@ class RoutedExperts(PluggableLayer):
+@@ -471,7 +472,7 @@ class RoutedExperts(PluggableLayer):
                  hidden_dim=hidden_dim,
                  shard_dim=shard_dim,
              )
@@ -691,7 +691,7 @@ index fb13ce2d40b2436cd21b459aef50e2fb68bdf593..6479db42bacfcdd52df47e803989dfb7
          elif shard_id in ("w1", "w3"):
              self._load_w13(
                  shard_id=shard_id,
-@@ -569,7 +570,7 @@ class RoutedExperts(PluggableLayer):
+@@ -598,7 +599,7 @@ class RoutedExperts(PluggableLayer):
              hidden_dim=hidden_dim,
              shard_dim=shard_dim,
          )
@@ -700,7 +700,7 @@ index fb13ce2d40b2436cd21b459aef50e2fb68bdf593..6479db42bacfcdd52df47e803989dfb7
  
      def _load_w2(
          self,
-@@ -620,17 +621,18 @@ class RoutedExperts(PluggableLayer):
+@@ -649,17 +650,18 @@ class RoutedExperts(PluggableLayer):
              ):
                  dst.copy_(src)
              return
@@ -722,9 +722,9 @@ index fb13ce2d40b2436cd21b459aef50e2fb68bdf593..6479db42bacfcdd52df47e803989dfb7
 +            loaded_weight = loaded_weight.reshape(target.shape)
 +        copy_weight(target, loaded_weight)
  
-     def _get_fused_shared_expert_quantizer(
-         self,
-@@ -693,11 +695,11 @@ class RoutedExperts(PluggableLayer):
+     @overload
+     def weight_loader(
+@@ -697,11 +699,11 @@ class RoutedExperts(PluggableLayer):
              # (FIXME) for gpt-oss all experts are combined
              if "bias" in weight_name:
                  dim1 = loaded_weight.shape[1]
@@ -738,7 +738,7 @@ index fb13ce2d40b2436cd21b459aef50e2fb68bdf593..6479db42bacfcdd52df47e803989dfb7
              return True if return_success else None
  
          from vllm.model_executor.layers.quantization.online.moe_base import (
-@@ -806,7 +808,7 @@ class RoutedExperts(PluggableLayer):
+@@ -812,7 +814,7 @@ class RoutedExperts(PluggableLayer):
                      loaded_weight,
                      hidden_dim=0,
                  )
@@ -747,7 +747,7 @@ index fb13ce2d40b2436cd21b459aef50e2fb68bdf593..6479db42bacfcdd52df47e803989dfb7
              else:
                  self._load_w13(
                      shard_id=shard_id,
-@@ -819,8 +821,9 @@ class RoutedExperts(PluggableLayer):
+@@ -825,8 +827,9 @@ class RoutedExperts(PluggableLayer):
  
          # Case input scale: input_scale loading is only supported for fp8
          if "input_scale" in weight_name:
@@ -759,7 +759,7 @@ index fb13ce2d40b2436cd21b459aef50e2fb68bdf593..6479db42bacfcdd52df47e803989dfb7
  
              # ModelOpt NVFP4 stores w13 input scales as two logical shards.
              # The generic assignment below would broadcast w1/w3 into the
-@@ -832,8 +835,9 @@ class RoutedExperts(PluggableLayer):
+@@ -838,8 +841,9 @@ class RoutedExperts(PluggableLayer):
              ):
                  scale_expert_id = global_expert_id if use_global_sf else expert_id
                  scale_shard_id = 0 if shard_id == "w1" else 1
@@ -772,10 +772,10 @@ index fb13ce2d40b2436cd21b459aef50e2fb68bdf593..6479db42bacfcdd52df47e803989dfb7
                  return True if return_success else None
  
 diff --git a/vllm/model_executor/layers/linear.py b/vllm/model_executor/layers/linear.py
-index deedd9eb62d4943515a623f8dc60b1951c3dedf3..8c7fc51d15aedf849c7d23afb2f994624ed116d0 100644
+index 428aefd8730c74c882a1c5001d7041f306a2a2d4..1253ca44f8139f876e0db3d1a10dd3ead264eb66 100644
 --- a/vllm/model_executor/layers/linear.py
 +++ b/vllm/model_executor/layers/linear.py
-@@ -42,6 +42,7 @@ from vllm.model_executor.parameter import (
+@@ -43,6 +43,7 @@ from vllm.model_executor.parameter import (
      RowvLLMParameter,
  )
  from vllm.model_executor.utils import set_weight_attrs
@@ -783,7 +783,7 @@ index deedd9eb62d4943515a623f8dc60b1951c3dedf3..8c7fc51d15aedf849c7d23afb2f99462
  from vllm.platforms import current_platform
  
  logger = init_logger(__name__)
-@@ -410,7 +411,7 @@ class ReplicatedLinear(LinearBase):
+@@ -413,7 +414,7 @@ class ReplicatedLinear(LinearBase):
              f"Tried to load weights of size {loaded_weight.size()}"
              f"to a parameter of size {param.size()}"
          )
@@ -792,7 +792,7 @@ index deedd9eb62d4943515a623f8dc60b1951c3dedf3..8c7fc51d15aedf849c7d23afb2f99462
  
      def forward(
          self,
-@@ -604,7 +605,7 @@ class ColumnParallelLinear(LinearBase):
+@@ -607,7 +608,7 @@ class ColumnParallelLinear(LinearBase):
              loaded_weight = loaded_weight.reshape(1)
  
          assert param_data.shape == loaded_weight.shape
@@ -801,7 +801,7 @@ index deedd9eb62d4943515a623f8dc60b1951c3dedf3..8c7fc51d15aedf849c7d23afb2f99462
  
      def weight_loader_v2(self, param: BasevLLMParameter, loaded_weight: torch.Tensor):
          # Special case for loading scales off disk, which often do not
-@@ -793,7 +794,7 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
+@@ -796,7 +797,7 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
                      )
  
                  assert param_data.shape == loaded_weight.shape
@@ -810,7 +810,7 @@ index deedd9eb62d4943515a623f8dc60b1951c3dedf3..8c7fc51d15aedf849c7d23afb2f99462
                  return
  
              output_sizes = (
-@@ -878,7 +879,7 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
+@@ -881,7 +882,7 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
                  )
  
          assert param_data.shape == loaded_weight.shape
@@ -819,7 +819,7 @@ index deedd9eb62d4943515a623f8dc60b1951c3dedf3..8c7fc51d15aedf849c7d23afb2f99462
  
      def _load_fused_module_from_checkpoint(
          self,
-@@ -1233,7 +1234,7 @@ class QKVParallelLinear(ColumnParallelLinear):
+@@ -1236,7 +1237,7 @@ class QKVParallelLinear(ColumnParallelLinear):
                      )
  
                  assert param_data.shape == loaded_weight.shape
@@ -828,7 +828,7 @@ index deedd9eb62d4943515a623f8dc60b1951c3dedf3..8c7fc51d15aedf849c7d23afb2f99462
                  return
              shard_offsets = [
                  # (shard_id, shard_offset, shard_size)
-@@ -1335,7 +1336,7 @@ class QKVParallelLinear(ColumnParallelLinear):
+@@ -1338,7 +1339,7 @@ class QKVParallelLinear(ColumnParallelLinear):
                  )
  
          assert param_data.shape == loaded_weight.shape
@@ -837,7 +837,7 @@ index deedd9eb62d4943515a623f8dc60b1951c3dedf3..8c7fc51d15aedf849c7d23afb2f99462
  
      def load_weights(
          self, weights: Iterable[tuple[str, torch.Tensor]]
-@@ -1543,7 +1544,7 @@ class MinimaxM3QKVParallelLinearWithIndexer(QKVParallelLinear):
+@@ -1560,7 +1561,7 @@ class MinimaxM3QKVParallelLinearWithIndexer(QKVParallelLinear):
              output_dim, shard_rank * shard_size, shard_size
          )
          assert param_data.shape == loaded_weight.shape
@@ -846,7 +846,7 @@ index deedd9eb62d4943515a623f8dc60b1951c3dedf3..8c7fc51d15aedf849c7d23afb2f99462
  
  
  class KimiK3MergedQKVGateLinear(MergedColumnParallelLinear):
-@@ -1772,7 +1773,7 @@ class RowParallelLinear(LinearBase):
+@@ -1789,7 +1790,7 @@ class RowParallelLinear(LinearBase):
              loaded_weight = loaded_weight.reshape(1)
  
          assert param_data.shape == loaded_weight.shape
@@ -856,10 +856,10 @@ index deedd9eb62d4943515a623f8dc60b1951c3dedf3..8c7fc51d15aedf849c7d23afb2f99462
      def weight_loader_v2(self, param: BasevLLMParameter, loaded_weight: torch.Tensor):
          # Special case for loading scales off disk, which often do not
 diff --git a/vllm/model_executor/layers/mamba/mamba_mixer2.py b/vllm/model_executor/layers/mamba/mamba_mixer2.py
-index e310aaf40f12244e815cfe8c779d54b85b7f081c..8a3b7ef8493f2b2f45a352ae42c8a3b333e8b78c 100644
+index 76b13c69748d5daaf899345bcc0a5913e281c3e4..7e27ef7dd3dab1261fd14a5a1e382bd18858b357 100644
 --- a/vllm/model_executor/layers/mamba/mamba_mixer2.py
 +++ b/vllm/model_executor/layers/mamba/mamba_mixer2.py
-@@ -59,6 +59,7 @@ from vllm.model_executor.model_loader.weight_utils import (
+@@ -60,6 +60,7 @@ from vllm.model_executor.model_loader.weight_utils import (
  )
  from vllm.model_executor.parameter import BasevLLMParameter
  from vllm.model_executor.utils import set_weight_attrs
@@ -867,7 +867,7 @@ index e310aaf40f12244e815cfe8c779d54b85b7f081c..8a3b7ef8493f2b2f45a352ae42c8a3b3
  from vllm.platforms import current_platform
  from vllm.utils.torch_utils import (
      LayerNameType,
-@@ -244,13 +245,12 @@ def mamba_v2_sharded_weight_loader(
+@@ -245,13 +246,12 @@ def mamba_v2_sharded_weight_loader(
              #   seem to handle slices well.
              # https://github.com/python/mypy/issues/2410
              target_slice = param.data[boundary : (boundary + take), ...]
@@ -1181,7 +1181,7 @@ index 76f2d055c38ca07abda49bdee5903858fe7221dc..6ccab2971c54ae8dec0fc508f01b4779
          if len(parts) == 2:
              del pending[base]
 diff --git a/vllm/model_executor/model_loader/default_loader.py b/vllm/model_executor/model_loader/default_loader.py
-index a01daa7bb91d0fe831eb20412641cf917a99ca49..6ed91718129e6f792375bafdd8695e7182d68a97 100644
+index 013ba42a8fa7470e8520f7337b29d599aa4ed21d..f4cf32c8263f8666a9a4d046686c25108c37828b 100644
 --- a/vllm/model_executor/model_loader/default_loader.py
 +++ b/vllm/model_executor/model_loader/default_loader.py
 @@ -43,6 +43,7 @@ from vllm.model_executor.model_loader.weight_utils import (
@@ -1192,7 +1192,7 @@ index a01daa7bb91d0fe831eb20412641cf917a99ca49..6ed91718129e6f792375bafdd8695e71
  from vllm.tracing import instrument
  from vllm.transformers_utils.repo_utils import list_filtered_repo_files
  
-@@ -524,6 +525,7 @@ class DefaultModelLoader(BaseModelLoader):
+@@ -529,6 +530,7 @@ class DefaultModelLoader(BaseModelLoader):
          self._init_mm_encoder_only_weight_filter(model, model_config)
  
          loaded_weights = model.load_weights(self.get_all_weights(model_config, model))
@@ -1201,10 +1201,10 @@ index a01daa7bb91d0fe831eb20412641cf917a99ca49..6ed91718129e6f792375bafdd8695e71
          self.counter_after_loading_weights = time.perf_counter()
          logger.info_once(
 diff --git a/vllm/model_executor/model_loader/weight_utils.py b/vllm/model_executor/model_loader/weight_utils.py
-index 3262e9408846d183ca439385cd7d7849de56756c..9e963b98844e9f62ec880b0e963ab0a68c13c348 100644
+index 1fa5625225423632353841111dc35b890dfff762..afb015a16fb4c84936413e701c916512e47aa77f 100644
 --- a/vllm/model_executor/model_loader/weight_utils.py
 +++ b/vllm/model_executor/model_loader/weight_utils.py
-@@ -46,6 +46,7 @@ from vllm.model_executor.layers.quantization import (
+@@ -47,6 +47,7 @@ from vllm.model_executor.layers.quantization import (
  from vllm.model_executor.model_loader.ep_weight_filter import (
      should_skip_weight,
  )
@@ -1212,7 +1212,7 @@ index 3262e9408846d183ca439385cd7d7849de56756c..9e963b98844e9f62ec880b0e963ab0a6
  from vllm.platforms import current_platform
  from vllm.tracing import instrument
  from vllm.transformers_utils.repo_utils import hf_api, hf_fs
-@@ -1484,14 +1485,14 @@ def default_weight_loader(param: torch.Tensor, loaded_weight: torch.Tensor) -> N
+@@ -1513,14 +1514,14 @@ def default_weight_loader(param: torch.Tensor, loaded_weight: torch.Tensor) -> N
              # Sometimes scalar values aren't considered tensors with shapes
              # so if both param and loaded_weight are a scalar,
              # reshape to match before copying
@@ -1229,7 +1229,7 @@ index 3262e9408846d183ca439385cd7d7849de56756c..9e963b98844e9f62ec880b0e963ab0a6
      except Exception:
          # NOTE: This exception is added for the purpose of setting breakpoint to
          # debug weight loading issues.
-@@ -1565,6 +1566,8 @@ def composed_weight_loader(
+@@ -1594,6 +1595,8 @@ def composed_weight_loader(
  
      def composed_loader(param: torch.Tensor, loaded_weight: torch.Tensor) -> None:
          loader(param, loaded_weight)
@@ -1239,7 +1239,7 @@ index 3262e9408846d183ca439385cd7d7849de56756c..9e963b98844e9f62ec880b0e963ab0a6
          return
  
 diff --git a/vllm/model_executor/parameter.py b/vllm/model_executor/parameter.py
-index de1cc7d218884e4b37eedaa81f83f58e6b6f9ac9..7846665a7c81efd626f05117d10cbc9f61850f85 100644
+index b627db04ecb58c9a1da0587e40ca3cc83b9a1125..6fd5903d31322e63f79f8c7edcb929b83400472a 100644
 --- a/vllm/model_executor/parameter.py
 +++ b/vllm/model_executor/parameter.py
 @@ -14,6 +14,7 @@ from vllm.distributed import (
@@ -1259,7 +1259,7 @@ index de1cc7d218884e4b37eedaa81f83f58e6b6f9ac9..7846665a7c81efd626f05117d10cbc9f
  
      def load_column_parallel_weight(self, loaded_weight: torch.Tensor):
          self._assert_and_load(loaded_weight)
-@@ -148,7 +149,7 @@ class _ColumnvLLMParameter(BasevLLMParameter):
+@@ -142,7 +143,7 @@ class _ColumnvLLMParameter(BasevLLMParameter):
              self.output_dim, self.tp_rank * shard_size, shard_size
          )
          assert self.data.shape == loaded_weight.shape
@@ -1268,7 +1268,7 @@ index de1cc7d218884e4b37eedaa81f83f58e6b6f9ac9..7846665a7c81efd626f05117d10cbc9f
  
      def load_merged_column_weight(self, loaded_weight: torch.Tensor, **kwargs):
          shard_offset: int = kwargs["shard_offset"]
-@@ -170,7 +171,7 @@ class _ColumnvLLMParameter(BasevLLMParameter):
+@@ -164,7 +165,7 @@ class _ColumnvLLMParameter(BasevLLMParameter):
              self.output_dim, self.tp_rank * shard_size, shard_size
          )
          assert param_data.shape == loaded_weight.shape
@@ -1277,7 +1277,7 @@ index de1cc7d218884e4b37eedaa81f83f58e6b6f9ac9..7846665a7c81efd626f05117d10cbc9f
  
      def load_qkv_weight(self, loaded_weight: torch.Tensor, **kwargs):
          shard_offset: int = kwargs["shard_offset"]
-@@ -195,7 +196,7 @@ class _ColumnvLLMParameter(BasevLLMParameter):
+@@ -189,7 +190,7 @@ class _ColumnvLLMParameter(BasevLLMParameter):
          )
  
          assert param_data.shape == loaded_weight.shape
@@ -1286,7 +1286,7 @@ index de1cc7d218884e4b37eedaa81f83f58e6b6f9ac9..7846665a7c81efd626f05117d10cbc9f
  
  
  class RowvLLMParameter(BasevLLMParameter):
-@@ -223,7 +224,7 @@ class RowvLLMParameter(BasevLLMParameter):
+@@ -217,7 +218,7 @@ class RowvLLMParameter(BasevLLMParameter):
              loaded_weight = loaded_weight.reshape(1)
  
          assert self.data.shape == loaded_weight.shape
@@ -1295,7 +1295,7 @@ index de1cc7d218884e4b37eedaa81f83f58e6b6f9ac9..7846665a7c81efd626f05117d10cbc9f
  
  
  class ModelWeightParameter(_ColumnvLLMParameter, RowvLLMParameter):
-@@ -297,7 +298,7 @@ class PerTensorScaleParameter(BasevLLMParameter):
+@@ -291,7 +292,7 @@ class PerTensorScaleParameter(BasevLLMParameter):
  
          param_data = param_data[shard_id]
          assert param_data.shape == loaded_weight.shape
@@ -1305,7 +1305,7 @@ index de1cc7d218884e4b37eedaa81f83f58e6b6f9ac9..7846665a7c81efd626f05117d10cbc9f
  
  class PackedColumnParameter(_ColumnvLLMParameter):
 diff --git a/vllm/models/qwen4_exp/nvidia/mtp.py b/vllm/models/qwen4_exp/nvidia/mtp.py
-index c93c3eb64c10783a2fbfe19ff6fc86d1aef066f9..32075701beded9a177c44bbbbde39900586bb273 100644
+index c5e72e08c0e3614937ee291f038bfb8c95713a90..0918b4501ec711a4e1c165bb1d52193d1ff05f34 100644
 --- a/vllm/models/qwen4_exp/nvidia/mtp.py
 +++ b/vllm/models/qwen4_exp/nvidia/mtp.py
 @@ -469,6 +469,10 @@ class Qwen4ExpMTP(nn.Module, SupportsHCSP, SupportsPP, Qwen4ExpMixtureOfExperts)

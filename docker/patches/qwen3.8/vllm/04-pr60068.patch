@@ -3,8 +3,7 @@ Subject: [PATCH] [PR #60068] [MRV2][Spec Decode] Opt-in confidence stop for auto
 
 Upstream-PR: https://github.com/vllm-project/vllm/pull/60068
 Upstream-Commit: 8ae78ccaf8825b3e55ab014e282c769902ca198c
-Integration-Base: 355553ac22dca4080929ea8f88a446f15df1f3ba
-Refresh-Base: 90309f6b742cdb1d6305778b81063918cf61be81
+Integration-Base: 8084f0624dba24aba6ebac62d8e10cc00730a0fe
 
 Preserve both quantized draft-head and adaptive-depth documentation/tests.
 Use #60692's supports_decode_metadata_update API; confidence stopping
@@ -12,11 +11,13 @@ requires a separate graph for each draft step. Preserve the upstream
 watermarked sampling branch and update confidence before either sampler
 can modify logits in place.
 
+Retain upstream DraftLogitsCache and target attention-metadata reuse.
+
 diff --git a/docs/features/speculative_decoding/mtp.md b/docs/features/speculative_decoding/mtp.md
-index 2254827d13b54bf8f8f363c12364377446900765..66410e4da75a1e389acac9150882b6409f45c094 100644
+index 6ceee19ad799885c7f71c385ab651f2dd0d31734..d4483be1ea5b22408a877fdf6c9b68a3ecdde299 100644
 --- a/docs/features/speculative_decoding/mtp.md
 +++ b/docs/features/speculative_decoding/mtp.md
-@@ -140,3 +140,10 @@ checkpoint. Dynamic rows on a quantized lm_head need the ModelOpt NVFP4 format.
+@@ -139,3 +139,10 @@ lm_head require the ModelOpt NVFP4 format.
    per lm_head weight, e.g. 0.6 or 0.35 GiB for a 248k x 2560 head; it is
    counted in the model weights, so with `--kv-cache-memory-bytes` leave room
    for it.
@@ -28,10 +29,10 @@ index 2254827d13b54bf8f8f363c12364377446900765..66410e4da75a1e389acac9150882b640
 +  every draft step, which costs more than it saves on faster GPUs, so it is
 +  rejected elsewhere; SM120 (RTX PRO 6000, RTX 5090) is untested.
 diff --git a/tests/v1/core/test_scheduler.py b/tests/v1/core/test_scheduler.py
-index 99eb02ff3389274efe04d875c2088e8017e77d54..5800fe030553a592d62df807ba5f50bc1041d951 100644
+index 18bb469cd7201985a3f2ab942314d3793b60f8ba..5c6e5371a07199838f8c11b3f3c9f9026b523d74 100644
 --- a/tests/v1/core/test_scheduler.py
 +++ b/tests/v1/core/test_scheduler.py
-@@ -2124,6 +2124,43 @@ def test_per_request_spec_decode_subtracts_invalid_drafts():
+@@ -2851,6 +2851,43 @@ def test_per_request_spec_decode_subtracts_invalid_drafts():
      assert payload["acceptance_histogram"] == [0, 0, 1, 0]
  
  
@@ -375,10 +376,10 @@ index 0000000000000000000000000000000000000000..38c04d98b6367d9efa3a73719beb575e
 +        with pytest.raises(ValueError, match=error):
 +            VllmConfig._verify_draft_confidence_threshold(config)
 diff --git a/tests/v1/worker/test_gpu_target_dependent_ar_speculator.py b/tests/v1/worker/test_gpu_target_dependent_ar_speculator.py
-index 42678aa9d1f864c11d8d4636b31fb2a8f57a7518..f69c3c177b1ec33142b3683e6678914d317473a1 100644
+index 27c841a75754bd5124a91f66a3727a45ba0c67f0..dabc7fe60951cd6014535d12cf40038d1312343e 100644
 --- a/tests/v1/worker/test_gpu_target_dependent_ar_speculator.py
 +++ b/tests/v1/worker/test_gpu_target_dependent_ar_speculator.py
-@@ -175,6 +175,7 @@ def test_speculator_uses_draft_model_hidden_size(monkeypatch, hc_mult, expected)
+@@ -184,6 +184,7 @@ def test_speculator_uses_draft_model_hidden_size(monkeypatch, hc_mult, expected)
          use_local_argmax_reduction=False,
          draft_sample_method="greedy",
          enable_adaptive_verification=False,
@@ -387,10 +388,10 @@ index 42678aa9d1f864c11d8d4636b31fb2a8f57a7518..f69c3c177b1ec33142b3683e6678914d
      vllm_config = SimpleNamespace(
          speculative_config=speculative_config,
 diff --git a/vllm/config/speculative.py b/vllm/config/speculative.py
-index 2d82a6b3f0446f1b6a0f09a591352c6e732f3d48..001e94d8b663ea0ea058be0a04ee33ee559ec096 100644
+index 5da8aa318851e6b45363df418449b2d601744a49..75bfe651e41a8f4ffef620eaa65c2e2288068a33 100644
 --- a/vllm/config/speculative.py
 +++ b/vllm/config/speculative.py
-@@ -586,6 +586,18 @@ class SpeculativeConfig:
+@@ -632,6 +632,18 @@ class SpeculativeConfig:
      """Whether to adaptively size the draft-verification budget from per-request
      confidence. Currently only supported for method="dspark"."""
  
@@ -410,10 +411,10 @@ index 2d82a6b3f0446f1b6a0f09a591352c6e732f3d48..001e94d8b663ea0ea058be0a04ee33ee
      def _acceptance_length_to_rates(length: float, n: int) -> list[float]:
          """Mean acceptance length to unconditional per-position rates, using
 diff --git a/vllm/config/vllm.py b/vllm/config/vllm.py
-index a5f555fa9bd6622a5d244fc617b35edbede25356..a0d7149c4c180a6d68fc555aae336a3d299da605 100644
+index 879a3992137d8692b687112454d416a7340560c4..064277c62185e29d4b8d18dcc0383c23ced80a5c 100644
 --- a/vllm/config/vllm.py
 +++ b/vllm/config/vllm.py
-@@ -1109,6 +1109,44 @@ class VllmConfig:
+@@ -1141,6 +1141,44 @@ class VllmConfig:
          )
          speculative_config.num_speculative_tokens_per_batch_size = None
  
@@ -458,7 +459,7 @@ index a5f555fa9bd6622a5d244fc617b35edbede25356..a0d7149c4c180a6d68fc555aae336a3d
      def _normalize_piecewise_cudagraph_mode(
          self, *, breakable_cudagraph_enabled: bool
      ) -> None:
-@@ -1844,6 +1882,7 @@ class VllmConfig:
+@@ -1877,6 +1915,7 @@ class VllmConfig:
  
          self._maybe_disable_dynamic_sd_for_data_parallel()
          self._maybe_disable_dynamic_sd_for_v1()
@@ -467,10 +468,10 @@ index a5f555fa9bd6622a5d244fc617b35edbede25356..a0d7149c4c180a6d68fc555aae336a3d
  
          if (
 diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
-index a6ca6074dfda0ac56e3b8f49adae58bc199cd324..f5e91e65f7d7a229a1061e69647805b4d336be17 100644
+index 0db5e1f6bfc1eefa8d44a2886cbcfd7625d64328..301aae8e43fdeab106d57b9491b74a3a4e72db18 100644
 --- a/vllm/v1/core/sched/scheduler.py
 +++ b/vllm/v1/core/sched/scheduler.py
-@@ -2129,9 +2129,15 @@ class Scheduler(SchedulerInterface):
+@@ -2363,9 +2363,15 @@ class Scheduler(SchedulerInterface):
                          request.num_computed_tokens -= num_rejected
                      if request.num_output_placeholders > 0:
                          request.num_output_placeholders -= num_rejected
@@ -487,7 +488,7 @@ index a6ca6074dfda0ac56e3b8f49adae58bc199cd324..f5e91e65f7d7a229a1061e69647805b4
                      num_accepted_tokens=num_accepted,
                      num_invalid_spec_tokens=scheduler_output.num_invalid_spec_tokens,
                      request_id=req_id,
-@@ -2140,7 +2146,7 @@ class Scheduler(SchedulerInterface):
+@@ -2374,7 +2380,7 @@ class Scheduler(SchedulerInterface):
                      # Exclude grammar-invalidated drafts from the proposed
                      # count, mirroring make_spec_decoding_stats; the accepted
                      # bucket (j) is unaffected.
@@ -497,7 +498,7 @@ index a6ca6074dfda0ac56e3b8f49adae58bc199cd324..f5e91e65f7d7a229a1061e69647805b4
                          adj_draft_tokens -= (
                              scheduler_output.num_invalid_spec_tokens.get(req_id, 0)
 diff --git a/vllm/v1/outputs.py b/vllm/v1/outputs.py
-index 22169b1fda93861db267ea73be64637a3f5bc17e..9334a19504db60a67e211f37fc7ec7a6ca004a5e 100644
+index 93df3badee41fb2ee64c172b18144435fced8a96..1e1948ac35c61255ffac0fff848729166be4b146 100644
 --- a/vllm/v1/outputs.py
 +++ b/vllm/v1/outputs.py
 @@ -310,6 +310,10 @@ class ModelRunnerOutput:
@@ -512,10 +513,10 @@ index 22169b1fda93861db267ea73be64637a3f5bc17e..9334a19504db60a67e211f37fc7ec7a6
      def with_kv_conn_output_only(
          kv_connector_output: KVConnectorOutput | None,
 diff --git a/vllm/v1/worker/gpu/cudagraph_utils.py b/vllm/v1/worker/gpu/cudagraph_utils.py
-index 3a6409db55468ad8840276b3e63509fcfb31ac05..62a21adb67b0d422919bfa4ebf83957f06c344f6 100644
+index 995657462bf28d0c4d07b17c8e9b85a6732e8887..acfc0a14223cb5a553d491e28a6fe7064c674524 100644
 --- a/vllm/v1/worker/gpu/cudagraph_utils.py
 +++ b/vllm/v1/worker/gpu/cudagraph_utils.py
-@@ -269,6 +269,7 @@ class CudaGraphManager:
+@@ -277,6 +277,7 @@ class CudaGraphManager:
          # draft tokens. The scheduler might use a smaller number so we need
          # to capture graphs for all possible values during decode.
          speculative_config = self.vllm_config.speculative_config
@@ -523,7 +524,7 @@ index 3a6409db55468ad8840276b3e63509fcfb31ac05..62a21adb67b0d422919bfa4ebf83957f
          if (
              speculative_config
              and speculative_config.uses_dynamic_speculative_decoding()
-@@ -291,6 +292,19 @@ class CudaGraphManager:
+@@ -299,6 +300,19 @@ class CudaGraphManager:
                      for num_spec in dense_schedule[1:]
                  }
              )
@@ -543,7 +544,7 @@ index 3a6409db55468ad8840276b3e63509fcfb31ac05..62a21adb67b0d422919bfa4ebf83957f
          else:
              decode_query_lens = [self.decode_query_len]
  
-@@ -322,6 +336,10 @@ class CudaGraphManager:
+@@ -330,6 +344,10 @@ class CudaGraphManager:
                          rounded_num_tokens > max_decode_tokens
                          or rounded_num_tokens > max_cg_capture_size
                          or rounded_num_reqs > self.max_num_reqs
@@ -555,10 +556,10 @@ index 3a6409db55468ad8840276b3e63509fcfb31ac05..62a21adb67b0d422919bfa4ebf83957f
                          continue
  
 diff --git a/vllm/v1/worker/gpu/model_runner.py b/vllm/v1/worker/gpu/model_runner.py
-index 9615667d435f3499ee24ca565a75e13c149beb4b..9ac61c0acdd07bbf6ef1ada23e9084b37485e58c 100644
+index ebfa9da5235cb3e353507cf9595235aae7a15e1c..318a19bc8d7a772eb4254df9e61498891006efae 100644
 --- a/vllm/v1/worker/gpu/model_runner.py
 +++ b/vllm/v1/worker/gpu/model_runner.py
-@@ -1328,6 +1328,21 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+@@ -1376,6 +1376,21 @@ class GPUModelRunner(LoRAModelRunnerMixin):
              num_draft_tokens_np = np.fromiter(
                  num_drafts_iter, dtype=np.int32, count=num_reqs
              )
@@ -580,7 +581,7 @@ index 9615667d435f3499ee24ca565a75e13c149beb4b..9ac61c0acdd07bbf6ef1ada23e9084b3
              if self.adaptive_verification is not None:
                  num_toks = self.adaptive_verification.get_num_tokens(
                      num_tokens_per_req, draft_tokens
-@@ -1770,6 +1785,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+@@ -1833,6 +1848,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
          )
          if batch_req_state is not None:
              num_toks = batch_req_state.num_tokens
@@ -588,7 +589,7 @@ index 9615667d435f3499ee24ca565a75e13c149beb4b..9ac61c0acdd07bbf6ef1ada23e9084b3
              if batch_req_state.has_prefill:
                  # Varlen decode graphs replay decodes only, and their bound
                  # alone would admit a short prefill.
-@@ -2190,6 +2206,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+@@ -2269,6 +2285,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
              prompt_token_id_logprobs_dict=prompt_token_id_logprobs_dict,
              cudagraph_stats=cudagraph_stats,
          )
@@ -693,27 +694,26 @@ index 0000000000000000000000000000000000000000..ac762b2b38c4c38d815c16befbc8b7b0
 +        self._resolve_pending()
 +        return self._num_drafts_np[slots]
 diff --git a/vllm/v1/worker/gpu/spec_decode/speculator.py b/vllm/v1/worker/gpu/spec_decode/speculator.py
-index 261c83a94727f5138f300bf7d543754f73e99083..6266f830ec9a93f0e3acc9f71a4129816b8f5963 100644
+index bcd6bfd608e4e7b088426295fe314f4284f78df6..b2fadcf910b23f963fa0803cbf4a7d176a00096c 100644
 --- a/vllm/v1/worker/gpu/spec_decode/speculator.py
 +++ b/vllm/v1/worker/gpu/spec_decode/speculator.py
-@@ -38,6 +38,7 @@ from vllm.v1.worker.gpu.sample.gumbel import gumbel_sample
- from vllm.v1.worker.gpu.spec_decode.acceptance_estimator import (
+@@ -41,6 +41,7 @@ from vllm.v1.worker.gpu.spec_decode.acceptance_estimator import (
      OnlineAcceptanceEstimator,
  )
+ from vllm.v1.worker.gpu.spec_decode.draft_logits import DraftLogitsCache
 +from vllm.v1.worker.gpu.spec_decode.confidence_stop import DraftConfidenceStop
  from vllm.v1.worker.utils import AttentionGroup
  
  if TYPE_CHECKING:
-@@ -106,6 +107,8 @@ class BaseSpeculator(ABC):
- 
- 
- class DraftModelSpeculator(BaseSpeculator):
+@@ -112,6 +113,7 @@ class DraftModelSpeculator(BaseSpeculator):
+     # Draft prefill runs on the target's batch, so it can reuse the target
+     # forward's attention metadata. Otherwise the drafter rebuilds it.
+     can_reuse_target_attn_metadata: bool = True
 +    confidence_stop: DraftConfidenceStop | None = None
-+
+
      def __init__(self, vllm_config: VllmConfig, device: torch.device):
          self.vllm_config = vllm_config
-         self.device = device
-@@ -201,6 +204,18 @@ class DraftModelSpeculator(BaseSpeculator):
+@@ -209,6 +211,18 @@ class DraftModelSpeculator(BaseSpeculator):
                  watermark_config.deduplicate_contexts_max_history,
              )
  
@@ -732,7 +732,7 @@ index 261c83a94727f5138f300bf7d543754f73e99083..6266f830ec9a93f0e3acc9f71a412981
          self.supports_mm_inputs = False
          self.pcp_manager: PCPManager | None = None
          # Whether every draft attention builder can refresh its decode metadata
-@@ -488,6 +503,9 @@ class DraftModelSpeculator(BaseSpeculator):
+@@ -538,6 +552,9 @@ class DraftModelSpeculator(BaseSpeculator):
              return self.get_draft_top_tokens(hidden_states, spec_step_idx)
  
          logits = self.compute_draft_logits(hidden_states, spec_step_idx)
@@ -743,7 +743,7 @@ index 261c83a94727f5138f300bf7d543754f73e99083..6266f830ec9a93f0e3acc9f71a412981
              sampled = self.draft_watermarker.sample(
                  logits,
 diff --git a/vllm/v1/worker/gpu/spec_decode/target_dependent_ar/speculator.py b/vllm/v1/worker/gpu/spec_decode/target_dependent_ar/speculator.py
-index fdbedd78f6bd626555c0081c0a78ae0772ec5d69..16323deeedd9797de170c227dd2972ae92cad8a2 100644
+index 1c7db7c6970e3ff8ea8196e47ff76755679cb714..c4b66a13063d4a35e9917175defd592af4b654c5 100644
 --- a/vllm/v1/worker/gpu/spec_decode/target_dependent_ar/speculator.py
 +++ b/vllm/v1/worker/gpu/spec_decode/target_dependent_ar/speculator.py
 @@ -1,5 +1,6 @@
@@ -772,7 +772,7 @@ index fdbedd78f6bd626555c0081c0a78ae0772ec5d69..16323deeedd9797de170c227dd2972ae
              self.supports_decode_metadata_update = False
              return
          super()._configure_decode_metadata_update()
-@@ -293,6 +295,22 @@ class TargetDependentARSpeculator(DraftModelSpeculator):
+@@ -313,6 +315,22 @@ class TargetDependentARSpeculator(DraftModelSpeculator):
              )
          self.on_prefill_end(num_reqs)
  
@@ -795,7 +795,7 @@ index fdbedd78f6bd626555c0081c0a78ae0772ec5d69..16323deeedd9797de170c227dd2972ae
          if num_speculative_tokens <= 1:
              if num_speculative_tokens == 0:
                  self.draft_tokens[:num_reqs].fill_(-1)
-@@ -336,7 +354,7 @@ class TargetDependentARSpeculator(DraftModelSpeculator):
+@@ -362,7 +380,7 @@ class TargetDependentARSpeculator(DraftModelSpeculator):
          )
          if self.decode_cudagraph_manager is not None:
              decode_batch_desc = self.decode_cudagraph_manager.specialize_spec_tokens(
@@ -804,7 +804,7 @@ index fdbedd78f6bd626555c0081c0a78ae0772ec5d69..16323deeedd9797de170c227dd2972ae
              )
          num_tokens_across_dp = (
              decode_batch_sync.num_tokens_across_dp
-@@ -349,7 +367,7 @@ class TargetDependentARSpeculator(DraftModelSpeculator):
+@@ -375,7 +393,7 @@ class TargetDependentARSpeculator(DraftModelSpeculator):
          decode_fn = (
              self._fused_multi_step_decode
              if self.supports_decode_metadata_update
@@ -813,7 +813,7 @@ index fdbedd78f6bd626555c0081c0a78ae0772ec5d69..16323deeedd9797de170c227dd2972ae
          )
          decode_fn(
              num_reqs,
-@@ -357,7 +375,7 @@ class TargetDependentARSpeculator(DraftModelSpeculator):
+@@ -383,7 +401,7 @@ class TargetDependentARSpeculator(DraftModelSpeculator):
              decode_batch_desc,
              num_tokens_across_dp,
              input_batch.seq_lens_cpu_upper_bound,
@@ -822,7 +822,7 @@ index fdbedd78f6bd626555c0081c0a78ae0772ec5d69..16323deeedd9797de170c227dd2972ae
          )
          self.on_multi_step_decode_end(num_reqs)
  
-@@ -485,6 +503,7 @@ class TargetDependentARSpeculator(DraftModelSpeculator):
+@@ -516,6 +534,7 @@ class TargetDependentARSpeculator(DraftModelSpeculator):
          num_tokens_across_dp: torch.Tensor | None,
          seq_lens_cpu_upper_bound: torch.Tensor,
          num_speculative_steps: int,
@@ -830,7 +830,7 @@ index fdbedd78f6bd626555c0081c0a78ae0772ec5d69..16323deeedd9797de170c227dd2972ae
      ) -> None:
          positions = self.input_buffers.positions[:num_reqs]
          query_start_loc = self.input_buffers.query_start_loc[: num_reqs + 1]
-@@ -513,6 +532,10 @@ class TargetDependentARSpeculator(DraftModelSpeculator):
+@@ -544,6 +563,10 @@ class TargetDependentARSpeculator(DraftModelSpeculator):
                      step=step,
                  )
  
@@ -841,7 +841,7 @@ index fdbedd78f6bd626555c0081c0a78ae0772ec5d69..16323deeedd9797de170c227dd2972ae
              self.current_draft_step.fill_(step)
  
              if batch_desc.cg_mode == CUDAGraphMode.FULL:
-@@ -528,6 +551,11 @@ class TargetDependentARSpeculator(DraftModelSpeculator):
+@@ -559,6 +582,11 @@ class TargetDependentARSpeculator(DraftModelSpeculator):
                      cudagraph_runtime_mode=batch_desc.cg_mode,
                      num_speculative_steps=num_speculative_steps,
                  )

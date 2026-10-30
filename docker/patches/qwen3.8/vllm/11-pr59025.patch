@@ -2,11 +2,11 @@ From: schopde-nvidia
 Subject: [PATCH] [Kernel] Register the cudnn backend for FlashInfer BF16 mm
 
 Upstream-PR: https://github.com/vllm-project/vllm/pull/59025
-Upstream-Commit: 29f8cedf94c43ebb813d8475cbd089d378b4f4ae
-Integration-Base: 355553ac22dca4080929ea8f88a446f15df1f3ba
+Upstream-Commit: 67b308c2f75f7e26b33055afed0310f771afeee2
+Integration-Base: 8084f0624dba24aba6ebac62d8e10cc00730a0fe
 
 diff --git a/vllm/model_executor/layers/utils.py b/vllm/model_executor/layers/utils.py
-index 8d285dda75b84f83300ed3925b453d03337c64e8..d80ded870d8d265a3fec39b3ab0020d41f0a0c68 100644
+index fa1b598967d973ef93f4f37b87af9636b7132287..6ab3cba70e1b8969062118382480c8d96a04606d 100644
 --- a/vllm/model_executor/layers/utils.py
 +++ b/vllm/model_executor/layers/utils.py
 @@ -15,6 +15,7 @@ from vllm.logger import init_logger
@@ -35,7 +35,7 @@ index 8d285dda75b84f83300ed3925b453d03337c64e8..d80ded870d8d265a3fec39b3ab0020d4
      if x.ndim < 1 or weight.ndim != 2:
          return False
      if (
-@@ -145,12 +143,48 @@ def _can_use_flashinfer_cutedsl_bf16(
+@@ -145,12 +143,51 @@ def _can_use_flashinfer_cutedsl_bf16(
      )
  
  
@@ -61,7 +61,10 @@ index 8d285dda75b84f83300ed3925b453d03337c64e8..d80ded870d8d265a3fec39b3ab0020d4
 +    weight: torch.Tensor,
 +    bias: torch.Tensor | None,
 +) -> bool:
-+    if not current_platform.is_cuda():
++    # sm_10x showed no benefit in the same regime (measured 0.90-1.13x).
++    if not (
++        current_platform.is_cuda() and current_platform.is_device_capability_family(120)
++    ):
 +        return False
 +    if weight.shape[0] > _FLASHINFER_BF16_MAX_N:
 +        return False

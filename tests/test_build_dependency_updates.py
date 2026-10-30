@@ -112,8 +112,10 @@ class DependencyBuildTests(unittest.TestCase):
         ).split("\n\n", 1)[0]
         return re.sub(r"(?m)^\s*--mount=\S+\s*\\\n", "", run)
 
-    def run_flashinfer_wheels(self, cubin):
+    def run_flashinfer_wheels(self, cubin, jit_cache=True, providers=False):
         (self.root / "flashinfer-jit-cache").mkdir()
+        if providers:
+            (self.root / "flashinfer-jit-cache-provider").mkdir()
         if cubin:
             (self.root / "flashinfer-cubin").mkdir()
         (self.root / "pyproject.toml").write_text('license = "Apache-2.0"\n')
@@ -131,6 +133,7 @@ class DependencyBuildTests(unittest.TestCase):
         return subprocess.run(
             ["sh", "-c", run], cwd=self.root,
             env={**self.env, "FLASHINFER_BUILD_CUBIN": str(int(cubin)),
+                 "FLASHINFER_BUILD_JIT_CACHE": str(int(jit_cache)),
                  "FLASHINFER_BUILD_PYTHON": str(self.bin_dir / "prepared-python"),
                  "FLASHINFER_CUDA_ARCH_LIST": "12.1a"},
             text=True, capture_output=True,
@@ -143,6 +146,21 @@ class DependencyBuildTests(unittest.TestCase):
         self.assertTrue((self.root / "flashinfer-cubin/build").is_dir())
         self.assertTrue((self.root / "flashinfer-jit-cache/build").is_dir())
 
+    def test_regular_flashinfer_builds_providers_before_shim(self):
+        result = self.run_flashinfer_wheels(cubin=True, providers=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual([cmd["arch"] for cmd in self.commands()], [None, None, "12.1a", None])
+        self.assertTrue((self.root / "flashinfer-jit-cache-provider/build").is_dir())
+        self.assertTrue((self.root / "flashinfer-jit-cache/build").is_dir())
+
+    def test_provider_failure_stops_before_shim_and_provenance(self):
+        self.env["FAIL_UV_DIR"] = "flashinfer-jit-cache-provider"
+        result = self.run_flashinfer_wheels(cubin=True, providers=True)
+        self.assertEqual(result.returncode, 17, result.stderr)
+        self.assertEqual(len(self.commands()), 3)
+        self.assertFalse((self.root / "flashinfer-jit-cache/build").exists())
+        self.assertFalse((self.root / "wheels/.flashinfer-commit").exists())
+
     def test_cubin_failure_stops_before_jit_build_and_provenance(self):
         self.env["FAIL_UV_DIR"] = "flashinfer-cubin"
         result = self.run_flashinfer_wheels(cubin=True)
@@ -150,11 +168,12 @@ class DependencyBuildTests(unittest.TestCase):
         self.assertEqual(len(self.commands()), 2)
         self.assertFalse((self.root / "wheels/.flashinfer-commit").exists())
 
-    def test_b12x_build_skips_cubins_but_keeps_jit_and_provenance(self):
-        result = self.run_flashinfer_wheels(cubin=False)
+    def test_b12x_build_skips_cubins_and_jit_but_keeps_provenance(self):
+        result = self.run_flashinfer_wheels(cubin=False, jit_cache=False, providers=True)
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(len(self.commands()), 2)
-        self.assertTrue((self.root / "flashinfer-jit-cache/build").is_dir())
+        self.assertEqual(len(self.commands()), 1)
+        self.assertFalse((self.root / "flashinfer-jit-cache/build").exists())
+        self.assertFalse((self.root / "flashinfer-jit-cache-provider/build").exists())
         self.assertEqual((self.root / "wheels/.flashinfer-commit").read_text(), "test-commit\n")
         self.assertEqual((self.root / "wheels/.flashinfer-arch").read_text(), "12.1a\n")
 

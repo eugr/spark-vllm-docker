@@ -3,11 +3,10 @@ Subject: [PATCH] [Bugfix] Widen the QSA raw-key ring instead of asserting divisi
 
 Upstream-PR: https://github.com/vllm-project/vllm/pull/54912
 Upstream-Commit: 77b5ae7e2d9ce2dec02ea9bf40fa96ed4e53a071
-Integration-Base: 355553ac22dca4080929ea8f88a446f15df1f3ba
-Refresh-Base: 6aa70c4beca4f85c44b9f04c23f46326d9261f14
+Integration-Base: 8084f0624dba24aba6ebac62d8e10cc00730a0fe
 
 diff --git a/tests/models/qwen4_exp/test_config.py b/tests/models/qwen4_exp/test_config.py
-index 18246dbd08911ad33c6f96faf3a47291b569162b..4ac0d6c89eebccf9758b7559a0e179f59d4d7aa6 100644
+index bb01acdd8431f712ddb7145f4196e5e3987d8e10..e7b3afa3a814b870c20238a307b4f0b11b094c53 100644
 --- a/tests/models/qwen4_exp/test_config.py
 +++ b/tests/models/qwen4_exp/test_config.py
 @@ -17,11 +17,16 @@ from vllm.model_executor.layers.quantization.compressed_tensors.utils import (
@@ -27,7 +26,7 @@ index 18246dbd08911ad33c6f96faf3a47291b569162b..4ac0d6c89eebccf9758b7559a0e179f5
  from vllm.v1.worker.gpu.model_states.mamba_hybrid import MambaHybridModelState
  
  from ...utils import spawn_new_process_for_each_test
-@@ -319,3 +324,39 @@ def test_qkv_proj_mapping_allows_bf16_indexer(model_cls) -> None:
+@@ -285,3 +290,39 @@ def test_qkv_proj_mapping_allows_bf16_indexer(model_cls) -> None:
          ignore=["model.layers.3.self_attn.indexer.index_qk_proj"],
          fused_mapping=model_cls.packed_modules_mapping,
      )
@@ -68,7 +67,7 @@ index 18246dbd08911ad33c6f96faf3a47291b569162b..4ac0d6c89eebccf9758b7559a0e179f5
 +    with pytest.raises(ValueError, match="QSA ring"):
 +        qsa_ring_capacity(4, 13, block_size)
 diff --git a/vllm/models/qwen4_exp/common/qsa_cache.py b/vllm/models/qwen4_exp/common/qsa_cache.py
-index 5eba092eec25d792ce2b1ca1782c25cacf8f2a9c..9a282ac677d130eab31ba1e5a8d4a325c9221e45 100644
+index 8b7acee4a246630110740cbe1a331de2696cfbdf..b11806bddf76a2f4a48ed0c2052ee37b6b008564 100644
 --- a/vllm/models/qwen4_exp/common/qsa_cache.py
 +++ b/vllm/models/qwen4_exp/common/qsa_cache.py
 @@ -21,6 +21,7 @@ from torch import nn
