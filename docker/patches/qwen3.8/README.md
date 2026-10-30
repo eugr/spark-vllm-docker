@@ -60,6 +60,30 @@ upstream commit `397b9607c83cf201f3c44684c555c3698869b6bd`.
 
 ## Integration and refresh
 
+The October 30 refresh fixes pipeline 381's patch 05 failure on vLLM
+`deacc3670153845db2f013ea24085d6eaf338874`. Upstream
+[#64110](https://github.com/vllm-project/vllm/pull/64110) moved the QSA cache
+implementation to `qsa_indexer.py` and renamed its classes. Patch 05 now targets
+`QSARawKeyCache` there while retaining the ring-sizing limits and tests.
+
+The full series also targets main
+`dc4dd5a2217bc757232e9fa4d8a8b59e207ca068`. Patch 01 matches the merged #59958
+implementation, including its GPU synchronization guard, so the series detects
+it as already present. Patch 06 preserves the new Mooncake storage layouts from
+[#54307](https://github.com/vllm-project/vllm/pull/54307), the consumer decode
+replay boundary, and the offload event ordering from
+[#63249](https://github.com/vllm-project/vllm/pull/63249).
+
+Validation replays the entire series on a fresh archive without old patch-base
+objects: patch 01 skips and the other 14 patches apply. All 19 subsequent source
+patchers and CUTLASS pinning pass; all 108 changed Python files compile. The
+31-test series suite has 29 passes and two tensor tests skipped because their
+optional dependencies are unavailable; all 107 build checks pass. New regressions cover
+the renamed QSA cache's ring limits and preservation of Mooncake's consumer
+decode replay boundary with lookahead enabled or disabled. Wheel compilation
+and inference remain for CI; the separate B12X startup metadata-exchange failure
+is outside this source refresh.
+
 The October 29 full PR refresh validates vLLM main
 `8084f0624dba24aba6ebac62d8e10cc00730a0fe` and FlashInfer main
 `0d5bbf50b3fb3695dd2a4cf9feddabd2ab172412`. Three referenced PR heads changed:

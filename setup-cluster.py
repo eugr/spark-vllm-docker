@@ -405,8 +405,14 @@ def doctor(args, nodes, manifest, transport, connection_errors=None):
         except (ValueError, OSError, subprocess.SubprocessError) as error:
             env_error = str(error)
             print(f"{nodes[0]}: MANUAL: {env_error}")
-    def verify_all():
+    def verify_all(*, wait=False):
         failures = []
+        if wait:
+            try:
+                wait_for_network(nodes, plan, transport)
+            except (ValueError, OSError, subprocess.SubprocessError) as error:
+                print(str(error))
+                return [str(error)]
         for node in nodes:
             print(f"Checking mutual SSH and both CX7 rails from {node}…", flush=True)
             try:
@@ -446,7 +452,7 @@ def doctor(args, nodes, manifest, transport, connection_errors=None):
                 repair_errors.append(f"{node}: {error}")
         if added:
             print("Docker membership updated. Log out and back in before running Docker in existing sessions.")
-        failures = verify_all()
+        failures = verify_all(wait=True)
         if env_request and not failures:
             try:
                 transport.call(nodes[0], "env", transaction=transaction, **env_request)
@@ -711,6 +717,13 @@ def restore_cluster(transport, nodes, transaction, state_path, *, best_effort=Fa
     state_path.unlink()
 
 
+def wait_for_network(nodes, plan, transport):
+    # Finish every apply before waiting, and every wait before probing peers.
+    for node in nodes:
+        print(f"Waiting for CX7 addresses, links, MTUs, and routes on {node}…", flush=True)
+        transport.call(node, "wait-network", **plan[node])
+
+
 def setup(args, nodes, transport, user):
     inventory = {node: transport.call(node, "inspect") for node in nodes}
     topology, order, ports = choose_topology(nodes, inventory, args.topology, args.ports,
@@ -766,6 +779,7 @@ def setup(args, nodes, transport, user):
         for node in reversed(nodes):
             print(f"Applying CX7 networking on {node}…", flush=True)
             transport.call(node, "network", transaction=transaction, **plan[node])
+        wait_for_network(nodes, plan, transport)
         for node in nodes:
             print(f"Verifying mutual SSH and both CX7 rails from {node}…", flush=True)
             transport.call(node, "verify", **plan[node])

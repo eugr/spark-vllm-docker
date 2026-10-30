@@ -226,7 +226,7 @@ class PatchSeriesTests(unittest.TestCase):
             "test_qsa_ring_capacity_refuses_disproportionate_widening",
         }
         added_imports = {
-            "vllm.models.qwen4_exp.common.qsa_cache",
+            "vllm.models.qwen4_exp.common.qsa_indexer",
             "vllm.utils.math_utils",
         }
         functions = [n.name for n in after.body if isinstance(n, ast.FunctionDef)]
@@ -236,7 +236,7 @@ class PatchSeriesTests(unittest.TestCase):
             {n.module: [alias.name for alias in n.names]
              for n in after.body if isinstance(n, ast.ImportFrom)
              and n.module in added_imports},
-            {"vllm.models.qwen4_exp.common.qsa_cache":
+            {"vllm.models.qwen4_exp.common.qsa_indexer":
              ["QSA_RING_MAX_WIDENING", "qsa_ring_capacity"],
              "vllm.utils.math_utils": ["cdiv"]},
         )
@@ -247,6 +247,60 @@ class PatchSeriesTests(unittest.TestCase):
         # Preserve the new model imports and BF16-indexer regression verbatim.
         self.assertEqual(ast.dump(before), ast.dump(after))
         self.assertEqual(self.git("status", "--porcelain"), "")
+
+    def test_qsa_ring_patch_applies_after_upstream_indexer_rename(self):
+        # #64110 moved the cache module and renamed both cache classes.
+        # Exercise the real runtime hunks and cache-spec method without GPUs.
+        path = "vllm/models/qwen4_exp/common/qsa_indexer.py"
+        _, updated = self.apply_upstream_excerpt(
+            "05-pr54912.patch", path, "qsa_indexer_upstream.py",
+        )
+        tree = ast.parse(updated)
+        cache_class = next(n for n in tree.body if isinstance(n, ast.ClassDef)
+                           and n.name == "QSARawKeyCache")
+        method = next(n for n in cache_class.body if isinstance(n, ast.FunctionDef)
+                      and n.name == "get_kv_cache_spec")
+        selected = [n for n in tree.body if (
+            isinstance(n, ast.FunctionDef) and n.name == "qsa_ring_capacity"
+            or isinstance(n, ast.Assign)
+            and any(isinstance(t, ast.Name) and t.id == "QSA_RING_MAX_WIDENING"
+                    for t in n.targets)
+        )]
+        module = ast.Module(body=selected + [method], type_ignores=[])
+        namespace = {
+            "cdiv": lambda a, b: (a + b - 1) // b,
+            "logger": SimpleNamespace(info_once=Mock()),
+            "VllmConfig": object, "KVCacheSpec": object,
+            "CircularBufferSpec": SimpleNamespace,
+        }
+        exec(compile(module, path, "exec"), namespace)
+        for block_size in (848, 1616):
+            cache = SimpleNamespace(
+                compress_ratio=4, cache_config=SimpleNamespace(block_size=block_size),
+                head_size=128, dtype="bfloat16",
+            )
+            for depth in range(13):
+                with self.subTest(block_size=block_size, depth=depth):
+                    spec = namespace["get_kv_cache_spec"](
+                        cache, SimpleNamespace(num_speculative_tokens=depth),
+                    )
+                    minimal = 4 * ((4 + depth + 3) // 4)
+                    self.assertGreaterEqual(spec.block_size, 4 + depth)
+                    self.assertEqual(block_size % spec.block_size, 0)
+                    self.assertLessEqual(spec.block_size, 2 * minimal)
+                    self.assertEqual(spec.head_size, 128)
+                    self.assertEqual(spec.dtype, "bfloat16")
+                    if block_size % minimal == 0:
+                        self.assertEqual(spec.block_size, minimal)
+            with self.assertRaisesRegex(ValueError, "QSA ring"):
+                namespace["get_kv_cache_spec"](
+                    cache, SimpleNamespace(num_speculative_tokens=13),
+                )
+        self.assertEqual(namespace["qsa_ring_capacity"](4, 5, 848), 16)
+        result = self.apply()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Already present", result.stdout)
+        self.assertFalse((self.source / path.replace("qsa_indexer", "qsa_cache")).exists())
 
     def test_unquantized_backend_preserves_rdna_prefill_setting(self):
         upstream, updated = self.apply_upstream_excerpt(
@@ -545,7 +599,7 @@ class PatchSeriesTests(unittest.TestCase):
         mask = Mock(return_value=None)
         namespace = {
             "cdiv": lambda n, d: (n + d - 1) // d,
-            "_unwrap_spec": lambda spec: spec,
+            "_coverage_spec": lambda spec: spec,
             "MambaSpec": type("MambaSpec", (), {}),
             "KVCacheSpecRegistry": SimpleNamespace(
                 get_manager_class=lambda _: SimpleNamespace(reachable_block_mask=mask)
@@ -589,6 +643,32 @@ class PatchSeriesTests(unittest.TestCase):
                     self.assertEqual(
                         call.kwargs["use_eagle"], eagle and not lookahead and group == 0
                     )
+
+    def test_mooncake_lookahead_preserves_decode_replay_boundary(self):
+        _, updated = self.apply_upstream_excerpt(
+            "06-pr50897.patch",
+            "vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/worker.py",
+            "mooncake_worker_replay_upstream.py",
+            ("num_prompt_tokens=replay_boundary",),
+        )
+        namespace = {}
+        exec(updated, namespace)
+        worker = namespace["KVCacheStoreSendingThread"]()
+        worker.coord = SimpleNamespace(store_mask=Mock(return_value=(None,)))
+        for role in ("kv_consumer", "kv_producer"):
+            for lookahead in (False, True):
+                for checkpoint, expected in ((64, 64), (96, 97)):
+                    with self.subTest(role=role, lookahead=lookahead,
+                                      checkpoint=checkpoint):
+                        worker.kv_role = role
+                        worker.use_lookahead_block_hashes = lookahead
+                        worker.mask(SimpleNamespace(prefill_end_tokens=64),
+                                    checkpoint, 32)
+                        worker.coord.store_mask.assert_called_with(
+                            checkpoint, 32,
+                            num_prompt_tokens=expected if role == "kv_consumer" else 64,
+                            apply_eagle=not lookahead,
+                        )
 
     def test_disk_offload_implements_embedding_interface(self):
         _, updated = self.apply_upstream_excerpt(

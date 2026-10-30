@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-# Upstream excerpt from 2339bd39d661965b821bfbe652db8f536e0b3dcd:
+# Upstream excerpt from dc4dd5a2217bc757232e9fa4d8a8b59e207ca068:
 # vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/coordinator.py
 
 class MooncakeStoreCoordinator:
@@ -33,30 +33,28 @@ class MooncakeStoreCoordinator:
         )
         masks: list[list[bool] | None] = []
         for g_idx, g in enumerate(self.kv_cache_groups):
-            spec = _unwrap_spec(g.kv_cache_spec)
-            end_chunk = aligned_token_len // spec.block_size
-            start_chunk = min(end_chunk, max(0, cdiv(start_token, spec.block_size)))
+            spec = _coverage_spec(g.kv_cache_spec)
+            end_block = aligned_token_len // spec.block_size
+            start_block = min(end_block, max(0, cdiv(start_token, spec.block_size)))
             if exclude_mamba and isinstance(spec, MambaSpec):
-                masks.append([False] * (end_chunk - start_chunk))
+                masks.append([False] * (end_block - start_block))
                 continue
             manager_cls = KVCacheSpecRegistry.get_manager_class(spec)
             assert manager_cls is not None
             use_eagle = g_idx in self.eagle_group_ids
             mask = manager_cls.reachable_block_mask(
-                start_block=start_chunk,
-                end_block=end_chunk,
+                start_block=start_block,
+                end_block=end_block,
                 alignment_tokens=self.lcm_block_size,
                 kv_cache_spec=spec,
                 use_eagle=use_eagle,
                 retention_interval=retention_interval,
                 reachable_boundaries=reachable_boundaries,
-                # ``spec`` is already DCP-resolved (worker.py applies
-                # resolve_dcp_kv_cache_spec) and ``end_chunk`` is indexed in
-                # that scaled block size, so the mask must not scale again.
+                # Worker initialization has already resolved DCP in this spec.
                 dcp_world_size=1,
             )
             if mask is not None:
-                assert len(mask) == end_chunk - start_chunk
+                assert len(mask) == end_block - start_block
             masks.append(mask)
         return tuple(masks)
 
