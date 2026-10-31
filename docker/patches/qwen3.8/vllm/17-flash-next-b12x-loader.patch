@@ -1,6 +1,6 @@
 Subject: [PATCH] Flash Next B12X checkpoint loading in the regular lane
 
-Integration-Base: 8084f0624dba24aba6ebac62d8e10cc00730a0fe
+Integration-Base: 564ac0de1b228568cafcbfbe8ccaccc82d6023eb
 
 Apply after 16-flash-next-fp4.patch.
 Reference: local-inference-lab/vllm
@@ -888,34 +888,34 @@ index 76b13c69748d5daaf899345bcc0a5913e281c3e4..7e27ef7dd3dab1261fd14a5a1e382bd1
              # move indexing boundaries
              boundary += shard_size
 diff --git a/vllm/model_executor/layers/vocab_parallel_embedding.py b/vllm/model_executor/layers/vocab_parallel_embedding.py
-index 574aed3090fe422f376075c60bf3c023897f38d9..cd126e811f7f41f9cb7cf7906dd89793fee1e0b9 100644
+index 51671d9b003398ac51fb88b6a6c4784d4124f5b6..aef316c242e34c047d27d35140b0da9971ff01f4 100644
 --- a/vllm/model_executor/layers/vocab_parallel_embedding.py
 +++ b/vllm/model_executor/layers/vocab_parallel_embedding.py
-@@ -31,6 +31,7 @@ from vllm.model_executor.layers.quantization.utils.fp8_utils import is_fp8
- from vllm.model_executor.layers.utils import dispatch_unquantized_gemm
+@@ -34,6 +34,7 @@ from vllm.model_executor.layers.utils import (
+ )
  from vllm.model_executor.parameter import BasevLLMParameter
  from vllm.model_executor.utils import set_weight_attrs
 +from vllm.model_executor.weight_transfer import copy_weight
  from vllm.platforms import current_platform
- 
+
  DEFAULT_VOCAB_PADDING_SIZE = 64
-@@ -491,7 +492,7 @@ class VocabParallelEmbedding(PluggableLayer):
+@@ -496,7 +497,7 @@ class VocabParallelEmbedding(PluggableLayer):
              ):
                  loaded_weight = loaded_weight.reshape(1)
              assert param.data.shape == loaded_weight.shape
 -            param.data.copy_(loaded_weight)
 +            copy_weight(param.data, loaded_weight)
              return
- 
+
          # Shard indexes for loading the weight
-@@ -516,7 +517,7 @@ class VocabParallelEmbedding(PluggableLayer):
- 
+@@ -521,7 +522,7 @@ class VocabParallelEmbedding(PluggableLayer):
+
          # Copy the data. Select chunk corresponding to current shard.
          loaded_weight = loaded_weight.narrow(output_dim, start_idx, shard_size)
 -        param[: loaded_weight.shape[0]].data.copy_(loaded_weight)
 +        copy_weight(param[: loaded_weight.shape[0]].data, loaded_weight)
          param[loaded_weight.shape[0] :].data.fill_(0)
- 
+
      def forward(self, input_):
 diff --git a/vllm/model_executor/model_loader/__init__.py b/vllm/model_executor/model_loader/__init__.py
 index 226caebe1cd49fac95d9f66ec14e4c7aab71f9c8..fc7fb868d84365c7b8231efbf393012ab548a520 100644

@@ -3,7 +3,7 @@ Subject: [PATCH] [PR #54614] [Kernel] Dynamic NVFP4 W4A4/W4A16 selection with sh
 
 Upstream-PR: https://github.com/vllm-project/vllm/pull/54614
 Upstream-Commit: 5feaedcf9b4fa18d9e0b817153d681bededdd4d9
-Integration-Base: 8084f0624dba24aba6ebac62d8e10cc00730a0fe
+Integration-Base: 564ac0de1b228568cafcbfbe8ccaccc82d6023eb
 
 Preserve the quantized-input shape and autotune cache-key tests from main.
 Keep round_up=True and full-model autotuning after removal of the obsolete
@@ -647,22 +647,22 @@ index 47c25d046d2c13df9f5a437d5e0da1c933f2e569..c7622f7a6541093571a139c7179d8cbf
      a_fp4,
      b_fp4,
 diff --git a/tests/kernels/quantization/test_nvfp4_kernel_selection.py b/tests/kernels/quantization/test_nvfp4_kernel_selection.py
-index ba069dbad1767a29caebb9fa818b1f2e59852f7e..57fd844ec86701d4ff5d309835056a6faae8f542 100644
+index ec9ebc98a97e33b9682a04249f7962582121914c..0ab08610a52af1cd96d376defd517e324f603af0 100644
 --- a/tests/kernels/quantization/test_nvfp4_kernel_selection.py
 +++ b/tests/kernels/quantization/test_nvfp4_kernel_selection.py
 @@ -2,6 +2,8 @@
  # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
  """Tests for NVFP4 linear kernel selection order (CPU-only)."""
- 
+
 +from collections.abc import Callable
 +
  import pytest
- 
- from vllm.model_executor.kernels.linear import (
-@@ -22,6 +24,10 @@ W4A4_KERNELS_ON_SM12X = (
+
+ import vllm.envs as envs
+@@ -25,6 +27,10 @@ W4A4_KERNELS_ON_SM12X = (
  )
- 
- 
+
+
 +def _constant_support(available: bool) -> Callable[[int], bool]:
 +    return lambda cc: available
 +
@@ -670,10 +670,10 @@ index ba069dbad1767a29caebb9fa818b1f2e59852f7e..57fd844ec86701d4ff5d309835056a6f
  @pytest.mark.parametrize("w4a4_kernel", W4A4_KERNELS_ON_SM12X)
  def test_w4a16_kernel_does_not_precede_w4a4_kernels(w4a4_kernel):
      candidates = _POSSIBLE_NVFP4_KERNELS[PlatformEnum.CUDA]
-@@ -30,3 +36,92 @@ def test_w4a16_kernel_does_not_precede_w4a4_kernels(w4a4_kernel):
-         f"{w4a4_kernel.__name__} must be preferred over "
-         f"{FlashInferCuteDslNvFp4W4A16LinearKernel.__name__}"
-     )
+@@ -46,3 +52,92 @@ def test_batch_invariant_w4a16_selects_humming(monkeypatch):
+         )
+     kernel = init_nvfp4_linear_kernel(use_a16=True)
+     assert isinstance(kernel, HummingNvFp4LinearKernel)
 +
 +
 +def test_dynamic_rejects_uncalibrated_weight_only_checkpoint(monkeypatch):

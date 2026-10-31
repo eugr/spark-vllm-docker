@@ -2,7 +2,7 @@ Subject: [PATCH] [PR #50897] Lookahead-aware prefix cache hashing
 
 Upstream-PR: https://github.com/vllm-project/vllm/pull/50897
 Upstream-Commit: 7f7139246af9793d0cfb2a1be60068a5fba5604c
-Integration-Base: dc4dd5a2217bc757232e9fa4d8a8b59e207ca068
+Integration-Base: 564ac0de1b228568cafcbfbe8ccaccc82d6023eb
 
 Preserve the draft-head/adaptive-depth tests and current upstream cache tests.
 Retain the Mooncake partial-tail integration: lookahead proof replaces the
@@ -54,24 +54,22 @@ index f340e2dcb602cc02abe7baf9a9655f9ee2a98e3d..f11800e01bb356fb319703e0f1165572
      _run_mamba_prefix_cache_mrv2(monkeypatch, async_scheduling=True)
 
 diff --git a/tests/v1/e2e/spec_decode/mtp/qwen3_5/test_mtp.py b/tests/v1/e2e/spec_decode/mtp/qwen3_5/test_mtp.py
-index 57f3468e8ee8b25c3bf85f7a24eaf5d49ca34bb4..73641c60dcbb0a1a82856052106ffbae7ceaed9e 100644
+index c1205fb03dfd122f0064c642f4131c347cfb2715..1fad30f4e2a0923905729bb7bff0407aeeeb0380 100644
 --- a/tests/v1/e2e/spec_decode/mtp/qwen3_5/test_mtp.py
 +++ b/tests/v1/e2e/spec_decode/mtp/qwen3_5/test_mtp.py
-@@ -2,9 +2,12 @@
- # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-
- import pytest
-+import torch
+@@ -9,8 +9,10 @@ import torch
+ from safetensors import safe_open
+ from safetensors.torch import save_file
 
 +from tests.models.utils import check_logprobs_close
  from tests.utils import single_gpu_only
 -from vllm import SamplingParams
 +from vllm import LLM, SamplingParams, TokensPrompt
 +from vllm.distributed import cleanup_dist_env_and_memory
+ from vllm.model_executor.model_loader.weight_utils import download_weights_from_hf
  from vllm.platforms import current_platform
-
- from ...utils import (
-@@ -203,3 +206,84 @@ def test_mtp_draft_confidence_stop(
+ from vllm.v1.metrics.reader import Vector
+@@ -278,3 +280,84 @@ def test_mtp_draft_confidence_stop(
      assert al >= 0.9 * ref_al, f"acceptance length {al:.3f} vs {ref_al:.3f}"
      assert drafts_per_round[None] == 3
      assert 1 <= drafts_per_round[0.6] < 4, drafts_per_round
@@ -2089,18 +2087,18 @@ index da74702a9239c62a2dadd1e349b9e68d6f77b448..093da8453554e327e3150ec872d22880
          if not any(checkpoint_offsets):
              return None
 diff --git a/vllm/v1/core/kv_cache_utils.py b/vllm/v1/core/kv_cache_utils.py
-index d24674e483181956991591d85914d78ac7b8a0ab..a6ce2fd1446b6b87abbcbaeccf71ac4e112e66c1 100644
+index 9f239e82fb877c5f44d5861fe003ad5f2090cc4b..394f1d6aff551e2dc89d925be6e72b608b325ac5 100644
 --- a/vllm/v1/core/kv_cache_utils.py
 +++ b/vllm/v1/core/kv_cache_utils.py
-@@ -37,6 +37,7 @@ from vllm.v1.request import Request
+@@ -38,6 +38,7 @@ from vllm.v1.request import Request
  from vllm.v1.utils import tensor_data
 
  if TYPE_CHECKING:
 +    from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorBase_V1
      from vllm.v1.core.block_pool import BlockPool
      from vllm.v1.core.single_type_kv_cache_manager import SingleTypeKVCacheManager
-
-@@ -950,6 +951,30 @@ def resolve_cache_hit_alignment_tokens(
+     from vllm.v1.engine import EngineCoreRequest, PrefixHashConfig
+@@ -952,6 +953,30 @@ def resolve_cache_hit_alignment_tokens(
      return scheduler_block_size
 
 
@@ -2167,23 +2165,36 @@ index 80fc0530e3893e2062ae0a49cd47f8d8e5ed5475..06e2977a731f4ba7a4602245671161a9
          assert session.prompt_token_ids is not None
          # Extend prompt with kept output tokens.
 diff --git a/vllm/v1/engine/core.py b/vllm/v1/engine/core.py
-index 854388eb5bdcaf4ad4639988f02737f747e0ab0c..11cfec42406b63d80130a9ea5a3b1342bbae7f2d 100644
+index d61bb4df1adbcd40fe7a03dd3cd742ef061938ad..d33d4e10b8b074f072efa8c2fe0584e43f3806f3 100644
 --- a/vllm/v1/engine/core.py
 +++ b/vllm/v1/engine/core.py
-@@ -61,6 +61,7 @@ from vllm.v1.core.kv_cache_planning import (
- from vllm.v1.core.kv_cache_utils import (
+@@ -63,6 +63,7 @@ from vllm.v1.core.kv_cache_utils import (
      BlockHash,
+     frontend_block_hashes,
      generate_scheduler_kv_cache_config,
 +    get_num_hash_lookahead_tokens,
      get_request_block_hasher,
      init_none_hash,
      resolve_cache_hit_alignment_tokens,
-@@ -233,7 +234,7 @@ class EngineCore:
+@@ -235,16 +236,19 @@ class EngineCore:
+             )
+             init_none_hash(caching_hash_fn)
+
++            num_hash_lookahead_tokens = get_num_hash_lookahead_tokens(
++                vllm_config, kv_connector
++            )
              self.request_block_hasher = get_request_block_hasher(
                  hash_block_size,
                  caching_hash_fn,
 -                vllm_config.num_hash_lookahead_tokens,
-+                get_num_hash_lookahead_tokens(vllm_config, kv_connector),
++                num_hash_lookahead_tokens,
+             )
+             self.prefix_hash_config = PrefixHashConfig(
+                 hash_algo=vllm_config.cache_config.prefix_caching_hash_algo,
+                 hash_block_size=hash_block_size,
+                 none_hash=kv_cache_utils.NONE_HASH,
+-                num_lookahead_tokens=vllm_config.num_hash_lookahead_tokens,
++                num_lookahead_tokens=num_hash_lookahead_tokens,
              )
 
          self.step_fn = (

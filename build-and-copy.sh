@@ -36,6 +36,8 @@ EXP_B12X=false
 EXP_B12X_VLLM_REPO="https://github.com/local-inference-lab/vllm"
 EXP_B12X_VLLM_REF="dev/karmic-kraken"
 EXP_B12X_FLASHINFER_REPO="https://github.com/local-inference-lab/flashinfer.git"
+# Passing 2026-10-15 CI revision, before the expanded MLA tuning search.
+EXP_B12X_FLASHINFER_REF="9873d7a33f91aeb14c83286552e1f3d84efa2c2e"
 EXP_B12X_TORCH_VERSION="2.13.0"
 EXP_B12X_TORCHVISION_VERSION="0.28.0"
 EXP_B12X_TORCHAUDIO_VERSION="2.11.0"
@@ -572,6 +574,16 @@ validate_flashinfer_wheel_set() {
     local jit=("$wheels_dir"/flashinfer_jit_cache-*.whl)
     local python=("$wheels_dir"/flashinfer_python-*.whl)
 
+    if [ "$FLASHINFER_PROFILE" = "b12x" ]; then
+        local cached_commit=""
+        [ ! -f "$wheels_dir/.flashinfer-commit" ] || cached_commit=$(cat "$wheels_dir/.flashinfer-commit")
+        if [ "$cached_commit" != "$EXP_B12X_FLASHINFER_REF" ]; then
+            echo "Error: B12X FlashInfer wheels must match pinned commit $EXP_B12X_FLASHINFER_REF."
+            echo "       Re-run with --rebuild-flashinfer to rebuild the selected wheel set."
+            return 1
+        fi
+    fi
+
     if [ "$FLASHINFER_BUILD_CUBIN" = "1" ]; then
         if [ "${#cubin[@]}" -ne 1 ] || [ ! -f "${cubin[0]}" ]; then
             echo "Error: FlashInfer profile $wheels_dir does not contain exactly one cubin wheel."
@@ -929,6 +941,9 @@ if [ "$NORMALIZED_VLLM_REPO" = "$NORMALIZED_DEFAULT_VLLM_REPO" ] || \
     fi
     if [ "$NORMALIZED_VLLM_REPO" = "$EXP_B12X_VLLM_REPO" ]; then
         FLASHINFER_REPO="$EXP_B12X_FLASHINFER_REPO"
+        if [ "$FLASHINFER_REF_SET" = false ]; then
+            FLASHINFER_REF="$EXP_B12X_FLASHINFER_REF"
+        fi
         FLASHINFER_BUILD_CUBIN=0
         FLASHINFER_BUILD_JIT_CACHE=0
     fi

@@ -1944,8 +1944,15 @@ vLLM source includes it. The script travels with locally exported wheels;
 older source refs and downloaded wheel sets without it skip this copy.
 
 The `--exp-b12x` profile and any branch, tag, or commit selected from
-`local-inference-lab/vllm` use the FlashInfer fork. Regular builds keep the
-original `flashinfer-ai/flashinfer` source and published wheel release.
+`local-inference-lab/vllm` use the FlashInfer fork temporarily pinned to
+[`9873d7a33f91aeb14c83286552e1f3d84efa2c2e`](https://github.com/local-inference-lab/flashinfer/commit/9873d7a33f91aeb14c83286552e1f3d84efa2c2e),
+the revision used by the passing October 15, 2026 CI image. This predates the
+expanded MLA tuning search that grew preparation-cache exchanges beyond the
+TCPStore message limit. Its schema-22 cache is separate from the affected
+schema-23 cache; existing caches do not need to be deleted for this rollback.
+Source builds replace cached wheels whose commit does not match the pin.
+Regular builds keep the original `flashinfer-ai/flashinfer` source and published
+wheel release.
 `--flashinfer-ref` and `--apply-flashinfer-pr` apply to the selected FlashInfer
 repository. Source checkout caches are isolated by repository as well.
 

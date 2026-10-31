@@ -3,7 +3,7 @@ Subject: [PATCH] [PR #60068] [MRV2][Spec Decode] Opt-in confidence stop for auto
 
 Upstream-PR: https://github.com/vllm-project/vllm/pull/60068
 Upstream-Commit: 8ae78ccaf8825b3e55ab014e282c769902ca198c
-Integration-Base: 8084f0624dba24aba6ebac62d8e10cc00730a0fe
+Integration-Base: 564ac0de1b228568cafcbfbe8ccaccc82d6023eb
 
 Preserve both quantized draft-head and adaptive-depth documentation/tests.
 Use #60692's supports_decode_metadata_update API; confidence stopping
@@ -77,18 +77,10 @@ index 18bb469cd7201985a3f2ab942314d3793b60f8ba..5c6e5371a07199838f8c11b3f3c9f902
      scheduler = create_scheduler(num_speculative_tokens=3)
      assert scheduler.spec_decode_metrics_level == "none"
 diff --git a/tests/v1/e2e/spec_decode/mtp/qwen3_5/test_mtp.py b/tests/v1/e2e/spec_decode/mtp/qwen3_5/test_mtp.py
-index 0feaa9efc604c38cee76f8edf797f4bd8c9d279a..57f3468e8ee8b25c3bf85f7a24eaf5d49ca34bb4 100644
+index 5147097ef2903c0051eee8c50719726da93c26f8..c1205fb03dfd122f0064c642f4131c347cfb2715 100644
 --- a/tests/v1/e2e/spec_decode/mtp/qwen3_5/test_mtp.py
 +++ b/tests/v1/e2e/spec_decode/mtp/qwen3_5/test_mtp.py
-@@ -10,6 +10,7 @@ from vllm.platforms import current_platform
- from ...utils import (
-     assert_request_outputs_match,
-     compute_acceptance_len,
-+    get_spec_decode_metric_value,
-     get_test_prompts,
- )
- from .._correctness import check_mtp_correctness
-@@ -147,3 +148,58 @@ def test_mtp_draft_lm_head_quantization_survives_sleep_and_reload(
+@@ -223,3 +223,58 @@ def test_mtp_draft_lm_head_quantization_survives_sleep_and_reload(
              context="after weight reload",
          )
          assert al == pytest.approx(ref_al, rel=0.03)

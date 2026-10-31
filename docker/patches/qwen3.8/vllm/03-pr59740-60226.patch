@@ -5,11 +5,13 @@ Upstream-PR: https://github.com/vllm-project/vllm/pull/59740
 Upstream-Commit: 178caf8dfb0908542ffb7dbf0f72c42f11b99fc0
 Upstream-PR: https://github.com/vllm-project/vllm/pull/60226
 Upstream-Commit: 92ed4c1160e11cd712934eb2525b6df3b8cebb83
-Integration-Base: 8084f0624dba24aba6ebac62d8e10cc00730a0fe
+Integration-Base: 564ac0de1b228568cafcbfbe8ccaccc82d6023eb
 
 Combine the latest sparse draft API with #60226 checkpoint-quantized heads.
 Use draft_lm_head_quantization, a fixed rank-256 scorer and TP=1 validation.
 Preserve upstream MTP changes without restoring removed fused-expert imports.
+Retain the shared-head helper and defer full-head quantization for sparse maps;
+the sparse loader quantizes only selected rows while sharing validation remains.
 
 diff --git a/.buildkite/test_areas/spec_decode.yaml b/.buildkite/test_areas/spec_decode.yaml
 index 1cca6d4160efd80c254c89208d97783d1ba9e92e..571adfc18fa403dc778b739a00dcbd09826e3e4b 100644
@@ -1529,7 +1531,7 @@ index 68e21c9dc284246ee2450494a34e123a23ab8ce9..5ef46805496f57267e7dd15136cc2f0f
      def combine_hidden_states(
          self,
 diff --git a/vllm/model_executor/models/qwen3_5_mtp.py b/vllm/model_executor/models/qwen3_5_mtp.py
-index aa7e6c06e3384ce8cce83bb2665e20b12f98b2ce..81e670f117825cc6fb357cf7848500d3d1bcbc33 100644
+index b6b2c3851c916c67deafd6442df32ded2541aea3..2097257f23d368eb932f293172484367debe14cd 100644
 --- a/vllm/model_executor/models/qwen3_5_mtp.py
 +++ b/vllm/model_executor/models/qwen3_5_mtp.py
 @@ -12,6 +12,7 @@ from vllm.compilation.decorators import support_torch_compile
@@ -1540,9 +1542,9 @@ index aa7e6c06e3384ce8cce83bb2665e20b12f98b2ce..81e670f117825cc6fb357cf7848500d3
  from vllm.model_executor.layers.linear import ColumnParallelLinear
  from vllm.model_executor.layers.logits_processor import LogitsProcessor
  from vllm.model_executor.layers.vocab_parallel_embedding import (
-@@ -245,6 +246,12 @@ class Qwen3_5MTP(LocalArgmaxMixin, nn.Module, SupportsMultiModal, SupportsPP):
+@@ -250,6 +251,12 @@ class Qwen3_5MTP(LocalArgmaxMixin, nn.Module, SupportsMultiModal, SupportsPP):
              self.lm_head = PPMissingLayer()
- 
+
          self.logits_processor = LogitsProcessor(config.vocab_size)
 +        spec = vllm_config.speculative_config
 +        self.draft_vocab = DraftVocab(
@@ -1550,21 +1552,21 @@ index aa7e6c06e3384ce8cce83bb2665e20b12f98b2ce..81e670f117825cc6fb357cf7848500d3
 +            config.vocab_size,
 +            keep_quantized_head=spec is not None and spec.draft_token_map is not None,
 +        )
- 
+
          self.make_empty_intermediate_tensors = (
              self.model.make_empty_intermediate_tensors
-@@ -295,7 +302,7 @@ class Qwen3_5MTP(LocalArgmaxMixin, nn.Module, SupportsMultiModal, SupportsPP):
+@@ -305,7 +312,7 @@ class Qwen3_5MTP(LocalArgmaxMixin, nn.Module, SupportsMultiModal, SupportsPP):
          hidden_states: torch.Tensor,
          spec_step_idx: int = 0,
      ) -> torch.Tensor | None:
 -        return self.logits_processor(self.lm_head, hidden_states)
 +        return self.draft_vocab.compute_logits(self.lm_head, hidden_states)
- 
-     def is_unused_checkpoint_weight(self, name: str) -> bool:
-         return not name.startswith("mtp.") and not any(
-@@ -314,7 +321,11 @@ class Qwen3_5MTP(LocalArgmaxMixin, nn.Module, SupportsMultiModal, SupportsPP):
+
+     def get_top_tokens(
+         self,
+@@ -332,7 +339,11 @@ class Qwen3_5MTP(LocalArgmaxMixin, nn.Module, SupportsMultiModal, SupportsPP):
                  yield name, weight
- 
+
          loader = AutoWeightsLoader(self)
 -        return loader.load_weights(remap_weight_names(weights))
 +        return loader.load_weights(
@@ -1572,8 +1574,8 @@ index aa7e6c06e3384ce8cce83bb2665e20b12f98b2ce..81e670f117825cc6fb357cf7848500d3
 +                remap_weight_names(weights), self.lm_head
 +            )
 +        )
- 
- 
+
+
  class Qwen3_5MoeMTP(Qwen3_5MTP, QwenNextMixtureOfExperts):
 diff --git a/vllm/model_executor/models/qwen3_dflash.py b/vllm/model_executor/models/qwen3_dflash.py
 index e5eb0959ac97698f7e081cb88594b2f8cab258b3..83140062cf4b66b5fa125fb190ec317f1e61f22d 100644
@@ -1627,18 +1629,18 @@ index e5eb0959ac97698f7e081cb88594b2f8cab258b3..83140062cf4b66b5fa125fb190ec317f
      def precompute_and_store_context_kv(
          self,
 diff --git a/vllm/model_executor/models/qwen3_dspark.py b/vllm/model_executor/models/qwen3_dspark.py
-index cfa06c63cb9553ecd922836494dc53a9e4c52413..241ec8b4b6ac1edda8384470f0741f4f3de4931a 100644
+index 6f902170546e98809e59774dee9af9dd2ed1694d..c4dfb4f02b9b16d9f69a8ca65b8e3ed549212a6b 100644
 --- a/vllm/model_executor/models/qwen3_dspark.py
 +++ b/vllm/model_executor/models/qwen3_dspark.py
 @@ -22,6 +22,7 @@ import torch.nn as nn
- 
+
  from vllm.config import VllmConfig
  from vllm.logger import init_logger
 +from vllm.model_executor.layers.draft_vocab import DraftVocab
  from vllm.model_executor.layers.linear import ReplicatedLinear
  from vllm.model_executor.layers.logits_processor import LogitsProcessor
  from vllm.model_executor.layers.quantization import QuantizationConfig
-@@ -258,16 +259,10 @@ class Qwen3DSparkForCausalLM(DFlashQwen3ForCausalLM):
+@@ -264,16 +265,10 @@ class Qwen3DSparkForCausalLM(DFlashQwen3ForCausalLM):
              self.config.draft_vocab_size, scale=logit_scale
          )
          self.target_vocab_size = vllm_config.model_config.get_vocab_size()
@@ -1656,19 +1658,19 @@ index cfa06c63cb9553ecd922836494dc53a9e4c52413..241ec8b4b6ac1edda8384470f0741f4f
 +        # embedding size) maps identically, so it gets no d2t.
 +        self.draft_vocab = DraftVocab(self.logits_processor, self.target_vocab_size)
 +        self.draft_id_to_target_id = self.draft_vocab.draft_id_to_target_id
- 
+
      def get_draft_kv_cache_layer_names(self) -> list[str]:
          return [layer.self_attn.attn.layer_name for layer in self.model.layers]
-@@ -278,10 +273,7 @@ class Qwen3DSparkForCausalLM(DFlashQwen3ForCausalLM):
-         return self.logits_processor(self.lm_head, hidden_states)
- 
+@@ -288,10 +283,7 @@ class Qwen3DSparkForCausalLM(DFlashQwen3ForCausalLM):
+         return self.logits_processor(self.lm_head, hidden_states, skip_gather=True)
+
      def map_draft_to_target(self, draft_ids: torch.Tensor) -> torch.Tensor:
 -        # Map draft-vocab ids to target ids (identity for full-vocab drafts).
 -        if self.draft_id_to_target_id is None:
 -            return draft_ids
 -        return draft_ids + self.draft_id_to_target_id[draft_ids]
 +        return self.draft_vocab.map_draft_to_target(draft_ids)
- 
+
      def markov_embed(self, token_ids: torch.Tensor) -> torch.Tensor:
          return self.model.markov_head.embed(token_ids)
 diff --git a/vllm/model_executor/models/qwen3_eagle3.py b/vllm/model_executor/models/qwen3_eagle3.py
@@ -1788,27 +1790,40 @@ index 30401ca56dcb91171e9e22258b5153a4acd28469..c5e72e08c0e3614937ee291f038bfb8c
      def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
          def remap_weight_names():
 diff --git a/vllm/v1/worker/gpu/spec_decode/eagle/utils.py b/vllm/v1/worker/gpu/spec_decode/eagle/utils.py
-index c71395ec3f4eacad15104c6a38118baffc65d2c3..8744ffd24d5685bd9b70022f46cc6c4caf5fad6f 100644
+index 8cba9af864211fc26665e7e6e5c218a40ba3eacc..f7567c863086be08704eaa4541614f6be088d43b 100644
 --- a/vllm/v1/worker/gpu/spec_decode/eagle/utils.py
 +++ b/vllm/v1/worker/gpu/spec_decode/eagle/utils.py
-@@ -116,7 +116,12 @@ def load_eagle_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mod
-         eagle_model, "has_own_lm_head", draft_lm_head, target_lm_head
-     ):
-         draft_head = target_lm_head
--        if speculative_config.draft_lm_head_quantization is not None:
-+        # With a draft token map only its rows are quantized, in
-+        # load_draft_token_map below.
-+        if (
-+            speculative_config.draft_lm_head_quantization is not None
-+            and speculative_config.draft_token_map is None
-+        ):
-             draft_head = quantized_lm_head_copy(
-                 target_lm_head, speculative_config.draft_lm_head_quantization
+@@ -47,6 +47,8 @@ def share_target_lm_head(
+     target_lm_head: nn.Module | None,
+     quantization: Literal["fp8", "nvfp4"] | None,
+     can_share: bool = True,
++    *,
++    defer_quantization: bool = False,
+ ) -> nn.Module | None:
+     """Install the target lm_head, or its quantized copy, on a drafter that
+     shares it. Returns the installed head, or None if the drafter keeps its own.
+@@ -64,7 +66,7 @@ def share_target_lm_head(
              )
-@@ -139,6 +144,12 @@ def load_eagle_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mod
-             "draft_lm_head_quantization needs a drafter that shares the target lm_head."
-         )
- 
+         return None
+     head = target_lm_head
+-    if quantization is not None:
++    if quantization is not None and not defer_quantization:
+         head = quantized_lm_head_copy(target_lm_head, quantization)
+     if draft_lm_head is not None:
+         del draft_model.lm_head
+@@ -146,6 +148,8 @@ def load_eagle_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mod
+         eagle_model,
+         get_target_lm_head(target_model, target_language_model),
+         speculative_config.draft_lm_head_quantization,
++        # Sparse vocabulary loading quantizes only the selected rows.
++        defer_quantization=speculative_config.draft_token_map is not None,
+     )
+     if draft_head is not None:
+         # MTP layers route logits through layer.shared_head.head, not
+@@ -159,6 +163,12 @@ def load_eagle_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mod
+                     del sh.head
+                     sh.head = draft_head
+
 +    # Only now does the drafter hold the lm_head it drafts with.
 +    if speculative_config.draft_token_map is not None:
 +        from vllm.model_executor.layers.draft_vocab import load_draft_token_map

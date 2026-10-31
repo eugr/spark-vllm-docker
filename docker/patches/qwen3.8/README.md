@@ -60,6 +60,30 @@ upstream commit `397b9607c83cf201f3c44684c555c3698869b6bd`.
 
 ## Integration and refresh
 
+The October 31 refresh follows pipeline 382's patch 06 conflict on vLLM
+`87cb835db2bbbaa03e3faa6ae588ba92dce1eea4`. Upstream added a Qwen3.5 multi-module
+MTP test and imports shared with patches 04 and 06. Their refreshed test sections
+preserve that coverage alongside adaptive draft depth and prefix-cache reuse.
+
+The complete series is validated on main
+`564ac0de1b228568cafcbfbe8ccaccc82d6023eb`. Patch 03 retains the refactored
+`share_target_lm_head` helper and its validation, deferring quantization until
+sparse vocabulary rows are selected when a token map is configured. It also
+keeps upstream's MTP step argument and DSpark local-logit path. Patch 06 gives
+the new frontend prefix-hash configuration the same effective connector
+lookahead depth as the engine hasher. Patch 07 preserves the new batch-invariant
+W4A16 test, and patch 17 retains the current embedding imports.
+
+All 15 series entries replay on a fresh archive without historical patch-base
+objects: merged patch 01 skips and the other 14 apply, producing the reviewed
+tree exactly. All 19 subsequent source patchers and CUTLASS pinning pass, and all
+108 changed Python files compile. The 35-test series suite has 33 passes and two
+optional tensor-dependency skips; all 107 build checks pass. Regressions cover
+both MTP patches together, deferred shared-head quantization and its rejection
+rules, matching frontend/engine hash policy, and preservation of upstream's
+batch-invariant test. GPU wheel compilation and inference remain for CI. This
+refresh does not change the separate B12X startup metadata-exchange failure.
+
 The October 30 refresh fixes pipeline 381's patch 05 failure on vLLM
 `deacc3670153845db2f013ea24085d6eaf338874`. Upstream
 [#64110](https://github.com/vllm-project/vllm/pull/64110) moved the QSA cache

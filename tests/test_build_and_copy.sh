@@ -97,6 +97,7 @@ if [ "${1:-}" = "build" ]; then
         build_arch="12.1a"
         build_cubin=1
         build_jit_cache=1
+        build_ref="flashinfer-commit"
         while [ "$#" -gt 0 ]; do
             case "$1" in
                 --target) target="$2"; shift 2 ;;
@@ -107,6 +108,7 @@ if [ "${1:-}" = "build" ]; then
                         FLASHINFER_CUDA_ARCH_LIST=*) build_arch="${2#FLASHINFER_CUDA_ARCH_LIST=}" ;;
                         FLASHINFER_BUILD_CUBIN=*) build_cubin="${2#FLASHINFER_BUILD_CUBIN=}" ;;
                         FLASHINFER_BUILD_JIT_CACHE=*) build_jit_cache="${2#FLASHINFER_BUILD_JIT_CACHE=}" ;;
+                        FLASHINFER_REF=*) build_ref="${2#FLASHINFER_REF=}" ;;
                     esac
                     shift 2
                     ;;
@@ -139,7 +141,7 @@ if [ "${1:-}" = "build" ]; then
                                 "$MOCK_FLASHINFER_UNEXPECTED_WHEEL" 0.7.0
                         fi
                         printf 'fake wheel\n' > "$dest/flashinfer_python-built.whl"
-                        printf 'flashinfer-commit\n' > "$dest/.flashinfer-commit"
+                        printf '%s\n' "${MOCK_FLASHINFER_EXPORTED_COMMIT:-$build_ref}" > "$dest/.flashinfer-commit"
                         printf '%s\n' "$build_arch" > "$dest/.flashinfer-arch"
                         ;;
                     vllm-export)
@@ -1101,7 +1103,7 @@ test_exp_b12x_rebuild_vllm_uses_preset_source_build() {
     run_build --exp-b12x --rebuild-vllm || fail "--exp-b12x --rebuild-vllm run failed"
     assert_log_not_contains '^docker pull eugr/spark-vllm-b12x:latest$'
     assert_log_contains '^docker build --target vllm-export .*--build-arg TORCH_CUDA_ARCH_LIST=12.1a --build-arg FLASHINFER_CUDA_ARCH_LIST=12.1a .*--build-arg TORCH_VERSION=2.13.0 --build-arg TORCHVISION_VERSION=0.28.0 --build-arg TORCHAUDIO_VERSION=2.11.0 --build-arg CUTLASS_DSL_VERSION=4.7.0 .*--build-arg VLLM_REF=dev/karmic-kraken --build-arg VLLM_REPO=https://github.com/local-inference-lab/vllm --build-arg VLLM_APPLY_PRESET_PRS=0 .*--build-arg VLLM_PRESERVE_SM12X_TARGET=1 --build-arg VLLM_PATCH_B12X_C128A_ALIGNMENT=1'
-    assert_log_contains '^docker build --target flashinfer-export .*--build-arg FLASHINFER_REF=main --build-arg FLASHINFER_REPO=https://github.com/local-inference-lab/flashinfer.git --build-arg FLASHINFER_BUILD_CUBIN=0 --build-arg FLASHINFER_BUILD_JIT_CACHE=0 '
+    assert_log_contains '^docker build --target flashinfer-export .*--build-arg FLASHINFER_REF=9873d7a33f91aeb14c83286552e1f3d84efa2c2e --build-arg FLASHINFER_REPO=https://github.com/local-inference-lab/flashinfer.git --build-arg FLASHINFER_BUILD_CUBIN=0 --build-arg FLASHINFER_BUILD_JIT_CACHE=0 '
     assert_log_contains '^docker build -t vllm-node-b12x .*--build-context flashinfer_wheels=\./\.wheel-cache/flashinfer/b12x --build-context vllm_wheels=\./\.wheel-cache/vllm/b12x '
     assert_log_not_contains 'B12X_(FROM_PYPI|REPO|REF|CACHEBUST)='
     assert_log_not_contains '^curl .*prebuilt-flashinfer'
@@ -1153,6 +1155,36 @@ test_b12x_flashinfer_custom_ref_is_isolated() {
     assert_log_contains '^docker build -t vllm-node-b12x .*--build-context flashinfer_wheels=\./\.wheel-cache/flashinfer/b12x-custom '
     assert_log_not_contains '^curl .*prebuilt-flashinfer'
     pass "custom B12X refs and PRs use the fork and an isolated wheel cache"
+}
+
+test_b12x_flashinfer_rebuilds_unpinned_cache() {
+    setup_fixture
+    local b12x="$FIXTURE_DIR/.wheel-cache/flashinfer/b12x"
+    for cached in newer-commit missing; do
+        printf 'cached wheel\n' > "$b12x/flashinfer_python-built.whl"
+        if [ "$cached" = missing ]; then
+            rm -f "$b12x/.flashinfer-commit"
+        else
+            printf '%s\n' "$cached" > "$b12x/.flashinfer-commit"
+        fi
+        : > "$TEST_LOG"
+        run_build --exp-b12x --rebuild-vllm || fail "B12X pin did not replace $cached provenance"
+        assert_log_contains '^docker build --target flashinfer-export .*FLASHINFER_REF=9873d7a33f91aeb14c83286552e1f3d84efa2c2e '
+        [ "$(cat "$b12x/.flashinfer-commit")" = 9873d7a33f91aeb14c83286552e1f3d84efa2c2e ] || fail "B12X cache does not match pin"
+    done
+    pass "B12X replaces cached wheels with missing or different source provenance"
+}
+
+test_b12x_flashinfer_rejects_unpinned_export() {
+    setup_fixture
+    export MOCK_FLASHINFER_EXPORTED_COMMIT=unexpected-source
+    if run_build --exp-b12x --rebuild-vllm; then
+        fail "B12X accepted an export from a different commit"
+    fi
+    unset MOCK_FLASHINFER_EXPORTED_COMMIT
+    assert_output_contains 'B12X FlashInfer wheels must match pinned commit'
+    assert_log_not_contains '^docker build --target vllm-export '
+    pass "B12X verifies the exported FlashInfer commit before building vLLM"
 }
 
 test_b12x_flashinfer_rejects_upstream_download() {
@@ -1266,7 +1298,7 @@ test_exp_b12x_preserves_blackwell_arches() {
         setup_fixture
         run_build --exp-b12x --gpu-arch "$arch" || \
             fail "--exp-b12x --gpu-arch $arch run failed"
-        assert_log_contains "^docker build --target flashinfer-export .*--build-arg FLASHINFER_CUDA_ARCH_LIST=${arch} .*--build-arg FLASHINFER_REF=main"
+        assert_log_contains "^docker build --target flashinfer-export .*--build-arg FLASHINFER_CUDA_ARCH_LIST=${arch} .*--build-arg FLASHINFER_REF=9873d7a33f91aeb14c83286552e1f3d84efa2c2e"
         assert_log_contains "^docker build --target vllm-export .*--build-arg TORCH_CUDA_ARCH_LIST=${arch} --build-arg FLASHINFER_CUDA_ARCH_LIST=${arch} .*--build-arg NCCL_NVCC_GENCODE=-gencode=arch=compute_${nccl_arch},code=sm_${nccl_arch} .*--build-arg VLLM_PRESERVE_SM12X_TARGET=1"
         assert_log_contains "^docker build -t vllm-node-b12x .*--build-arg TORCH_CUDA_ARCH_LIST=${arch} --build-arg FLASHINFER_CUDA_ARCH_LIST=${arch} "
         assert_output_contains "Rebuilding FlashInfer wheels for GPU architecture ${arch}\.\.\."
@@ -2054,6 +2086,8 @@ test_exp_b12x_rebuild_vllm_uses_preset_source_build
 test_exp_b12x_allows_vllm_prs
 test_b12x_flashinfer_cache_is_independent
 test_b12x_flashinfer_custom_ref_is_isolated
+test_b12x_flashinfer_rebuilds_unpinned_cache
+test_b12x_flashinfer_rejects_unpinned_export
 test_b12x_flashinfer_rejects_upstream_download
 test_fork_use_wheels_never_implicitly_builds_flashinfer
 test_b12x_flashinfer_rebuilds_old_jit_cache

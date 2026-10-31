@@ -248,6 +248,46 @@ class PatchSeriesTests(unittest.TestCase):
         self.assertEqual(ast.dump(before), ast.dump(after))
         self.assertEqual(self.git("status", "--porcelain"), "")
 
+    def test_mtp_patches_preserve_upstream_multi_module_test(self):
+        # Upstream 87cb835db2 already imports torch and the spec-decode metric
+        # helper for its new per-module draft test. Replay both overlapping
+        # patches from that snapshot, without any historical patch-base blobs.
+        path = "tests/v1/e2e/spec_decode/mtp/qwen3_5/test_mtp.py"
+        upstream = (PROJECT / "tests/fixtures/qwen38-patch-series/mtp_modules_upstream.py").read_text()
+        target = self.source / path
+        target.parent.mkdir(parents=True)
+        target.write_text(upstream)
+        self.commit()
+        names = ("04-pr60068.patch", "06-pr50897.patch")
+        for name in names:
+            patch_text = (PROJECT / "docker/patches/qwen3.8/vllm" / name).read_text()
+            section = next(s for s in re.split(r"(?m)(?=^diff --git )", patch_text)
+                           if s.startswith(f"diff --git a/{path} "))
+            (self.series / name).write_text(section)
+        (self.series / "series").write_text("\n".join(names) + "\n")
+
+        result = self.apply()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        updated = target.read_text()
+        compile(updated, path, "exec")
+        before, after = ast.parse(upstream), ast.parse(updated)
+        additions = {"test_mtp_draft_confidence_stop",
+                     "test_qwen3_5_mtp_prefix_cache_reuses_last_safe_block"}
+        functions = [n.name for n in after.body if isinstance(n, ast.FunctionDef)]
+        for name in additions:
+            self.assertEqual(functions.count(name), 1)
+        after.body = [n for n in after.body if not (
+            isinstance(n, ast.FunctionDef) and n.name in additions
+            or isinstance(n, ast.ImportFrom)
+            and n.module in ("tests.models.utils", "vllm.distributed")
+        )]
+        vllm_import = next(n for n in after.body if isinstance(n, ast.ImportFrom)
+                           and n.module == "vllm")
+        vllm_import.names = [n for n in vllm_import.names if n.name == "SamplingParams"]
+        # Preserve every upstream import, helper, test body, and decorator.
+        self.assertEqual(ast.dump(before), ast.dump(after))
+        self.assertEqual(self.git("status", "--porcelain"), "")
+
     def test_qsa_ring_patch_applies_after_upstream_indexer_rename(self):
         # #64110 moved the cache module and renamed both cache classes.
         # Exercise the real runtime hunks and cache-spec method without GPUs.
@@ -709,6 +749,105 @@ class PatchSeriesTests(unittest.TestCase):
                 tree.body.remove(added[0])
                 self.assertEqual(ast.dump(tree), ast.dump(ast.parse(upstream)))
                 self.assertNotIn("is_model_fused_shared_expert_compatible", updated)
+
+    def test_sparse_vocab_defers_shared_head_quantization(self):
+        _, updated = self.apply_upstream_excerpt(
+            "03-pr59740-60226.patch",
+            "vllm/v1/worker/gpu/spec_decode/eagle/utils.py",
+            "eagle_shared_head_upstream.py",
+        )
+        tree = ast.parse(updated)
+        share = next(n for n in tree.body if isinstance(n, ast.FunctionDef)
+                     and n.name == "share_target_lm_head")
+        load = next(n for n in tree.body if isinstance(n, ast.FunctionDef)
+                    and n.name == "load_eagle_model")
+        share_call = next(n for n in load.body if isinstance(n, ast.Assign)
+                          and isinstance(n.value, ast.Call)
+                          and getattr(n.value.func, "id", None) == "share_target_lm_head")
+        quantized = object()
+        quantize = Mock(return_value=quantized)
+        can_share = Mock(return_value=True)
+        namespace = {"quantized_lm_head_copy": quantize, "_should_share": can_share}
+        exec("from __future__ import annotations\n" + ast.unparse(share), namespace)
+        for token_map in (None, "vocab.json"):
+            for quantization in (None, "fp8", "nvfp4"):
+                with self.subTest(token_map=token_map, quantization=quantization):
+                    quantize.reset_mock()
+                    target_head = object()
+                    draft = SimpleNamespace(lm_head=object())
+                    namespace.update(
+                        eagle_model=draft, target_model=object(),
+                        target_language_model=object(),
+                        get_target_lm_head=lambda *_: target_head,
+                        speculative_config=SimpleNamespace(
+                            draft_token_map=token_map,
+                            draft_lm_head_quantization=quantization,
+                        ),
+                    )
+                    exec(compile(ast.Module(body=[share_call], type_ignores=[]),
+                                 "share_head.py", "exec"), namespace)
+                    expected = quantized if quantization and token_map is None else target_head
+                    self.assertIs(draft.lm_head, expected)
+                    self.assertIs(namespace["draft_head"], expected)
+                    if quantization and token_map is None:
+                        quantize.assert_called_once_with(target_head, quantization)
+                    else:
+                        quantize.assert_not_called()
+        # Deferral still rejects quantization for a drafter with its own head.
+        can_share.return_value = False
+        for deferred in (False, True):
+            with self.assertRaisesRegex(ValueError, "shares the target lm_head"):
+                namespace["share_target_lm_head"](
+                    SimpleNamespace(lm_head=object()), object(), "fp8",
+                    defer_quantization=deferred,
+                )
+
+    def test_frontend_and_engine_share_connector_lookahead_policy(self):
+        _, updated = self.apply_upstream_excerpt(
+            "06-pr50897.patch", "vllm/v1/engine/core.py",
+            "engine_frontend_hash_upstream.py", ("num_hash_lookahead_tokens =",),
+        )
+        resolve = Mock()
+        make_hasher = Mock(return_value=object())
+        namespace = {
+            "get_num_hash_lookahead_tokens": resolve,
+            "get_request_block_hasher": make_hasher,
+            "get_hash_fn_by_name": lambda _: "hash_fn",
+            "init_none_hash": Mock(), "PrefixHashConfig": SimpleNamespace,
+            "kv_cache_utils": SimpleNamespace(NONE_HASH="none_hash"),
+        }
+        exec(updated, namespace)
+        config = SimpleNamespace(
+            num_hash_lookahead_tokens=3,
+            cache_config=SimpleNamespace(enable_prefix_caching=True,
+                                         prefix_caching_hash_algo="sha256"),
+        )
+        for connector, effective in ((None, 3), (object(), 0), (object(), 1)):
+            with self.subTest(connector=connector, effective=effective):
+                resolve.reset_mock()
+                make_hasher.reset_mock()
+                resolve.return_value = effective
+                engine = namespace["EngineCore"]()
+                engine.init_hash(config, connector, 16)
+                resolve.assert_called_once_with(config, connector)
+                make_hasher.assert_called_once_with(16, "hash_fn", effective)
+                self.assertEqual(engine.prefix_hash_config.num_lookahead_tokens, effective)
+                self.assertEqual(engine.prefix_hash_config.hash_block_size, 16)
+                self.assertEqual(engine.prefix_hash_config.none_hash, "none_hash")
+
+    def test_dynamic_nvfp4_preserves_upstream_batch_invariant_test(self):
+        upstream, updated = self.apply_upstream_excerpt(
+            "07-pr54614.patch",
+            "tests/kernels/quantization/test_nvfp4_kernel_selection.py",
+            "nvfp4_batch_invariant_upstream.py",
+        )
+        before, after = ast.parse(upstream), ast.parse(updated)
+        after.body = [n for n in after.body if not (
+            isinstance(n, ast.FunctionDef)
+            and (n.name.startswith("test_dynamic_") or n.name == "_constant_support")
+            or isinstance(n, ast.ImportFrom) and n.module == "collections.abc"
+        )]
+        self.assertEqual(ast.dump(before), ast.dump(after))
 
     def test_dynamic_nvfp4_preserves_fused_activation_for_other_kernels(self):
         _, updated = self.apply_upstream_excerpt(
