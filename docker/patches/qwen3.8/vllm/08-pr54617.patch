@@ -3,6 +3,7 @@ Subject: [PATCH] [Kernel][Quant][MoE] Per-forward NVFP4 W4A4/W4A16 selection for
 
 Upstream-PR: https://github.com/vllm-project/vllm/pull/54617
 Upstream-Commit: 69d21d81808bcea2de3b97a0b68c97545808a043
+Refresh-Base: fe5fe8ba5fb9412ac6deafd192ae8b7c466b96c5
 Integration-Base: 355553ac22dca4080929ea8f88a446f15df1f3ba
 
 Preserve #61082's monokernel setting alongside the dynamic NVFP4 MoE settings.
@@ -273,7 +274,7 @@ index 0000000000000000000000000000000000000000..bb58ef9015b5678c21be7faee78073ed
 +    assert err.mean() < 2.5e-1, f"mean rel err {err.mean():.3e}"
 +    assert torch.equal(outs[0], outs[2])
 diff --git a/vllm/config/kernel.py b/vllm/config/kernel.py
-index e4466dea2f87feb9e5306c618fd385d1d6ac94e1..3d6eee04ffc07e72c8526bcc92d81e480e1498ff 100644
+index c1fd3357914bb6a323eb216a037be08b2466bdec..e5938b9a8db04085b23562fdcb389d4dc8b1a536 100644
 --- a/vllm/config/kernel.py
 +++ b/vllm/config/kernel.py
 @@ -131,6 +131,7 @@ MoEBackend = Literal[
@@ -284,9 +285,9 @@ index e4466dea2f87feb9e5306c618fd385d1d6ac94e1..3d6eee04ffc07e72c8526bcc92d81e48
      "b12x",
      "flashinfer_moe_ep_mega_deep_gemm",
      "marlin",
-@@ -310,6 +311,17 @@ class KernelConfig:
-     in a single launch (DeepSeek-V4.1 on MI355X). A deployment that cannot run
-     it is refused at startup."""
+@@ -315,6 +316,17 @@ class KernelConfig:
+     in a single launch (DeepSeek-V4.1 on MI355X, DeepSeek-V4-Pro at TP8 on
+     MI355X). A deployment that cannot run it is refused at startup."""
  
 +    nvfp4_moe_dynamic_max_tokens: int = Field(default=0, ge=0)
 +    """With moe_backend="flashinfer_cutile", run NVFP4 routed experts as W4A16
@@ -302,7 +303,7 @@ index e4466dea2f87feb9e5306c618fd385d1d6ac94e1..3d6eee04ffc07e72c8526bcc92d81e48
      moe_backend: MoEBackend = "auto"
      """Backend for MoE expert computation kernels. Available options:
  
-@@ -328,6 +340,9 @@ class KernelConfig:
+@@ -333,6 +345,9 @@ class KernelConfig:
        load); requires Blackwell, expert parallelism, and NVSHMEM
      - "flashinfer_b12x": Use FlashInfer CuteDSL fused MoE for SM12x
        (RTX Pro 6000 / DGX Spark)

@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-# Upstream excerpt from 2339bd39d661965b821bfbe652db8f536e0b3dcd:
+# Upstream excerpt from fe5fe8ba5fb9412ac6deafd192ae8b7c466b96c5:
 # vllm/v1/core/kv_cache_coordinator.py
 
 def replay_boundaries(
@@ -40,7 +40,7 @@ class KVCacheCoordinator:
         boundaries = replay_boundaries(
             request.num_prompt_tokens,
             self.scheduler_block_size,
-            use_eagle=bool(self.eagle_group_ids),
+            use_eagle=bool(self.drop_eagle_group_ids),
         )
         for group_id, manager in enumerate(self.single_type_managers):
             if not manager.enable_caching:

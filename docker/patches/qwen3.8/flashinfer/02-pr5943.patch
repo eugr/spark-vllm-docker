@@ -3,13 +3,18 @@ Subject: [PATCH] feat(gemm): add SM12x MXFP8 support to the CuTe DSL mm_mxfp8 ba
 
 Upstream-PR: https://github.com/flashinfer-ai/flashinfer/pull/5943
 Upstream-Commit: 15c5c8d21388c118558c8370299204aa4b110ced
-Integration-Base: 2895577720741ddfedff118202c89584996b8875
+Integration-Base: 431c9687f3bb9a048e194c74a178d7cfb02b1585
+Autotuner-Integration-Base: 82e93625e87b196a9cb0d83fd5d85a29b8e7bdc7
+
+Preserve upstream cold-chain and individual timing, dataclass overrides,
+and SM107 low-M GEMM dispatch. Preserve collective CUPTI fallback and
+initialization-before-warmup while honoring per-operation timing/repeats.
 
 diff --git a/benchmarks/routines/flashinfer_benchmark_utils.py b/benchmarks/routines/flashinfer_benchmark_utils.py
-index 4dadfb48507125d0f5e4f85f62050a9f55872781..de919eb296fb99403e2cc3bdcb41a0d149b81b87 100644
+index 2407b18fc7bc1d994e4d053ee4bf1aac2ff55085..ae1b57d5034084f822114bb55fc440f426a44bd6 100644
 --- a/benchmarks/routines/flashinfer_benchmark_utils.py
 +++ b/benchmarks/routines/flashinfer_benchmark_utils.py
-@@ -626,8 +626,8 @@ routine_cc_to_supported_backends = {
+@@ -615,8 +615,8 @@ routine_cc_to_supported_backends = {
          "10.3": ["cutlass", "cute-dsl", "trtllm", "cudnn"],
          "10.7": ["cutlass", "cute-dsl", "trtllm"],
          "11.0": ["cutlass", "cudnn"],
@@ -21,10 +26,10 @@ index 4dadfb48507125d0f5e4f85f62050a9f55872781..de919eb296fb99403e2cc3bdcb41a0d1
      "tinygemm_bf16": {
          "7.5": [],
 diff --git a/benchmarks/routines/gemm.py b/benchmarks/routines/gemm.py
-index 78c9cfb7fe4d1207533490cf736a80b4247c7607..cca034eba444aa97c8eac439d96167a61a42a087 100644
+index b43b93d3b1cb5144476c4dcad6a00e420b175619..e5f61ea1ea82a65aa5fb473fd579d32292618fc9 100644
 --- a/benchmarks/routines/gemm.py
 +++ b/benchmarks/routines/gemm.py
-@@ -1850,6 +1850,7 @@ def testMmMxfp8(args):
+@@ -1867,6 +1867,7 @@ def testMmMxfp8(args):
          "cute-dsl",
          "trtllm",
          "cudnn",
@@ -32,7 +37,7 @@ index 78c9cfb7fe4d1207533490cf736a80b4247c7607..cca034eba444aa97c8eac439d96167a6
          "auto",
      ]
      res = []
-@@ -1924,7 +1925,7 @@ def testMmMxfp8(args):
+@@ -1941,7 +1942,7 @@ def testMmMxfp8(args):
          backend: str,
          inputs: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
      ) -> torch.Tensor:
@@ -42,13 +47,13 @@ index 78c9cfb7fe4d1207533490cf736a80b4247c7607..cca034eba444aa97c8eac439d96167a6
          )
          input_mxfp8, mat2_mxfp8, input_scale, mat2_scale = inputs
 diff --git a/flashinfer/autotuner/autotuner.py b/flashinfer/autotuner/autotuner.py
-index 7902ab5d6b356e0d0c98eb5a9e3dcc306786724f..16c59ebc53ea574f477998fd705ba714461fa902 100644
+index 0cb45694e4244826309ce5f3b6bc43c255edca75..30c7954c05926b9c6e5b816ec1ed75df3e9470a7 100644
 --- a/flashinfer/autotuner/autotuner.py
 +++ b/flashinfer/autotuner/autotuner.py
-@@ -525,6 +525,16 @@ class TuningConfig:
-             lane views in the reusable A/B profiling arenas. Their contents are
-             staged once per profile even when they are not value-aware. Shared
-             read-only tensors may be omitted and retain one pointer.
+@@ -541,6 +541,16 @@ class TuningConfig:
+             Cold-L2 profiling uses a separate measurement path. This
+             choice is recorded as tuning provenance because it can change the
+             winner; ordinary lookup can still consume that winner.
 +        timer (str | None): Per-operation timing implementation. ``"cupti"``
 +            times each profiled call by its CUPTI kernel span (the
 +            ``bench_gpu_time`` measurement), which ranks microsecond-scale
@@ -62,25 +67,16 @@ index 7902ab5d6b356e0d0c98eb5a9e3dcc306786724f..16c59ebc53ea574f477998fd705ba714
      """
  
      dynamic_tensor_specs: tuple[DynamicTensorSpec, ...] = ()
-@@ -544,6 +554,8 @@ class TuningConfig:
-     # for inputs whose default tensor_initializer would be random
+@@ -562,6 +572,8 @@ class TuningConfig:
      # (e.g. token_selected_experts in MoE workloads).
      inputs_pre_hook: Callable | None = None
+     use_cuda_graph_individual_timing: bool = False
 +    timer: str | None = None
 +    first_tactic_margin: float = 0.0
  
- 
- class ValueProfileArena:
-@@ -2156,6 +2168,8 @@ class AutoTuner:
-             value_aware_input_indices=tuning_config.value_aware_input_indices,
-             profile_arena_input_indices=tuning_config.profile_arena_input_indices,
-             inputs_pre_hook=tuning_config.inputs_pre_hook,
-+            timer=tuning_config.timer,
-+            first_tactic_margin=tuning_config.first_tactic_margin,
-         )
-         self._override_config_cache.setdefault(tuning_config, {})[cache_key] = (
-             new_config
-@@ -2407,6 +2421,9 @@ class AutoTuner:
+     @property
+     def uses_cold_chain(self) -> bool:
+@@ -2920,6 +2932,9 @@ class AutoTuner:
                          min_time = float("inf")
                          # Initialize runner and tactic as None in case of no valid tactic or runners are found
                          runner_id, tactic = None, None
@@ -90,7 +86,7 @@ index 7902ab5d6b356e0d0c98eb5a9e3dcc306786724f..16c59ebc53ea574f477998fd705ba714
                          skipped_count = 0
                          for r_id, r in enumerate(runners):
                              runner_preparation_oom = False
-@@ -2528,10 +2545,21 @@ class AutoTuner:
+@@ -3083,10 +3098,21 @@ class AutoTuner:
                                      # Set time_measured to inf to notify the failure of the tactic. This can happen when `get_valid_tactics` mistakenly return wrong tactics
                                      # or some runtime error occurs during profiling.
                                      time_measured = float("inf")
@@ -112,10 +108,13 @@ index 7902ab5d6b356e0d0c98eb5a9e3dcc306786724f..16c59ebc53ea574f477998fd705ba714
                          if skipped_count > 0:
                              logger.info(
                                  f"[Autotuner]: Skipped {skipped_count} unsupported tactic(s) for {custom_op} "
-@@ -3033,9 +3061,17 @@ class AutoTuner:
-             # any other.  A CUPTI *infrastructure* failure (single-subscriber
-             # conflict) is not a tactic failure: fall back to the CUDA-event
-             # path for this and all later measurements.
+@@ -3779,9 +3805,16 @@ class AutoTuner:
+         # fallback).
+         profile_exc: Optional[BaseException] = None
+         try:
+-            cupti_requested = (
+-                measure_policy is not None and measure_policy.timer == "cupti"
+-            )
 +            # The op's timer applies unless the policy pins one (explicit
 +            # timer or eager execution, which must include host cost).
 +            requested_timer = tuning_config.timer
@@ -125,29 +124,24 @@ index 7902ab5d6b356e0d0c98eb5a9e3dcc306786724f..16c59ebc53ea574f477998fd705ba714
 +                or measure_policy.execution_mode == "eager"
 +            ):
 +                requested_timer = measure_policy.timer
-             use_cupti = (
--                measure_policy is not None
--                and measure_policy.timer == "cupti"
-+                requested_timer == "cupti"
-                 and not self._cupti_disabled
-                 and _load_cupti() is not None
-             )
-@@ -3217,7 +3253,9 @@ class AutoTuner:
-                     runner(inputs, tactic=tactic, **kwargs)
++            cupti_requested = requested_timer == "cupti"
+             use_cupti = False
+             cupti_error = None
+             if cupti_requested:
+@@ -4036,7 +4069,7 @@ class AutoTuner:
  
              spans_ms = _cupti_measure_spans(
--                run_iteration, self.repeat, prologue=prologue
-+                run_iteration,
+                 run_iteration,
+-                self.repeat,
 +                self._get_profiling_repeat(tuning_config),
-+                prologue=prologue,
-             )
- 
-         # Median, not mean: robust to first-iteration instrumentation
+                 prologue=prologue,
+                 check_ready=check_ready,
+                 prepare=prepare,
 diff --git a/flashinfer/gemm/gemm_base.py b/flashinfer/gemm/gemm_base.py
-index 97f6282caeee9662a467500cc866d3a9527216e9..cf3ef46d76d8eb52fce6d80d7f9ab9e68ac9beb7 100644
+index 8a42262f7c7c0c9574e5936b95136a32af050c4f..8115b73b58b3d9330bac88984de2fb0f9f1451d5 100644
 --- a/flashinfer/gemm/gemm_base.py
 +++ b/flashinfer/gemm/gemm_base.py
-@@ -6013,12 +6013,14 @@ def _check_mm_mxfp8_problem_size(
+@@ -6192,12 +6192,14 @@ def _check_mm_mxfp8_problem_size(
              f"K dimension mismatch in mm_mxfp8. got {a.shape[1]=}, {b.shape[0]=}"
          )
  
@@ -165,7 +159,7 @@ index 97f6282caeee9662a467500cc866d3a9527216e9..cf3ef46d76d8eb52fce6d80d7f9ab9e6
              f"got m={a.shape[0]}, n={b.shape[1]}, k={a.shape[1]}."
          )
  
-@@ -6168,17 +6170,30 @@ def _trtllm_gemm_mxfp8_requirement(
+@@ -6347,17 +6349,30 @@ def _trtllm_gemm_mxfp8_requirement(
      return True
  
  
@@ -203,10 +197,10 @@ index 97f6282caeee9662a467500cc866d3a9527216e9..cf3ef46d76d8eb52fce6d80d7f9ab9e6
      # CuTe DSL MXFP8 path currently expects swizzled 1D block scales
      # in F8_128x4 layout for both A and B.
      if a_descale.ndim != 1 or b_descale.ndim != 1:
-@@ -6390,6 +6405,11 @@ def _cute_dsl_gemm_mxfp8_runner(
-     out_dtype: torch.dtype,
-     warp_splitk_supports: Optional[Callable[[List[torch.Tensor]], bool]] = None,
+@@ -6592,6 +6607,11 @@ def _cute_dsl_gemm_mxfp8_runner(
+     low_m_only: bool = False,
  ):
+     """``low_m_only``: only the M <= 32 narrow-tile / split-K tactics (SM107)."""
 +    if sm_major == 12:
 +        from .kernels.sm12x_mxfp8.runner import get_runner
 +
@@ -215,7 +209,7 @@ index 97f6282caeee9662a467500cc866d3a9527216e9..cf3ef46d76d8eb52fce6d80d7f9ab9e6
      import cutlass
  
      from .kernels.dense_blockscaled_gemm_sm100 import (
-@@ -7133,7 +7153,8 @@ def mm_mxfp8(
+@@ -7399,7 +7419,8 @@ def mm_mxfp8(
  
      out: Optional[torch.Tensor]
          Out tensor, shape (m, n), bf16 or fp16. If provided, the result is written
@@ -225,7 +219,7 @@ index 97f6282caeee9662a467500cc866d3a9527216e9..cf3ef46d76d8eb52fce6d80d7f9ab9e6
          Defaults to ``None``.
  
      out_dtype: torch.dtype
-@@ -7152,7 +7173,17 @@ def mm_mxfp8(
+@@ -7418,7 +7439,17 @@ def mm_mxfp8(
            small-M decode tiles. It requires CUDA 13+, nvidia-cutlass-dsl >=
            4.6.0, 1D swizzled 128x4 scales, and K divisible by 128.
          - The ``"cute-dsl"`` backend currently requires swizzled 1D scales
@@ -244,7 +238,7 @@ index 97f6282caeee9662a467500cc866d3a9527216e9..cf3ef46d76d8eb52fce6d80d7f9ab9e6
          - The ``"cutedsl_low_latency"`` backend requires SM100/SM103, ``M <= 8``,
            ``K % 128 == 0``, and swizzled 1D scales in the 128x4 layout.
          - The ``"trtllm"`` requires b to be quantized with 128x4 swizzle layout and shuffled.
-@@ -7260,11 +7291,12 @@ def mm_mxfp8(
+@@ -7526,11 +7557,12 @@ def mm_mxfp8(
  
      tuner = AutoTuner.get()
  
@@ -262,7 +256,7 @@ index 97f6282caeee9662a467500cc866d3a9527216e9..cf3ef46d76d8eb52fce6d80d7f9ab9e6
  
      runner, tactic = tuner.choose_one(
          custom_op="mxfp8_gemm",
-@@ -9265,6 +9297,17 @@ _MM_MXFP8_CUTE_DSL_TUNING_CONFIG = replace(
+@@ -9546,6 +9578,17 @@ _MM_MXFP8_CUTE_DSL_TUNING_CONFIG = replace(
      use_cold_l2_cache=True,
  )
  
@@ -4998,10 +4992,10 @@ index 0000000000000000000000000000000000000000..54c659f6d22d17066876fa2631e4f755
 +            stream=stream,
 +        )
 diff --git a/tests/autotuner/test_autotuner_core.py b/tests/autotuner/test_autotuner_core.py
-index dbf4501f7454025f63154855984bc009867695f6..82115c2312b6ffac9b2e761518e045ce74adc0aa 100644
+index ed55a38e84793d637af8cde34166d1ac811213c0..6026b82645f4e2d8b75495a898a0acfee0eac286 100644
 --- a/tests/autotuner/test_autotuner_core.py
 +++ b/tests/autotuner/test_autotuner_core.py
-@@ -474,6 +474,49 @@ def test_choose_one_tuning_selects_best_tactic_and_populates_cache(monkeypatch):
+@@ -476,6 +476,49 @@ def test_choose_one_tuning_selects_best_tactic_and_populates_cache(monkeypatch):
      assert tuner.stats.tuned_op_successful_configs["dummy_tune"] >= 1
  
  
@@ -5051,7 +5045,7 @@ index dbf4501f7454025f63154855984bc009867695f6..82115c2312b6ffac9b2e761518e045ce
  @pytest.mark.parametrize("phase", ("forward", "precompile"))
  def test_choose_one_recovers_from_memory_error_during_preparation(monkeypatch, phase):
      class PreparationMemoryErrorRunner(DummyRunner):
-@@ -1297,6 +1340,8 @@ def test_tuning_overrides_preserve_tensor_initializers():
+@@ -1308,6 +1351,8 @@ def test_tuning_overrides_preserve_tensor_initializers():
          ),
          tensor_initializers=((0, initializer),),
          profiling_repeat=100,
@@ -5060,7 +5054,7 @@ index dbf4501f7454025f63154855984bc009867695f6..82115c2312b6ffac9b2e761518e045ce
      )
  
      with autotune(tune_mode=False, tuning_buckets=(100, 200)):
-@@ -1304,6 +1349,8 @@ def test_tuning_overrides_preserve_tensor_initializers():
+@@ -1315,6 +1360,8 @@ def test_tuning_overrides_preserve_tensor_initializers():
  
      assert overridden.tensor_initializers == config.tensor_initializers
      assert overridden.profiling_repeat == 100
@@ -5070,7 +5064,7 @@ index dbf4501f7454025f63154855984bc009867695f6..82115c2312b6ffac9b2e761518e045ce
  
  def test_tuning_config_profiling_repeat_override(monkeypatch):
 diff --git a/tests/gemm/test_mm_mxfp8.py b/tests/gemm/test_mm_mxfp8.py
-index ad6ddddb909f1a4546faeadbf8c058427fe5444b..1fb0331330d0f3a8b99bcb2f255c4694d4e6a32b 100644
+index 88fea1f8707587ad3bfab8d442402d3380684fdd..d3d0ca5468138db9d6515b9ca8d274d42f786862 100644
 --- a/tests/gemm/test_mm_mxfp8.py
 +++ b/tests/gemm/test_mm_mxfp8.py
 @@ -173,6 +173,8 @@ def test_mm_mxfp8_cute_dsl_narrow_tiles_only_within_32_tokens():

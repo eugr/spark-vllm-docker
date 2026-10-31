@@ -4,10 +4,13 @@ Subject: [PATCH] [PR #60068] [MRV2][Spec Decode] Opt-in confidence stop for auto
 Upstream-PR: https://github.com/vllm-project/vllm/pull/60068
 Upstream-Commit: 8ae78ccaf8825b3e55ab014e282c769902ca198c
 Integration-Base: 355553ac22dca4080929ea8f88a446f15df1f3ba
+Refresh-Base: 90309f6b742cdb1d6305778b81063918cf61be81
 
 Preserve both quantized draft-head and adaptive-depth documentation/tests.
 Use #60692's supports_decode_metadata_update API; confidence stopping
-requires a separate graph for each draft step.
+requires a separate graph for each draft step. Preserve the upstream
+watermarked sampling branch and update confidence before either sampler
+can modify logits in place.
 
 diff --git a/docs/features/speculative_decoding/mtp.md b/docs/features/speculative_decoding/mtp.md
 index 2254827d13b54bf8f8f363c12364377446900765..66410e4da75a1e389acac9150882b6409f45c094 100644
@@ -73,15 +76,10 @@ index 99eb02ff3389274efe04d875c2088e8017e77d54..5800fe030553a592d62df807ba5f50bc
      scheduler = create_scheduler(num_speculative_tokens=3)
      assert scheduler.spec_decode_metrics_level == "none"
 diff --git a/tests/v1/e2e/spec_decode/mtp/qwen3_5/test_mtp.py b/tests/v1/e2e/spec_decode/mtp/qwen3_5/test_mtp.py
-index 893594b0a7317d685372240648d0c64e76aa3d35..57f3468e8ee8b25c3bf85f7a24eaf5d49ca34bb4 100644
+index 0feaa9efc604c38cee76f8edf797f4bd8c9d279a..57f3468e8ee8b25c3bf85f7a24eaf5d49ca34bb4 100644
 --- a/tests/v1/e2e/spec_decode/mtp/qwen3_5/test_mtp.py
 +++ b/tests/v1/e2e/spec_decode/mtp/qwen3_5/test_mtp.py
-@@ -5,10 +5,12 @@ import pytest
- 
- from tests.utils import single_gpu_only
- from vllm import SamplingParams
-+from vllm.platforms import current_platform
- 
+@@ -10,6 +10,7 @@ from vllm.platforms import current_platform
  from ...utils import (
      assert_request_outputs_match,
      compute_acceptance_len,
@@ -89,7 +87,7 @@ index 893594b0a7317d685372240648d0c64e76aa3d35..57f3468e8ee8b25c3bf85f7a24eaf5d4
      get_test_prompts,
  )
  from .._correctness import check_mtp_correctness
-@@ -146,3 +148,58 @@ def test_mtp_draft_lm_head_quantization_survives_sleep_and_reload(
+@@ -147,3 +148,58 @@ def test_mtp_draft_lm_head_quantization_survives_sleep_and_reload(
              context="after weight reload",
          )
          assert al == pytest.approx(ref_al, rel=0.03)
@@ -412,10 +410,10 @@ index 2d82a6b3f0446f1b6a0f09a591352c6e732f3d48..001e94d8b663ea0ea058be0a04ee33ee
      def _acceptance_length_to_rates(length: float, n: int) -> list[float]:
          """Mean acceptance length to unconditional per-position rates, using
 diff --git a/vllm/config/vllm.py b/vllm/config/vllm.py
-index 054cdd2849b9bdc48230d39aa234b502b34811c4..abad73f52bea097230f4360ec22387957b86c493 100644
+index a5f555fa9bd6622a5d244fc617b35edbede25356..a0d7149c4c180a6d68fc555aae336a3d299da605 100644
 --- a/vllm/config/vllm.py
 +++ b/vllm/config/vllm.py
-@@ -1074,6 +1074,44 @@ class VllmConfig:
+@@ -1109,6 +1109,44 @@ class VllmConfig:
          )
          speculative_config.num_speculative_tokens_per_batch_size = None
  
@@ -460,10 +458,10 @@ index 054cdd2849b9bdc48230d39aa234b502b34811c4..abad73f52bea097230f4360ec2238795
      def _normalize_piecewise_cudagraph_mode(
          self, *, breakable_cudagraph_enabled: bool
      ) -> None:
-@@ -1798,6 +1836,7 @@ class VllmConfig:
-             )
+@@ -1844,6 +1882,7 @@ class VllmConfig:
  
          self._maybe_disable_dynamic_sd_for_data_parallel()
+         self._maybe_disable_dynamic_sd_for_v1()
 +        self._verify_draft_confidence_threshold()
          self._maybe_override_dynamic_sd_cudagraph_mode()
  
@@ -695,10 +693,10 @@ index 0000000000000000000000000000000000000000..ac762b2b38c4c38d815c16befbc8b7b0
 +        self._resolve_pending()
 +        return self._num_drafts_np[slots]
 diff --git a/vllm/v1/worker/gpu/spec_decode/speculator.py b/vllm/v1/worker/gpu/spec_decode/speculator.py
-index d86a0b0351f05073ebecf59af06e68cdcb1ad96c..59f6fb083aab55a1d77889f38098942ade6943e6 100644
+index 261c83a94727f5138f300bf7d543754f73e99083..6266f830ec9a93f0e3acc9f71a4129816b8f5963 100644
 --- a/vllm/v1/worker/gpu/spec_decode/speculator.py
 +++ b/vllm/v1/worker/gpu/spec_decode/speculator.py
-@@ -35,6 +35,7 @@ from vllm.v1.worker.gpu.sample.gumbel import gumbel_sample
+@@ -38,6 +38,7 @@ from vllm.v1.worker.gpu.sample.gumbel import gumbel_sample
  from vllm.v1.worker.gpu.spec_decode.acceptance_estimator import (
      OnlineAcceptanceEstimator,
  )
@@ -706,7 +704,7 @@ index d86a0b0351f05073ebecf59af06e68cdcb1ad96c..59f6fb083aab55a1d77889f38098942a
  from vllm.v1.worker.utils import AttentionGroup
  
  if TYPE_CHECKING:
-@@ -103,6 +104,8 @@ class BaseSpeculator(ABC):
+@@ -106,6 +107,8 @@ class BaseSpeculator(ABC):
  
  
  class DraftModelSpeculator(BaseSpeculator):
@@ -715,9 +713,9 @@ index d86a0b0351f05073ebecf59af06e68cdcb1ad96c..59f6fb083aab55a1d77889f38098942a
      def __init__(self, vllm_config: VllmConfig, device: torch.device):
          self.vllm_config = vllm_config
          self.device = device
-@@ -211,6 +214,18 @@ class DraftModelSpeculator(BaseSpeculator):
-         # in place, so the refresh can be recorded in the draft CUDA graph.
-         self.supports_decode_metadata_update = False
+@@ -201,6 +204,18 @@ class DraftModelSpeculator(BaseSpeculator):
+                 watermark_config.deduplicate_contexts_max_history,
+             )
  
 +        threshold = self.speculative_config.draft_confidence_threshold
 +        if threshold is not None:
@@ -731,19 +729,19 @@ index d86a0b0351f05073ebecf59af06e68cdcb1ad96c..59f6fb083aab55a1d77889f38098942a
 +                device,
 +            )
 +
-     @abstractmethod
-     def load_draft_model(
-         self, target_model: nn.Module, target_attn_layer_names: set[str]
-@@ -451,6 +466,9 @@ class DraftModelSpeculator(BaseSpeculator):
+         self.supports_mm_inputs = False
+         self.pcp_manager: PCPManager | None = None
+         # Whether every draft attention builder can refresh its decode metadata
+@@ -488,6 +503,9 @@ class DraftModelSpeculator(BaseSpeculator):
              return self.get_draft_top_tokens(hidden_states, spec_step_idx)
  
          logits = self.compute_draft_logits(hidden_states, spec_step_idx)
 +        if self.confidence_stop is not None:
 +            # Before sampling, which may scale the logits in place.
 +            self.confidence_stop.update(logits, draft_step)
-         if draft_logits is not None:
-             sampler = (
-                 gumbel_sample
+         if draft_logits is not None and self.draft_watermarker is not None:
+             sampled = self.draft_watermarker.sample(
+                 logits,
 diff --git a/vllm/v1/worker/gpu/spec_decode/target_dependent_ar/speculator.py b/vllm/v1/worker/gpu/spec_decode/target_dependent_ar/speculator.py
 index fdbedd78f6bd626555c0081c0a78ae0772ec5d69..16323deeedd9797de170c227dd2972ae92cad8a2 100644
 --- a/vllm/v1/worker/gpu/spec_decode/target_dependent_ar/speculator.py

@@ -216,24 +216,30 @@ class ApiKeyAuthPatchTests(unittest.TestCase):
                 PATCHER.patch_authentication(source)
 
     def test_entry_point_validates_both_files_before_writing(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            auth_path, cli_path = root / PATCHER.AUTH_REL, root / PATCHER.CLI_REL
-            auth_path.parent.mkdir(parents=True)
-            cli_path.parent.mkdir(parents=True)
-            auth_path.write_text(B12X_SOURCE)
-            cli_path.write_text("unexpected = True\n")
-            result = subprocess.run([sys.executable, str(PATCH_PATH), str(root)], capture_output=True, text=True)
-            self.assertNotEqual(result.returncode, 0)
-            self.assertEqual(auth_path.read_text(), B12X_SOURCE)
-            self.assertEqual(cli_path.read_text(), "unexpected = True\n")
-            for args in ([str(root)], []):
+        for cli_relative in PATCHER.CLI_RELS:
+            with self.subTest(path=cli_relative), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                auth_path, cli_path = root / PATCHER.AUTH_REL, root / cli_relative
+                auth_path.parent.mkdir(parents=True)
+                cli_path.parent.mkdir(parents=True)
                 auth_path.write_text(B12X_SOURCE)
-                cli_path.write_text(CLI_SOURCE)
-                result = subprocess.run([sys.executable, str(PATCH_PATH), *args], cwd=root, capture_output=True, text=True)
-                self.assertEqual(result.returncode, 0, result.stderr)
-                self.assertEqual(auth_path.read_text(), PATCHER.patch_authentication(B12X_SOURCE))
-                self.assertEqual(cli_path.read_text(), PATCHER.patch_cli_help(CLI_SOURCE))
+                command = [sys.executable, str(PATCH_PATH), str(root)]
+                result = subprocess.run(command, capture_output=True, text=True)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("CLI arguments are absent", result.stderr)
+                self.assertEqual(auth_path.read_text(), B12X_SOURCE)
+                cli_path.write_text("unexpected = True\n")
+                result = subprocess.run(command, capture_output=True, text=True)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(auth_path.read_text(), B12X_SOURCE)
+                self.assertEqual(cli_path.read_text(), "unexpected = True\n")
+                for args in ([str(root)], []):
+                    auth_path.write_text(B12X_SOURCE)
+                    cli_path.write_text(CLI_SOURCE)
+                    result = subprocess.run([sys.executable, str(PATCH_PATH), *args], cwd=root, capture_output=True, text=True)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(auth_path.read_text(), PATCHER.patch_authentication(B12X_SOURCE))
+                    self.assertEqual(cli_path.read_text(), PATCHER.patch_cli_help(CLI_SOURCE))
 
     def test_absent_middleware_is_not_applicable(self):
         with tempfile.TemporaryDirectory() as directory:

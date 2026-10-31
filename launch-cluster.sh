@@ -1674,6 +1674,25 @@ wait_for_cluster() {
     exit 1
 }
 
+# Detached workers and earlyoom write to container logs, outside the foreground
+# head stream. Capture their recent output before cleanup removes the containers.
+dump_cluster_failure_logs() {
+    echo "Collecting container logs before cleanup (last 200 lines per node)..." >&2
+    echo "--- Head container logs ---" >&2
+    timeout 15s docker logs --timestamps --tail 200 "$CONTAINER_NAME" >&2 2>&1 || \
+        echo "Warning: Could not collect head container logs." >&2
+
+    local worker remote_cmd
+    printf -v remote_cmd 'docker logs --timestamps --tail 200 %q' "$CONTAINER_NAME"
+    for worker in "${PEER_NODES[@]}"; do
+        echo "--- Worker container logs ($worker) ---" >&2
+        timeout 15s ssh -o BatchMode=yes -o ConnectTimeout=5 \
+            -o ServerAliveInterval=5 -o ServerAliveCountMax=1 \
+            "$worker" "$remote_cmd" >&2 2>&1 || \
+            echo "Warning: Could not collect worker container logs ($worker)." >&2
+    done
+}
+
 # Execute command on head node (daemon or interactive)
 _exec_on_head() {
     local cmd="$1"
@@ -1683,6 +1702,11 @@ _exec_on_head() {
     else
         if [ -t 0 ]; then DOCKER_EXEC_FLAGS="-it"; else DOCKER_EXEC_FLAGS="-i"; fi
         docker exec $DOCKER_EXEC_FLAGS "$CONTAINER_NAME" bash -c "$cmd"
+        local status=$?
+        if [[ "$status" -ne 0 ]]; then
+            dump_cluster_failure_logs
+        fi
+        return "$status"
     fi
 }
 
@@ -1721,13 +1745,7 @@ exec_no_ray_cluster() {
     fi
 
     echo "Executing command on head node (rank 0): $head_cmd"
-    if [[ "$DAEMON_MODE" == "true" ]]; then
-        docker exec -d "$CONTAINER_NAME" bash -c "$head_cmd >> /proc/1/fd/1 2>&1"
-        echo "Command dispatched in background (Daemon mode). Container: $CONTAINER_NAME"
-    else
-        if [ -t 0 ]; then DOCKER_EXEC_FLAGS="-it"; else DOCKER_EXEC_FLAGS="-i"; fi
-        docker exec $DOCKER_EXEC_FLAGS "$CONTAINER_NAME" bash -c "$head_cmd"
-    fi
+    _exec_on_head "$head_cmd"
 }
 
 if [[ "$ACTION" == "exec" && "$SOLO_MODE" == "false" && "$NO_RAY_MODE" == "false" && "$LAUNCH_SCRIPT_MODE" != "true" ]]; then

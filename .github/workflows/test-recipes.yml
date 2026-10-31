@@ -13,7 +13,8 @@ on:
       - 'setup-cluster.py'
       - 'setup_cluster_node.py'
       - 'build-and-copy.sh'
-      - 'docker/image_identity.py'
+      - 'Dockerfile'
+      - 'docker/**'
       - 'hf-download.sh'
       - 'hf-cache.py'
       - 'recipes/**'
@@ -32,7 +33,8 @@ on:
       - 'setup-cluster.py'
       - 'setup_cluster_node.py'
       - 'build-and-copy.sh'
-      - 'docker/image_identity.py'
+      - 'Dockerfile'
+      - 'docker/**'
       - 'hf-download.sh'
       - 'hf-cache.py'
       - 'recipes/**'
@@ -107,6 +109,12 @@ jobs:
       run: |
         python3 tests/test_image_identity.py
         bash tests/test_build_and_copy.sh
+
+    - name: Test source patch series and B12X source fixes
+      run: |
+        python3 tests/test_regular_patch_series.py
+        python3 tests/test_vllm_b12x_scale_swizzle.py
+        python3 tests/test_flashinfer_b12x_loader_include_order_patch.py
     
     - name: Verify all recipes with dry-run
       run: |

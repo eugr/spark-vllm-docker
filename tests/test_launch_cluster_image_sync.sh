@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-# Focused behavior tests for launch-cluster.sh image consistency checks.
+# Focused launch-cluster.sh image consistency and failure diagnostic tests.
 # All Docker and SSH operations are handled by fake commands.
 
 set -euo pipefail
@@ -75,6 +75,15 @@ if [[ "${1:-}" == "image" && "${2:-}" == "inspect" ]]; then
     exit 0
 fi
 
+if [[ "${1:-}" == "exec" && ( "${2:-}" == -i || "${2:-}" == -it ) ]]; then
+    exit "${HEAD_EXEC_STATUS:-0}"
+fi
+
+if [[ "${1:-}" == "logs" ]]; then
+    echo 'earlyoom: head memory report'
+    exit "${HEAD_LOG_STATUS:-0}"
+fi
+
 exit 0
 DOCKER
 
@@ -97,6 +106,11 @@ if [[ "$*" == *"docker image inspect"* ]]; then
         cat "$REMOTE_INSPECT_FILE"
         exit "${REMOTE_INSPECT_STATUS:-0}"
     fi
+fi
+
+if [[ "$*" == *"docker logs"* ]]; then
+    echo 'Worker_TP1: original startup exception'
+    exit "${WORKER_LOG_STATUS:-0}"
 fi
 
 exit 0
@@ -125,6 +139,22 @@ run_launch() {
                 --ib-if ib0 \
                 --no-cache-dirs \
                 -d "$@" start
+    ) > "$OUTPUT_LOG" 2>&1
+}
+
+run_exec() {
+    (
+        cd "$FIXTURE_DIR"
+        PATH="$FAKE_BIN_DIR:$PATH" \
+            TEST_LOG="$TEST_LOG" \
+            LOCAL_INSPECT_FILE="$LOCAL_INSPECT_FILE" \
+            REMOTE_INSPECT_FILE="$REMOTE_INSPECT_FILE" \
+            LOCAL_IP="10.0.0.1" \
+            ./launch-cluster.sh \
+                --config "$FIXTURE_DIR/test.env" \
+                --nodes "10.0.0.1,10.0.0.2" \
+                --eth-if eth0 --ib-if ib0 --no-cache-dirs \
+                "$@" exec vllm serve test-model --tensor-parallel-size 2
     ) > "$OUTPUT_LOG" 2>&1
 }
 
@@ -256,6 +286,55 @@ test_missing_head_image_aborts_before_launch() {
     pass "missing head image aborts before containers start"
 }
 
+test_failed_exec_captures_logs_before_cleanup() {
+    setup_fixture
+    local status=0
+    HEAD_EXEC_STATUS=42 run_exec || status=$?
+    [[ "$status" == 42 ]] || fail "head exit status was not preserved: $status"
+    assert_output_contains 'earlyoom: head memory report'
+    assert_output_contains 'Worker_TP1: original startup exception'
+    assert_log_contains '^docker logs --timestamps --tail 200 vllm_node$'
+    assert_log_contains '^ssh .*ConnectTimeout=5 .*docker logs --timestamps --tail 200 vllm_node$'
+    local worker_log_line first_stop_line
+    worker_log_line=$(grep -nE '^ssh .*docker logs ' "$TEST_LOG" | cut -d: -f1)
+    first_stop_line=$(grep -nE '^docker stop ' "$TEST_LOG" | head -1 | cut -d: -f1)
+    [[ "$worker_log_line" -lt "$first_stop_line" ]] || fail "containers stopped before worker log collection"
+    pass "failed foreground exec captures head and worker logs before cleanup"
+}
+
+test_log_errors_preserve_exec_status_and_cleanup() {
+    setup_fixture
+    local status=0
+    HEAD_EXEC_STATUS=42 HEAD_LOG_STATUS=1 WORKER_LOG_STATUS=255 run_exec || status=$?
+    [[ "$status" == 42 ]] || fail "log collection replaced head exit status: $status"
+    assert_output_contains 'Could not collect head container logs'
+    assert_output_contains 'Could not collect worker container logs'
+    assert_log_contains '^docker stop vllm_node$'
+    assert_log_contains '^ssh .*docker stop vllm_node$'
+    pass "unavailable logs preserve the original failure and cluster cleanup"
+}
+
+test_successful_and_daemon_exec_do_not_dump_logs() {
+    setup_fixture
+    run_exec || fail "successful foreground exec failed"
+    assert_log_not_contains 'docker logs '
+    setup_fixture
+    HEAD_EXEC_STATUS=42 run_exec -d || fail "daemon dispatch failed"
+    assert_log_not_contains 'docker logs '
+    assert_log_not_contains 'docker stop '
+    pass "successful foreground exec and daemon dispatch do not dump logs"
+}
+
+test_solo_failure_captures_only_local_logs() {
+    setup_fixture
+    local status=0
+    HEAD_EXEC_STATUS=42 run_exec --solo || status=$?
+    [[ "$status" == 42 ]] || fail "solo exit status was not preserved: $status"
+    assert_output_contains 'earlyoom: head memory report'
+    assert_log_not_contains '^ssh '
+    pass "solo failure captures local container logs without contacting peers"
+}
+
 test_matching_images_launch_cluster
 test_unlimited_memlock_on_every_node
 test_mismatched_image_aborts_before_launch
@@ -264,5 +343,9 @@ test_mixed_image_stores_launch_cluster
 test_changed_config_aborts_before_launch
 test_unreadable_content_aborts_before_launch
 test_missing_head_image_aborts_before_launch
+test_failed_exec_captures_logs_before_cleanup
+test_log_errors_preserve_exec_status_and_cleanup
+test_successful_and_daemon_exec_do_not_dump_logs
+test_solo_failure_captures_only_local_logs
 
-echo "All $TESTS_PASSED launch-cluster image consistency tests passed."
+echo "All $TESTS_PASSED launch-cluster image consistency and diagnostic tests passed."

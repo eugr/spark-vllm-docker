@@ -29,6 +29,9 @@ defaults:
   gpu_memory_utilization: 0.8
 
 env:
+  # Bound PyTorch CUDA reservation during A16 weight preparation on shared RAM.
+  # This allocator cap is independent of vLLM's gpu_memory_utilization budget.
+  PYTORCH_ALLOC_CONF: "per_process_memory_fraction:0.8"
   VLLM_PLE_TABLE_MEMORY: "disk"
   B12X_DISK_BACKEND: "io_uring"
   CUTE_DSL_ARCH: "sm_121a"

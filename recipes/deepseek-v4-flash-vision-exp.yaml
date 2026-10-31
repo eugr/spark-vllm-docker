@@ -21,7 +21,8 @@ defaults:
   port: 8000
   host: 0.0.0.0
   tensor_parallel: 2
-  gpu_memory_utilization: 0.85
+  # Leave room for host and distributed-worker allocations in Spark's shared RAM.
+  gpu_memory_utilization: 0.8
   max_model_len: auto
   block_size: 256
   max_num_seqs: 8

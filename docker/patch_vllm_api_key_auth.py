@@ -12,7 +12,9 @@ from pathlib import Path
 
 
 AUTH_REL = Path("vllm/entrypoints/serve/middleware/authenticate.py")
-CLI_REL = Path("vllm/entrypoints/launchers/cli_args.py")
+CLI_REL = Path("vllm/entrypoints/common/cli_args.py")
+# Upstream #62390 moved these arguments; B12X still uses the launcher layout.
+CLI_RELS = (CLI_REL, Path("vllm/entrypoints/launchers/cli_args.py"))
 
 # Production blocks from PR #58028 at ab14efdfba01.
 OLD_GUARD = '''GUARDED_PREFIX = ("/v1", "/v2", "/inference", "/cohere")
@@ -144,8 +146,14 @@ def main() -> None:
         return
     updates = []
     try:
-        for relative, patcher in ((AUTH_REL, patch_authentication), (CLI_REL, patch_cli_help)):
-            path = args.source_root / relative
+        cli_path = next(
+            (args.source_root / relative for relative in CLI_RELS
+             if (args.source_root / relative).is_file()),
+            None,
+        )
+        if cli_path is None:
+            raise FileNotFoundError("API-key CLI arguments are absent from common and launchers")
+        for path, patcher in ((auth_path, patch_authentication), (cli_path, patch_cli_help)):
             source = path.read_text()
             patched = patcher(source)
             updates.append((path, patched))

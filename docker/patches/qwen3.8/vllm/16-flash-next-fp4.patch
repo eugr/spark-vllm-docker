@@ -3,6 +3,7 @@ Subject: [PATCH] Flash Next FP4 resident CSF scales and loading helpers
 Source-Patch: mods/draft/flash-next-fp4/flash-next-fp4-local.patch
 Source-SHA256: 80192a2d8213d7852d7c10eb982235a71da0f672d117478b8e83bb67b9df0462
 Integration-Base: 355553ac22dca4080929ea8f88a446f15df1f3ba
+Refresh-Base: 24324ef0f667c633ee9bbb9412343d829f7e6d4e
 
 Apply after #60646's CSF decoder and the existing draft vocabulary packaging.
 Keep resident CSF scales opt-in through VLLM_CSF_RESIDENT=1. Preserve the
@@ -1320,7 +1321,7 @@ index 0000000000000000000000000000000000000000..52926815d1d79e8d480fb2b87a73de71
 +            ),
 +        )
 diff --git a/vllm/model_executor/model_loader/default_loader.py b/vllm/model_executor/model_loader/default_loader.py
-index 7fda769fb26b1bff047e424060420855a44b44a9..a01daa7bb91d0fe831eb20412641cf917a99ca49 100644
+index 3159ba2d1daf257d72650cdb0940472f8538660e..013ba42a8fa7470e8520f7337b29d599aa4ed21d 100644
 --- a/vllm/model_executor/model_loader/default_loader.py
 +++ b/vllm/model_executor/model_loader/default_loader.py
 @@ -14,6 +14,7 @@ import torch
@@ -1328,10 +1329,10 @@ index 7fda769fb26b1bff047e424060420855a44b44a9..a01daa7bb91d0fe831eb20412641cf91
  from transformers.utils import SAFE_WEIGHTS_INDEX_NAME
  
 +import vllm.envs as envs
- from vllm.config import ModelConfig
+ from vllm.config import ModelConfig, get_current_vllm_config_or_none
  from vllm.config.load import LoadConfig
  from vllm.logger import init_logger
-@@ -385,10 +386,11 @@ class DefaultModelLoader(BaseModelLoader):
+@@ -390,10 +391,11 @@ class DefaultModelLoader(BaseModelLoader):
          if self.counter_before_loading_weights == 0.0:
              self.counter_before_loading_weights = time.perf_counter()
          # Apply the prefix.

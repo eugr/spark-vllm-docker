@@ -26,9 +26,11 @@ defaults:
   max_num_batched_tokens: 4096
   num_speculative_tokens: 5
   kv_cache_memory_bytes: 8G
-  gpu_memory_utilization: 0.87
+  gpu_memory_utilization: 0.8
 
 env:
+  # Bound cached CUDA reservations during A16 preparation on Spark's shared RAM.
+  PYTORCH_ALLOC_CONF: "per_process_memory_fraction:0.8"
   CUTE_DSL_ARCH: "sm_121a"
   SAFETENSORS_FAST_GPU: "1"
   VLLM_ENABLE_ROCE_ALLREDUCE: "1"

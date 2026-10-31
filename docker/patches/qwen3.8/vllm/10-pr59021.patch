@@ -4,12 +4,15 @@ Subject: [PATCH] [Kernel] Allow steering the unquantized linear backend independ
 Upstream-PR: https://github.com/vllm-project/vllm/pull/59021
 Upstream-Commit: 0d1a683a3471ce352ef5a9aa2d7a9616bd1ac4bf
 Integration-Base: 355553ac22dca4080929ea8f88a446f15df1f3ba
+Refresh-Base: c4f2bb4abbdbad9ed5b0a71acd0bd585056eeab8
+
+Preserve upstream RDNA hybrid prefill dequantization settings and validation.
 
 diff --git a/vllm/config/kernel.py b/vllm/config/kernel.py
-index 3d6eee04ffc07e72c8526bcc92d81e480e1498ff..dd6fe8282a230f8793b431e3c213643d1c7c34f3 100644
+index 18ad1321ea956eadffb80648002f40763619cfd1..b6908e95c5537b1bd7c773acb8300c62ffe96114 100644
 --- a/vllm/config/kernel.py
 +++ b/vllm/config/kernel.py
-@@ -417,6 +417,11 @@ class KernelConfig:
+@@ -427,6 +427,11 @@ class KernelConfig:
      precedence over ``linear_backend``; for example,
      ``{"nvfp4_w4a16": "humming"}``."""
  
@@ -18,10 +21,10 @@ index 3d6eee04ffc07e72c8526bcc92d81e480e1498ff..dd6fe8282a230f8793b431e3c213643d
 +    ``linear_backend`` (which also drives the quantized kernel selector).
 +    "auto" (default) falls back to ``linear_backend``."""
 +
-     @field_validator("moe_backend", mode="before")
-     @classmethod
-     def _normalize_moe_backend(cls, value: Any) -> Any:
-@@ -424,7 +429,7 @@ class KernelConfig:
+     rdna_hybrid_w4a16_prefill_dequant: RDNAHybridW4A16PrefillDequantMode = "disable"
+     """Cache a dense dequantized copy of each weight for the RDNA hybrid W4A16
+     linear kernel's prefill GEMM. Applies only on gfx11/gfx12 RDNA GPUs, where
+@@ -450,7 +455,7 @@ class KernelConfig:
              return value.lower().replace("-", "_")
          return value
  

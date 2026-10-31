@@ -4,28 +4,33 @@ Subject: [PATCH] [Bugfix] Widen the QSA raw-key ring instead of asserting divisi
 Upstream-PR: https://github.com/vllm-project/vllm/pull/54912
 Upstream-Commit: 77b5ae7e2d9ce2dec02ea9bf40fa96ed4e53a071
 Integration-Base: 355553ac22dca4080929ea8f88a446f15df1f3ba
+Refresh-Base: 6aa70c4beca4f85c44b9f04c23f46326d9261f14
 
 diff --git a/tests/models/qwen4_exp/test_config.py b/tests/models/qwen4_exp/test_config.py
-index 7d23c3aed129642f838d4246b640c95b52140222..1ace9ed5111cf42afd3e86d77e74ee865195a4d4 100644
+index 18246dbd08911ad33c6f96faf3a47291b569162b..4ac0d6c89eebccf9758b7559a0e179f59d4d7aa6 100644
 --- a/tests/models/qwen4_exp/test_config.py
 +++ b/tests/models/qwen4_exp/test_config.py
-@@ -15,7 +15,12 @@ from vllm.model_executor.models.config import (
-     Qwen3_5ForConditionalGenerationConfig,
+@@ -17,11 +17,16 @@ from vllm.model_executor.layers.quantization.compressed_tensors.utils import (
+ from vllm.model_executor.models.config import (
      Qwen4ExpForConditionalGenerationConfig,
  )
 +from vllm.models.qwen4_exp.common.qsa_cache import (
 +    QSA_RING_MAX_WIDENING,
 +    qsa_ring_capacity,
 +)
+ from vllm.models.qwen4_exp.nvidia.model import (
+     Qwen4ExpForCausalLM,
+     Qwen4ExpForConditionalGeneration,
+ )
  from vllm.models.qwen4_exp.nvidia.model_state import Qwen4ExpModelState
 +from vllm.utils.math_utils import cdiv
  from vllm.v1.worker.gpu.model_states.mamba_hybrid import MambaHybridModelState
  
  from ...utils import spawn_new_process_for_each_test
-@@ -319,3 +324,39 @@ def test_qwen4_exp_model_state_prepares_stable_dummy_ngram_inputs() -> None:
+@@ -319,3 +324,39 @@ def test_qkv_proj_mapping_allows_bf16_indexer(model_cls) -> None:
+         ignore=["model.layers.3.self_attn.indexer.index_qk_proj"],
+         fused_mapping=model_cls.packed_modules_mapping,
      )
-     assert second["query_start_loc"].data_ptr() == query_start_loc_ptr
-     assert second["ngram_context"].data_ptr() == ngram_context_ptr
 +
 +
 +@pytest.mark.parametrize("block_size", [848, 1616])
@@ -63,7 +68,7 @@ index 7d23c3aed129642f838d4246b640c95b52140222..1ace9ed5111cf42afd3e86d77e74ee86
 +    with pytest.raises(ValueError, match="QSA ring"):
 +        qsa_ring_capacity(4, 13, block_size)
 diff --git a/vllm/models/qwen4_exp/common/qsa_cache.py b/vllm/models/qwen4_exp/common/qsa_cache.py
-index f960dea071947394459a64388707c720c20bebec..35f271e4008c7fbf728502c3560a48c401db5aee 100644
+index 5eba092eec25d792ce2b1ca1782c25cacf8f2a9c..9a282ac677d130eab31ba1e5a8d4a325c9221e45 100644
 --- a/vllm/models/qwen4_exp/common/qsa_cache.py
 +++ b/vllm/models/qwen4_exp/common/qsa_cache.py
 @@ -21,6 +21,7 @@ from torch import nn
@@ -139,7 +144,7 @@ index f960dea071947394459a64388707c720c20bebec..35f271e4008c7fbf728502c3560a48c4
  class QSAKeyStateCache(_QSAStateCache):
      """Raw BF16 key, optionally followed by exact int64 MRoPE positions."""
  
-@@ -842,16 +894,10 @@ class QSAKeyStateCache(_QSAStateCache):
+@@ -840,16 +892,10 @@ class QSAKeyStateCache(_QSAStateCache):
          return self.kv_cache[..., self.rope_position_offset :].view(torch.int64)
  
      def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
@@ -149,7 +154,7 @@ index f960dea071947394459a64388707c720c20bebec..35f271e4008c7fbf728502c3560a48c4
 -        # the scheduler block size). Anything narrower lets a rejected draft row
 -        # overwrite a committed key the next step needs to close the group.
 -        span = self.compress_ratio + vllm_config.num_speculative_tokens
--        capacity = self.compress_ratio * cdiv(span, self.compress_ratio)
+-        capacity = round_up(span, self.compress_ratio)
 -        assert self.cache_config.block_size % capacity == 0, (
 -            f"QSA ring capacity {capacity} must divide the attention block "
 -            f"size {self.cache_config.block_size}"

@@ -8,6 +8,7 @@ Base-Commit: 4e0681ed5654c1d8afb3c104d4381afd08529de8
 Upstream-PR: https://github.com/vllm-project/vllm/pull/58815
 Upstream-Commit: a7ebbe5fa1fe5984e4d0f1f2d65ab3501d6ba9ac
 Integration-Base: 355553ac22dca4080929ea8f88a446f15df1f3ba
+Test-Refresh-Base: 24324ef0f667c633ee9bbb9412343d829f7e6d4e
 
 NVFP4 PLE support from #56273 is already in the integration base.
 Carry the remaining host-file-gather integration from the recorded PR
@@ -135,29 +136,29 @@ index 818f51543857a403c4beafed8c945db72c55441c..7d23c3aed129642f838d4246b640c95b
      model_state = object.__new__(Qwen4ExpModelState)
      model_state.uses_ngram_embedding = True
 diff --git a/tests/models/qwen4_exp/test_ple.py b/tests/models/qwen4_exp/test_ple.py
-index 119ec3b1ac8ffd69bc24277ceae4972cb6d9568e..0115e2fb74510dc082421b5f8349d8ff131b346b 100644
+index b4382ebd15b236142e5942457967fb1d5d979efb..b3dff33ac8abd41fac68c892f23bc29751d79011 100644
 --- a/tests/models/qwen4_exp/test_ple.py
 +++ b/tests/models/qwen4_exp/test_ple.py
-@@ -1,13 +1,18 @@
- # SPDX-License-Identifier: Apache-2.0
+@@ -2,13 +2,18 @@
  # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
  
+ import logging
 +import mmap
 +import os
  from dataclasses import dataclass
- from functools import partial
  from itertools import accumulate
 +from pathlib import Path
  from types import SimpleNamespace
  
  import pytest
  import torch
+ from compressed_tensors.quantization import QuantizationArgs
 +from safetensors import safe_open
 +from safetensors.torch import load, load_file, save_file
  from torch import nn
  from torch.nn import functional as F
  from transformers import Qwen4ExpTextConfig
-@@ -15,6 +20,7 @@ from transformers import Qwen4ExpTextConfig
+@@ -16,6 +21,7 @@ from transformers import Qwen4ExpTextConfig
  import vllm.model_executor.layers.vocab_parallel_embedding as embedding_module
  import vllm.model_executor.parameter as parameter_module
  import vllm.models.qwen4_exp.common.ngram_embedding as ngram_embedding_module
@@ -165,7 +166,7 @@ index 119ec3b1ac8ffd69bc24277ceae4972cb6d9568e..0115e2fb74510dc082421b5f8349d8ff
  from tests.v1.attention.utils import BatchSpec, create_common_attn_metadata
  from vllm.config import SpeculativeConfig, VllmConfig
  from vllm.config.compilation import CUDAGraphMode
-@@ -40,6 +46,7 @@ from vllm.models.qwen4_exp.nvidia.ngram_embedding import (
+@@ -49,6 +55,7 @@ from vllm.models.qwen4_exp.nvidia.ngram_embedding import (
      Qwen4ExpNGramEmbedding,
      Qwen4ExpPLEDeviceEmbedding,
      Qwen4ExpPLEEmbeddingMethod,
@@ -173,8 +174,8 @@ index 119ec3b1ac8ffd69bc24277ceae4972cb6d9568e..0115e2fb74510dc082421b5f8349d8ff
      Qwen4ExpPLEFp8EmbeddingMethod,
      Qwen4ExpPLENvFp4EmbeddingMethod,
      Qwen4ExpPLEPinnedHostEmbedding,
-@@ -1042,6 +1049,466 @@ def test_ple_fp8_embedding_supports_mixed_precision_config() -> None:
-         )
+@@ -1111,6 +1118,466 @@ def test_ple_fp8_embedding_supports_mixed_precision_config(
+     )
  
  
 +def _patch_ple_construction(
