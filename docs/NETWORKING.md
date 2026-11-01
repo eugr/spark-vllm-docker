@@ -151,9 +151,13 @@ On every node it:
    the current user's `authorized_keys`. A block prepended to `~/.ssh/config`
    selects the key and a dedicated verified host-key file for cluster IPs.
    This enables SSH over management and directly reachable CX7 addresses.
-4. Applies Netplan on workers and then the head. It checks interface-bound
-   pings at the selected MTU without fragmentation on both rails in both directions,
-   then checks passwordless SSH from every
+4. Applies Netplan on workers and then the head. Before sending connectivity
+   probes, it waits up to 60 seconds per node for the planned CX7 addresses,
+   link/carrier state, MTUs, and direct routes with the expected source addresses.
+   All nodes must be ready before it checks interface-bound
+   pings at the selected MTU without fragmentation on both rails in both directions.
+   Each ping gets up to three attempts, with one second between failed attempts.
+   It then checks passwordless SSH from every
    node to every other management IP and each directly reachable CX7 IP.
 5. Saves an autodiscovery-compatible `.env` beside `setup-cluster.sh` on the
    head, after all nodes pass verification. Existing unrelated settings and
@@ -240,7 +244,8 @@ Docker group list in the current head login; a new login is required to refresh 
 Repairs can restore missing helper-managed files, correct file permissions,
 reapply saved Netplan settings for runtime drift, add missing Docker membership,
 and save missing launch configuration. Workers are repaired before the head,
-then checks run again. Existing journals keep the original restore baseline.
+then the same CX7 readiness wait runs before connectivity checks run again.
+Existing journals keep the original restore baseline.
 Recovery images, including private SSH keys and any `.env` credentials, stay in
 each node's root-only journal. Older journals can recover matching Netplan files
 from their original backups; missing files without a recoverable after-image
