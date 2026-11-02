@@ -60,6 +60,26 @@ upstream commit `397b9607c83cf201f3c44684c555c3698869b6bd`.
 
 ## Integration and refresh
 
+The November 2 refresh fixes pipeline 384, job 700,
+which stopped at patch 06 on vLLM `5c8ae7c74aaa99d1f7fbeea942fd7282e3413810`.
+Mooncake's new `supports_divergent_local_hybrid_hits` property now coexists with
+the patch's lookahead-hash capability. Replaying the remaining series exposed
+additional conflicts in patches 07, 08, and 16. Their refreshed sections keep
+upstream's removal of the batch-invariant W4A16 test, DeepSeek indexer
+autotuning, expanded MonoKernel documentation, and worker VMM driver import.
+Dynamic NVFP4 logits warmup and host-heap trimming remain intact.
+
+All 15 entries replay from fresh archives of the failed revision and current
+main `bb197a852fbc3bf0a2b15bd57189dde616bf12c5`, without historical patch-base
+objects: merged patch 01 skips and the remaining 14 apply. All 19 subsequent
+source patchers and CUTLASS pinning pass; all 108 changed Python files compile
+on both revisions. The 37-test series suite has 35 passes and two optional
+tensor-dependency skips; all 109 build checks pass. New regressions exercise
+both Mooncake capability properties and preservation of indexer autotuning
+with dynamic NVFP4, including draft-expanded token buckets and attention
+skipping. GPU compilation and inference remain for CI. Pipeline 384's B12X
+build, tests, and image publication succeeded independently.
+
 The October 31 refresh follows pipeline 382's patch 06 conflict on vLLM
 `87cb835db2bbbaa03e3faa6ae588ba92dce1eea4`. Upstream added a Qwen3.5 multi-module
 MTP test and imports shared with patches 04 and 06. Their refreshed test sections

@@ -684,6 +684,36 @@ class PatchSeriesTests(unittest.TestCase):
                         call.kwargs["use_eagle"], eagle and not lookahead and group == 0
                     )
 
+    def test_mooncake_lookahead_preserves_divergent_hybrid_hits(self):
+        upstream, updated = self.apply_upstream_excerpt(
+            "06-pr50897.patch",
+            "vllm/distributed/kv_transfer/kv_connector/v1/mooncake/mooncake_connector.py",
+            "mooncake_connector_hybrid_upstream.py",
+        )
+        before, after = ast.parse(upstream), ast.parse(updated)
+        connector = after.body[0]
+        added = "supports_lookahead_block_hashes"
+        self.assertEqual(sum(getattr(n, "name", None) == added
+                             for n in connector.body), 1)
+        connector.body = [n for n in connector.body
+                          if getattr(n, "name", None) != added]
+        # Preserve upstream's property, role checks, and Mamba-group detection.
+        self.assertEqual(ast.dump(before), ast.dump(after))
+        namespace = {
+            "KVConnectorBase_V1": type("KVConnectorBase_V1", (), {}),
+            "SupportsHMA": type("SupportsHMA", (), {}),
+            "CacheHitSource": SimpleNamespace(P2P="p2p"),
+        }
+        exec("from __future__ import annotations\n" + updated, namespace)
+        connector_class = namespace["MooncakeConnector"]
+        connector = connector_class.__new__(connector_class)
+        for pulls_mamba_state in (False, True):
+            with self.subTest(pulls_mamba_state=pulls_mamba_state):
+                connector._pulls_mamba_state = pulls_mamba_state
+                self.assertIs(connector.supports_divergent_local_hybrid_hits,
+                              pulls_mamba_state)
+                self.assertIs(connector.supports_lookahead_block_hashes, True)
+
     def test_mooncake_lookahead_preserves_decode_replay_boundary(self):
         _, updated = self.apply_upstream_excerpt(
             "06-pr50897.patch",
@@ -835,11 +865,11 @@ class PatchSeriesTests(unittest.TestCase):
                 self.assertEqual(engine.prefix_hash_config.hash_block_size, 16)
                 self.assertEqual(engine.prefix_hash_config.none_hash, "none_hash")
 
-    def test_dynamic_nvfp4_preserves_upstream_batch_invariant_test(self):
+    def test_dynamic_nvfp4_preserves_upstream_kernel_selection_tests(self):
         upstream, updated = self.apply_upstream_excerpt(
             "07-pr54614.patch",
             "tests/kernels/quantization/test_nvfp4_kernel_selection.py",
-            "nvfp4_batch_invariant_upstream.py",
+            "nvfp4_kernel_selection_upstream.py",
         )
         before, after = ast.parse(upstream), ast.parse(updated)
         after.body = [n for n in after.body if not (
@@ -848,6 +878,81 @@ class PatchSeriesTests(unittest.TestCase):
             or isinstance(n, ast.ImportFrom) and n.module == "collections.abc"
         )]
         self.assertEqual(ast.dump(before), ast.dump(after))
+
+    def test_dynamic_nvfp4_warmup_preserves_indexer_autotuning(self):
+        _, updated = self.apply_upstream_excerpt(
+            "07-pr54614.patch",
+            "vllm/model_executor/warmup/kernel_warmup.py",
+            "nvfp4_indexer_warmup_upstream.py",
+        )
+        module = ast.parse(updated)
+        # Substitute GPU imports while executing the real warmup control flow.
+        for function in module.body:
+            function.body = [n for n in function.body
+                             if not isinstance(n, (ast.Import, ast.ImportFrom))]
+        fi_utils = SimpleNamespace(
+            autotune=Mock(side_effect=lambda **kwargs: nullcontext()),
+            flashinfer_get_hybrid_num_tokens_buckets=lambda n: (n,),
+        )
+        indexer = Mock()
+        randomize = Mock(return_value="randomized hidden states")
+        namespace = {
+            "fi_utils": fi_utils, "autotune_indexer_wq_b": indexer,
+            "torch": SimpleNamespace(rand_like=randomize), "logger": Mock(),
+            "_flashinfer_deferred_moe_token_counts": lambda runner: (4,),
+        }
+        exec(compile(module, "warmup_fixture.py", "exec"), namespace)
+        model = SimpleNamespace(compute_logits=Mock())
+        config = SimpleNamespace(
+            linear_backend="auto", nvfp4_dynamic_max_tokens=2,
+            nvfp4_dynamic_silu_max_tokens=3,
+        )
+        runner = SimpleNamespace(
+            scheduler_config=SimpleNamespace(max_num_batched_tokens=16),
+            vllm_config=SimpleNamespace(
+                kernel_config=config,
+                compilation_config=SimpleNamespace(cudagraph_capture_sizes=[0, 1, 2, 4, 16]),
+            ),
+            speculator=SimpleNamespace(num_query_per_req=3),
+            max_num_reqs=4, max_num_tokens=16, get_model=lambda: model,
+            _dummy_run=Mock(),
+        )
+        for dynamic in (False, True):
+            for skip_attn in (False, True):
+                for sample in (None, SimpleNamespace(shape=(3, 8))):
+                    with self.subTest(dynamic=dynamic, skip_attn=skip_attn,
+                                      hidden_states=sample is not None):
+                        config.linear_backend = "nvfp4_dynamic" if dynamic else "auto"
+                        runner._dummy_run.reset_mock()
+                        runner._dummy_run.return_value = (None, sample)
+                        indexer.reset_mock()
+                        model.compute_logits.reset_mock()
+                        randomize.reset_mock()
+                        fi_utils.autotune.reset_mock()
+                        namespace["_run_flashinfer_autotune_dummy_runs"](
+                            runner, skip_attn=skip_attn,
+                        )
+                        counts = [16, 1, 2, 3, 4] if dynamic else [16, 4]
+                        self.assertEqual(
+                            [c.kwargs["num_tokens"] for c in runner._dummy_run.call_args_list],
+                            counts,
+                        )
+                        for call in runner._dummy_run.call_args_list:
+                            self.assertEqual(call.kwargs.get("skip_attn", False), skip_attn)
+                        expected_buckets = [max(n, min(n, 4, 16 // 3) * 3) for n in counts]
+                        self.assertEqual([c.args for c in indexer.call_args_list],
+                                         [(model, n) for n in expected_buckets])
+                        self.assertEqual(
+                            [c.kwargs for c in fi_utils.autotune.call_args_list
+                             if "round_up" in c.kwargs],
+                            [{"tuning_buckets": (n,), "round_up": True}
+                             for n in expected_buckets],
+                        )
+                        logits_runs = len(counts) if dynamic and sample is not None else 0
+                        self.assertEqual(model.compute_logits.call_count, logits_runs)
+                        self.assertEqual(randomize.call_count, logits_runs)
+                        for call in model.compute_logits.call_args_list:
+                            self.assertEqual(call.args, ("randomized hidden states",))
 
     def test_dynamic_nvfp4_preserves_fused_activation_for_other_kernels(self):
         _, updated = self.apply_upstream_excerpt(

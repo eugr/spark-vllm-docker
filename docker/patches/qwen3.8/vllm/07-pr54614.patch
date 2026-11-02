@@ -4,6 +4,10 @@ Subject: [PATCH] [PR #54614] [Kernel] Dynamic NVFP4 W4A4/W4A16 selection with sh
 Upstream-PR: https://github.com/vllm-project/vllm/pull/54614
 Upstream-Commit: 5feaedcf9b4fa18d9e0b817153d681bededdd4d9
 Integration-Base: 564ac0de1b228568cafcbfbe8ccaccc82d6023eb
+Refresh-Base: 5c8ae7c74aaa99d1f7fbeea942fd7282e3413810
+
+Preserve upstream's removal of the batch-invariant W4A16 test and its imports.
+Keep DeepSeek indexer autotuning alongside dynamic NVFP4 logits warmup.
 
 Preserve the quantized-input shape and autotune cache-key tests from main.
 Keep round_up=True and full-model autotuning after removal of the obsolete
@@ -647,7 +651,7 @@ index 47c25d046d2c13df9f5a437d5e0da1c933f2e569..c7622f7a6541093571a139c7179d8cbf
      a_fp4,
      b_fp4,
 diff --git a/tests/kernels/quantization/test_nvfp4_kernel_selection.py b/tests/kernels/quantization/test_nvfp4_kernel_selection.py
-index ec9ebc98a97e33b9682a04249f7962582121914c..0ab08610a52af1cd96d376defd517e324f603af0 100644
+index ba069dbad1767a29caebb9fa818b1f2e59852f7e..57fd844ec86701d4ff5d309835056a6faae8f542 100644
 --- a/tests/kernels/quantization/test_nvfp4_kernel_selection.py
 +++ b/tests/kernels/quantization/test_nvfp4_kernel_selection.py
 @@ -2,6 +2,8 @@
@@ -658,8 +662,8 @@ index ec9ebc98a97e33b9682a04249f7962582121914c..0ab08610a52af1cd96d376defd517e32
 +
  import pytest
 
- import vllm.envs as envs
-@@ -25,6 +27,10 @@ W4A4_KERNELS_ON_SM12X = (
+ from vllm.model_executor.kernels.linear import (
+@@ -22,6 +24,10 @@ W4A4_KERNELS_ON_SM12X = (
  )
 
 
@@ -670,10 +674,10 @@ index ec9ebc98a97e33b9682a04249f7962582121914c..0ab08610a52af1cd96d376defd517e32
  @pytest.mark.parametrize("w4a4_kernel", W4A4_KERNELS_ON_SM12X)
  def test_w4a16_kernel_does_not_precede_w4a4_kernels(w4a4_kernel):
      candidates = _POSSIBLE_NVFP4_KERNELS[PlatformEnum.CUDA]
-@@ -46,3 +52,92 @@ def test_batch_invariant_w4a16_selects_humming(monkeypatch):
-         )
-     kernel = init_nvfp4_linear_kernel(use_a16=True)
-     assert isinstance(kernel, HummingNvFp4LinearKernel)
+@@ -30,3 +36,92 @@ def test_w4a16_kernel_does_not_precede_w4a4_kernels(w4a4_kernel):
+         f"{w4a4_kernel.__name__} must be preferred over "
+         f"{FlashInferCuteDslNvFp4W4A16LinearKernel.__name__}"
+     )
 +
 +
 +def test_dynamic_rejects_uncalibrated_weight_only_checkpoint(monkeypatch):
@@ -1337,10 +1341,10 @@ index 46320b2c8eae6dd151ea2988a2a53561bcd1fa95..6680c2c34b261684c0ac008b993faeee
          if self.expert_gate is not None:
              out = F.sigmoid(self.expert_gate(x)[0]) * out
 diff --git a/vllm/model_executor/warmup/kernel_warmup.py b/vllm/model_executor/warmup/kernel_warmup.py
-index 0e706a390541af3b3a15d6ae43df8a36fdbb1588..2b84d0ae3b24ad34c78ddbe32ff4fd2f2234cd0b 100644
+index f7171219bfd781999c82fad881eabbad621e9848..facc16e910c57222540c925e5c4a213e6eda0b68 100644
 --- a/vllm/model_executor/warmup/kernel_warmup.py
 +++ b/vllm/model_executor/warmup/kernel_warmup.py
-@@ -342,6 +342,19 @@ def _flashinfer_autotune_token_counts(runner: "GPUModelRunner") -> tuple[int, ..
+@@ -387,6 +387,19 @@ def _flashinfer_autotune_token_counts(runner: "GPUModelRunner") -> tuple[int, ..
      max_tokens = runner.scheduler_config.max_num_batched_tokens
      # Tune the widest bucket set first so bounded passes reuse its configs.
      token_counts = [max_tokens]
@@ -1360,7 +1364,7 @@ index 0e706a390541af3b3a15d6ae43df8a36fdbb1588..2b84d0ae3b24ad34c78ddbe32ff4fd2f
      token_counts.extend(_flashinfer_deferred_moe_token_counts(runner))
      return tuple(dict.fromkeys(token_counts))
  
-@@ -379,13 +392,23 @@ def _run_flashinfer_autotune_dummy_runs(
+@@ -425,11 +438,21 @@ def _run_flashinfer_autotune_dummy_runs(
          # Round M up to match serving-time bucket selection for non-bucket M.
          # See https://github.com/flashinfer-ai/flashinfer/issues/5450
          with fi_utils.autotune(tuning_buckets=tuning_buckets, round_up=True):
@@ -1382,6 +1386,4 @@ index 0e706a390541af3b3a15d6ae43df8a36fdbb1588..2b84d0ae3b24ad34c78ddbe32ff4fd2f
 +                        runner.get_model().compute_logits(
 +                            torch.rand_like(sample_hidden_states)
 +                        )
- 
- 
- def _autotune_cache_fingerprint(path: Path) -> tuple[str, int] | None:
+             autotune_indexer_wq_b(runner.get_model(), max_tuning_tokens)

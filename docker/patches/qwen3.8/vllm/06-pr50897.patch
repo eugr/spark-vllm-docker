@@ -3,6 +3,10 @@ Subject: [PATCH] [PR #50897] Lookahead-aware prefix cache hashing
 Upstream-PR: https://github.com/vllm-project/vllm/pull/50897
 Upstream-Commit: 7f7139246af9793d0cfb2a1be60068a5fba5604c
 Integration-Base: 564ac0de1b228568cafcbfbe8ccaccc82d6023eb
+Refresh-Base: 5c8ae7c74aaa99d1f7fbeea942fd7282e3413810
+
+Preserve Mooncake's divergent-local-hybrid-hit capability alongside lookahead
+hash support.
 
 Preserve the draft-head/adaptive-depth tests and current upstream cache tests.
 Retain the Mooncake partial-tail integration: lookahead proof replaces the
@@ -1219,10 +1223,10 @@ index 8997571407d5c327fb9e35d709c2e43a1942f537..42435ef0d0f609d3c0b859030654b707
 
          Returns:
 diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/mooncake_connector.py b/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/mooncake_connector.py
-index cabec9a0c74408546aa7498ee7c970ec50d54731..a85f8c8760c9a27702a97f7f0a3e4b482af46b64 100644
+index 8fa9b69f55e0a2814829d479c5d3fce31d8671d0..88635c2c29ae9b014eb3deba2de645ce98018a65 100644
 --- a/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/mooncake_connector.py
 +++ b/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/mooncake_connector.py
-@@ -771,6 +771,11 @@ class MooncakeConnectorMetadata(KVConnectorMetadata):
+@@ -772,6 +772,11 @@ class MooncakeConnectorMetadata(KVConnectorMetadata):
  class MooncakeConnector(KVConnectorBase_V1, SupportsHMA):
      _cache_hit_source = CacheHitSource.P2P
 
@@ -1231,9 +1235,9 @@ index cabec9a0c74408546aa7498ee7c970ec50d54731..a85f8c8760c9a27702a97f7f0a3e4b48
 +        # P/D transfers identify physical blocks rather than cache hashes.
 +        return True
 +
-     def __init__(
-         self,
-         vllm_config: VllmConfig,
+     @property
+     def supports_divergent_local_hybrid_hits(self) -> bool:
+         # A decode pulls the unhashed blocks of every transfer group, so the
 diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/connector.py b/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/connector.py
 index a91167234da41797399432b242e48a8c5df3d99d..7074c94c215eb5418a6d14feed52eb0fbc3a7683 100644
 --- a/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/connector.py
