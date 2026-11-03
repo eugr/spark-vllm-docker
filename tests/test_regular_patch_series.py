@@ -248,45 +248,154 @@ class PatchSeriesTests(unittest.TestCase):
         self.assertEqual(ast.dump(before), ast.dump(after))
         self.assertEqual(self.git("status", "--porcelain"), "")
 
-    def test_mtp_patches_preserve_upstream_multi_module_test(self):
-        # Upstream 87cb835db2 already imports torch and the spec-decode metric
-        # helper for its new per-module draft test. Replay both overlapping
-        # patches from that snapshot, without any historical patch-base blobs.
-        path = "tests/v1/e2e/spec_decode/mtp/qwen3_5/test_mtp.py"
-        upstream = (PROJECT / "tests/fixtures/qwen38-patch-series/mtp_modules_upstream.py").read_text()
-        target = self.source / path
-        target.parent.mkdir(parents=True)
-        target.write_text(upstream)
-        self.commit()
-        names = ("04-pr60068.patch", "06-pr50897.patch")
-        for name in names:
-            patch_text = (PROJECT / "docker/patches/qwen3.8/vllm" / name).read_text()
-            section = next(s for s in re.split(r"(?m)(?=^diff --git )", patch_text)
-                           if s.startswith(f"diff --git a/{path} "))
-            (self.series / name).write_text(section)
-        (self.series / "series").write_text("\n".join(names) + "\n")
-
-        result = self.apply()
-        self.assertEqual(result.returncode, 0, result.stderr)
-        updated = target.read_text()
-        compile(updated, path, "exec")
+    def test_adaptive_mtp_preserves_upstream_module_and_prefix_cache_tests(self):
+        upstream, updated = self.apply_upstream_excerpt(
+            "04-pr60068.patch", "tests/v1/e2e/spec_decode/mtp/qwen3_5/test_mtp.py",
+            "mtp_modules_upstream.py",
+        )
         before, after = ast.parse(upstream), ast.parse(updated)
-        additions = {"test_mtp_draft_confidence_stop",
-                     "test_qwen3_5_mtp_prefix_cache_reuses_last_safe_block"}
-        functions = [n.name for n in after.body if isinstance(n, ast.FunctionDef)]
-        for name in additions:
-            self.assertEqual(functions.count(name), 1)
-        after.body = [n for n in after.body if not (
-            isinstance(n, ast.FunctionDef) and n.name in additions
-            or isinstance(n, ast.ImportFrom)
-            and n.module in ("tests.models.utils", "vllm.distributed")
-        )]
-        vllm_import = next(n for n in after.body if isinstance(n, ast.ImportFrom)
-                           and n.module == "vllm")
-        vllm_import.names = [n for n in vllm_import.names if n.name == "SamplingParams"]
-        # Preserve every upstream import, helper, test body, and decorator.
+        added = "test_mtp_draft_confidence_stop"
+        self.assertEqual(sum(getattr(n, "name", None) == added for n in after.body), 1)
+        after.body = [n for n in after.body if getattr(n, "name", None) != added]
         self.assertEqual(ast.dump(before), ast.dump(after))
-        self.assertEqual(self.git("status", "--porcelain"), "")
+
+    def test_adaptive_depth_preserves_decode_graph_eligibility(self):
+        _, updated = self.apply_upstream_excerpt(
+            "04-pr60068.patch", "vllm/v1/worker/gpu/model_runner.py",
+            "decode_graph_dispatch_upstream.py",
+            ("+            max_query_len = int(batch_req_state",),
+        )
+        namespace = {}
+        exec(updated, namespace)
+        runner = namespace["Runner"]()
+        runner.pcp_manager = None
+        scheduler = SimpleNamespace(
+            num_scheduled_tokens={"request": 5}, total_num_scheduled_tokens=5,
+        )
+        for eligible, expected in ((True, 2), (False, None)):
+            state = SimpleNamespace(
+                num_tokens=2, decode_graph_eligible=eligible,
+                num_scheduled_tokens=SimpleNamespace(max=lambda: 2),
+            )
+            runner.gather_batch_req_state = lambda *args: (state, None)
+            self.assertEqual(runner.prepare_dispatch(scheduler, False), (2, expected))
+        runner.gather_batch_req_state = lambda *args: (None, None)
+        self.assertEqual(runner.prepare_dispatch(scheduler, True), (5, 5))
+
+    def test_loader_copy_preserves_upstream_mmap_prefaulting(self):
+        _, updated = self.apply_upstream_excerpt(
+            "17-flash-next-b12x-loader.patch", "vllm/model_executor/utils.py",
+            "weight_copy_upstream.py",
+        )
+        events = []
+
+        class Source:
+            def numel(self):
+                return self.size
+
+            def is_contiguous(self):
+                return self.contiguous
+
+            def reshape(self, *args):
+                return self
+
+            def view(self, *args):
+                return self
+
+            def __getitem__(self, index):
+                return self
+
+            def sum(self):
+                events.append("prefault")
+
+        source = Source()
+        destination = SimpleNamespace(dtype="bf16", device="cuda")
+
+        def transfer(dst, src):
+            self.assertIs(dst, destination)
+            self.assertIs(src, source)
+            events.append("transfer")
+            return dst
+
+        namespace = {
+            "torch": SimpleNamespace(uint8="uint8"),
+            "mmap": SimpleNamespace(PAGESIZE=4096),
+        }
+        exec("from __future__ import annotations\n" + updated, namespace)
+        cases = [
+            ("cpu", "bf16", 16, True, True, 2),
+            ("cpu", "bf16", 1, True, True, 0),
+            ("cpu", "fp32", 16, True, True, 0),
+            ("cpu", "bf16", 16, False, True, 0),
+            ("cpu", "bf16", 16, True, False, 0),
+            ("meta", "bf16", 16, True, True, 0),
+            ("cuda", "bf16", 16, True, True, 0),
+        ]
+        with patch.dict("sys.modules", {
+            "vllm.model_executor.weight_transfer": SimpleNamespace(copy_weight=transfer),
+        }):
+            for device, dtype, size, contiguous, integrated, touches in cases:
+                with self.subTest(device=device, dtype=dtype, size=size,
+                                  contiguous=contiguous, integrated=integrated):
+                    events.clear()
+                    source.device = SimpleNamespace(type=device)
+                    source.dtype, source.size, source.contiguous = dtype, size, contiguous
+                    namespace["_is_integrated_gpu"] = lambda device: integrated
+                    self.assertIs(namespace["copy_weight_"](destination, source), destination)
+                    self.assertEqual(events, ["prefault"] * touches + ["transfer"])
+
+    def test_mamba_graph_inputs_alias_buffers_and_preserve_fallback_padding(self):
+        try:
+            import torch
+        except ImportError:
+            self.skipTest("CPU tensor checks require torch")
+        _, updated = self.apply_upstream_excerpt(
+            "18-pr65182.patch", "vllm/v1/attention/backends/mamba_attn.py",
+            "mamba_graph_inputs_upstream.py",
+            ("+    def bind_mrv2_graph_inputs(", "+            assert state_indices_tensor_d"),
+        )
+        namespace = {"torch": torch, "NULL_BLOCK_ID": -1}
+        exec("from __future__ import annotations\n" + updated, namespace)
+        cls = namespace["BaseMambaAttentionMetadataBuilder"]
+        for depth in (0, 2):
+            for bind in (False, True):
+                with self.subTest(depth=depth, bind=bind):
+                    builder = cls.__new__(cls)
+                    builder.use_spec_decode = depth > 0
+                    builder.decode_cudagraph_max_bs = 8
+                    builder.compilation_config = SimpleNamespace(
+                        cudagraph_mode=SimpleNamespace(has_full_cudagraphs=lambda: True),
+                    )
+                    aligned = torch.arange(8 * (1 + depth), dtype=torch.int32).view(8, -1)
+                    accepted = torch.arange(1, 9, dtype=torch.int32) if depth else None
+                    builder.state_indices_tensor_d = torch.empty_like(aligned)
+                    if depth:
+                        builder.decode_num_accepted_tokens = torch.empty_like(accepted)
+                    if bind:
+                        builder.bind_mrv2_graph_inputs(aligned, accepted)
+                        self.assertIs(builder.state_indices_tensor_d, aligned)
+                        if depth:
+                            self.assertIs(builder.decode_num_accepted_tokens, accepted)
+                        with self.assertRaises(AssertionError):
+                            builder.bind_mrv2_graph_inputs(aligned[:2], accepted)
+                    expected = aligned[:2].clone()
+                    # Aliased graph inputs must avoid even an in-place self-copy.
+                    guard = (patch.object(torch.Tensor, "copy_", side_effect=AssertionError(
+                        "graph inputs were copied")) if bind else nullcontext())
+                    with guard:
+                        indices, counts = builder.stage(
+                            SimpleNamespace(num_prefills=0, num_decodes=2, num_reqs=4),
+                            aligned[:2], None if accepted is None else accepted[:2],
+                            torch.arange(5, dtype=torch.int32),
+                        )
+                    self.assertEqual(indices.data_ptr(), builder.state_indices_tensor_d.data_ptr())
+                    torch.testing.assert_close(indices[:2], expected)
+                    self.assertTrue(torch.all(indices[2:] == -1))
+                    if depth:
+                        self.assertEqual(counts.data_ptr(), builder.decode_num_accepted_tokens.data_ptr())
+                        self.assertEqual(counts.tolist(), [1, 2, 1, 1])
+                    else:
+                        self.assertIsNone(counts)
 
     def test_qsa_ring_patch_applies_after_upstream_indexer_rename(self):
         # #64110 moved the cache module and renamed both cache classes.
@@ -532,10 +641,12 @@ class PatchSeriesTests(unittest.TestCase):
         statuses = SimpleNamespace(WAITING_FOR_STREAMING_REQ="streaming", WAITING="waiting")
         namespace = {"RequestStatus": statuses}
         exec("from __future__ import annotations\n" + updated, namespace)
-        for token_count, computed, plain_hashes, lookahead_hashes in (
-            (9, 3, 2, 1), (8, 3, 1, 1), (1, 0, 0, 0),
+        for token_count, computed, retained_by_depth in (
+            (9, 3, (2, 1, 1, 1, 1, 0)),
+            (8, 3, (1, 1, 1, 1, 0, 0)),
+            (1, 0, (0, 0, 0, 0, 0, 0)),
         ):
-            for lookahead in (False, True):
+            for lookahead, retained in enumerate(retained_by_depth):
                 with self.subTest(tokens=token_count, lookahead=lookahead):
                     runner = namespace["Scheduler"]()
                     runner.hash_block_size = 4
@@ -563,7 +674,6 @@ class PatchSeriesTests(unittest.TestCase):
                     self.assertEqual(session._all_token_ids, tokens[:-1] + [20, 21])
                     self.assertEqual(session.prompt_token_ids, session._all_token_ids)
                     self.assertEqual(session._output_token_ids, [])
-                    retained = lookahead_hashes if lookahead else plain_hashes
                     self.assertEqual(session.block_hashes, ["block0", "block1"][:retained])
                     session.update_block_hashes.assert_called_once_with()
                     self.assertEqual(runner.num_waiting_for_streaming_input, 0)
@@ -585,160 +695,6 @@ class PatchSeriesTests(unittest.TestCase):
         )
         self.assertEqual(config.unsupported_features(),
                          ["speculative draft_token_map", "Parse 3.5 MTP"])
-
-    def test_lookahead_connector_gating_preserves_upstream_multi_token_hashing(self):
-        upstream, updated = self.apply_upstream_excerpt(
-            "06-pr50897.patch", "vllm/v1/core/kv_cache_utils.py",
-            "lookahead_hashing_merged_upstream.py",
-            ("+def get_num_hash_lookahead_tokens(",),
-        )
-        after = ast.parse(updated)
-        after.body = [n for n in after.body
-                      if getattr(n, "name", None) != "get_num_hash_lookahead_tokens"]
-        self.assertEqual(ast.dump(ast.parse(upstream)), ast.dump(after))
-        namespace = {}
-        exec("from __future__ import annotations\n" + updated, namespace)
-        resolve = namespace["get_num_hash_lookahead_tokens"]
-        spec = SimpleNamespace(use_eagle_block_drop=lambda: True,
-                               disable_lookahead_block_hashes=False)
-        config = SimpleNamespace(
-            speculative_config=spec, kv_transfer_config=None,
-            attention_config=SimpleNamespace(hisparse_config=None),
-            num_hash_lookahead_tokens=3, num_prefill_lookahead_tokens=3,
-        )
-        supported = SimpleNamespace(supports_lookahead_block_hashes=True)
-        unsupported = SimpleNamespace(supports_lookahead_block_hashes=False)
-        self.assertEqual(resolve(config), 3)
-        config.kv_transfer_config = object()
-        self.assertEqual(resolve(config, supported), 0)  # one-token connectors only
-        config.num_prefill_lookahead_tokens = 1
-        self.assertEqual(resolve(config, supported), 1)
-        self.assertEqual(resolve(config, unsupported), 0)
-        self.assertEqual(resolve(config), 0)
-        spec.disable_lookahead_block_hashes = True
-        self.assertEqual(resolve(config, supported), 0)
-        spec.disable_lookahead_block_hashes = False
-        config.attention_config.hisparse_config = object()
-        self.assertEqual(resolve(config, supported), 0)
-        config.kv_transfer_config = None
-        self.assertEqual(resolve(config), 0)
-        config.attention_config.hisparse_config = None
-        config.num_hash_lookahead_tokens = 0
-        self.assertEqual(resolve(config), 0)
-
-    def test_core_and_mooncake_retain_matching_replay_boundaries(self):
-        # #61589 now supplies core replay policy unchanged by our patch.
-        core = (PROJECT / "tests/fixtures/qwen38-patch-series/replay_boundaries_upstream.py").read_text()
-        _, mooncake = self.apply_upstream_excerpt(
-            "06-pr50897.patch",
-            "vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/coordinator.py",
-            "mooncake_replay_upstream.py",
-            ("exclude_mamba: bool = False", "use_eagle=bool(self.eagle_group_ids)",
-             "use_eagle = g_idx in self.eagle_group_ids"),
-        )
-        mask = Mock(return_value=None)
-        namespace = {
-            "cdiv": lambda n, d: (n + d - 1) // d,
-            "_coverage_spec": lambda spec: spec,
-            "MambaSpec": type("MambaSpec", (), {}),
-            "KVCacheSpecRegistry": SimpleNamespace(
-                get_manager_class=lambda _: SimpleNamespace(reachable_block_mask=mask)
-            ),
-        }
-        exec("from __future__ import annotations\n" + core + mooncake, namespace)
-        core_coord = namespace["KVCacheCoordinator"]()
-        core_coord.scheduler_block_size = 32
-        core_coord.retention_interval = 0
-        manager = SimpleNamespace(enable_caching=True, cache_blocks=Mock())
-        core_coord.single_type_managers = [manager]
-        core_coord.get_num_cacheable_tokens = lambda n, _: n
-        store_coord = namespace["MooncakeStoreCoordinator"]()
-        store_coord.enable_partial_hash_hits = False
-        store_coord.lcm_block_size = 32
-        store_coord.kv_cache_groups = [
-            SimpleNamespace(kv_cache_spec=SimpleNamespace(block_size=8))
-            for _ in range(2)
-        ]
-        for prompt, lookahead, eagle, expected in [
-            (100, False, True, (64,)), (96, False, True, (32, 64)),
-            (100, True, True, (99,)), (96, True, True, (95,)),
-            (100, False, False, (99,)), (96, False, False, (95,)),
-        ]:
-            with self.subTest(prompt=prompt, lookahead=lookahead, eagle=eagle):
-                groups = {0} if eagle else set()
-                core_coord.eagle_group_ids = store_coord.eagle_group_ids = groups
-                core_coord.drop_eagle_group_ids = set() if lookahead else groups
-                core_coord.cache_blocks(SimpleNamespace(num_prompt_tokens=prompt), 96)
-                self.assertEqual(
-                    manager.cache_blocks.call_args.kwargs["replay_boundaries"], expected
-                )
-                mask.reset_mock()
-                store_coord._reachable_masks(
-                    96, 0, retention_interval=0, num_prompt_tokens=prompt,
-                    apply_eagle=not lookahead,
-                )
-                self.assertEqual(mask.call_count, 2)
-                for group, call in enumerate(mask.call_args_list):
-                    self.assertEqual(call.kwargs["reachable_boundaries"], expected)
-                    self.assertEqual(
-                        call.kwargs["use_eagle"], eagle and not lookahead and group == 0
-                    )
-
-    def test_mooncake_lookahead_preserves_divergent_hybrid_hits(self):
-        upstream, updated = self.apply_upstream_excerpt(
-            "06-pr50897.patch",
-            "vllm/distributed/kv_transfer/kv_connector/v1/mooncake/mooncake_connector.py",
-            "mooncake_connector_hybrid_upstream.py",
-        )
-        before, after = ast.parse(upstream), ast.parse(updated)
-        connector = after.body[0]
-        added = "supports_lookahead_block_hashes"
-        self.assertEqual(sum(getattr(n, "name", None) == added
-                             for n in connector.body), 1)
-        connector.body = [n for n in connector.body
-                          if getattr(n, "name", None) != added]
-        # Preserve upstream's property, role checks, and Mamba-group detection.
-        self.assertEqual(ast.dump(before), ast.dump(after))
-        namespace = {
-            "KVConnectorBase_V1": type("KVConnectorBase_V1", (), {}),
-            "SupportsHMA": type("SupportsHMA", (), {}),
-            "CacheHitSource": SimpleNamespace(P2P="p2p"),
-        }
-        exec("from __future__ import annotations\n" + updated, namespace)
-        connector_class = namespace["MooncakeConnector"]
-        connector = connector_class.__new__(connector_class)
-        for pulls_mamba_state in (False, True):
-            with self.subTest(pulls_mamba_state=pulls_mamba_state):
-                connector._pulls_mamba_state = pulls_mamba_state
-                self.assertIs(connector.supports_divergent_local_hybrid_hits,
-                              pulls_mamba_state)
-                self.assertIs(connector.supports_lookahead_block_hashes, True)
-
-    def test_mooncake_lookahead_preserves_decode_replay_boundary(self):
-        _, updated = self.apply_upstream_excerpt(
-            "06-pr50897.patch",
-            "vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/worker.py",
-            "mooncake_worker_replay_upstream.py",
-            ("num_prompt_tokens=replay_boundary",),
-        )
-        namespace = {}
-        exec(updated, namespace)
-        worker = namespace["KVCacheStoreSendingThread"]()
-        worker.coord = SimpleNamespace(store_mask=Mock(return_value=(None,)))
-        for role in ("kv_consumer", "kv_producer"):
-            for lookahead in (False, True):
-                for checkpoint, expected in ((64, 64), (96, 97)):
-                    with self.subTest(role=role, lookahead=lookahead,
-                                      checkpoint=checkpoint):
-                        worker.kv_role = role
-                        worker.use_lookahead_block_hashes = lookahead
-                        worker.mask(SimpleNamespace(prefill_end_tokens=64),
-                                    checkpoint, 32)
-                        worker.coord.store_mask.assert_called_with(
-                            checkpoint, 32,
-                            num_prompt_tokens=expected if role == "kv_consumer" else 64,
-                            apply_eagle=not lookahead,
-                        )
 
     def test_disk_offload_implements_embedding_interface(self):
         _, updated = self.apply_upstream_excerpt(
@@ -831,39 +787,6 @@ class PatchSeriesTests(unittest.TestCase):
                     SimpleNamespace(lm_head=object()), object(), "fp8",
                     defer_quantization=deferred,
                 )
-
-    def test_frontend_and_engine_share_connector_lookahead_policy(self):
-        _, updated = self.apply_upstream_excerpt(
-            "06-pr50897.patch", "vllm/v1/engine/core.py",
-            "engine_frontend_hash_upstream.py", ("num_hash_lookahead_tokens =",),
-        )
-        resolve = Mock()
-        make_hasher = Mock(return_value=object())
-        namespace = {
-            "get_num_hash_lookahead_tokens": resolve,
-            "get_request_block_hasher": make_hasher,
-            "get_hash_fn_by_name": lambda _: "hash_fn",
-            "init_none_hash": Mock(), "PrefixHashConfig": SimpleNamespace,
-            "kv_cache_utils": SimpleNamespace(NONE_HASH="none_hash"),
-        }
-        exec(updated, namespace)
-        config = SimpleNamespace(
-            num_hash_lookahead_tokens=3,
-            cache_config=SimpleNamespace(enable_prefix_caching=True,
-                                         prefix_caching_hash_algo="sha256"),
-        )
-        for connector, effective in ((None, 3), (object(), 0), (object(), 1)):
-            with self.subTest(connector=connector, effective=effective):
-                resolve.reset_mock()
-                make_hasher.reset_mock()
-                resolve.return_value = effective
-                engine = namespace["EngineCore"]()
-                engine.init_hash(config, connector, 16)
-                resolve.assert_called_once_with(config, connector)
-                make_hasher.assert_called_once_with(16, "hash_fn", effective)
-                self.assertEqual(engine.prefix_hash_config.num_lookahead_tokens, effective)
-                self.assertEqual(engine.prefix_hash_config.hash_block_size, 16)
-                self.assertEqual(engine.prefix_hash_config.none_hash, "none_hash")
 
     def test_dynamic_nvfp4_preserves_upstream_kernel_selection_tests(self):
         upstream, updated = self.apply_upstream_excerpt(

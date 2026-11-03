@@ -4,6 +4,7 @@ Subject: [PATCH] [PR #60068] [MRV2][Spec Decode] Opt-in confidence stop for auto
 Upstream-PR: https://github.com/vllm-project/vllm/pull/60068
 Upstream-Commit: 8ae78ccaf8825b3e55ab014e282c769902ca198c
 Integration-Base: 564ac0de1b228568cafcbfbe8ccaccc82d6023eb
+Refresh-Base: c7a760751977e4e3396d586956d8767a9bc44a82
 
 Preserve both quantized draft-head and adaptive-depth documentation/tests.
 Use #60692's supports_decode_metadata_update API; confidence stopping
@@ -12,6 +13,8 @@ watermarked sampling branch and update confidence before either sampler
 can modify logits in place.
 
 Retain upstream DraftLogitsCache and target attention-metadata reuse.
+
+Preserve upstream decode_graph_eligible when dispatching adaptive draft batches.
 
 diff --git a/docs/features/speculative_decoding/mtp.md b/docs/features/speculative_decoding/mtp.md
 index 6ceee19ad799885c7f71c385ab651f2dd0d31734..d4483be1ea5b22408a877fdf6c9b68a3ecdde299 100644
@@ -548,10 +551,10 @@ index 995657462bf28d0c4d07b17c8e9b85a6732e8887..acfc0a14223cb5a553d491e28a6fe706
                          continue
  
 diff --git a/vllm/v1/worker/gpu/model_runner.py b/vllm/v1/worker/gpu/model_runner.py
-index ebfa9da5235cb3e353507cf9595235aae7a15e1c..318a19bc8d7a772eb4254df9e61498891006efae 100644
+index 156f6472474ca03d2902069db99b0bad1de18755..5b3d9570fc749de4673f648e347eaed2e5ef943e 100644
 --- a/vllm/v1/worker/gpu/model_runner.py
 +++ b/vllm/v1/worker/gpu/model_runner.py
-@@ -1376,6 +1376,21 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+@@ -1407,6 +1407,21 @@ class GPUModelRunner(LoRAModelRunnerMixin):
              num_draft_tokens_np = np.fromiter(
                  num_drafts_iter, dtype=np.int32, count=num_reqs
              )
@@ -573,15 +576,15 @@ index ebfa9da5235cb3e353507cf9595235aae7a15e1c..318a19bc8d7a772eb4254df9e6149889
              if self.adaptive_verification is not None:
                  num_toks = self.adaptive_verification.get_num_tokens(
                      num_tokens_per_req, draft_tokens
-@@ -1833,6 +1848,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+@@ -1857,6 +1872,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
          )
          if batch_req_state is not None:
              num_toks = batch_req_state.num_tokens
 +            max_query_len = int(batch_req_state.num_scheduled_tokens.max())
-             if batch_req_state.has_prefill:
-                 # Varlen decode graphs replay decodes only, and their bound
-                 # alone would admit a short prefill.
-@@ -2269,6 +2285,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+             if not batch_req_state.decode_graph_eligible:
+                 # A query-length bound alone would admit a short prefill.
+                 max_query_len = None
+@@ -2296,6 +2312,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
              prompt_token_id_logprobs_dict=prompt_token_id_logprobs_dict,
              cudagraph_stats=cudagraph_stats,
          )

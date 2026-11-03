@@ -24,7 +24,7 @@ The vLLM order is:
 2. [#59740](https://github.com/vllm-project/vllm/pull/59740) and [#60226](https://github.com/vllm-project/vllm/pull/60226): sparse draft vocabulary, including quantized heads.
 3. [#60068](https://github.com/vllm-project/vllm/pull/60068): adaptive draft depth.
 4. [#54912](https://github.com/vllm-project/vllm/pull/54912): QSA ring sizing.
-5. [#50897](https://github.com/vllm-project/vllm/pull/50897): lookahead-aware prefix hashing.
+5. [#50897](https://github.com/vllm-project/vllm/pull/50897): invalidate stale lookahead hashes on streaming updates. Core and connector hashing are now supplied by upstream #61589 and #64096.
 6. [#54614](https://github.com/vllm-project/vllm/pull/54614): dynamic NVFP4 linear kernels.
 7. [#54617](https://github.com/vllm-project/vllm/pull/54617): dynamic NVFP4 MoE.
 8. [#60252](https://github.com/vllm-project/vllm/pull/60252): DFlash2 draft cache block sizing.
@@ -39,6 +39,10 @@ The vLLM order is:
 14. `17-flash-next-b12x-loader.patch`: opt-in `--load-format b12x` for Flash
     Next and its embedded MTP draft on Spark, using FlashInfer's checkpoint
     reader and the weight-transfer helpers supplied by patch 16.
+15. [#65182](https://github.com/vllm-project/vllm/pull/65182): reuse MRV2's
+    persistent Mamba2 aligned state indices and accepted-token buffers as CUDA
+    graph inputs, avoiding redundant metadata copies. Frozen at
+    `14d3984b7118db638a188bc4f20b79c0bacfb232`, with upstream aliasing tests.
 
 [#55601](https://github.com/vllm-project/vllm/pull/55601) is already in the
 validated upstream base. Quantized draft heads from
@@ -59,6 +63,34 @@ Canonical NVFP4 W4A4 MoE from
 upstream commit `397b9607c83cf201f3c44684c555c3698869b6bd`.
 
 ## Integration and refresh
+
+The November 3 refresh fixes pipeline 385, job 702, which stopped at patch 04
+on vLLM `c7a760751977e4e3396d586956d8767a9bc44a82`. Adaptive draft dispatch now
+preserves upstream's `decode_graph_eligible` check, including rejection of short
+prefills. Replaying the remaining series exposed conflicts in patches 06, 08
+and 17. Patch 08 retains the new `refill_derived` import. Patch 17 routes scoped
+checkpoint transfers through upstream's `copy_weight_` helper after its
+integrated-GPU mmap prefaulting, preserving both normal copies and deferred
+loader reads.
+
+Upstream [#64096](https://github.com/vllm-project/vllm/pull/64096), commit
+`75be1384286d6f4c5ca3ad493bc9390159d93f5b`, now supplies connector lookahead
+hashing alongside core [#61589](https://github.com/vllm-project/vllm/pull/61589).
+Patch 06 retains only the streaming-session invalidation fix and its regression.
+The superseded backports and their fixtures are retired, preserving upstream's
+configuration-time connector capability API, multi-token lookahead, Mooncake
+replay handling and prefix-cache tests. Patch 18 adds #65182 without changes to
+its runtime code.
+
+All 16 entries replay from fresh archives of the failed revision and main
+`39dbf518390ddbadf05c6712ee6aefa1c9190219`, without historical patch-base objects:
+merged patch 01 skips and the other 15 apply. All 19 subsequent source patchers,
+CUTLASS pinning and compilation of all 83 changed Python files pass on both
+revisions. All 35 series tests pass with CPU tensor dependencies, including
+graph eligibility, multi-token streaming invalidation, mmap prefaulting and
+Mamba buffer aliasing/fallback padding. The loader suite has 28 passes and one
+GPU-only skip; all 109 build checks pass. GPU wheel compilation and inference
+remain for CI.
 
 The November 2 refresh fixes pipeline 384, job 700,
 which stopped at patch 06 on vLLM `5c8ae7c74aaa99d1f7fbeea942fd7282e3413810`.

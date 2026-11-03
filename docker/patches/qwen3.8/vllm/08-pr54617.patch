@@ -4,11 +4,13 @@ Subject: [PATCH] [Kernel][Quant][MoE] Per-forward NVFP4 W4A4/W4A16 selection for
 Upstream-PR: https://github.com/vllm-project/vllm/pull/54617
 Upstream-Commit: 69d21d81808bcea2de3b97a0b68c97545808a043
 Integration-Base: 8084f0624dba24aba6ebac62d8e10cc00730a0fe
-Refresh-Base: 5c8ae7c74aaa99d1f7fbeea942fd7282e3413810
+Refresh-Base: c7a760751977e4e3396d586956d8767a9bc44a82
 
 Preserve the expanded upstream MonoKernel documentation.
 
 Preserve #61082's monokernel setting alongside the dynamic NVFP4 MoE settings.
+
+Retain the upstream refill_derived helper import.
 
 diff --git a/tests/kernels/moe/test_flashinfer_cutile_nvfp4_moe.py b/tests/kernels/moe/test_flashinfer_cutile_nvfp4_moe.py
 new file mode 100644
@@ -745,7 +747,7 @@ index 0000000000000000000000000000000000000000..61e1ff5e6f934face65d0675f817d382
 +            topk_weights.float().contiguous(),
 +        )
 diff --git a/vllm/model_executor/layers/fused_moe/oracle/nvfp4.py b/vllm/model_executor/layers/fused_moe/oracle/nvfp4.py
-index d265f7629af049dcba68e434961c12bba0b40b46..6862406b840afa60deb1c16983f32101eab38080 100644
+index 63ef15f05d0cdbbfe66fa35595f042bb5ce9659a..b7a47e1e301905b1d7314c7787273067e2b3806c 100644
 --- a/vllm/model_executor/layers/fused_moe/oracle/nvfp4.py
 +++ b/vllm/model_executor/layers/fused_moe/oracle/nvfp4.py
 @@ -36,6 +36,7 @@ from vllm.model_executor.layers.quantization.utils.nvfp4_emulation_utils import
@@ -754,7 +756,7 @@ index d265f7629af049dcba68e434961c12bba0b40b46..6862406b840afa60deb1c16983f32101
      QuantKey,
 +    amax_for_moe_activation_quant,
  )
- from vllm.model_executor.utils import move_parameter
+ from vllm.model_executor.utils import move_parameter, refill_derived
  
 @@ -49,6 +50,7 @@ class NvFp4MoeBackend(Enum):
      FLASHINFER_CUTEDSL = "FLASHINFER_CUTEDSL"
