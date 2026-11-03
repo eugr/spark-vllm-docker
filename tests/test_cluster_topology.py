@@ -366,6 +366,27 @@ detect_copy_hosts
 ''')
         self.run_script("legacy.sh")
 
+    def test_forced_discovery_rescans_instead_of_reusing_saved_nodes(self):
+        # Regression for #338: --discover must not reuse CLUSTER_NODES from .env.
+        script = self.root / "nodes.sh"
+        script.write_text('''#!/bin/bash
+set -e
+CONFIG_FILE="$1"; FORCE_DISCOVER="$2"
+source "$(dirname "$0")/autodiscover.sh"
+[[ -n "$DOTENV_CLUSTER_NODES" ]]
+LOCAL_IP=192.0.2.1; CIDR=192.0.2.1/24; NODES_ARG=""
+_scan_subnet_for_gb10() { echo scanned >&2; printf '192.0.2.9\\n' >> "$3"; }
+detect_nodes
+echo "NODES=$NODES_ARG PEERS=${PEER_NODES[*]}"
+''')
+        forced = self.run_script("nodes.sh", str(self.config), "true")
+        self.assertIn("scanned", forced.stderr)
+        self.assertIn("NODES=192.0.2.1,192.0.2.9 PEERS=192.0.2.9\n", forced.stdout)
+        # Without a forced discovery the saved node list is still authoritative.
+        saved = self.run_script("nodes.sh", str(self.config), "false")
+        self.assertNotIn("scanned", saved.stderr)
+        self.assertIn(f"NODES={','.join(ORDER)} PEERS={' '.join(ORDER[1:])}\n", saved.stdout)
+
 
 class RecipeTests(unittest.TestCase):
     def setUp(self):
