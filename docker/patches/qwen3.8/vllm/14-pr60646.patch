@@ -3,7 +3,7 @@ Subject: [PATCH] [Model Loader] Decode CSF-compressed NVFP4 block scales at load
 
 Upstream-PR: https://github.com/vllm-project/vllm/pull/60646
 Upstream-Commit: 00b5ad0712629374e6352e2b31de0460be0fdf17
-Integration-Base: 355553ac22dca4080929ea8f88a446f15df1f3ba
+Integration-Base: 8084f0624dba24aba6ebac62d8e10cc00730a0fe
 
 diff --git a/tests/model_executor/model_loader/test_csf_scales.py b/tests/model_executor/model_loader/test_csf_scales.py
 new file mode 100644
@@ -203,7 +203,7 @@ index 0000000000000000000000000000000000000000..76f2d055c38ca07abda49bdee5903858
 +    if decoded:
 +        logger.info("Decoded %d CSF expert scale tensors at load", decoded)
 diff --git a/vllm/model_executor/model_loader/default_loader.py b/vllm/model_executor/model_loader/default_loader.py
-index 07283e50279eba3740faec00c6403615cf495fa8..7fda769fb26b1bff047e424060420855a44b44a9 100644
+index f02cfd4476e6a7f9a9f51114ff423c7459570149..3159ba2d1daf257d72650cdb0940472f8538660e 100644
 --- a/vllm/model_executor/model_loader/default_loader.py
 +++ b/vllm/model_executor/model_loader/default_loader.py
 @@ -4,6 +4,7 @@ from __future__ import annotations
@@ -257,7 +257,7 @@ index 07283e50279eba3740faec00c6403615cf495fa8..7fda769fb26b1bff047e424060420855
              if len(hf_weights_files) > 0:
                  if pattern.endswith(".safetensors"):
                      use_safetensors = True
-@@ -362,7 +385,10 @@ class DefaultModelLoader(BaseModelLoader):
+@@ -367,7 +390,10 @@ class DefaultModelLoader(BaseModelLoader):
          if self.counter_before_loading_weights == 0.0:
              self.counter_before_loading_weights = time.perf_counter()
          # Apply the prefix.

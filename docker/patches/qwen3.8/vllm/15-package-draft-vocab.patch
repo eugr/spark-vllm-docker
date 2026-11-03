@@ -1,16 +1,16 @@
 Subject: Include the Flash Next draft vocabulary in exported vLLM wheels
 
-Integration-Base: 355553ac22dca4080929ea8f88a446f15df1f3ba
+Integration-Base: 8084f0624dba24aba6ebac62d8e10cc00730a0fe
 
 diff --git a/setup.py b/setup.py
-index abefefa35bc89df03e163c08158671ab5282dcfc..5793ffcd0aea3796f7d3f884dc66d72e872c45d8 100644
+index ae9f72e4cf3a983e84a3c78a09ff2f45120c9999..afb6101780ff66bf46fb291fa03eed2d631a8c0d 100644
 --- a/setup.py
 +++ b/setup.py
-@@ -1600,6 +1600,7 @@ package_data = {
+@@ -1623,6 +1623,7 @@ package_data = {
      "vllm": [
          "py.typed",
          "libs/*.so*",
 +        "model_executor/layers/draft_vocab_lists/*.json",
          "model_executor/layers/fused_moe/configs/*.json",
-         "model_executor/layers/quantization/utils/configs/*.json",
-         "entrypoints/serve/instrumentator/static/*.js",
+         # Tuned kernel configs must be explicit: the setuptools-scm git
+         # file-finder is inactive when building from a .git-less tree

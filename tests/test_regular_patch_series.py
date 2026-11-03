@@ -226,7 +226,7 @@ class PatchSeriesTests(unittest.TestCase):
             "test_qsa_ring_capacity_refuses_disproportionate_widening",
         }
         added_imports = {
-            "vllm.models.qwen4_exp.common.qsa_cache",
+            "vllm.models.qwen4_exp.common.qsa_indexer",
             "vllm.utils.math_utils",
         }
         functions = [n.name for n in after.body if isinstance(n, ast.FunctionDef)]
@@ -236,7 +236,7 @@ class PatchSeriesTests(unittest.TestCase):
             {n.module: [alias.name for alias in n.names]
              for n in after.body if isinstance(n, ast.ImportFrom)
              and n.module in added_imports},
-            {"vllm.models.qwen4_exp.common.qsa_cache":
+            {"vllm.models.qwen4_exp.common.qsa_indexer":
              ["QSA_RING_MAX_WIDENING", "qsa_ring_capacity"],
              "vllm.utils.math_utils": ["cdiv"]},
         )
@@ -247,6 +247,100 @@ class PatchSeriesTests(unittest.TestCase):
         # Preserve the new model imports and BF16-indexer regression verbatim.
         self.assertEqual(ast.dump(before), ast.dump(after))
         self.assertEqual(self.git("status", "--porcelain"), "")
+
+    def test_mtp_patches_preserve_upstream_multi_module_test(self):
+        # Upstream 87cb835db2 already imports torch and the spec-decode metric
+        # helper for its new per-module draft test. Replay both overlapping
+        # patches from that snapshot, without any historical patch-base blobs.
+        path = "tests/v1/e2e/spec_decode/mtp/qwen3_5/test_mtp.py"
+        upstream = (PROJECT / "tests/fixtures/qwen38-patch-series/mtp_modules_upstream.py").read_text()
+        target = self.source / path
+        target.parent.mkdir(parents=True)
+        target.write_text(upstream)
+        self.commit()
+        names = ("04-pr60068.patch", "06-pr50897.patch")
+        for name in names:
+            patch_text = (PROJECT / "docker/patches/qwen3.8/vllm" / name).read_text()
+            section = next(s for s in re.split(r"(?m)(?=^diff --git )", patch_text)
+                           if s.startswith(f"diff --git a/{path} "))
+            (self.series / name).write_text(section)
+        (self.series / "series").write_text("\n".join(names) + "\n")
+
+        result = self.apply()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        updated = target.read_text()
+        compile(updated, path, "exec")
+        before, after = ast.parse(upstream), ast.parse(updated)
+        additions = {"test_mtp_draft_confidence_stop",
+                     "test_qwen3_5_mtp_prefix_cache_reuses_last_safe_block"}
+        functions = [n.name for n in after.body if isinstance(n, ast.FunctionDef)]
+        for name in additions:
+            self.assertEqual(functions.count(name), 1)
+        after.body = [n for n in after.body if not (
+            isinstance(n, ast.FunctionDef) and n.name in additions
+            or isinstance(n, ast.ImportFrom)
+            and n.module in ("tests.models.utils", "vllm.distributed")
+        )]
+        vllm_import = next(n for n in after.body if isinstance(n, ast.ImportFrom)
+                           and n.module == "vllm")
+        vllm_import.names = [n for n in vllm_import.names if n.name == "SamplingParams"]
+        # Preserve every upstream import, helper, test body, and decorator.
+        self.assertEqual(ast.dump(before), ast.dump(after))
+        self.assertEqual(self.git("status", "--porcelain"), "")
+
+    def test_qsa_ring_patch_applies_after_upstream_indexer_rename(self):
+        # #64110 moved the cache module and renamed both cache classes.
+        # Exercise the real runtime hunks and cache-spec method without GPUs.
+        path = "vllm/models/qwen4_exp/common/qsa_indexer.py"
+        _, updated = self.apply_upstream_excerpt(
+            "05-pr54912.patch", path, "qsa_indexer_upstream.py",
+        )
+        tree = ast.parse(updated)
+        cache_class = next(n for n in tree.body if isinstance(n, ast.ClassDef)
+                           and n.name == "QSARawKeyCache")
+        method = next(n for n in cache_class.body if isinstance(n, ast.FunctionDef)
+                      and n.name == "get_kv_cache_spec")
+        selected = [n for n in tree.body if (
+            isinstance(n, ast.FunctionDef) and n.name == "qsa_ring_capacity"
+            or isinstance(n, ast.Assign)
+            and any(isinstance(t, ast.Name) and t.id == "QSA_RING_MAX_WIDENING"
+                    for t in n.targets)
+        )]
+        module = ast.Module(body=selected + [method], type_ignores=[])
+        namespace = {
+            "cdiv": lambda a, b: (a + b - 1) // b,
+            "logger": SimpleNamespace(info_once=Mock()),
+            "VllmConfig": object, "KVCacheSpec": object,
+            "CircularBufferSpec": SimpleNamespace,
+        }
+        exec(compile(module, path, "exec"), namespace)
+        for block_size in (848, 1616):
+            cache = SimpleNamespace(
+                compress_ratio=4, cache_config=SimpleNamespace(block_size=block_size),
+                head_size=128, dtype="bfloat16",
+            )
+            for depth in range(13):
+                with self.subTest(block_size=block_size, depth=depth):
+                    spec = namespace["get_kv_cache_spec"](
+                        cache, SimpleNamespace(num_speculative_tokens=depth),
+                    )
+                    minimal = 4 * ((4 + depth + 3) // 4)
+                    self.assertGreaterEqual(spec.block_size, 4 + depth)
+                    self.assertEqual(block_size % spec.block_size, 0)
+                    self.assertLessEqual(spec.block_size, 2 * minimal)
+                    self.assertEqual(spec.head_size, 128)
+                    self.assertEqual(spec.dtype, "bfloat16")
+                    if block_size % minimal == 0:
+                        self.assertEqual(spec.block_size, minimal)
+            with self.assertRaisesRegex(ValueError, "QSA ring"):
+                namespace["get_kv_cache_spec"](
+                    cache, SimpleNamespace(num_speculative_tokens=13),
+                )
+        self.assertEqual(namespace["qsa_ring_capacity"](4, 5, 848), 16)
+        result = self.apply()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Already present", result.stdout)
+        self.assertFalse((self.source / path.replace("qsa_indexer", "qsa_cache")).exists())
 
     def test_unquantized_backend_preserves_rdna_prefill_setting(self):
         upstream, updated = self.apply_upstream_excerpt(
@@ -545,7 +639,7 @@ class PatchSeriesTests(unittest.TestCase):
         mask = Mock(return_value=None)
         namespace = {
             "cdiv": lambda n, d: (n + d - 1) // d,
-            "_unwrap_spec": lambda spec: spec,
+            "_coverage_spec": lambda spec: spec,
             "MambaSpec": type("MambaSpec", (), {}),
             "KVCacheSpecRegistry": SimpleNamespace(
                 get_manager_class=lambda _: SimpleNamespace(reachable_block_mask=mask)
@@ -590,11 +684,67 @@ class PatchSeriesTests(unittest.TestCase):
                         call.kwargs["use_eagle"], eagle and not lookahead and group == 0
                     )
 
-    def test_file_gather_implements_embedding_interface(self):
+    def test_mooncake_lookahead_preserves_divergent_hybrid_hits(self):
+        upstream, updated = self.apply_upstream_excerpt(
+            "06-pr50897.patch",
+            "vllm/distributed/kv_transfer/kv_connector/v1/mooncake/mooncake_connector.py",
+            "mooncake_connector_hybrid_upstream.py",
+        )
+        before, after = ast.parse(upstream), ast.parse(updated)
+        connector = after.body[0]
+        added = "supports_lookahead_block_hashes"
+        self.assertEqual(sum(getattr(n, "name", None) == added
+                             for n in connector.body), 1)
+        connector.body = [n for n in connector.body
+                          if getattr(n, "name", None) != added]
+        # Preserve upstream's property, role checks, and Mamba-group detection.
+        self.assertEqual(ast.dump(before), ast.dump(after))
+        namespace = {
+            "KVConnectorBase_V1": type("KVConnectorBase_V1", (), {}),
+            "SupportsHMA": type("SupportsHMA", (), {}),
+            "CacheHitSource": SimpleNamespace(P2P="p2p"),
+        }
+        exec("from __future__ import annotations\n" + updated, namespace)
+        connector_class = namespace["MooncakeConnector"]
+        connector = connector_class.__new__(connector_class)
+        for pulls_mamba_state in (False, True):
+            with self.subTest(pulls_mamba_state=pulls_mamba_state):
+                connector._pulls_mamba_state = pulls_mamba_state
+                self.assertIs(connector.supports_divergent_local_hybrid_hits,
+                              pulls_mamba_state)
+                self.assertIs(connector.supports_lookahead_block_hashes, True)
+
+    def test_mooncake_lookahead_preserves_decode_replay_boundary(self):
+        _, updated = self.apply_upstream_excerpt(
+            "06-pr50897.patch",
+            "vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/worker.py",
+            "mooncake_worker_replay_upstream.py",
+            ("num_prompt_tokens=replay_boundary",),
+        )
+        namespace = {}
+        exec(updated, namespace)
+        worker = namespace["KVCacheStoreSendingThread"]()
+        worker.coord = SimpleNamespace(store_mask=Mock(return_value=(None,)))
+        for role in ("kv_consumer", "kv_producer"):
+            for lookahead in (False, True):
+                for checkpoint, expected in ((64, 64), (96, 97)):
+                    with self.subTest(role=role, lookahead=lookahead,
+                                      checkpoint=checkpoint):
+                        worker.kv_role = role
+                        worker.use_lookahead_block_hashes = lookahead
+                        worker.mask(SimpleNamespace(prefill_end_tokens=64),
+                                    checkpoint, 32)
+                        worker.coord.store_mask.assert_called_with(
+                            checkpoint, 32,
+                            num_prompt_tokens=expected if role == "kv_consumer" else 64,
+                            apply_eagle=not lookahead,
+                        )
+
+    def test_disk_offload_implements_embedding_interface(self):
         _, updated = self.apply_upstream_excerpt(
             "01-pr59958.patch", "vllm/models/qwen4_exp/nvidia/ngram_embedding.py",
             "ple_file_gather_interface_upstream.py",
-            ("class Qwen4ExpPLEFileGatherEmbedding",),
+            ("class Qwen4ExpPLEDiskOffloadEmbedding",),
         )
         namespace = {
             "ABC": ABC, "abstractmethod": abstractmethod,
@@ -602,7 +752,7 @@ class PatchSeriesTests(unittest.TestCase):
             "nn": SimpleNamespace(Module=object),
         }
         exec("from __future__ import annotations\n" + updated, namespace)
-        embedding_cls = namespace["Qwen4ExpPLEFileGatherEmbedding"]
+        embedding_cls = namespace["Qwen4ExpPLEDiskOffloadEmbedding"]
         # Allocation alone enforces ABC completeness, before tensor allocation
         # or loading weights. This is the startup failure with either loader.
         embedding = embedding_cls.__new__(embedding_cls)
@@ -611,14 +761,289 @@ class PatchSeriesTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "does not support prefetch"):
             embedding.finalize_prefetch(total_tokens=4)
 
-    def test_file_gather_reuses_merged_nvfp4_lookup(self):
+    def test_sparse_mtp_imports_preserve_upstream_shared_expert_removal(self):
+        for path, fixture in (
+            ("vllm/model_executor/models/qwen3_5_mtp.py", "mtp_qwen35_imports_upstream.py"),
+            ("vllm/models/qwen4_exp/amd/mtp.py", "mtp_qwen4_amd_imports_upstream.py"),
+            ("vllm/models/qwen4_exp/nvidia/mtp.py", "mtp_qwen4_nvidia_imports_upstream.py"),
+        ):
+            with self.subTest(path=path):
+                upstream, updated = self.apply_upstream_excerpt(
+                    "03-pr59740-60226.patch", path, fixture,
+                    ("+from vllm.model_executor.layers.draft_vocab import DraftVocab",),
+                )
+                tree = ast.parse(updated)
+                added = [n for n in tree.body if isinstance(n, ast.ImportFrom)
+                         and n.module == "vllm.model_executor.layers.draft_vocab"]
+                self.assertEqual(len(added), 1)
+                tree.body.remove(added[0])
+                self.assertEqual(ast.dump(tree), ast.dump(ast.parse(upstream)))
+                self.assertNotIn("is_model_fused_shared_expert_compatible", updated)
+
+    def test_sparse_vocab_defers_shared_head_quantization(self):
+        _, updated = self.apply_upstream_excerpt(
+            "03-pr59740-60226.patch",
+            "vllm/v1/worker/gpu/spec_decode/eagle/utils.py",
+            "eagle_shared_head_upstream.py",
+        )
+        tree = ast.parse(updated)
+        share = next(n for n in tree.body if isinstance(n, ast.FunctionDef)
+                     and n.name == "share_target_lm_head")
+        load = next(n for n in tree.body if isinstance(n, ast.FunctionDef)
+                    and n.name == "load_eagle_model")
+        share_call = next(n for n in load.body if isinstance(n, ast.Assign)
+                          and isinstance(n.value, ast.Call)
+                          and getattr(n.value.func, "id", None) == "share_target_lm_head")
+        quantized = object()
+        quantize = Mock(return_value=quantized)
+        can_share = Mock(return_value=True)
+        namespace = {"quantized_lm_head_copy": quantize, "_should_share": can_share}
+        exec("from __future__ import annotations\n" + ast.unparse(share), namespace)
+        for token_map in (None, "vocab.json"):
+            for quantization in (None, "fp8", "nvfp4"):
+                with self.subTest(token_map=token_map, quantization=quantization):
+                    quantize.reset_mock()
+                    target_head = object()
+                    draft = SimpleNamespace(lm_head=object())
+                    namespace.update(
+                        eagle_model=draft, target_model=object(),
+                        target_language_model=object(),
+                        get_target_lm_head=lambda *_: target_head,
+                        speculative_config=SimpleNamespace(
+                            draft_token_map=token_map,
+                            draft_lm_head_quantization=quantization,
+                        ),
+                    )
+                    exec(compile(ast.Module(body=[share_call], type_ignores=[]),
+                                 "share_head.py", "exec"), namespace)
+                    expected = quantized if quantization and token_map is None else target_head
+                    self.assertIs(draft.lm_head, expected)
+                    self.assertIs(namespace["draft_head"], expected)
+                    if quantization and token_map is None:
+                        quantize.assert_called_once_with(target_head, quantization)
+                    else:
+                        quantize.assert_not_called()
+        # Deferral still rejects quantization for a drafter with its own head.
+        can_share.return_value = False
+        for deferred in (False, True):
+            with self.assertRaisesRegex(ValueError, "shares the target lm_head"):
+                namespace["share_target_lm_head"](
+                    SimpleNamespace(lm_head=object()), object(), "fp8",
+                    defer_quantization=deferred,
+                )
+
+    def test_frontend_and_engine_share_connector_lookahead_policy(self):
+        _, updated = self.apply_upstream_excerpt(
+            "06-pr50897.patch", "vllm/v1/engine/core.py",
+            "engine_frontend_hash_upstream.py", ("num_hash_lookahead_tokens =",),
+        )
+        resolve = Mock()
+        make_hasher = Mock(return_value=object())
+        namespace = {
+            "get_num_hash_lookahead_tokens": resolve,
+            "get_request_block_hasher": make_hasher,
+            "get_hash_fn_by_name": lambda _: "hash_fn",
+            "init_none_hash": Mock(), "PrefixHashConfig": SimpleNamespace,
+            "kv_cache_utils": SimpleNamespace(NONE_HASH="none_hash"),
+        }
+        exec(updated, namespace)
+        config = SimpleNamespace(
+            num_hash_lookahead_tokens=3,
+            cache_config=SimpleNamespace(enable_prefix_caching=True,
+                                         prefix_caching_hash_algo="sha256"),
+        )
+        for connector, effective in ((None, 3), (object(), 0), (object(), 1)):
+            with self.subTest(connector=connector, effective=effective):
+                resolve.reset_mock()
+                make_hasher.reset_mock()
+                resolve.return_value = effective
+                engine = namespace["EngineCore"]()
+                engine.init_hash(config, connector, 16)
+                resolve.assert_called_once_with(config, connector)
+                make_hasher.assert_called_once_with(16, "hash_fn", effective)
+                self.assertEqual(engine.prefix_hash_config.num_lookahead_tokens, effective)
+                self.assertEqual(engine.prefix_hash_config.hash_block_size, 16)
+                self.assertEqual(engine.prefix_hash_config.none_hash, "none_hash")
+
+    def test_dynamic_nvfp4_preserves_upstream_kernel_selection_tests(self):
+        upstream, updated = self.apply_upstream_excerpt(
+            "07-pr54614.patch",
+            "tests/kernels/quantization/test_nvfp4_kernel_selection.py",
+            "nvfp4_kernel_selection_upstream.py",
+        )
+        before, after = ast.parse(upstream), ast.parse(updated)
+        after.body = [n for n in after.body if not (
+            isinstance(n, ast.FunctionDef)
+            and (n.name.startswith("test_dynamic_") or n.name == "_constant_support")
+            or isinstance(n, ast.ImportFrom) and n.module == "collections.abc"
+        )]
+        self.assertEqual(ast.dump(before), ast.dump(after))
+
+    def test_dynamic_nvfp4_warmup_preserves_indexer_autotuning(self):
+        _, updated = self.apply_upstream_excerpt(
+            "07-pr54614.patch",
+            "vllm/model_executor/warmup/kernel_warmup.py",
+            "nvfp4_indexer_warmup_upstream.py",
+        )
+        module = ast.parse(updated)
+        # Substitute GPU imports while executing the real warmup control flow.
+        for function in module.body:
+            function.body = [n for n in function.body
+                             if not isinstance(n, (ast.Import, ast.ImportFrom))]
+        fi_utils = SimpleNamespace(
+            autotune=Mock(side_effect=lambda **kwargs: nullcontext()),
+            flashinfer_get_hybrid_num_tokens_buckets=lambda n: (n,),
+        )
+        indexer = Mock()
+        randomize = Mock(return_value="randomized hidden states")
+        namespace = {
+            "fi_utils": fi_utils, "autotune_indexer_wq_b": indexer,
+            "torch": SimpleNamespace(rand_like=randomize), "logger": Mock(),
+            "_flashinfer_deferred_moe_token_counts": lambda runner: (4,),
+        }
+        exec(compile(module, "warmup_fixture.py", "exec"), namespace)
+        model = SimpleNamespace(compute_logits=Mock())
+        config = SimpleNamespace(
+            linear_backend="auto", nvfp4_dynamic_max_tokens=2,
+            nvfp4_dynamic_silu_max_tokens=3,
+        )
+        runner = SimpleNamespace(
+            scheduler_config=SimpleNamespace(max_num_batched_tokens=16),
+            vllm_config=SimpleNamespace(
+                kernel_config=config,
+                compilation_config=SimpleNamespace(cudagraph_capture_sizes=[0, 1, 2, 4, 16]),
+            ),
+            speculator=SimpleNamespace(num_query_per_req=3),
+            max_num_reqs=4, max_num_tokens=16, get_model=lambda: model,
+            _dummy_run=Mock(),
+        )
+        for dynamic in (False, True):
+            for skip_attn in (False, True):
+                for sample in (None, SimpleNamespace(shape=(3, 8))):
+                    with self.subTest(dynamic=dynamic, skip_attn=skip_attn,
+                                      hidden_states=sample is not None):
+                        config.linear_backend = "nvfp4_dynamic" if dynamic else "auto"
+                        runner._dummy_run.reset_mock()
+                        runner._dummy_run.return_value = (None, sample)
+                        indexer.reset_mock()
+                        model.compute_logits.reset_mock()
+                        randomize.reset_mock()
+                        fi_utils.autotune.reset_mock()
+                        namespace["_run_flashinfer_autotune_dummy_runs"](
+                            runner, skip_attn=skip_attn,
+                        )
+                        counts = [16, 1, 2, 3, 4] if dynamic else [16, 4]
+                        self.assertEqual(
+                            [c.kwargs["num_tokens"] for c in runner._dummy_run.call_args_list],
+                            counts,
+                        )
+                        for call in runner._dummy_run.call_args_list:
+                            self.assertEqual(call.kwargs.get("skip_attn", False), skip_attn)
+                        expected_buckets = [max(n, min(n, 4, 16 // 3) * 3) for n in counts]
+                        self.assertEqual([c.args for c in indexer.call_args_list],
+                                         [(model, n) for n in expected_buckets])
+                        self.assertEqual(
+                            [c.kwargs for c in fi_utils.autotune.call_args_list
+                             if "round_up" in c.kwargs],
+                            [{"tuning_buckets": (n,), "round_up": True}
+                             for n in expected_buckets],
+                        )
+                        logits_runs = len(counts) if dynamic and sample is not None else 0
+                        self.assertEqual(model.compute_logits.call_count, logits_runs)
+                        self.assertEqual(randomize.call_count, logits_runs)
+                        for call in model.compute_logits.call_args_list:
+                            self.assertEqual(call.args, ("randomized hidden states",))
+
+    def test_dynamic_nvfp4_preserves_fused_activation_for_other_kernels(self):
+        _, updated = self.apply_upstream_excerpt(
+            "07-pr54614.patch", "vllm/model_executor/models/qwen2_moe.py",
+            "qwen2_moe_mlp_upstream.py",
+        )
+        fuse = Mock(return_value="quantized")
+        namespace = {"nn": SimpleNamespace(Module=object), "maybe_fused_act_quant": fuse}
+        exec("from __future__ import annotations\n" + updated, namespace)
+        mlp = namespace["Qwen2MoeMLP"].__new__(namespace["Qwen2MoeMLP"])
+        kernel = SimpleNamespace(apply_silu_or_linear=Mock(return_value="dynamic"))
+        mlp.gate_up_proj = Mock(return_value=("gate_up", None))
+        mlp.down_proj = Mock(return_value=("fused", None))
+        mlp.down_proj.quant_method = SimpleNamespace(kernel=kernel)
+        mlp.act_fn = object()
+        mlp.expert_gate = None
+        mlp._dynamic_nvfp4 = False
+        self.assertEqual(mlp.forward("input"), "fused")
+        fuse.assert_called_once_with(mlp.act_fn, "gate_up", mlp.down_proj)
+        mlp.down_proj.assert_called_once_with("quantized")
+        fuse.reset_mock()
+        mlp.down_proj.reset_mock()
+        mlp._dynamic_nvfp4 = True
+        self.assertEqual(mlp.forward("input"), "dynamic")
+        kernel.apply_silu_or_linear.assert_called_once_with(mlp.down_proj, "gate_up", True)
+        fuse.assert_not_called()
+        mlp.down_proj.assert_not_called()
+
+    def test_resident_csf_preserves_online_shared_expert_redirection(self):
+        _, updated = self.apply_upstream_excerpt(
+            "16-flash-next-fp4.patch",
+            "vllm/model_executor/layers/fused_moe/routed_experts.py",
+            "routed_experts_loader_upstream.py",
+        )
+        namespace = {"_index_expert_mapping": lambda mapping: {"0": mapping},
+                     "logger": Mock()}
+        exec("from __future__ import annotations\n" + updated, namespace)
+        layer = namespace["RoutedExperts"]()
+        layer.layer_name = "model.experts"
+        layer.get_expert_mapping = lambda **kw: [("scale", "0.scale", 0, "w2")]
+        redirect = Mock(return_value="csf.fixed")
+        layer.shared_expert_online_loader = SimpleNamespace(redirect_param_name=redirect)
+        parameter = SimpleNamespace(weight_loader=Mock(return_value=True))
+        layer.get_parameter = Mock(return_value=parameter)
+        weight = Mock()
+        weight.dim.return_value = 2
+        weight.unsqueeze.return_value.unbind.return_value = (weight,)
+        list(layer.load_weights([("0.scale", weight)]))
+        redirect.assert_called_once_with("scale", "w2", 0)
+        layer.get_parameter.assert_called_once_with("csf.fixed")
+        self.assertIs(parameter.weight_loader.call_args.kwargs["param"], parameter)
+        self.assertIs(parameter.weight_loader.call_args.kwargs["loaded_weight"], weight)
+        layer.shared_expert_online_loader = None
+        layer.scale = parameter
+        layer.get_parameter.reset_mock()
+        list(layer.load_weights([("0.scale", weight)]))
+        layer.get_parameter.assert_not_called()
+
+    def test_cudnn_bf16_refresh_limits_dispatch_to_sm12x_narrow_outputs(self):
+        _, updated = self.apply_upstream_excerpt(
+            "11-pr59025.patch", "vllm/model_executor/layers/utils.py",
+            "bf16_mm_dispatch_upstream.py",
+            ("+def _can_use_flashinfer_cudnn_bf16(",),
+        )
+        node = next(n for n in ast.parse(updated).body
+                    if getattr(n, "name", None) == "_can_use_flashinfer_cudnn_bf16")
+        shape_check = Mock(return_value=True)
+        platform = SimpleNamespace(is_cuda=lambda: True,
+                                   is_device_capability_family=lambda family: False)
+        namespace = {"current_platform": platform, "_FLASHINFER_BF16_MAX_N": 128,
+                     "_bf16_mm_shape_supported": shape_check}
+        exec("from __future__ import annotations\n" + ast.unparse(node), namespace)
+        dispatch = namespace[node.name]
+        x, weight = object(), SimpleNamespace(shape=(128, 5120))
+        self.assertFalse(dispatch(x, weight, None))
+        shape_check.assert_not_called()
+        platform.is_device_capability_family = lambda family: family == 120
+        self.assertTrue(dispatch(x, weight, None))
+        weight.shape = (129, 5120)
+        self.assertFalse(dispatch(x, weight, None))
+        weight.shape = (128, 5120)
+        shape_check.return_value = False
+        self.assertFalse(dispatch(x, weight, None))
+
+    def test_disk_offload_reuses_merged_nvfp4_lookup(self):
         # #56273 is now in main. Apply only the remaining shared-decoder
         # integration to its real device and pinned lookup implementations.
         _, updated = self.apply_upstream_excerpt(
             "01-pr59958.patch", "vllm/models/qwen4_exp/common/ngram_embedding.py",
             "nvfp4_ple_merged_upstream.py",
-            ("+    def lookup_rows(",
-             "-        _lookup_nvfp4_ple_embedding_kernel[(ids.numel(),)]("),
+            ("+    def decode_rows(",),
         )
         launch = Mock()
         grids = []
@@ -664,7 +1089,7 @@ class PatchSeriesTests(unittest.TestCase):
 
         launch.reset_mock()
         staged_weight, staged_scale = object(), Mock()
-        method.lookup_rows(staged_weight, staged_scale, layer.weight_scale_2,
+        method.decode_rows(staged_weight, staged_scale, layer.weight_scale_2,
                            ids, output, 0, 4)
         launch.assert_called_once_with(
             staged_weight, staged_scale.view.return_value,
@@ -673,9 +1098,175 @@ class PatchSeriesTests(unittest.TestCase):
         self.assertEqual(grids, [(4,), (4,), (4,)])
         launch.reset_mock()
         ids.numel.return_value = 0
-        method.lookup_rows(staged_weight, staged_scale, layer.weight_scale_2,
+        method.decode_rows(staged_weight, staged_scale, layer.weight_scale_2,
                            ids, output, 0, 0)
         launch.assert_not_called()
+
+    def test_disk_offload_stages_checkpoint_bytes_without_resident_tables(self):
+        try:
+            import torch
+            from safetensors import safe_open
+            from safetensors.torch import save_file
+            import numpy  # noqa: F401 - used by the PR's row-buffer views
+        except ImportError:
+            self.skipTest("CPU tensor checks require torch, safetensors and numpy")
+        import mmap
+
+        _, updated = self.apply_upstream_excerpt(
+            "01-pr59958.patch", "vllm/models/qwen4_exp/nvidia/ngram_embedding.py",
+            "ple_file_gather_interface_upstream.py",
+            ("class Qwen4ExpPLEDiskOffloadEmbedding",),
+        )
+        nvfp4 = type("NvFp4Method", (), {})
+        namespace = {
+            "ABC": ABC, "abstractmethod": abstractmethod, "os": os, "mmap": mmap,
+            "torch": torch, "nn": SimpleNamespace(Module=object),
+            "PLEVocabParallelEmbedding": type("PLEVocabParallelEmbedding", (), {}),
+            "Qwen4ExpPLENvFp4EmbeddingMethod": nvfp4,
+            "get_current_vllm_config": lambda: SimpleNamespace(
+                load_config=SimpleNamespace(load_format="safetensors")),
+        }
+        exec("from __future__ import annotations\n" + updated, namespace)
+
+        def base_init(layer, rows, width, *, params_dtype, embedding_method, **kw):
+            layer.org_vocab_size = rows
+            if isinstance(embedding_method, nvfp4):
+                layer.weight = layer.allocate_embedding_weight(rows, width // 2, torch.uint8)
+                layer.weight_scale = layer.allocate_embedding_weight(rows, width // 16,
+                                                                     torch.float8_e4m3fn)
+            else:
+                layer.weight = layer.allocate_embedding_weight(rows, width, params_dtype)
+
+        namespace["Qwen4ExpPLEEmbedding"].__init__ = base_init
+        cls = namespace["Qwen4ExpPLEDiskOffloadEmbedding"]
+        ids = torch.tensor([[23, 0], [5, 6], [12, 17], [23, 23]])
+        for fmt, dtype in (("bf16", torch.bfloat16), ("fp8", torch.float8_e4m3fn),
+                           ("nvfp4", torch.uint8)):
+            with self.subTest(format=fmt):
+                path = self.root / f"{fmt}.safetensors"
+                width = 16 if fmt == "nvfp4" else 32
+                planes = {"weight": torch.arange(24 * width).reshape(24, width).to(dtype)}
+                if fmt == "nvfp4":
+                    planes["weight_scale"] = torch.arange(48).reshape(24, 2).to(torch.float8_e4m3fn)
+                save_file({f"{name}.{i}": shard.clone() for name, plane in planes.items()
+                           for i, shard in enumerate(plane.split(6))}, path)
+                layer = cls(24, 32, params_dtype=dtype, padding_size=1, prefix="ple",
+                            embedding_method=nvfp4() if fmt == "nvfp4" else object(),
+                            num_ngram_heads=2, max_total_tokens=4)
+                self.assertEqual(layer.weight.numel(), 0)
+                with safe_open(path, framework="pt") as checkpoint:
+                    for name in planes:
+                        for i in range(4):
+                            layer.accept_checkpoint_shard(i, checkpoint.get_tensor(f"{name}.{i}"), 6, name)
+                    layer.bind_file_shards()
+                try:
+                    moved = path.with_suffix(".renamed")
+                    path.rename(moved)  # Binding retains open descriptors, not filenames.
+                    addresses = {name: buffers[0].data_ptr() for name, buffers in layer._planes.items()}
+                    for selected in (ids, ids.flip(0)):
+                        layer.copy_ids_to_host(selected)
+                        layer.stage_rows(4)
+                        for name, plane in planes.items():
+                            staging = layer._planes[name][0]
+                            expected = plane.view(torch.uint8)[selected]
+                            self.assertTrue(torch.equal(staging.view(torch.uint8), expected))
+                            self.assertEqual(staging.data_ptr(), addresses[name])
+                    os.truncate(moved, 0)
+                    with self.assertRaisesRegex(ValueError, "truncated at offset"):
+                        layer.stage_rows(4)
+                    with self.assertRaisesRegex(RuntimeError, "does not support weight reload"):
+                        layer.accept_checkpoint_shard(0, planes["weight"][:6], 6, "weight")
+                finally:
+                    for fd in layer._fds.values():
+                        os.close(fd)
+
+    def test_refreshed_sparse_vocab_preserves_logits_and_quantized_padding(self):
+        try:
+            import torch
+        except ImportError:
+            self.skipTest("CPU tensor checks require torch")
+        # This file is wholly added by patch 03; execute its production class
+        # with CPU linear stand-ins instead of importing CUDA kernel packages.
+        path = "vllm/model_executor/layers/draft_vocab.py"
+        patch_text = (PROJECT / "docker/patches/qwen3.8/vllm/03-pr59740-60226.patch").read_text()
+        section = next(s for s in re.split(r"(?m)(?=^diff --git )", patch_text)
+                       if s.startswith(f"diff --git a/{path} "))
+        source = "\n".join(line[1:] for line in section.splitlines()
+                           if line.startswith("+") and not line.startswith("+++"))
+        nodes = [n for n in ast.parse(source).body
+                 if getattr(n, "name", None) in {"DraftVocab", "scatter_draft_logits",
+                                                 "gather_rows_gemv", "load_draft_token_map"}]
+        class Unquantized:
+            pass
+
+        class Head(torch.nn.Module):
+            def __init__(self, weights, quantized=False):
+                super().__init__()
+                self.weight = torch.nn.Parameter(weights, requires_grad=False)
+                self.org_vocab_size, self.embedding_dim = weights.shape
+                self.num_embeddings_padded = self.org_vocab_size
+                self.params_dtype = weights.dtype
+                self.tp_size = 1
+                self.quant_method = (SimpleNamespace(apply=lambda head, x: x @ head.weight.T)
+                                     if quantized else Unquantized())
+                self.quant_config = SimpleNamespace(get_name=lambda: "test-quant")
+
+        class Rows:
+            def __init__(self, weights, quantization):
+                self.weights = weights
+            def __call__(self, x):
+                return x @ self.weights.T
+
+        def listed_rows(head, weights, ids):
+            selected = weights["weight"][ids]
+            return Head(torch.cat((selected, torch.zeros_like(selected[:1]))), True)
+
+        namespace = {"torch": torch, "nn": torch.nn, "_Rows": Rows,
+                     "ParallelLMHead": Head, "VocabParallelEmbedding": Head,
+                     "_UNQUANTIZED": (Unquantized,), "_DYNAMIC_RANK": 256, "_CHUNK": 1024,
+                     "logger": Mock(), "_listed_rows": listed_rows}
+        exec("from __future__ import annotations\n" + ast.unparse(ast.Module(body=nodes, type_ignores=[])), namespace)
+        cls = namespace["DraftVocab"]
+        gen = torch.Generator().manual_seed(4)
+        weights = torch.randn(20, 8, generator=gen)
+        hidden = torch.randn(4, 8, generator=gen)
+        ids = torch.tensor([0, 3, 7, 13])
+        processor = SimpleNamespace(vocab_size=20, head_dtype=None, scale=1.0, soft_cap=None)
+        for quantized, dynamic in ((False, 0), (False, 3), (True, 0)):
+            with self.subTest(quantized=quantized, dynamic_rows=dynamic):
+                head = Head(weights, quantized)
+                vocab = cls(processor, 20, keep_quantized_head=quantized)
+                if quantized:
+                    list(vocab.keep_head_weights([("lm_head.weight", weights)], head))
+                vocab.load_token_map(head, ids, dynamic)
+                logits = vocab.compute_logits(head, hidden)
+                kept = logits.isfinite()
+                self.assertTrue(torch.all(kept.sum(-1) == len(ids) + dynamic))
+                torch.testing.assert_close(logits[kept], (hidden @ weights.T)[kept])
+                torch.testing.assert_close(vocab.get_top_tokens(head, hidden), logits.argmax(-1))
+                self.assertEqual(vocab.head_weights, {})
+        head = Head(weights)
+        head.tp_size = 2
+        with self.assertRaisesRegex(ValueError, "tensor parallelism"):
+            cls(processor, 20).load_token_map(head, ids)
+        head = Head(weights, True)
+        vocab = cls(processor, 20, True)
+        list(vocab.keep_head_weights([("lm_head.weight", weights)], head))
+        with self.assertRaisesRegex(ValueError, "draft_lm_head_quantization"):
+            vocab.load_token_map(head, ids, quantization="fp8")
+        vocab = cls(processor, 20)
+        vocab.load_token_map = Mock()
+        namespace["load_draft_token_ids"] = Mock(return_value=ids)
+        config = SimpleNamespace(
+            speculative_config=SimpleNamespace(draft_token_map="vocab.json",
+                                               draft_token_map_dynamic_rows=3,
+                                               draft_lm_head_quantization="nvfp4"),
+            model_config=SimpleNamespace(hf_text_config=SimpleNamespace(eos_token_id=0),
+                                         try_get_generation_config=lambda: {"eos_token_id": [1, 2]}),
+        )
+        namespace["load_draft_token_map"](SimpleNamespace(draft_vocab=vocab, lm_head=head), config)
+        namespace["load_draft_token_ids"].assert_called_once_with("vocab.json", [0, 1, 2])
+        vocab.load_token_map.assert_called_once_with(head, ids, 3, "nvfp4")
 
     def test_ple_sequence_parallel_preserves_full_token_rows(self):
         _, updated = self.apply_upstream_excerpt(
@@ -712,15 +1303,15 @@ class PatchSeriesTests(unittest.TestCase):
             def finalize_prefetch(self, *, total_tokens):
                 return super().__call__(range(total_tokens))
 
-        class FileEmbedding(DeviceEmbedding):
-            def __call__(self, tokens):
-                # File gather already has every rank's vocabulary rows.
-                return Rows([2] * len(tokens))
+        class DiskEmbedding(DeviceEmbedding):
+            def staged_rows(self, num_tokens):
+                # Disk staging already has every rank's vocabulary rows.
+                return Rows([2] * num_tokens)
 
         namespace = {
             "Qwen4ExpPLEDeviceEmbedding": DeviceEmbedding,
             "Qwen4ExpPLEPinnedHostEmbedding": PinnedEmbedding,
-            "Qwen4ExpPLEFileGatherEmbedding": FileEmbedding,
+            "Qwen4ExpPLEDiskOffloadEmbedding": DiskEmbedding,
             "is_fp8": lambda _: False,
             "get_tp_group": lambda: SimpleNamespace(world_size=2),
             "sp_shard": lambda rows: Rows(rows[:len(rows) // 2]),
@@ -729,12 +1320,12 @@ class PatchSeriesTests(unittest.TestCase):
             ),
         }
         exec("from __future__ import annotations\n" + updated, namespace)
-        for storage in ("device", "pinned", "file"):
+        for storage in ("device", "pinned", "disk"):
             for sequence_parallel in (False, True):
                 for etp_size in (1, 2):
                     with self.subTest(storage=storage, sp=sequence_parallel, etp=etp_size):
                         config = SimpleNamespace(
-                            host_file_gather=storage == "file",
+                            disk_offload=storage == "disk",
                             cpu_offload=storage == "pinned",
                         )
                         namespace["get_current_vllm_config"] = lambda: SimpleNamespace(

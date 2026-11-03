@@ -20,12 +20,15 @@ import stat
 import struct
 import subprocess
 import tempfile
+import time
 
 NETPLAN = Path("/etc/netplan/98-spark-vllm-docker.yaml")
 STATE = Path("/var/lib/spark-vllm-docker/setup-cluster")
 LEGACY_STATE = Path("/var/lib/spark-vllm/setup-cluster")
 IPV6_CONF = Path("/proc/sys/net/ipv6/conf")
 DEFAULT_MTU = 9000
+NETWORK_READY_TIMEOUT = 60
+PING_ATTEMPTS = 3
 PORTS = {p: [f"enp1s0f{p}np{p}", f"enP2p1s0f{p}np{p}"] for p in (0, 1)}
 ENV_KEYS = {"CLUSTER_NODES", "COPY_HOSTS", "LOCAL_IP", "ETH_IF", "IB_IF", "CLUSTER_LINKS",
             "CONTAINER_NCCL_NET_PLUGIN", "CONTAINER_NCCL_IB_SUBNET_AWARE_ROUTING",
@@ -730,7 +733,67 @@ def apply_network(request, journal):
     journal.state["network_started"] = True
     journal.save()
     run(["netplan", "apply"])
+    # Wait only after every node has applied its configuration: a peer that
+    # started administratively down may need its own apply to bring up carrier.
     return {}
+
+
+def network_pending(request, deadline):
+    """Inspect local CX7 state without sending packets to peers."""
+    def read(argv):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("CX7 readiness inspection timed out")
+        return run(argv, check=False, timeout=min(5, remaining))
+
+    result = read(["ip", "-j", "address", "show"])
+    if result.returncode:
+        return ["could not read CX7 interface state"]
+    links = {link["ifname"]: link for link in json.loads(result.stdout)}
+    pending = []
+    mtu = requested_mtu(request)
+    for name, cidr in request["interfaces"].items():
+        link = links.get(name)
+        if not link:
+            pending.append(f"{name}: interface missing")
+            continue
+        if not {"UP", "LOWER_UP"} <= set(link.get("flags", [])):
+            pending.append(f"{name}: waiting for link and carrier")
+        if link.get("mtu") != mtu:
+            pending.append(f"{name}: waiting for MTU {mtu}")
+        addresses = {f"{a['local']}/{a['prefixlen']}" for a in link.get("addr_info", [])
+                     if a.get("family") == "inet" and not a.get("tentative") and not a.get("dadfailed")}
+        if cidr not in addresses:
+            pending.append(f"{name}: waiting for address {cidr}")
+    if pending:
+        return pending
+    # Check the kernel's chosen device AND source, rather than just the presence
+    # of an address. Netplan can return while old routes/sources are still active.
+    for name, address in request["ping_targets"]:
+        source = str(ipaddress.ip_interface(request["interfaces"][name]).ip)
+        result = read(["ip", "-j", "-4", "route", "get", address])
+        routes = json.loads(result.stdout) if result.returncode == 0 else []
+        if not any(r.get("dev") == name and r.get("prefsrc") == source
+                   and not r.get("gateway") and r.get("type", "unicast") == "unicast"
+                   and "linkdown" not in r.get("flags", []) for r in routes):
+            pending.append(f"{name}: waiting for direct route to {address} with source {source}")
+    return pending
+
+
+def wait_network(request, timeout=NETWORK_READY_TIMEOUT):
+    deadline = time.monotonic() + timeout
+    pending = ["CX7 interface and route state unavailable"]
+    while time.monotonic() < deadline:
+        try:
+            pending = network_pending(request, deadline)
+        except (TimeoutError, subprocess.TimeoutExpired):
+            pending = ["CX7 interface/route inspection timed out"]
+        if not pending:
+            return {}
+        remaining = deadline - time.monotonic()
+        if remaining > 0:
+            time.sleep(min(1, remaining))
+    raise ValueError(f"CX7 readiness timed out after {timeout:g}s: " + "; ".join(pending))
 
 
 def check_restore(journal):
@@ -968,11 +1031,21 @@ def verify(request, account):
     # misleadingly reported as a passwordless SSH failure.
     for interface, address in request["ping_targets"]:
         # IPv4 (20 bytes) + ICMP echo (8 bytes) leaves MTU - 28 for payload.
-        result = run(["ping", "-c", "2", "-W", "3", "-M", "do", "-s", str(mtu - 28),
-                      "-I", interface, address], check=False)
-        if result.returncode:
+        for attempt in range(PING_ATTEMPTS):
+            try:
+                result = run(["ping", "-4", "-c", "2", "-W", "3", "-M", "do", "-s", str(mtu - 28),
+                              "-I", interface, address], check=False, timeout=10)
+            except subprocess.TimeoutExpired:
+                pass
+            else:
+                if result.returncode == 0:
+                    break
+            if attempt + 1 < PING_ATTEMPTS:
+                time.sleep(1)
+        else:
             raise ValueError(f"CX7 reachability failed: {interface} -> {address}; "
-                             f"check cable order, port selection, addresses, and MTU {mtu}")
+                             f"after {PING_ATTEMPTS} attempts; check cable order, port selection, "
+                             f"addresses, and MTU {mtu}")
     for address in request["ssh_targets"]:
         result = run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10",
                       "-o", "ControlMaster=no", "-o", "ControlPath=none",
@@ -1008,6 +1081,8 @@ def dispatch(request):
         return {"netplan_files": [str(path) for path in files]}
     if action == "verify":
         return verify(request, account)
+    if action == "wait-network":
+        return wait_network(request)
     if os.geteuid() != 0:
         raise ValueError("Node changes require sudo")
     state_dir = state_directory()

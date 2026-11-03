@@ -1887,11 +1887,13 @@ from `local-inference-lab/vllm@dev/karmic-kraken` and
 ./build-and-copy.sh --exp-b12x --rebuild-vllm
 ```
 
-This builds the fork's FlashInfer wheels when its cache is missing or incomplete.
-Add `--rebuild-flashinfer` to refresh an existing cached set. B12X builds omit
-the `flashinfer-cubin` wheel and retain the Python, JIT-cache, and required
-JIT provider wheels. They never download regular FlashInfer wheels;
-`--force-flashinfer-download` is unsupported for this lane.
+This builds the fork's FlashInfer Python wheel when its cache is missing or
+incomplete. Add `--rebuild-flashinfer` to refresh an existing cached wheel.
+B12X builds skip cubin downloads and produce only `flashinfer-python`, without
+`flashinfer-cubin`, JIT-cache, or JIT provider wheels. Kernels compile on demand
+at runtime. Older B12X caches containing cubin or JIT-cache/provider wheels are
+rebuilt automatically during source builds. B12X builds never download regular
+FlashInfer wheels; `--force-flashinfer-download` is unsupported for this lane.
 
 It can be combined with `--apply-vllm-pr <pr-num>` to build custom vLLM patches.
 The preset preserves selected Blackwell subarchitectures in vLLM's CUDA 13
@@ -1924,7 +1926,7 @@ Wheel profiles are selected automatically:
 ├── flashinfer/
 │   ├── regular/       # upstream FlashInfer
 │   ├── custom/        # upstream with a custom ref/PR or GPU target
-│   ├── b12x/          # local-inference-lab FlashInfer, without cubins
+│   ├── b12x/          # local-inference-lab FlashInfer, Python wheel only
 │   └── b12x-custom/   # fork with a custom ref/PR or GPU target
 └── vllm/
     ├── regular/
@@ -1942,8 +1944,15 @@ vLLM source includes it. The script travels with locally exported wheels;
 older source refs and downloaded wheel sets without it skip this copy.
 
 The `--exp-b12x` profile and any branch, tag, or commit selected from
-`local-inference-lab/vllm` use the FlashInfer fork. Regular builds keep the
-original `flashinfer-ai/flashinfer` source and published wheel release.
+`local-inference-lab/vllm` use the FlashInfer fork temporarily pinned to
+[`9873d7a33f91aeb14c83286552e1f3d84efa2c2e`](https://github.com/local-inference-lab/flashinfer/commit/9873d7a33f91aeb14c83286552e1f3d84efa2c2e),
+the revision used by the passing October 15, 2026 CI image. This predates the
+expanded MLA tuning search that grew preparation-cache exchanges beyond the
+TCPStore message limit. Its schema-22 cache is separate from the affected
+schema-23 cache; existing caches do not need to be deleted for this rollback.
+Source builds replace cached wheels whose commit does not match the pin.
+Regular builds keep the original `flashinfer-ai/flashinfer` source and published
+wheel release.
 `--flashinfer-ref` and `--apply-flashinfer-pr` apply to the selected FlashInfer
 repository. Source checkout caches are isolated by repository as well.
 
@@ -2196,9 +2205,16 @@ discovered correctly:
 
 When a foreground `exec` command fails, the launcher prints the last 200
 container-log lines from the head and each worker before cleanup. This includes
-detached worker tracebacks and earlyoom output in the terminal or CI job log.
+worker tracebacks and earlyoom output in the terminal or CI job log.
 Log collection is limited to 15 seconds per node and preserves the command's
 original exit status.
+
+Foreground no-Ray cluster launches also monitor each worker command through
+its SSH connection. If a worker exits while the head is still running, the
+launcher reports its rank, node and exit status, collects logs, and fails
+without waiting for the server startup timeout. SSH keepalives detect lost
+worker connections. Daemon (`-d`) launches remain detached and do not have this
+host-side supervision.
 
 ### Early OOM Monitor
 

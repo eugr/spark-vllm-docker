@@ -3,10 +3,10 @@ Subject: [PATCH] [Bugfix][Spec Decode] Keep SW draft block a divisor of the prim
 
 Upstream-PR: https://github.com/vllm-project/vllm/pull/60252
 Upstream-Commit: 15787522732a833aa8c6a95bdb59e8b3e3ec4f88
-Integration-Base: 355553ac22dca4080929ea8f88a446f15df1f3ba
+Integration-Base: 8084f0624dba24aba6ebac62d8e10cc00730a0fe
 
 diff --git a/tests/v1/attention/test_backend_per_kind.py b/tests/v1/attention/test_backend_per_kind.py
-index 53dedf3d6bce23e5fa3861329a9d5b1056de0821..1461e8dbe650a76982b19828528950a72114db31 100644
+index 5a32b302f23052c61fcb923603e8ac31c7cb977a..896eac1a3cf95924d7f4106fdb250bcaca9b33bc 100644
 --- a/tests/v1/attention/test_backend_per_kind.py
 +++ b/tests/v1/attention/test_backend_per_kind.py
 @@ -5,16 +5,24 @@
@@ -109,7 +109,7 @@ index 53dedf3d6bce23e5fa3861329a9d5b1056de0821..1461e8dbe650a76982b19828528950a7
      "signals,expected",
      [
 diff --git a/vllm/model_executor/layers/attention/attention.py b/vllm/model_executor/layers/attention/attention.py
-index bec1856d93ad6f6e8083b45ac5b8dedd5d5f5178..b1fbe12d22177bd0b9ec0510dcf616fcbe7251a2 100644
+index 98b7f6509303f5009121012ca2250a7a6742a600..e33cc791e8ab1bc00bdfd2e48c7a89815d6d216d 100644
 --- a/vllm/model_executor/layers/attention/attention.py
 +++ b/vllm/model_executor/layers/attention/attention.py
 @@ -104,6 +104,7 @@ def _largest_kernel_block_within(
@@ -148,7 +148,7 @@ index bec1856d93ad6f6e8083b45ac5b8dedd5d5f5178..b1fbe12d22177bd0b9ec0510dcf616fc
      return max(fitting) if fitting else smallest
  
  
-@@ -649,12 +664,16 @@ class Attention(nn.Module, AttentionLayerBase):
+@@ -659,12 +674,16 @@ class Attention(nn.Module, AttentionLayerBase):
              )
              sw_per_token = kv_cache_spec.real_page_size_bytes
              page_budget = shared_page or sw_per_token * block_size

@@ -1,10 +1,10 @@
 # Recipe: Qwen3.8-Flash-Next-FP4-Local (dual-node cluster)
 # Two-node configuration using the B12X-optimized serving stack with PLE
-# tables in shared memory.
+# tables allocated on the GPU.
 
 recipe_version: "1"
 name: Qwen3.8-Flash-Next-FP4-Local (Cluster)
-description: vLLM serving nvidia/Qwen3.8-Flash-Next-FP4-Local on a dual DGX Spark cluster with shared PLE tables
+description: vLLM serving nvidia/Qwen3.8-Flash-Next-FP4-Local on a dual DGX Spark cluster with GPU-resident PLE tables
 
 model: nvidia/Qwen3.8-Flash-Next-FP4-Local
 container: vllm-node-b12x
@@ -29,7 +29,6 @@ defaults:
   gpu_memory_utilization: 0.7
 
 env:
-  VLLM_PLE_TABLE_MEMORY: "shared"
   VLLM_ENABLE_ROCE_ALLREDUCE: "1"
   VLLM_ROCE_ALLREDUCE_MAX_SIZE: "2MB"
   NCCL_BUFFSIZE: "1048576"
@@ -61,6 +60,7 @@ command: |
     --quantization modelopt_mixed \
     --block-size {block_size} \
     --load-format b12x \
+    --additional-config '{{"ple_table_memory":"device"}}' \
     --max-model-len {max_model_len} \
     --max-num-seqs {max_num_seqs} \
     --max-num-batched-tokens {max_num_batched_tokens} \

@@ -308,11 +308,17 @@ RAM. A higher budget can fail vLLM's free-memory check on a worker before
 weights load, leaving the head with a Gloo peer-disconnect error. Override with
 `--gpu-mem VALUE` only when every node has enough free memory at startup.
 
-For example, override the Qwen3.8 Flash Next cluster recipe's shared PLE tables:
+The Qwen3.8 Flash Next cluster recipe includes
+`--additional-config '{"ple_table_memory":"device"}'` in its command, so a
+normal recipe launch allocates PLE tables on the GPU. This explicit setting
+takes precedence over `VLLM_PLE_TABLE_MEMORY` environment overrides.
+
+To override the cluster recipe with disk offload:
 
 ```bash
 ./run-recipe.sh qwen3.8-flash-next-nvfp4-cluster \
-  -e VLLM_PLE_TABLE_MEMORY=disk -e B12X_DISK_BACKEND=io_uring
+  -e B12X_DISK_BACKEND=io_uring \
+  -- --additional-config '{"ple_table_memory":"disk"}'
 ```
 
 ```bash

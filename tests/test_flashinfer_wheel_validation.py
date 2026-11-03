@@ -30,6 +30,7 @@ class FlashInferWheelValidationTests(unittest.TestCase):
         self.vllm.mkdir()
         self.architectures = "12.1a"
         self.build_cubin = "1"
+        self.build_jit_cache = "1"
         self.cubin = self.write_wheel("flashinfer-cubin")
         self.write_wheel("flashinfer-python")
         self.jit = self.write_wheel("flashinfer-jit-cache")
@@ -60,6 +61,7 @@ class FlashInferWheelValidationTests(unittest.TestCase):
                     "set -e\n" + VALIDATORS + "\nGPU_ARCH_LIST="
                     + shlex.quote(self.architectures)
                     + "\nFLASHINFER_BUILD_CUBIN=" + self.build_cubin
+                    + "\nFLASHINFER_BUILD_JIT_CACHE=" + self.build_jit_cache
                     + "\n" + shlex.join(commands[gate])
                 )
                 result = subprocess.run(
@@ -83,22 +85,43 @@ class FlashInferWheelValidationTests(unittest.TestCase):
         self.cubin.unlink()
         self.check("does not contain exactly one cubin wheel")
 
-    def test_b12x_accepts_no_cubin(self):
+    def b12x_profile(self):
         self.build_cubin = "0"
+        self.build_jit_cache = "0"
         self.cubin.unlink()
+        self.jit.unlink()
+
+    def test_b12x_accepts_python_only(self):
+        self.b12x_profile()
         self.check()
 
     def test_b12x_rejects_cubin_contamination(self):
-        self.build_cubin = "0"
+        self.b12x_profile()
+        self.write_wheel("flashinfer-cubin")
         self.check("must not contain cubin wheels")
 
-    def test_b12x_still_requires_jit_providers(self):
-        self.build_cubin = "0"
-        self.cubin.unlink()
-        self.shim("flashinfer-jit-cache-sm121a==0.7.0")
-        self.check("provider wheel for arch sm121a")
+    def test_b12x_rejects_jit_cache(self):
+        self.b12x_profile()
+        self.write_wheel("flashinfer-jit-cache")
+        self.check("must not contain JIT-cache or provider wheels")
+
+    def test_b12x_rejects_provider_without_shim(self):
+        self.b12x_profile()
         self.write_wheel("flashinfer-jit-cache-sm121a")
-        self.check()
+        self.check("must not contain JIT-cache or provider wheels")
+
+    def test_b12x_requires_exactly_one_python_wheel(self):
+        self.b12x_profile()
+        python_wheel = next(self.fi.glob("flashinfer_python-*.whl"))
+        python_wheel.unlink()
+        self.check("does not contain exactly one complete wheel set")
+        self.write_wheel("flashinfer-python")
+        self.write_wheel("flashinfer-python", "0.6.0")
+        self.check("does not contain exactly one complete wheel set")
+
+    def test_regular_still_requires_jit_cache(self):
+        self.jit.unlink()
+        self.check("does not contain exactly one JIT-cache wheel")
 
     def test_historical_monolithic_cache_needs_no_arch_marker_for_runner(self):
         (self.fi / ".flashinfer-arch").unlink()

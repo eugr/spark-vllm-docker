@@ -489,6 +489,117 @@ class CommandTests(unittest.TestCase):
             self.assertEqual(worker.lldp_neighbors(), {})
 
 
+class NetworkReadinessTests(unittest.TestCase):
+    def setUp(self):
+        self.request = setup.make_plan(NODES[:4], "ring", {}, "10.20.0.0/16")[NODES[0]]
+        self.info = inventory(NODES[0], interfaces=self.request["interfaces"])
+        for link in self.info["links"]:
+            if link["ifname"] in self.request["interfaces"]:
+                link["mtu"] = 9000
+        self.routes = {address: {"dev": name, "prefsrc": self.request["interfaces"][name].split("/")[0]}
+                       for name, address in self.request["ping_targets"]}
+        self.now = 0
+        self.run = Mock(side_effect=self.fake_run)
+        self.sleep = Mock(side_effect=self.advance)
+        patcher = patch.object(worker, "run", self.run)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        for name, value in (("monotonic", lambda: self.now), ("sleep", self.sleep)):
+            patcher = patch.object(worker.time, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def advance(self, seconds):
+        self.now += seconds
+
+    def fake_run(self, argv, **kwargs):
+        self.assertGreater(kwargs["timeout"], 0)
+        self.assertLessEqual(kwargs["timeout"], 5)
+        if argv == ["ip", "-j", "address", "show"]:
+            return subprocess.CompletedProcess(argv, 0, json.dumps(self.info["links"]), "")
+        self.assertEqual(argv[:-1], ["ip", "-j", "-4", "route", "get"])
+        route = self.routes.get(argv[-1])
+        return subprocess.CompletedProcess(argv, 0 if route else 2, json.dumps([route] if route else []), "")
+
+    def test_ready_network_returns_immediately_without_probing_peers(self):
+        self.assertEqual(worker.wait_network(self.request), {})
+        self.sleep.assert_not_called()
+        self.assertEqual(self.run.call_count, 1 + len(self.routes))
+
+    def test_readiness_respects_selected_mtu(self):
+        self.request["mtu"] = 1500
+        for link in self.info["links"]:
+            if link["ifname"] in self.request["interfaces"]:
+                link["mtu"] = 1500
+        self.assertEqual(worker.wait_network(self.request), {})
+        self.sleep.assert_not_called()
+
+    def test_waits_for_addresses_then_routes_and_correct_sources(self):
+        name, target = self.request["ping_targets"][0]
+        link = next(link for link in self.info["links"] if link["ifname"] == name)
+        addresses = link["addr_info"]
+        link["addr_info"] = []
+        route = self.routes.pop(target)
+        def converge(seconds):
+            self.advance(seconds)
+            if self.now == 1:
+                link["addr_info"] = addresses
+            elif self.now == 2:
+                self.routes[target] = {**route, "prefsrc": NODES[0]}
+            else:
+                self.routes[target] = route
+        self.sleep.side_effect = converge
+        self.assertEqual(worker.wait_network(self.request), {})
+        self.assertEqual(self.now, 3)
+        self.assertEqual(self.sleep.call_count, 3)
+
+    def test_missing_link_address_carrier_and_mtu_are_reported_on_timeout(self):
+        name = next(iter(self.request["interfaces"]))
+        for problem, message in (("missing", "interface missing"), ("address", "waiting for address"),
+                                 ("carrier", "link and carrier"), ("mtu", "MTU 9000"),
+                                 ("tentative", "waiting for address")):
+            with self.subTest(problem=problem):
+                links = json.loads(json.dumps(self.info["links"]))
+                link = next(link for link in self.info["links"] if link["ifname"] == name)
+                if problem == "missing":
+                    self.info["links"].remove(link)
+                elif problem == "address":
+                    link["addr_info"][0]["prefixlen"] = 16
+                elif problem == "carrier":
+                    link["flags"] = ["UP"]
+                elif problem == "mtu":
+                    link["mtu"] = 1500
+                else:
+                    link["addr_info"][0]["tentative"] = True
+                self.now = 0
+                with self.assertRaisesRegex(ValueError, f"CX7 readiness timed out after 2s:.*{name}.*{message}"):
+                    worker.wait_network(self.request, timeout=2)
+                self.assertEqual(self.now, 2)
+                self.info["links"] = links
+
+    def test_wrong_route_device_source_or_gateway_never_passes(self):
+        name, target = self.request["ping_targets"][0]
+        expected = self.routes[target]
+        for change in ({"dev": "management0"}, {"prefsrc": NODES[0]}, {"gateway": NODES[1]},
+                       {"type": "unreachable"}, {"flags": ["linkdown"]}):
+            with self.subTest(change=change):
+                self.routes[target] = {**expected, **change}
+                self.now = 0
+                with self.assertRaisesRegex(ValueError, f"{name}: waiting for direct route to {target} with source"):
+                    worker.wait_network(self.request, timeout=2)
+                self.assertEqual(self.now, 2)
+
+    def test_command_timeouts_respect_overall_readiness_deadline(self):
+        def timeout(argv, **kwargs):
+            self.advance(kwargs["timeout"])
+            raise subprocess.TimeoutExpired(argv, kwargs["timeout"])
+        self.run.side_effect = timeout
+        with self.assertRaisesRegex(ValueError, "CX7 readiness timed out after 7s:.*inspection timed out"):
+            worker.wait_network(self.request, timeout=7)
+        self.assertEqual(self.now, 7)
+        self.assertEqual([call.kwargs["timeout"] for call in self.run.call_args_list], [5, 1])
+
+
 class NodeTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix="spark-setup-test-")
@@ -523,6 +634,9 @@ class NodeTests(unittest.TestCase):
             patcher = patch.object(worker, name, **kwargs)
             patcher.start()
             self.addCleanup(patcher.stop)
+        sleeper = patch.object(worker.time, "sleep")
+        self.sleep = sleeper.start()
+        self.addCleanup(sleeper.stop)
         # Tests run unprivileged. Root-owned simulated files have normalized
         # ownership; user SSH files retain their real uid/gid.
         original_write, original_snapshot = worker.atomic_write, worker.snapshot
@@ -973,6 +1087,35 @@ class NodeTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "CX7 reachability failed"):
                 worker.verify(self.request, self.account)
         self.assertEqual(calls.call_args.args[0][0], "ping")
+        self.assertEqual(calls.call_count, worker.PING_ATTEMPTS)
+        self.assertEqual(self.sleep.call_count, worker.PING_ATTEMPTS - 1)
+
+    def test_transient_ping_failure_is_retried_before_ssh(self):
+        attempts = 0
+        def converge(argv, **kwargs):
+            nonlocal attempts
+            result = self.fake_run(argv, **kwargs)
+            if argv[0] == "ping":
+                attempts += 1
+                result.returncode = int(attempts == 1)
+            return result
+        with patch.object(worker, "run", side_effect=converge):
+            worker.verify(self.request, self.account)
+        pings = [c for c in self.calls if c[0] == "ping"]
+        self.assertEqual(pings[0], pings[1])
+        self.assertEqual(len(pings), len(self.request["ping_targets"]) + 1)
+        self.assertEqual(pings[0][pings[0].index("-I") + 1], self.request["ping_targets"][0][0])
+        first_ssh = next(i for i, c in enumerate(self.calls) if c[0] == "ssh")
+        self.assertTrue(all(c[0] == "ping" for c in self.calls[:first_ssh]))
+        self.sleep.assert_called_once_with(1)
+
+    def test_ping_command_timeouts_are_retried_and_remain_bounded(self):
+        with patch.object(worker, "run", side_effect=subprocess.TimeoutExpired("ping", 10)) as calls:
+            with self.assertRaisesRegex(ValueError, "CX7 reachability failed.*after 3 attempts"):
+                worker.verify(self.request, self.account)
+        self.assertEqual(calls.call_count, worker.PING_ATTEMPTS)
+        self.assertTrue(all(c.args[0][0] == "ping" and c.kwargs["timeout"] == 10
+                            for c in calls.call_args_list))
 
     def test_verification_sizes_unfragmented_packets_for_selected_mtu(self):
         for mtu in (None, 68, 1500, 4096, 9216, 65535):
@@ -1403,6 +1546,23 @@ class OrchestrationTests(unittest.TestCase):
         self.assertEqual([c.args for c in calls[-5:-1]], [(n, "verify") for n in NODES[:4]])
         self.assertEqual(json.loads(self.path.read_text())["env_file"], str(self.args.env_file))
 
+    def test_all_nodes_apply_then_become_ready_before_any_verification(self):
+        self.run_setup()
+        calls = self.transport.call.call_args_list
+        phases = [c.args for c in calls if c.args[1] in ("network", "wait-network", "verify")]
+        self.assertEqual(phases, [(n, "network") for n in reversed(NODES[:4])] +
+                         [(n, "wait-network") for n in NODES[:4]] +
+                         [(n, "verify") for n in NODES[:4]])
+
+    def test_readiness_timeout_rolls_back_without_pings_or_env_save(self):
+        self.failed = (NODES[2], "wait-network")
+        with self.assertRaisesRegex(ValueError, "injected failure"):
+            self.run_setup()
+        calls = self.transport.call.call_args_list
+        self.assertFalse(any(c.args[1] in ("verify", "env") for c in calls))
+        self.assertEqual([c.args[0] for c in calls if c.args[1] == "restore"], NODES[:4][::-1])
+        self.assertFalse(self.path.exists())
+
     def test_no_env_skips_read_and_write(self):
         self.args.no_env = True
         self.run_setup()
@@ -1446,6 +1606,10 @@ class OrchestrationTests(unittest.TestCase):
         self.assertEqual(sum(c.args[1] == "verify" for c in calls), 8)
         self.assertEqual(sum(c.args[1] == "doctor-inspect" for c in calls), 8)
         self.assertFalse(any(c.args[1] in ("restore", "prepare", "network") for c in calls))
+        repair_end = max(i for i, c in enumerate(calls) if c.args[1] == "doctor-repair")
+        self.assertEqual([c.args for c in calls[repair_end+1:repair_end+5]],
+                         [(n, "wait-network") for n in NODES[:4]])
+        self.assertEqual(calls[repair_end+5].args, (NODES[0], "verify"))
 
     def test_doctor_passes_saved_mtu_to_repairs_and_verification(self):
         reports = self.doctor_transport()
@@ -1582,7 +1746,7 @@ class OrchestrationTests(unittest.TestCase):
         self.assertIn("MTU: 1500", output.getvalue())
         self.assertEqual(json.loads(self.path.read_text())["mtu"], 1500)
         for call in self.transport.call.call_args_list:
-            if call.args[1] in ("preflight", "prepare", "network", "verify"):
+            if call.args[1] in ("preflight", "prepare", "network", "wait-network", "verify"):
                 self.assertEqual(call.kwargs["mtu"], 1500)
 
     def test_preflight_failure_does_not_start_setup(self):
@@ -1602,7 +1766,7 @@ class OrchestrationTests(unittest.TestCase):
         self.assertFalse(self.path.exists())
 
     def test_prepare_apply_and_verify_failure_roll_back_all_nodes(self):
-        for action in ("prepare", "docker", "ssh", "network", "verify"):
+        for action in ("prepare", "docker", "ssh", "network", "wait-network", "verify"):
             with self.subTest(action=action):
                 self.transport.reset_mock()
                 self.failed = (NODES[2], action)
