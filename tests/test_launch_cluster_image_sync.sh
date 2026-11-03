@@ -433,7 +433,7 @@ test_recipe_launch_script_worker_failure() {
     [[ "$status" == 31 ]] || fail "recipe script worker status was lost: $status"
     assert_output_contains 'Worker rank 1 on 10.0.0.2 exited with status 31'
     assert_log_contains '^scp '
-    assert_log_contains '^ssh -n .*docker exec vllm_node bash -c /workspace/exec-script.sh'
+    assert_log_contains "^ssh -n .*docker exec vllm_node bash -c '/workspace/exec-script.sh"
     assert_exec_clients_stopped
     pass "recipe-generated launch scripts receive the same worker failure supervision"
 }
