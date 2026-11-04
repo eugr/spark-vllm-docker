@@ -47,6 +47,9 @@ wheels and runners built with `--use-wheels`. On integrated NVIDIA GPUs under
 WSL, vLLM keeps CUDA's reported free memory instead of replacing it with guest
 RAM availability. Native Linux UMA accounting and proactive allocator-cache
 release keep their upstream behavior.
+The patch supports both older memory snapshots and the shared memory-reporting
+helper introduced by [vLLM PR #65413](https://github.com/vllm-project/vllm/pull/65413),
+so profiling and extensible KV-cache sizing use the same WSL policy.
 
 Regular and B12X source builds also trim unused glibc CPU heap pages before
 the final KV cache sizing measurement, after profiling cleanup. On Spark's
