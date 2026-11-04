@@ -64,6 +64,30 @@ upstream commit `397b9607c83cf201f3c44684c555c3698869b6bd`.
 
 ## Integration and refresh
 
+The November 4 refresh fixes pipeline 386, job 705, which stopped at patch 04
+on vLLM `790be385c8a69f45ec9a7a85ef00836d1684060f`. Upstream moved the shared
+autoregressive decode loop into `AutoRegressiveSpeculator` and moved decode
+graph shapes into `VllmConfig.get_decode_cudagraph_query_lens`. Patch 04 now
+uses those interfaces, preserving metadata construction before confidence
+checks, distributed dispatch, graph specialization and decode hooks. Adaptive
+verification lengths retain their single-request limits; full and fallback
+depths support larger batches within upstream's request and token budgets.
+
+Newer main already includes #60252. Patch 09 now matches its merged test
+imports and type narrowing, allowing the existing reverse-apply check to
+recognize it without changing its runtime code. It remains in the series for
+the failed revision, where that fix is still needed.
+
+All 16 entries replay from fresh archives of the failed revision and main
+`101cfd10011bc104849622709b8f59d7ea9d1ff9`, without historical patch-base
+objects. Patch 01 skips on both; patch 09 also skips on main. All 19 subsequent
+source patchers, including the WSL helper, and CUTLASS pinning pass. All changed
+Python files compile: 83 on the failed revision and 81 on main. All 39 series
+tests pass with CPU tensor dependencies, including adaptive/fixed draft
+forwarding, metadata ordering, fused-decode selection, distributed dispatch
+and graph budgets. All 109 build checks pass. GPU wheel compilation and
+inference remain for CI.
+
 The November 3 refresh fixes pipeline 385, job 702, which stopped at patch 04
 on vLLM `c7a760751977e4e3396d586956d8767a9bc44a82`. Adaptive draft dispatch now
 preserves upstream's `decode_graph_eligible` check, including rejection of short

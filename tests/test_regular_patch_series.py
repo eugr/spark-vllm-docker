@@ -3,7 +3,9 @@
 
 import ast
 from abc import ABC, abstractmethod
+import bisect
 from contextlib import nullcontext
+from functools import partial
 import os
 from pathlib import Path
 import re
@@ -1350,7 +1352,7 @@ class PatchSeriesTests(unittest.TestCase):
     def test_confidence_stop_disables_fused_decode_after_metadata_refactor(self):
         _, updated = self.apply_upstream_excerpt(
             "04-pr60068.patch",
-            "vllm/v1/worker/gpu/spec_decode/target_dependent_ar/speculator.py",
+            "vllm/v1/worker/gpu/spec_decode/autoregressive/speculator.py",
             "draft_metadata_upstream.py", ("def _configure_decode_metadata_update",),
         )
 
@@ -1364,7 +1366,7 @@ class PatchSeriesTests(unittest.TestCase):
             for stop in (None, object()):
                 for supported in (False, True):
                     with self.subTest(steps=steps, stop=stop is not None, backend=supported):
-                        speculator = namespace["TargetDependentARSpeculator"]()
+                        speculator = namespace["AutoRegressiveSpeculator"]()
                         speculator.num_speculative_steps = steps
                         speculator.confidence_stop = stop
                         speculator.backend_supports_update = supported
@@ -1373,6 +1375,256 @@ class PatchSeriesTests(unittest.TestCase):
                             speculator.supports_decode_metadata_update,
                             steps > 1 and stop is None and supported,
                         )
+
+    def test_confidence_stop_preserves_decode_graph_request_and_token_limits(self):
+        _, updated = self.apply_upstream_excerpt(
+            "04-pr60068.patch", "vllm/config/vllm.py",
+            "decode_graph_limits_upstream.py",
+            ("+            and speculative_config.draft_confidence_fallback_depth",),
+        )
+        namespace = {"bisect": bisect}
+        exec("from __future__ import annotations\n" + updated, namespace)
+        config = namespace["VllmConfig"]()
+        config.scheduler_config = SimpleNamespace(max_num_seqs=8)
+        config.num_speculative_tokens = 4
+        spec = SimpleNamespace(
+            uses_dynamic_speculative_decoding=lambda: False,
+            draft_confidence_fallback_depth=2,
+        )
+        config.speculative_config = spec
+        lengths = config.get_decode_cudagraph_query_lens(5)
+        self.assertEqual(lengths, {2: 1, 3: 8, 4: 1, 5: 8})
+        shapes = namespace["decode_cudagraph_capture_shapes"]
+        self.assertEqual(shapes([1, 2, 4, 8], lengths, 12), [
+            (1, 2), (1, 3), (2, 3), (4, 3), (1, 4), (1, 5), (2, 5),
+        ])
+        self.assertEqual(shapes([1, 2, 4, 8], lengths, 3), [(1, 2), (1, 3)])
+        # The runner may sample more than one new token per request.
+        self.assertEqual(config.get_decode_cudagraph_query_lens(6),
+                         {3: 1, 4: 8, 5: 1, 6: 8})
+        spec.draft_confidence_fallback_depth = 4
+        self.assertEqual(config.get_decode_cudagraph_query_lens(5),
+                         {2: 1, 3: 1, 4: 1, 5: 8})
+        self.assertEqual(config.get_decode_cudagraph_query_lens(1), {1: 8})
+        spec.draft_confidence_fallback_depth = None
+        self.assertEqual(config.get_decode_cudagraph_query_lens(5), {5: 8})
+        config.speculative_config = None
+        config.num_speculative_tokens = 0
+        self.assertEqual(config.get_decode_cudagraph_query_lens(1), {1: 8})
+        # Upstream dynamic scheduling retains its own per-length request caps.
+        config.speculative_config = spec
+        config.num_speculative_tokens = 4
+        spec.uses_dynamic_speculative_decoding = lambda: True
+        spec.num_speculative_tokens_per_batch_size = object()
+        lookup = Mock(return_value=[0, 4, 4, 2, 2, 1, 1, 0, 0])
+        with patch.dict("sys.modules", {
+            "vllm.v1.spec_decode.dynamic.utils": SimpleNamespace(
+                build_dynamic_sd_schedule_lookup=lookup,
+            ),
+        }):
+            self.assertEqual(config.get_decode_cudagraph_query_lens(5),
+                             {5: 2, 3: 4, 2: 6, 1: 8})
+        lookup.assert_called_once_with(
+            spec.num_speculative_tokens_per_batch_size,
+            vllm_max_batch_size=8, vllm_num_speculative_tokens=4,
+        )
+
+    def shared_autoregressive_namespace(self):
+        _, updated = self.apply_upstream_excerpt(
+            "04-pr60068.patch",
+            "vllm/v1/worker/gpu/spec_decode/autoregressive/speculator.py",
+            "draft_decode_loop_upstream.py",
+        )
+        # Execute real patched methods without importing CUDA-only dependencies.
+        tree = ast.parse(updated)
+        tree.body = [node for node in tree.body if isinstance(node, ast.ClassDef)]
+        namespace = {
+            "DraftModelSpeculator": object, "partial": partial,
+            "CUDAGraphMode": SimpleNamespace(FULL="full"),
+            "dispatch_cg_and_sync_dp": Mock(),
+            "build_slot_mappings_by_layer": Mock(return_value="slots"),
+        }
+        exec("from __future__ import annotations\n" + ast.unparse(tree), namespace)
+        return namespace
+
+    def test_shared_decode_loop_waits_after_metadata_and_stops_before_launch(self):
+        namespace = self.shared_autoregressive_namespace()
+        for mode in ("full", "eager"):
+            for advance in (False, True):
+                for skip_attn in (False, True):
+                    for decisions in (None, [False], [True, False], [True] * 3):
+                        with self.subTest(mode=mode, advance=advance, skip=skip_attn,
+                                          decisions=decisions):
+                            speculator = namespace["AutoRegressiveSpeculator"]()
+                            events = []
+                            speculator.input_buffers = SimpleNamespace(
+                                positions=[0], query_start_loc=[0, 1],
+                            )
+                            speculator.idx_mapping = [0]
+                            speculator.kv_cache_config = object()
+                            speculator.advance_draft_positions = advance
+                            speculator.block_tables = Mock()
+                            speculator._build_uniform_attn_metadata = Mock(
+                                side_effect=lambda **kw: events.append(("metadata", kw["step"])),
+                            )
+                            speculator.current_draft_step = SimpleNamespace(
+                                fill_=lambda step: events.append(("step", step)),
+                            )
+                            speculator.decode_cudagraph_manager = SimpleNamespace(
+                                run_fullgraph=lambda desc: events.append("graph"),
+                            )
+                            speculator._decode = lambda *args: events.append("eager")
+                            stop = None
+                            if decisions is not None:
+                                pending = iter(decisions)
+
+                                def should_continue():
+                                    events.append("wait")
+                                    return next(pending)
+
+                                stop = SimpleNamespace(
+                                    should_continue=should_continue,
+                                    step_launched=lambda: events.append("launched"),
+                                    end_round=lambda: events.append("end"),
+                                )
+                            speculator._multi_step_decode(
+                                1, skip_attn,
+                                SimpleNamespace(cg_mode=mode, num_tokens=1),
+                                None, [4], 4, confidence_stop=stop,
+                            )
+                            expected = []
+                            for step in range(1, 4):
+                                if not skip_attn and (advance or step == 1):
+                                    expected.append(("metadata", step))
+                                if decisions is not None:
+                                    expected.append("wait")
+                                    if not decisions[step - 1]:
+                                        break
+                                expected.extend([("step", step),
+                                                 "graph" if mode == "full" else "eager"])
+                                if decisions is not None:
+                                    expected.append("launched")
+                            else:
+                                if decisions is not None:
+                                    expected.append("end")
+                            self.assertEqual(events, expected)
+
+    def test_shared_decode_dispatch_preserves_dp_specialization_and_hooks(self):
+        namespace = self.shared_autoregressive_namespace()
+        dispatch = namespace["dispatch_cg_and_sync_dp"]
+        for fused, stop in ((True, None), (False, None), (False, object())):
+            for depth in (2, 4):
+                with self.subTest(fused=fused, adaptive=stop is not None, depth=depth):
+                    speculator = namespace["AutoRegressiveSpeculator"]()
+                    events = []
+                    speculator.dp_size, speculator.dp_rank = 2, 1
+                    speculator.vllm_config = SimpleNamespace(parallel_config=object())
+                    sync = SimpleNamespace(num_tokens_across_dp=object())
+                    dp_state = SimpleNamespace(num_reqs=1)
+                    speculator._build_uniform_batch_dp_sync = Mock(return_value=(sync, 2))
+                    descriptor, specialized = object(), object()
+                    dispatch.reset_mock()
+                    dispatch.return_value = (descriptor, sync)
+                    speculator.decode_cudagraph_manager = SimpleNamespace(
+                        specialize_spec_tokens=Mock(return_value=specialized),
+                    )
+                    speculator._prepare_decode_inputs = Mock()
+                    speculator.on_multi_step_decode_begin = lambda n: events.append(("begin", n))
+                    speculator.on_multi_step_decode_end = lambda n: events.append(("end", n))
+                    speculator.supports_decode_metadata_update = fused
+                    speculator._run_fused_multi_step_decode = Mock(
+                        side_effect=lambda *args: events.append("fused"),
+                    )
+                    speculator._multi_step_decode = Mock(
+                        side_effect=lambda *args, **kw: events.append("separate"),
+                    )
+                    speculator._run_multi_step_decode(
+                        "batch", "rejected", 3, False, dp_state, "bounds", True,
+                        depth, confidence_stop=stop,
+                    )
+                    self.assertEqual(events, [("begin", 1), "fused" if fused else "separate",
+                                              ("end", 1)])
+                    speculator._build_uniform_batch_dp_sync.assert_called_once_with(dp_state, 1)
+                    dispatch.assert_called_once_with(
+                        speculator.decode_cudagraph_manager, 1, 2,
+                        uniform_token_count=1, dp_size=2, dp_rank=1, need_eager=True,
+                        dp_sync_state=sync, parallel_config=speculator.vllm_config.parallel_config,
+                    )
+                    speculator.decode_cudagraph_manager.specialize_spec_tokens.assert_called_once_with(
+                        descriptor, depth,
+                    )
+                    speculator._prepare_decode_inputs.assert_called_once_with(
+                        "batch", "rejected", 1, False, specialized,
+                    )
+                    selected, unused = (
+                        (speculator._run_fused_multi_step_decode, speculator._multi_step_decode)
+                        if fused else
+                        (speculator._multi_step_decode, speculator._run_fused_multi_step_decode)
+                    )
+                    selected.assert_called_once_with(
+                        1, False, specialized, sync.num_tokens_across_dp, "bounds", depth,
+                        **({} if fused else {"confidence_stop": stop}),
+                    )
+                    unused.assert_not_called()
+
+    def test_target_draft_round_forwards_adaptive_and_fixed_depths_to_shared_loop(self):
+        _, updated = self.apply_upstream_excerpt(
+            "04-pr60068.patch",
+            "vllm/v1/worker/gpu/spec_decode/target_dependent_ar/speculator.py",
+            "draft_round_upstream.py",
+        )
+        namespace = {"CUDAGraphMode": SimpleNamespace(FULL="full")}
+        exec("from __future__ import annotations\n" + updated, namespace)
+        cases = [
+            # requests, grammar, dummy, profile, enabled, expected depth/stop
+            (1, False, False, False, True, 4, True),
+            (2, False, False, False, True, 2, False),
+            (1, True, False, False, True, 4, False),
+            (2, True, False, False, True, 4, False),
+            (1, False, True, False, True, 4, False),
+            (2, False, False, True, True, 4, False),
+            (2, False, False, False, False, 4, False),
+        ]
+        for requests, grammar, dummy, profile, enabled, depth, adaptive in cases:
+            with self.subTest(requests=requests, grammar=grammar, dummy=dummy,
+                              profile=profile, enabled=enabled):
+                speculator = namespace["TargetDependentARSpeculator"]()
+                stop = Mock(fallback_depth=2)
+                speculator.confidence_stop = stop if enabled else None
+                speculator.prefill_cudagraph_manager = Mock()
+                speculator.on_prefill_end = Mock()
+                speculator.pcp_manager = object()
+                speculator.block_tables = Mock()
+                speculator.draft_tokens = [1, 2]
+                speculator._run_multi_step_decode = Mock()
+                batch = SimpleNamespace(
+                    has_structured_output_reqs=grammar, idx_mapping_np=[7, 8][:requests],
+                    idx_mapping=object(), seq_lens_cpu_upper_bound="bounds",
+                )
+                speculator.propose_tail(
+                    batch, "rejected", requests, dummy, True, "dp", profile,
+                    4, SimpleNamespace(cg_mode="full"),
+                )
+                speculator._run_multi_step_decode.assert_called_once_with(
+                    batch, "rejected", requests, dummy, "dp", "bounds", profile,
+                    depth, confidence_stop=stop if adaptive else None,
+                )
+                if adaptive:
+                    stop.begin_round.assert_called_once_with(7)
+                    stop.step_launched.assert_called_once_with()
+                    stop.fixed_round.assert_not_called()
+                elif enabled and not (dummy or profile):
+                    stop.fixed_round.assert_called_once_with(batch.idx_mapping_np, depth)
+                    stop.begin_round.assert_not_called()
+                    stop.step_launched.assert_not_called()
+                else:
+                    self.assertEqual(stop.mock_calls, [])
+                if dummy:
+                    speculator.block_tables.gather_block_tables.assert_not_called()
+                else:
+                    speculator.block_tables.gather_block_tables.assert_called_once_with(
+                        batch.idx_mapping, num_reqs_padded=requests,
+                    )
 
     def test_resident_csf_preserves_modelopt_block_quant_dispatch(self):
         # #59604 adds IQ2/Q8 dispatch at the resident-CSF insertion point.
