@@ -399,6 +399,61 @@ class PatchSeriesTests(unittest.TestCase):
                     else:
                         self.assertIsNone(counts)
 
+    def test_mamba_persistent_buffers_preserve_replayssm_initialization(self):
+        try:
+            import torch
+        except ImportError:
+            self.skipTest("CPU tensor checks require torch")
+        _, updated = self.apply_upstream_excerpt(
+            "18-pr65182.patch",
+            "vllm/v1/worker/gpu/model_states/mamba_hybrid.py",
+            "mamba_replayssm_upstream.py",
+            ("+        self._mamba_num_accepted_tokens_batch = (",),
+        )
+
+        class DefaultModelState:
+            def __init__(self, config, model, encoder_cache, device):
+                self.max_num_reqs = 4
+                self.device = device
+
+        namespace = {"torch": torch, "DefaultModelState": DefaultModelState}
+        exec("from __future__ import annotations\n" + updated, namespace)
+        for mode in ("align", "none"):
+            for depth in (0, 2):
+                for replay in (False, True):
+                    with self.subTest(mode=mode, depth=depth, replay=replay):
+                        config = SimpleNamespace(
+                            cache_config=SimpleNamespace(
+                                mamba_cache_mode=mode, use_kda_recoverssm=False,
+                            ),
+                            num_speculative_tokens=depth,
+                            use_flashinfer_replayssm=replay,
+                        )
+                        state = namespace["MambaHybridModelState"](
+                            config, None, None, torch.device("cpu"),
+                        )
+                        self.assertIsNone(state._replayssm_query_start_loc)
+                        self.assertEqual(state._use_flashinfer_replayssm, replay)
+                        if replay:
+                            torch.testing.assert_close(
+                                state._is_prefilling_gpu, torch.zeros(4, dtype=torch.bool),
+                            )
+                        else:
+                            self.assertFalse(hasattr(state, "_is_prefilling_gpu"))
+                        if mode == "align" or replay:
+                            self.assertIsNone(state._mamba_ctx)
+                            self.assertEqual(state._mamba_group_ids, [])
+                            self.assertIsNone(state._mamba_state_copy_funcs)
+                        batch = state._mamba_num_accepted_tokens_batch
+                        if mode == "align" and depth:
+                            torch.testing.assert_close(batch, torch.ones(4, dtype=torch.int32))
+                            # Batch ordering must not overwrite per-request acceptance counts.
+                            self.assertNotEqual(batch.data_ptr(), state.num_accepted_tokens_gpu.data_ptr())
+                            batch.fill_(3)
+                            self.assertEqual(state.num_accepted_tokens_gpu.tolist(), [1] * 4)
+                        else:
+                            self.assertIsNone(batch)
+
     def test_qsa_ring_patch_applies_after_upstream_indexer_rename(self):
         # #64110 moved the cache module and renamed both cache classes.
         # Exercise the real runtime hunks and cache-spec method without GPUs.

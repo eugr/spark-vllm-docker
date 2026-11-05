@@ -64,6 +64,25 @@ upstream commit `397b9607c83cf201f3c44684c555c3698869b6bd`.
 
 ## Integration and refresh
 
+The November 4 follow-up refresh catches a new patch 18 conflict after the
+successful pipeline 386, job 708, built vLLM
+`c902b75ac1239b07f1f6816965479765f75726ee`. On main
+`46f36fa294559d080edc61a09e5b57826218a2bf`, upstream's FlashInfer ReplaySSM
+support changed `MambaHybridModelState` initialization. Patch 18 now allocates
+its persistent accepted-token batch after the existing align-mode flag,
+preserving ReplaySSM's query-start tracking, prefill buffer and shared Mamba
+context initialization. The graph-input aliasing and fallback paths remain.
+
+All 16 vLLM entries replay from a fresh archive without historical patch-base
+objects: patches 01 and 09 skip, and the remaining 14 apply. All 19 source
+patchers, CUTLASS pinning and compilation of all 81 changed Python files pass.
+The FlashInfer series and loader include-order helper also pass on
+`9ae6fe46349bb4aff8e2c82b07ce4412f1c69518`; all 17 changed Python files compile.
+All 40 series tests and 109 build checks pass. The new regression covers
+ReplaySSM with and without align mode and speculative decoding, including
+separate batch and per-request acceptance buffers. GPU compilation and
+inference remain for CI.
+
 The November 4 refresh fixes pipeline 386, job 705, which stopped at patch 04
 on vLLM `790be385c8a69f45ec9a7a85ef00836d1684060f`. Upstream moved the shared
 autoregressive decode loop into `AutoRegressiveSpeculator` and moved decode
