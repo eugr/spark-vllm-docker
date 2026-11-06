@@ -1,0 +1,134 @@
+# Recipe: GLM-5.3-Flash-NVFP4 (NVIDIA checkpoint)
+# NVIDIA's official NVFP4 checkpoint on a dual DGX Spark cluster: TP=2 + DCP=2, MTP k=3,
+# 512K context, B12X stack.
+#
+# The NVIDIA checkpoint leaves ~11.3 GiB of attention projections (KDA q/k/v/o) and ~2 GiB of
+# shared experts in BF16; they are read in full on every decode step. The
+# glm53-nvidia-online-mxfp8 mod quantizes them at load time (here: NVFP4 W4A16), which is where
+# most of the decode gain comes from. MTP acceptance is unchanged.
+#
+# Measured on 2x DGX Spark (DGX OS 7.6, kernel 7.0.0-1019, driver 580.178.04, GPU clocks capped at
+# 2150 MHz), lab port, no other traffic, 3 runs x 1024 tokens, thinking off, T=0:
+#   decode c1      prose 34.1 / code 41.0 / JSON 47.7 tok/s   (BF16 dense layers: 26.8 / 33.0 / 38.7)
+#   C4 aggregate   69.3 tok/s                                 (60.9)
+#   prefill 54K    ~1,660 tok/s                               (1,720; W4A16 computes in BF16)
+#   quality        tool-eval-bench (d84fce4, 69 scenarios, seed 42, T=0): 95/100
+#   needle         recovered at 225K and 451K tokens
+#   KV pool        1,711,646 tokens = 3.26x at 524,288 (6 GiB pin, nvfp4_ds_mla)
+#
+# Memory is tight: the head node ends up with ~1 GiB available after warmup. If your nodes run a
+# desktop session or other services, lower kv_cache_memory_bytes (each GiB ~ 285K tokens).
+#
+# Scheduling: --prefill-compute-share auto + --max-parallel-prefills 2 + a 1024-token prefill cap
+# per contended step (port of local-inference-lab/vllm#862) keep short requests decoding while
+# long prompts prefill. With 3x150K prompts in flight, 1,000 tokens of prose take 100-160 s instead
+# of 359 s, at -12% aggregate prefill.
+#
+# Mods:
+#   fix-spec-accepted-clamp-upstream       a draft-acceptance assert cannot kill the engine under
+#                                          guided decoding + speculation
+#   glm53-thinking-template-nvidia         the checkpoint's template ignores enable_thinking:false
+#                                          and leaks the reasoning into content; this fixes it
+#   glm53-nvidia-mtp-unquantized           the MTP layer (45) is BF16 but not declared as such; without
+#                                          this the drafter fails to load at TP=2
+#   glm53-nvidia-online-mxfp8              online MXFP8/NVFP4 of the BF16 dense layers (see above)
+#   glm53-port-fork862-prefill-decode-latency  prefill token cap per contended step
+
+recipe_version: "1"
+name: GLM-5.3-Flash-NVFP4-NVIDIA
+description: vLLM serving nvidia/GLM-5.3-Flash-NVFP4 on a dual DGX Spark cluster (TP2+DCP2, MTP k3, 512K, online NVFP4 dense layers)
+
+model: nvidia/GLM-5.3-Flash-NVFP4
+container: vllm-node-b12x
+
+build_args:
+  - --exp-b12x
+
+cluster_only: true
+
+mods:
+  - mods/fix-spec-accepted-clamp-upstream
+  - mods/glm53-thinking-template-nvidia
+  - mods/glm53-nvidia-mtp-unquantized
+  - mods/glm53-nvidia-online-mxfp8
+  - mods/glm53-port-fork862-prefill-decode-latency
+
+defaults:
+  port: 8000
+  host: 0.0.0.0
+  tensor_parallel: 2
+  pipeline_parallel: 1
+  decode_context_parallel: 2
+  block_size: 256
+  max_model_len: 524288
+  max_num_seqs: 4
+  max_num_batched_tokens: 2048
+  num_speculative_tokens: 3
+  max_cudagraph_capture_size: 16
+  kv_cache_memory_bytes: 6G
+  gpu_memory_utilization: 0.86
+
+env:
+  HF_HUB_OFFLINE: "1"
+  TRANSFORMERS_OFFLINE: "1"
+  CUTE_DSL_ARCH: "sm_121a"
+  VLLM_ENABLE_ROCE_ALLREDUCE: "1"
+  VLLM_ROCE_ALLREDUCE_MAX_SIZE: "2MB"
+  VLLM_WORKER_MULTIPROC_METHOD: "spawn"
+  VLLM_SSM_CONV_STATE_LAYOUT: "DS"
+  VLLM_USE_AOT_COMPILE: "1"
+  VLLM_USE_MEGA_AOT_ARTIFACT: "1"
+  VLLM_USE_V2_MODEL_RUNNER: "1"
+  VLLM_ENABLE_PCIE_ALLREDUCE: "0"
+  VLLM_B12X_MLA_CKV_GATHER: "1"
+  VLLM_B12X_MLA_CKV_GATHER_MAX_TOKENS: "65536"
+  # online quantization of the BF16 dense layers (mod glm53-nvidia-online-mxfp8)
+  VLLM_GLM53_ONLINE_MXFP8: "attn,shared"
+  VLLM_GLM53_ONLINE_MXFP8_A16: "0"
+  VLLM_GLM53_ONLINE_NVFP4: "shared,oproj,qkv"
+  VLLM_GLM53_ONLINE_NVFP4_A16: "1"
+  # prefill cap per contended step (mod glm53-port-fork862-prefill-decode-latency)
+  VLLM_GLM53_PREFILL_DECODE_LATENCY: "1"
+  INSTANTTENSOR_BACKEND: "BUFFERED"
+  INSTANTTENSOR_BUFFER_SIZE: "67108864"
+  INSTANTTENSOR_CHUNK_SIZE: "8388608"
+  INSTANTTENSOR_CONCURRENCY: "1"
+  INSTANTTENSOR_IO_DEPTH: "3"
+
+command: |
+  vllm serve nvidia/GLM-5.3-Flash-NVFP4 \
+    --revision 09b04e5e74bca08ca8549fc736d4cdd8624bfde3 \
+    --host {host} \
+    --port {port} \
+    --tensor-parallel-size {tensor_parallel} \
+    --pipeline-parallel-size {pipeline_parallel} \
+    --decode-context-parallel-size {decode_context_parallel} \
+    --cp-kv-cache-interleave-size 4 \
+    --mamba-cache-mode align \
+    --enable-prefix-caching \
+    --enable-chunked-prefill \
+    --dtype bfloat16 \
+    --kv-cache-dtype nvfp4_ds_mla \
+    --quantization modelopt_mixed \
+    --attention-backend B12X \
+    --block-size {block_size} \
+    --moe-backend b12x \
+    --linear-backend b12x \
+    --no-enable-flashinfer-autotune \
+    --load-format instanttensor \
+    --max-model-len {max_model_len} \
+    --max-num-seqs {max_num_seqs} \
+    --max-num-batched-tokens {max_num_batched_tokens} \
+    --prefill-compute-share auto \
+    --max-parallel-prefills 2 \
+    --max-num-prefill-tokens-per-step 1024 \
+    --max-cudagraph-capture-size {max_cudagraph_capture_size} \
+    --kv-cache-memory-bytes {kv_cache_memory_bytes} \
+    --reasoning-parser glm45 \
+    --tool-call-parser glm47 \
+    --enable-auto-tool-choice \
+    --exclude-tools-when-tool-choice-none \
+    --speculative-config '{{"method":"mtp","num_speculative_tokens":{num_speculative_tokens},"moe_backend":"auto","attention_backend":"B12X"}}' \
+    --chat-template /tmp/glm53-nvidia-chat-template.jinja \
+    --gpu-memory-utilization {gpu_memory_utilization} \
+    --served-model-name glm-5.3-flash
