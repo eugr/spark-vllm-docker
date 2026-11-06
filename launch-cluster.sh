@@ -62,6 +62,30 @@ CLI_ENV_ARGS=()
 ENABLE_EARLYOOM="false"
 EARLYOOM_ARGS="${VLLM_SPARK_EARLYOOM_ARGS:--M 524288,102400 -s 100 -r 60}"
 
+# Quote words for command strings that SSH runs through the remote user's login
+# shell. That shell may be dash (/bin/sh on Ubuntu), and printf %q can emit
+# bash-only $'...' quoting for newlines or control characters, which dash
+# misreads. POSIX single quotes are interpreted identically by bash and dash.
+# Words made only of shell-safe characters stay bare, as with %q.
+sh_quote() {
+    if [[ "$1" =~ ^[A-Za-z0-9_@%+=:,./-]+$ ]]; then
+        printf '%s' "$1"
+        return
+    fi
+    local quoted="${1//\'/\'\\\'\'}"
+    printf "'%s'" "$quoted"
+}
+
+# Quote each argument with sh_quote and join them with single spaces.
+sh_quote_words() {
+    local word result="" sep=""
+    for word in "$@"; do
+        result+="$sep$(sh_quote "$word")"
+        sep=" "
+    done
+    printf '%s' "$result"
+}
+
 # Function to print usage
 usage() {
     echo "Usage: $0 [-n <node_ips>] [-t <image_name>] [--name <container_name>] [--eth-if <if_name>] [--ib-if <if_name>] [--nccl-debug <level>] [--check-config] [--solo] [--ray|--no-ray] [-p <host:container>] [-v <local:container>] [-d] [action] [command]"
@@ -1440,7 +1464,7 @@ EARLYOOM_SETUP
     local setup_cmd=(docker exec --user 0 -w / "$CONTAINER_NAME" bash -c "$setup_script")
     if [[ "$is_local" == "false" ]]; then
         local remote_cmd
-        printf -v remote_cmd '%q ' "${setup_cmd[@]}"
+        remote_cmd=$(sh_quote_words "${setup_cmd[@]}")
         setup_cmd=(ssh -o BatchMode=yes -o StrictHostKeyChecking=no "$node_ip" "$remote_cmd")
     fi
     if "${setup_cmd[@]}"; then
@@ -1469,7 +1493,7 @@ verify_cluster_image_consistency() {
     echo "  [HEAD] $HEAD_IP: $head_image_id"
 
     local inspect_cmd
-    printf -v inspect_cmd "docker image inspect --format '{{.Id}}' %q" "$IMAGE_NAME"
+    inspect_cmd="docker image inspect --format '{{.Id}}' $(sh_quote "$IMAGE_NAME")"
 
     local worker
     local worker_image_id
@@ -1495,7 +1519,7 @@ verify_cluster_image_consistency() {
             fi
             if [[ -n "$head_fingerprint" ]]; then
                 local content_inspect_cmd
-                printf -v content_inspect_cmd 'docker image inspect %q' "$worker_image_id"
+                content_inspect_cmd="docker image inspect $(sh_quote "$worker_image_id")"
                 worker_fingerprint=$(
                     set -o pipefail
                     ssh -o BatchMode=yes -o StrictHostKeyChecking=no "$worker" "$content_inspect_cmd" |
@@ -1601,7 +1625,7 @@ start_cluster() {
         fi
         local docker_run_cmd="docker run $docker_caps_args $docker_resource_args $(get_env_flags "$worker") $docker_args_common"
         local remote_launch_args
-        printf -v remote_launch_args '%q ' "${CONTAINER_ENV_ARGS[@]}" "$IMAGE_NAME" "${keepalive_cmd[@]}"
+        remote_launch_args=$(sh_quote_words "${CONTAINER_ENV_ARGS[@]}" "$IMAGE_NAME" "${keepalive_cmd[@]}")
         ssh "$worker" "$docker_run_cmd $remote_launch_args" || { cleanup; return 1; }
         ensure_container_earlyoom "$worker" "false" || { cleanup; return 1; }
     done
@@ -1700,7 +1724,7 @@ dump_cluster_failure_logs() {
         echo "Warning: Could not collect head container logs." >&2
 
     local worker remote_cmd
-    printf -v remote_cmd 'docker logs --timestamps --tail 200 %q' "$CONTAINER_NAME"
+    remote_cmd="docker logs --timestamps --tail 200 $(sh_quote "$CONTAINER_NAME")"
     for worker in "${PEER_NODES[@]}"; do
         echo "--- Worker container logs ($worker) ---" >&2
         timeout 15s ssh -o BatchMode=yes -o ConnectTimeout=5 \
@@ -1788,10 +1812,10 @@ exec_no_ray_cluster() {
         local remote_payload remote_cmd
         remote_payload="$worker_cmd >> /proc/1/fd/1 2>&1"
         if [[ "$DAEMON_MODE" == "true" ]]; then
-            printf -v remote_cmd 'docker exec -d %q bash -c %q' "$CONTAINER_NAME" "$remote_payload"
+            remote_cmd="docker exec -d $(sh_quote_words "$CONTAINER_NAME" bash -c "$remote_payload")"
             ssh -o BatchMode=yes -o StrictHostKeyChecking=no "$worker" "$remote_cmd" || return $?
         else
-            printf -v remote_cmd 'docker exec %q bash -c %q' "$CONTAINER_NAME" "$remote_payload"
+            remote_cmd="docker exec $(sh_quote_words "$CONTAINER_NAME" bash -c "$remote_payload")"
             ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no -o ConnectTimeout=10 \
                 -o ServerAliveInterval=5 -o ServerAliveCountMax=3 \
                 "$worker" "$remote_cmd" &
