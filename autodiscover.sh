@@ -318,8 +318,9 @@ detect_nodes() {
         return 0
     fi
 
-    # Try to use CLUSTER_NODES from .env
-    if [[ -n "$DOTENV_CLUSTER_NODES" ]]; then
+    # Try to use CLUSTER_NODES from .env. A forced discovery (--discover/--setup)
+    # must rescan, otherwise a stale node list is saved back unchanged.
+    if [[ -n "${DOTENV_CLUSTER_NODES:-}" && "${FORCE_DISCOVER:-false}" != true ]]; then
         echo "  Using CLUSTER_NODES from .env: $DOTENV_CLUSTER_NODES"
         PEER_NODES=()
         IFS=',' read -ra ALL_NODES <<< "$DOTENV_CLUSTER_NODES"
