@@ -22,6 +22,15 @@ UPSTREAM_REPO = "https://github.com/vllm-project/DeepGEMM.git"
 STABLE_REF = "1e1842a833699298f7afc02eefb2ed168fff6938"
 OLD_REF = "e1f418c2a4f20818221f6b0e578b4c2f634d4c3f"
 
+# csrc/utils/compatibility.hpp at DeepGEMM 82ca617e5879d0efb0aba5b91b1c81852588af6f.
+# The runtime ABI floor is intentionally lower than the build header floor.
+TORCH_214_REQUIREMENTS = '''
+DG_STATIC_ASSERT(TORCH_ABI_VERSION >= TORCH_VERSION_2_14_0,
+                 "Building DeepGEMM requires PyTorch 2.14 or newer");
+DG_STATIC_ASSERT(TORCH_FEATURE_VERSION >= TORCH_VERSION_2_11_0,
+                 "DeepGEMM requires the PyTorch 2.11 stable ABI or newer");
+'''
+
 
 class DeepGemmSourceTests(unittest.TestCase):
     def setUp(self):
@@ -73,7 +82,7 @@ class DeepGemmSourceTests(unittest.TestCase):
         self.git(repo, "commit", "-m", "initial")
         return repo
 
-    def run_prepare(self, destination="checkout", repo="", ref=""):
+    def run_prepare(self, destination="checkout", repo="", ref="", torch_version="2.14.0"):
         # Execute the actual Docker RUN command with temporary paths. This also
         # exercises its argument wiring and propagation of helper failures.
         dockerfile = (PROJECT_DIR / "Dockerfile").read_text()
@@ -88,6 +97,7 @@ class DeepGemmSourceTests(unittest.TestCase):
         return subprocess.run(
             ["sh", "-c", run], cwd=self.vllm,
             env={**self.env, "DEEPGEMM_REPO": repo, "DEEPGEMM_REF": ref,
+                 "TORCH_VERSION": torch_version,
                  "DEEPGEMM_SRC_DIR": str(self.root / destination)},
             text=True, capture_output=True,
         )
@@ -154,6 +164,54 @@ class DeepGemmSourceTests(unittest.TestCase):
         self.assertIn("deep_gemm/_C.py", result.stderr)
         self.assertFalse((self.root / "checkout").exists())
 
+    def test_header_requirement_is_checked_even_with_older_runtime_abi(self):
+        repo = self.make_repo("torch214-deepgemm")
+        header = repo / "csrc/utils/compatibility.hpp"
+        header.parent.mkdir()
+        header.write_text(TORCH_214_REQUIREMENTS)
+        self.git(repo, "add", ".")
+        self.git(repo, "commit", "-m", "require newer Torch headers")
+        self.write_cmake(repo=str(repo), ref="main")
+        for version in ("2.11.0", "2.13.0+cu130"):
+            with self.subTest(version=version):
+                result = self.run_prepare(torch_version=version)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("requires PyTorch >= 2.14.0 headers", result.stderr)
+                self.assertIn(f"TORCH_VERSION={version}", result.stderr)
+                self.assertFalse((self.root / "checkout").exists())
+        # Explicit overrides are checked too, instead of silently replacing them.
+        result = self.run_prepare(repo=str(repo), ref="main", torch_version="2.13.0")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("requires PyTorch >= 2.14.0 headers", result.stderr)
+        for index, version in enumerate(("2.14.0", "2.14.0+cu130", "2.15.0.dev20261106")):
+            with self.subTest(version=version):
+                result = self.run_prepare(destination=f"supported-{index}", torch_version=version)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(
+                    self.git(self.root / f"supported-{index}", "rev-parse", "HEAD"),
+                    self.git(repo, "rev-parse", "HEAD"),
+                )
+
+    def test_older_stable_headers_accept_torch_213_and_ignore_comments(self):
+        repo = self.make_repo("torch211-deepgemm")
+        header = repo / "csrc/utils/compatibility.hpp"
+        header.parent.mkdir()
+        header.write_text('''
+// DG_STATIC_ASSERT(TORCH_ABI_VERSION >= TORCH_VERSION_2_15_0, "future");
+/* TORCH_ABI_VERSION >= TORCH_VERSION_2_16_0 */
+DG_STATIC_ASSERT(TORCH_FEATURE_VERSION >= TORCH_VERSION_2_11_0,
+                 "DeepGEMM requires PyTorch 2.11 or newer");
+''')
+        self.git(repo, "add", ".")
+        self.git(repo, "commit", "-m", "declare header requirement")
+        self.write_cmake(repo=str(repo), ref="main")
+        result = self.run_prepare(torch_version="2.13.0")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        result = self.run_prepare(destination="invalid", torch_version="unknown")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Cannot parse PyTorch build version", result.stderr)
+        self.assertFalse((self.root / "invalid").exists())
+
     def test_missing_ref_is_not_replaced_with_head(self):
         repo = self.make_repo("upstream")
         self.write_cmake(repo=str(repo), ref="nonexistent-ref")
@@ -164,7 +222,7 @@ class DeepGemmSourceTests(unittest.TestCase):
     def test_legacy_source_can_be_prepared_without_stable_shim(self):
         repo = self.make_repo("legacy", stable=False)
         self.write_cmake(stable=False)
-        result = self.run_prepare(repo=str(repo), ref="main")
+        result = self.run_prepare(repo=str(repo), ref="main", torch_version="2.13.0")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertFalse((self.root / "checkout/deep_gemm/_C.py").exists())
 

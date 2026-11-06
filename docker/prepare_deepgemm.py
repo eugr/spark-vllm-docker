@@ -37,7 +37,7 @@ def select_source(vllm: Path, repo: str = "", ref: str = "") -> tuple[str, str, 
     return repo, ref, stable_abi
 
 
-def validate_source(checkout: Path, stable_abi: bool) -> None:
+def validate_source(checkout: Path, stable_abi: bool, torch_version: str) -> None:
     required = ["csrc/python_api.cpp", "deep_gemm/__init__.py"]
     if stable_abi:
         required += ["deep_gemm/_C.py", "setup.py"]
@@ -48,9 +48,36 @@ def validate_source(checkout: Path, stable_abi: bool) -> None:
             f"DeepGEMM checkout is incompatible with vLLM's {layout} build: "
             f"missing {', '.join(missing)}. Check DEEPGEMM_REPO/DEEPGEMM_REF overrides."
         )
+    # DeepGEMM can target the 2.11 runtime ABI yet require newer headers to
+    # compile its convenience wrappers (2.14 since vllm-project/DeepGEMM#45).
+    # Check the selected checkout, including explicit overrides, rather than
+    # assuming that a compatible Python shim guarantees a compatible build.
+    compatibility = checkout / "csrc/utils/compatibility.hpp"
+    if stable_abi and compatibility.is_file():
+        source = re.sub(r"/\*.*?\*/|//[^\n]*", "", compatibility.read_text(), flags=re.S)
+        requirements = re.findall(
+            r"TORCH_(?:ABI|FEATURE)_VERSION\s*>=\s*TORCH_VERSION_(\d+)_(\d+)_(\d+)",
+            source,
+        )
+        if requirements:
+            minimum = max(tuple(map(int, version)) for version in requirements)
+            match = re.match(r"^(\d+)\.(\d+)\.(\d+)(?:[a-zA-Z+.-]|$)", torch_version)
+            if not match:
+                raise ValueError(f"Cannot parse PyTorch build version: {torch_version!r}")
+            if tuple(map(int, match.groups())) < minimum:
+                required_version = ".".join(map(str, minimum))
+                raise ValueError(
+                    f"Selected DeepGEMM requires PyTorch >= {required_version} headers "
+                    f"to build, but TORCH_VERSION={torch_version}. "
+                    "Select a matching --torch-version and --torchvision-version, "
+                    "or a compatible DEEPGEMM_REF. Its stable runtime ABI does not "
+                    "lower the build-time header requirement."
+                )
 
 
-def prepare(vllm: Path, cache: Path, destination: Path, repo: str, ref: str) -> None:
+def prepare(
+    vllm: Path, cache: Path, destination: Path, repo: str, ref: str, torch_version: str
+) -> None:
     repo, ref, stable_abi = select_source(vllm, repo, ref)
     layout = "stable-ABI" if stable_abi else "legacy SM121 workaround"
     print(f"DeepGEMM source ({layout}): {repo} @ {ref}", flush=True)
@@ -77,7 +104,7 @@ def prepare(vllm: Path, cache: Path, destination: Path, repo: str, ref: str) -> 
         ["clean", "-fdx"],
     ):
         subprocess.run(["git", *args], cwd=checkout, check=True)
-    validate_source(checkout, stable_abi)
+    validate_source(checkout, stable_abi, torch_version)
     subprocess.run(["git", "submodule", "sync", "--recursive"], cwd=checkout, check=True)
     subprocess.run(
         ["git", "submodule", "update", "--init", "--recursive"], cwd=checkout, check=True
@@ -93,9 +120,10 @@ def main() -> None:
     parser.add_argument("destination", type=Path)
     parser.add_argument("--repo", default="")
     parser.add_argument("--ref", default="")
+    parser.add_argument("--torch-version", required=True, help="PyTorch version used to build")
     args = parser.parse_args()
     try:
-        prepare(args.vllm, args.cache, args.destination, args.repo, args.ref)
+        prepare(args.vllm, args.cache, args.destination, args.repo, args.ref, args.torch_version)
     except (OSError, ValueError, subprocess.CalledProcessError) as error:
         raise SystemExit(f"DeepGEMM preparation failed: {error}") from error
 

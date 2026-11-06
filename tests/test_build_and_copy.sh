@@ -941,6 +941,10 @@ test_regular_rebuild_enables_flashinfer_patch_series() {
     run_build --rebuild-vllm --rebuild-flashinfer || fail "regular source rebuild failed"
     assert_log_contains '^docker build --target flashinfer-export .*FLASHINFER_APPLY_REGULAR_PATCHES=1'
     assert_log_contains '^docker build --target vllm-export .*VLLM_APPLY_PRESET_PRS=1'
+    local target
+    for target in '--target flashinfer-export' '--target vllm-export' '-t vllm-node'; do
+        assert_log_contains "^docker build $target .*--build-arg TORCH_VERSION=2.14.0 --build-arg TORCHVISION_VERSION=0.29.0 --build-arg TORCHAUDIO_VERSION=2.11.0"
+    done
     pass "regular source rebuild enables both checked-in patch series"
 }
 
@@ -1753,8 +1757,8 @@ test_dockerfile_uses_configurable_torch_versions() {
         fail "Dockerfile does not preserve the selected Torch-family versions during later installs"
     fi
     for expected in \
-        'ARG TORCH_VERSION=2.13.0' \
-        'ARG TORCHVISION_VERSION=0.28.0' \
+        'ARG TORCH_VERSION=2.14.0' \
+        'ARG TORCHVISION_VERSION=0.29.0' \
         'ARG TORCHAUDIO_VERSION=2.11.0'; do
         if ! grep -Fq "$expected" "$PROJECT_DIR/Dockerfile"; then
             fail "Dockerfile is missing Torch-family default: $expected"

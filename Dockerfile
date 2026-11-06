@@ -4,8 +4,8 @@
 ARG BUILD_JOBS=16
 ARG CUDA_IMAGE=nvidia/cuda:13.0.2-devel-ubuntu24.04
 ARG NCCL_NVCC_GENCODE="-gencode=arch=compute_121,code=sm_121"
-ARG TORCH_VERSION=2.13.0
-ARG TORCHVISION_VERSION=0.28.0
+ARG TORCH_VERSION=2.14.0
+ARG TORCHVISION_VERSION=0.29.0
 ARG TORCHAUDIO_VERSION=2.11.0
 ARG CUTLASS_DSL_VERSION=4.7.0
 
@@ -697,10 +697,11 @@ RUN --mount=type=cache,id=uv-cache,target=/root/.cache/uv \
 
 # Resolve after PRs and source patches: stable-ABI vLLM requires its declared
 # DeepGEMM fork/pin; older refs retain the SM121 regression workaround.
+# Check its build-time Torch header requirement before starting compilation.
 COPY docker/prepare_deepgemm.py /tmp/prepare_deepgemm.py
 RUN --mount=type=cache,id=repo-cache,target=/repo-cache,sharing=locked \
     python3 /tmp/prepare_deepgemm.py . /repo-cache "$DEEPGEMM_SRC_DIR" \
-        --repo "$DEEPGEMM_REPO" --ref "$DEEPGEMM_REF"
+        --repo "$DEEPGEMM_REPO" --ref "$DEEPGEMM_REF" --torch-version "$TORCH_VERSION"
 
 # Final Compilation
 RUN --mount=type=cache,id=ccache,target=/root/.ccache \
