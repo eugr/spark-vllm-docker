@@ -1,5 +1,5 @@
---- a/usr/local/lib/python3.12/dist-packages/vllm/v1/attention/backends/mla/triton_mla.py
-+++ b/usr/local/lib/python3.12/dist-packages/vllm/v1/attention/backends/mla/triton_mla.py
+--- a/vllm/v1/attention/backends/mla/triton_mla.py
++++ b/vllm/v1/attention/backends/mla/triton_mla.py
 @@ -135,7 +135,9 @@
          lse = torch.zeros(B, q_num_heads, dtype=q.dtype, device=q.device)
 
