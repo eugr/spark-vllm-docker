@@ -2664,6 +2664,19 @@ via `uvx` and `rsync` for model transfers.
 ./hf-download.sh -c --copy-parallel QuantTrio/MiniMax-M2-AWQ
 ```
 
+**Limit parallel download connections:**
+
+```bash
+./hf-download.sh --max-workers 2 QuantTrio/MiniMax-M2-AWQ
+# or
+HF_MAX_WORKERS=2 ./hf-download.sh QuantTrio/MiniMax-M2-AWQ
+```
+
+`hf download` opens 8 connections by default, which can overload some
+consumer routers. `--max-workers` takes precedence over `HF_MAX_WORKERS`; the
+value must be a positive integer. It only affects the download on the head
+node, not copies to peers.
+
 **Use nodes from `.env` (respects `COPY_HOSTS`):**
 
 ```bash
@@ -2848,6 +2861,7 @@ names. Without `-c`, saved `COPY_HOSTS` do not trigger remote operations.
 | `--revision <revision>` | With `--backup` or `--delete`, select one cached commit by hash, unique prefix (7+ characters), or branch/tag. |
 | `--format <format>` | Listing format: `console`, `csv`, `json`, or `md`. |
 | `--sort <order>` | Listing sort passed to `hf cache ls` (default: `size:desc`). |
+| `--max-workers <n>` | Download only: limit parallel connections passed to `hf download --max-workers`. Falls back to `HF_MAX_WORKERS`; when neither is set, the `hf` default (8) applies. |
 | `-c, --copy-to [hosts]` | Include peer nodes (space- or comma-separated). Omit hosts to use `COPY_HOSTS` from `.env` or autodiscovery. |
 | `--copy-to-host` | Alias for `--copy-to` (backwards compatibility). |
 | `--copy-parallel` | With `-c`, distribute downloads or restores concurrently. |
