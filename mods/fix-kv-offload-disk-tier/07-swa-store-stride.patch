@@ -1,0 +1,103 @@
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py b/vllm/distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py
+index 2a1e2b9..ce9def7 100644
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py
+@@ -257,6 +257,38 @@ STREAM_ENABLED = STREAM_WAVE_CHUNKS > 0
+ # incident ever reached even MAX_WAVE_PROMOTE_RETRIES (50 steps).
+ # 0 = retry forever (the previous behaviour).
+ WAVE_STUCK_S = float(os.environ.get("VLLM_OFFLOAD_STREAM_WAVE_STUCK_S", "120") or 0)
++# SWA STORE STRIDE -- disk budget for hybrid (full + sliding-window) models.
++#
++# The alignment store filter keeps each sliding-window group's tail (and the
++# eagle group's segment head) at EVERY full-attention boundary, so that any of
++# them can be a load point. On DeepSeek V4 (bpc=8) that is, per 2048 tokens,
++# 7 chunk files of 8.6 MB: g0 x1, g1 x1, g2 x2, g3 x1, g4 x2 -- the four SWA
++# groups are 6/7 of the tier. Measured on agent traffic: ~50 GB/h, ~1.2 TB/day.
++#
++# Almost none of the interior boundaries ever become load points. With stride
++# S the SWA groups keep their tail/head only at boundaries that are multiples
++# of S * alignment tokens, PLUS the last two boundaries of every request's
++# offloadable prefix -- where a multi-turn client's next request resumes. Only
++# prompt tokens are offloaded by default (offload_prompt_only), so that end is
++# known when the chunk is stored. (With offload_prompt_only off it moves with
++# decode, so decode-region boundaries are kept as well: more stores, still
++# correct.) Full-attention groups are untouched.
++#
++# The load path is unchanged: _sliding_window_lookup scans backward for the
++# last stored window below the ceiling, every SWA group lands on the same
++# boundary, and the eagle pair (tail of the segment ending there + head of the
++# segment starting there) is kept at exactly those boundaries, so the
++# admissible sets still coincide and the lookup converges in one pass. Chunks
++# already on disk from stride 1 remain valid (a superset).
++#
++# Measured, S=8: ~25% of the disk bytes; resuming a conversation re-prefills the
++# same as stride 1 (simulated 3000 turns: median 1533 vs 1536 tokens, 0
++# uncertified loads). Without the prompt-end boundaries every resumed turn paid
++# up to 14k tokens (~9 s) of extra prefill -- do not drop them.
++#   1 / unset = stock filter.
++SWA_STORE_STRIDE = max(
++    1, int(os.environ.get("VLLM_OFFLOAD_SWA_STORE_STRIDE", "1") or 1)
++)
+ # WAVE STREAMING (draft): log ceiling for a wave that makes no progress --
+ # its promotion refused by a full primary tier under concurrent contention, or
+ # re-staged because a staged key left the primary tier before its load (design
+@@ -760,6 +792,16 @@ class SchedulerOffloadConfig(NamedTuple):
+                 sorted(eagle_groups),
+             )
+ 
++        if SWA_STORE_STRIDE > 1:
++            logger.info(
++                "KV offloading: SWA groups store their window only at multiples "
++                "of %d tokens and at the end of each prompt "
++                "(VLLM_OFFLOAD_SWA_STORE_STRIDE=%d x %s-token alignment)",
++                SWA_STORE_STRIDE * (alignment_tokens or 0),
++                SWA_STORE_STRIDE,
++                alignment_tokens,
++            )
++
+         return cls(
+             num_workers=vllm_config.parallel_config.world_size,
+             kv_group_configs=tuple(
+@@ -2298,6 +2340,10 @@ class OffloadingConnectorScheduler:
+             num_offloadable_tokens = self._calc_num_offloadable_tokens(
+                 req_status, num_tokens_after_batch
+             )
++            # SWA_STORE_STRIDE: the end of what this request will ever offload.
++            final_offloadable = self._calc_num_offloadable_tokens(
++                req_status, req.num_tokens
++            )
+ 
+             # Filter out chunks skipped due to sliding window attention / SSM
+             # or unreachable by the load path's alignment constraints.
+@@ -2465,12 +2511,27 @@ class OffloadingConnectorScheduler:
+                         assert tail is not None
+                         abs_chunk_idx = start_chunk_idx + key_idx
+                         pos_in_segment = abs_chunk_idx % alignment_chunk_count
+-                        keep = pos_in_segment >= alignment_chunk_count - tail
++                        keep_tail = pos_in_segment >= alignment_chunk_count - tail
+                         # LOCAL PATCH (2026-08-30): the eagle certificate chunk sits
+                         # at the segment boundary, i.e. pos 0. See the note above.
+-                        if eagle_keep_segment_head and pos_in_segment == 0:
+-                            keep = True
+-                        if not keep:
++                        keep_head = eagle_keep_segment_head and pos_in_segment == 0
++                        if SWA_STORE_STRIDE > 1:
++                            # See SWA_STORE_STRIDE. A tail serves the boundary at
++                            # the END of its segment, a head the one at its START;
++                            # the last two boundaries of the prompt are always kept.
++                            segment = abs_chunk_idx // alignment_chunk_count
++                            last_boundary = final_offloadable // (
++                                alignment_chunk_count * group_config.tokens_per_chunk
++                            )
++                            keep_tail = keep_tail and (
++                                (segment + 1) % SWA_STORE_STRIDE == 0
++                                or segment + 1 >= last_boundary - 1
++                            )
++                            keep_head = keep_head and (
++                                segment % SWA_STORE_STRIDE == 0
++                                or segment >= last_boundary - 1
++                            )
++                        if not (keep_tail or keep_head):
+                             continue
+                     new_offload_keys.append(offload_key)
+ 
