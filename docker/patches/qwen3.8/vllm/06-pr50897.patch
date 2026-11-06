@@ -3,6 +3,7 @@ Subject: [PATCH] [PR #50897] Invalidate stale lookahead hashes on streaming upda
 Upstream-PR: https://github.com/vllm-project/vllm/pull/50897
 Upstream-Commit: 7f7139246af9793d0cfb2a1be60068a5fba5604c
 Integration-Base: c7a760751977e4e3396d586956d8767a9bc44a82
+Refresh-Base: ad457ad7440bf0da7a7a8edd67ba9e66a9dec590
 Merged-Dependency: #61589 at 2fb320d8304381e224dd27fbf8c13c30b4e1020f
 Merged-Dependency: #64096 at 75be1384286d6f4c5ca3ad493bc9390159d93f5b
 
@@ -55,12 +56,12 @@ index 5258fc7e0a3e6b944a9ab1600c6eef7b36e077c1..7df972e48e1e7b537c2aa707430e2464
          """Comprehensive integration test covering complete streaming request lifecycle
          including scheduler state management and aliasing bug prevention.
 diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
-index 8dd1166e350f09ecd7438f8f9769e944f37d8a02..f1cd2411bf19f1620c745e52e4ad99ad30dd4c58 100644
+index 858ae1fe6a842eb7e4df037a7a4277fe932880bf..c46d2b50a757110c806a3d4db41656dd2d416d16 100644
 --- a/vllm/v1/core/sched/scheduler.py
 +++ b/vllm/v1/core/sched/scheduler.py
-@@ -1889,7 +1889,9 @@ class Scheduler(SchedulerInterface):
-             session.num_prompt_tokens : keep_end
-         ]
+@@ -1964,7 +1964,9 @@ class Scheduler(SchedulerInterface):
+         keep_end = session.num_tokens - 1
+         assert keep_end >= session.num_computed_tokens
          del session._all_token_ids[keep_end:]
 -        del session.block_hashes[keep_end // self.hash_block_size :]
 +        # A lookahead hash also covers tokens after its block.

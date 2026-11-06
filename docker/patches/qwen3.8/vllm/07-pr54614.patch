@@ -4,7 +4,7 @@ Subject: [PATCH] [PR #54614] [Kernel] Dynamic NVFP4 W4A4/W4A16 selection with sh
 Upstream-PR: https://github.com/vllm-project/vllm/pull/54614
 Upstream-Commit: 5feaedcf9b4fa18d9e0b817153d681bededdd4d9
 Integration-Base: 564ac0de1b228568cafcbfbe8ccaccc82d6023eb
-Refresh-Base: 5c8ae7c74aaa99d1f7fbeea942fd7282e3413810
+Refresh-Base: ad457ad7440bf0da7a7a8edd67ba9e66a9dec590
 
 Preserve upstream's removal of the batch-invariant W4A16 test and its imports.
 Keep DeepSeek indexer autotuning alongside dynamic NVFP4 logits warmup.
@@ -768,13 +768,13 @@ index ba069dbad1767a29caebb9fa818b1f2e59852f7e..57fd844ec86701d4ff5d309835056a6f
 +    if not supported:
 +        assert "flashinfer_cutlass" in reason
 diff --git a/tests/model_executor/test_flashinfer_autotune_warmup.py b/tests/model_executor/test_flashinfer_autotune_warmup.py
-index 74ae494ed8f785230a675c8802f3e6fefa7f33a0..44b6c64812ee0f74288636263f296a640a17ceb0 100644
+index 0bbbd985c3c86e618af22c236930ef9cf7ad8f8b..55e9cac668ba10f62bb7bb65dd37dd84e47d6ed6 100644
 --- a/tests/model_executor/test_flashinfer_autotune_warmup.py
 +++ b/tests/model_executor/test_flashinfer_autotune_warmup.py
-@@ -41,11 +41,12 @@ def _make_moe(*, max_deferred_tokens: int = 128, enabled: bool = True):
+@@ -42,11 +42,12 @@ def _make_moe(*, max_deferred_tokens: int = 128, enabled: bool = True):
      return moe
- 
- 
+
+
 -def _make_runner(modules, *, max_tokens: int = 8192):
 +def _make_runner(modules, *, max_tokens: int = 8192, linear_backend: str = "auto"):
      """Create a runner carrying only the state used by FlashInfer warmup."""
@@ -785,10 +785,10 @@ index 74ae494ed8f785230a675c8802f3e6fefa7f33a0..44b6c64812ee0f74288636263f296a64
              attention_config=SimpleNamespace(hisparse_config=None),
              parallel_config=SimpleNamespace(
                  enable_elastic_ep=False,
-@@ -90,6 +91,29 @@ def test_flashinfer_autotune_token_counts_are_bounded_and_deduplicated():
+@@ -91,6 +92,29 @@ def test_flashinfer_autotune_token_counts_are_bounded_and_deduplicated():
      assert token_counts == (32,)
- 
- 
+
+
 +@pytest.mark.parametrize(
 +    "linear_cutoff,silu_cutoff,max_tokens,expected",
 +    [
@@ -815,10 +815,10 @@ index 74ae494ed8f785230a675c8802f3e6fefa7f33a0..44b6c64812ee0f74288636263f296a64
  @pytest.mark.parametrize("skip_attn", [False, True])
  def test_flashinfer_autotune_uses_token_buckets_for_each_dummy_run(skip_attn):
      from vllm.v1.worker.gpu.model_runner import GPUModelRunner as V2Runner
-@@ -683,3 +707,46 @@ def test_autotune_cache_key_normalizes_kv_init_fields():
-         _normalize_cache_config_for_hash(resolved).compute_hash()
-         != fresh.compute_hash()
-     )
+@@ -681,3 +705,46 @@ def test_autotune_cache_key_normalizes_kv_init_fields():
+     # block_size stays significant (the daemon keys on the resolved value).
+     resolved = CacheConfig(block_size=32)
+     assert hash_config(_normalize_cache_config_for_hash(resolved)) != hash_config(fresh)
 +
 +
 +def test_dynamic_nvfp4_logits_tuning_is_bounded_by_sampled_sequences():

@@ -1,4 +1,4 @@
-01-pr59958.patch
+# PR #59958 merged as b44a48cef1; upstream supplies disk-offloaded PLE tables.
 # PR #59973 merged as 784d1fff0c; upstream supplies quantized draft heads.
 03-pr59740-60226.patch
 04-pr60068.patch
