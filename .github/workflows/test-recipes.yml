@@ -90,6 +90,7 @@ jobs:
       run: |
         python3 tests/test_hf_cache_management.py
         bash tests/test_hf_download_copy.sh
+        bash tests/test_hf_download_remote_quoting.sh
 
     - name: Test memory profiling mod
       run: |
