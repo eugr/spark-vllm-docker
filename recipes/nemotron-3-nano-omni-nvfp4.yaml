@@ -1,0 +1,50 @@
+# Recipe: Nemotron-3-Nano-Omni-NVFP4
+# Nemotron-3-Nano-Omni multimodal reasoning model with NVFP4 quantization
+# Spark-specific defaults follow the NVIDIA model card guidance.
+
+recipe_version: "1"
+name: Nemotron-3-Nano-Omni-NVFP4
+description: vLLM serving Nemotron-3-Nano-Omni-NVFP4 on a single node.
+
+# HuggingFace model to download (optional, for --download-model)
+model: nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-NVFP4
+
+# Container image to use
+container: vllm-node
+
+# Spark guidance uses one GB10 GPU with tensor parallel size 1.
+solo_only: true
+
+mods:
+  - mods/nemotron-omni
+
+# Default settings (can be overridden via CLI)
+defaults:
+  port: 8000
+  host: 0.0.0.0
+  tensor_parallel: 1
+  gpu_memory_utilization: 0.8
+  max_model_len: 131072
+  max_num_seqs: 8
+  max_num_batched_tokens: 32768
+
+# The vLLM serve command template
+command: |
+  vllm serve nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-NVFP4 \
+      --served-model-name nemotron_3_nano_omni \
+      --max-num-seqs {max_num_seqs} \
+      --max-model-len {max_model_len} \
+      --port {port} \
+      --host {host} \
+      --trust-remote-code \
+      --gpu-memory-utilization {gpu_memory_utilization} \
+      --tensor-parallel-size {tensor_parallel} \
+      --limit-mm-per-prompt '{{"video": 1, "image": 1, "audio": 1}}' \
+      --media-io-kwargs '{{"video": {{"fps": 2, "num_frames": 256}}}}' \
+      --allowed-local-media-path / \
+      --enable-prefix-caching \
+      --max-num-batched-tokens {max_num_batched_tokens} \
+      --reasoning-parser nemotron_v3 \
+      --enable-auto-tool-choice \
+      --tool-call-parser qwen3_coder \
+      --kv-cache-dtype fp8
