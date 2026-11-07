@@ -25,7 +25,8 @@ defaults:
   tensor_parallel: 2
   gpu_memory_utilization: 0.8
   max_model_len: 262144
-  max_num_batched_tokens: 8192
+  max_num_batched_tokens: 16384
+  enable_thinking: '{\"enable_thinking\":true}'
 
 # Environment variables
 env: 
@@ -47,4 +48,5 @@ command: |
     --chat-template fixed_chat_template.jinja \
     --speculative-config '{{"method": "dflash", "model": "z-lab/Qwen3.6-35B-A3B-DFlash", "num_speculative_tokens": 15}}' \
     -tp {tensor_parallel} \
+    --default-chat-template-kwargs {enable_thinking} \
     --distributed-executor-backend ray

@@ -20,6 +20,7 @@ defaults:
   max_model_len: 262144
   max_num_seqs: 4
   max_num_batched_tokens: 8192
+  enable_thinking: '{\"enable_thinking\":true}'
 
 # Environment variables
 env:
@@ -46,4 +47,5 @@ command: |
     --reasoning-parser qwen3 \
     --tool-call-parser qwen3_xml \
     --enable-auto-tool-choice \
+    --default-chat-template-kwargs {enable_thinking} \
     --distributed-executor-backend ray
