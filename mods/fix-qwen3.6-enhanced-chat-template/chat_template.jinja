@@ -1,0 +1,212 @@
+{# =========================
+   Qwen 3.6 Multimodal Interleaved-Thinking Chat Template
+   - Multimodal: image/video tokens
+   - Tools: XML tool_call + tool_response wrapping
+   - M2.5-style interleaved thinking:
+     * historical assistant reasoning before the last real user query is hidden
+     * assistant turns after the last real user query keep <think>
+     * generation always starts in <think>
+   - Reference: https://huggingface.co/raydelossantos/Qwen3.5-40B-Claude-4.6-Opus-Deckard-Heretic-GPTQ-Int4/blob/main/chat_template.jinja
+   ========================= #}
+{%- set image_count = namespace(value=0) -%}
+{%- set video_count = namespace(value=0) -%}
+
+{# Macro to render individual tool parameters #}
+{%- macro render_tool_parameter(args_name, args_value) -%}
+    {{- '<parameter=' ~ args_name ~ '>\n' -}}
+    {%- set args_value = args_value | tojson(ensure_ascii=False) | safe if args_value is mapping or (args_value is sequence and args_value is not string) else args_value | string -%}
+    {{- args_value -}}
+    {{- '\n</parameter>\n' -}}
+{%- endmacro -%}
+
+{# Macro to render all tool arguments #}
+{%- macro render_tool_arguments(arguments) -%}
+    {%- if arguments is undefined or arguments is none -%}
+    {%- elif arguments is mapping -%}
+        {%- for args_name, args_value in arguments|items -%}
+            {{- render_tool_parameter(args_name, args_value) -}}
+        {%- endfor -%}
+    {%- elif arguments is string -%}
+        {%- set trimmed_arguments = arguments | trim -%}
+        {%- if trimmed_arguments -%}
+            {%- set parsed = trimmed_arguments | from_json -%}
+            {%- if parsed is mapping -%}
+                {%- for args_name, args_value in parsed | items -%}
+                    {{- render_tool_parameter(args_name, args_value) -}}
+                {%- endfor -%}
+            {%- else -%}
+                {{- trimmed_arguments -}}
+                {%- if not trimmed_arguments.endswith('\n') -%}
+                    {{- '\n' -}}
+                {%- endif -%}
+            {%- endif -%}
+        {%- endif -%}
+    {%- else -%}
+        {{- raise_exception('Unexpected tool_call.arguments type.') -}}
+    {%- endif -%}
+{%- endmacro -%}
+
+{# Core content renderer (Handles Text + Vision) #}
+{%- macro render_content(content, do_vision_count, is_system_content=false) -%}
+    {%- if content is string -%}
+        {{- content -}}
+    {%- elif content is iterable and content is not mapping -%}
+        {%- for item in content -%}
+            {%- if 'image' in item or 'image_url' in item or item.type == 'image' -%}
+                {%- if is_system_content -%}
+                    {{- raise_exception('System message cannot contain images.') -}}
+                {%- endif -%}
+                {%- if do_vision_count -%}
+                    {%- set image_count.value = image_count.value + 1 -%}
+                {%- endif -%}
+                {%- if add_vision_id -%}
+                    {{- 'Picture ' ~ image_count.value ~ ': ' -}}
+                {%- endif -%}
+                {{- '<|vision_start|><|image_pad|><|vision_end|>' -}}
+            {%- elif 'video' in item or item.type == 'video' -%}
+                {%- if is_system_content -%}
+                    {{- raise_exception('System message cannot contain videos.') -}}
+                {%- endif -%}
+                {%- if do_vision_count -%}
+                    {%- set video_count.value = video_count.value + 1 -%}
+                {%- endif -%}
+                {%- if add_vision_id -%}
+                    {{- 'Video ' ~ video_count.value ~ ': ' -}}
+                {%- endif -%}
+                {{- '<|vision_start|><|video_pad|><|vision_end|>' -}}
+            {%- elif 'text' in item -%}
+                {{- item.text -}}
+            {%- else -%}
+                {{- raise_exception('Unexpected item type in content.') -}}
+            {%- endif -%}
+        {%- endfor -%}
+    {%- elif content is none or content is undefined -%}
+        {{- '' -}}
+    {%- else -%}
+        {{- raise_exception('Unexpected content type.') -}}
+    {%- endif -%}
+{%- endmacro -%}
+
+{%- if not messages -%}
+    {{- raise_exception('No messages provided.') -}}
+{%- endif -%}
+
+{# -------- Tools & System Header -------- #}
+{%- if tools and tools is iterable and tools is not mapping -%}
+    {{- '<|im_start|>system\n' -}}
+    {{- "# Tools\n\nYou have access to the following functions:\n\n<tools>" -}}
+    {%- for tool in tools -%}
+        {{- "\n" -}}
+        {{- tool | tojson(ensure_ascii=False) -}}
+    {%- endfor -%}
+    {{- "\n</tools>" -}}
+    {{- '\n\nIMPORTANT: The assistant MUST always close its thinking with </think> before emitting any <tool_call>. Reasoning inside a <tool_call> or its parameters is strictly forbidden and will cause a fatal error. When calling a tool, output one or more XML blocks in exactly this format and nothing after the final </tool_call>:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\nRules:\n- If a suitable tool exists for the user request, use it instead of answering from memory.\n- If the user is modifying an existing object and a prior tool response contains its id, prefer the matching update_* tool and reuse that id.\n- Put any reasoning or natural language BEFORE the first <tool_call>, never after the last </tool_call>.\n- Include every required parameter.\n- Preserve user-provided string values verbatim when possible for ids, names, titles, subjects, emails, and search queries.\n- For object or array parameter values, write valid JSON inside the parameter body.\n- If no tool is needed, answer normally.\n\nFollow-up update example:\n<tool_response>\n{"status":"scheduled","id":"r-100"}\n</tool_response>\nIf the user then says "Actually make it 10:00 instead.", call:\n<tool_call>\n<function=update_reminder>\n<parameter=id>\nr-100\n</parameter>\n<parameter=datetime>\n2026-03-12T10:00:00\n</parameter>\n<parameter=timezone>\nAsia/Taipei\n</parameter>\n</function>\n</tool_call>' -}}
+    {%- if messages[0].role == 'system' -%}
+        {%- set sysc = render_content(messages[0].content, false, true)|trim -%}
+        {%- if sysc -%}
+            {{- '\n\n' ~ sysc -}}
+        {%- endif -%}
+    {%- endif -%}
+    {{- '<|im_end|>\n' -}}
+{%- else -%}
+    {%- if messages[0].role == 'system' -%}
+        {%- set sysc = render_content(messages[0].content, false, true)|trim -%}
+        {{- '<|im_start|>system\n' ~ sysc ~ '<|im_end|>\n' -}}
+    {%- endif -%}
+{%- endif -%}
+
+{# -------- Interleaved-thinking boundary: last REAL user query -------- #}
+{%- set ns = namespace(last_user_index=-1) -%}
+{%- for m in messages -%}
+    {%- if m.role == "user" -%}
+        {%- set uc = render_content(m.content, false)|trim -%}
+        {%- if not (uc.startswith('<tool_response>') and uc.endswith('</tool_response>')) -%}
+            {%- set ns.last_user_index = loop.index0 -%}
+        {%- endif -%}
+    {%- endif -%}
+{%- endfor -%}
+
+{# -------- Render messages -------- #}
+{%- for message in messages -%}
+    {%- set content = render_content(message.content, true)|trim -%}
+    {%- if message.role == "system" -%}
+        {%- if not loop.first -%}
+            {{- raise_exception('System message must be at the beginning.') -}}
+        {%- endif -%}
+    {%- elif message.role == "user" -%}
+        {{- '<|im_start|>user\n' ~ content ~ '<|im_end|>\n' -}}
+    {%- elif message.role == "assistant" -%}
+        {%- set content = render_content(message.content, true)|trim -%}
+
+        {# --- 完美自癒：處理任意數量 <think> 未閉合的情況 --- #}
+        {%- if '<tool_call>' in content and '<think>' in content -%}
+            {%- set last_think = content.rfind('<think>') -%}
+            {%- set last_close = content.rfind('</think>') -%}
+            {%- set tool_pos = content.find('<tool_call>') -%}
+            {%- if last_close < last_think or last_close == -1 -%}
+                {%- if tool_pos > last_think -%}
+                    {%- set content = content[:tool_pos] + '</think>' + content[tool_pos:] -%}
+                {%- else -%}
+                    {%- set content = content + '</think>' -%}
+                {%- endif -%}
+            {%- endif -%}
+        {%- endif -%}
+
+        {%- set reasoning_content = '' -%}
+        {%- if message.reasoning_content is string -%}
+            {%- set reasoning_content = message.reasoning_content -%}
+        {%- else -%}
+            {%- if '</think>' in content -%}
+                {%- set reasoning_content = content.split('</think>')[0].rstrip('\n').split('<think>')[-1].lstrip('\n') -%}
+                {%- set content = content.split('</think>')[-1].lstrip('\n') -%}
+            {%- endif -%}
+        {%- endif -%}
+        {%- set reasoning_content = reasoning_content|trim -%}
+
+        {# --- 總是輸出閉合的 think 塊，即使 reasoning 為空，確保 tool_call 永遠在外面 --- #}
+        {%- if (preserve_thinking is defined and preserve_thinking is true) or (loop.index0 > ns.last_user_index) %}
+            {{- '<|im_start|>assistant\n<think>\n' ~ reasoning_content ~ '\n</think>\n\n' ~ content -}}
+        {%- else -%}
+            {{- '<|im_start|>assistant\n' ~ content -}}
+        {%- endif -%}
+
+        {%- if message.tool_calls and message.tool_calls is iterable and message.tool_calls is not mapping -%}
+            {%- for tool_call in message.tool_calls -%}
+                {%- if tool_call.function is defined -%}
+                    {%- set tool_call = tool_call.function -%}
+                {%- endif -%}
+                {%- if loop.first -%}
+                    {%- if content|trim -%}
+                        {{- '\n\n<tool_call>\n<function=' ~ tool_call.name ~ '>\n' -}}
+                    {%- else -%}
+                        {{- '<tool_call>\n<function=' ~ tool_call.name ~ '>\n' -}}
+                    {%- endif -%}
+                {%- else -%}
+                    {{- '\n<tool_call>\n<function=' ~ tool_call.name ~ '>\n' -}}
+                {%- endif -%}
+                {{- render_tool_arguments(tool_call.arguments) -}}
+                {{- '</function>\n</tool_call>' -}}
+            {%- endfor -%}
+        {%- endif -%}
+        {{- '<|im_end|>\n' -}}
+    {%- elif message.role == "tool" -%}
+        {%- if loop.index0 == 0 or messages[loop.index0 - 1].role != "tool" -%}
+            {{- '<|im_start|>user' -}}
+        {%- endif -%}
+        {{- '\n<tool_response>\n' ~ content ~ '\n</tool_response>' -}}
+        {%- if loop.last or messages[loop.index0 + 1].role != "tool" -%}
+            {{- '\n<|im_end|>\n' -}}
+        {%- endif -%}
+    {%- else -%}
+        {{- raise_exception('Unexpected message role.') -}}
+    {%- endif -%}
+{%- endfor -%}
+{# -------- Generation prompt -------- #}
+{%- if add_generation_prompt -%}
+    {{- '<|im_start|>assistant\n' -}}
+    {%- if enable_thinking is defined and enable_thinking is false -%}
+        {{- '<think>\n\n</think>\n\n' -}}
+    {%- else -%}
+        {{- '<think>\n' -}}
+    {%- endif -%}
+{%- endif -%}
