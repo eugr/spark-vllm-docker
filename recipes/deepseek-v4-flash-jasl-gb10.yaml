@@ -1,0 +1,85 @@
+# Recipe: DeepSeek-V4-Flash on 2x DGX Spark (GB10 / sm_121)
+# Uses the ds4-vllm-gb10:pr image built from jasl/vllm-ds4-sm120-harness; see README
+# for build instructions. Tracks vllm-project/vllm#41834.
+
+recipe_version: "1"
+name: DeepSeek-V4-Flash-jasl-GB10
+description: vLLM serving deepseek-ai/DeepSeek-V4-Flash on two GB10 DGX Sparks (jasl PR branch image)
+
+# HuggingFace model to download (optional, for --download-model)
+model: deepseek-ai/DeepSeek-V4-Flash
+
+# Custom GB10-only image. Build from:
+#   https://github.com/jasl/vllm-ds4-sm120-harness/tree/main/docker/gb10-pr
+container: ds4-vllm-gb10:pr
+
+# Can only be run in a cluster (TP=2 across two GB10 nodes)
+cluster_only: true
+
+# No mods — the image is already a DSv4-tuned vLLM build.
+mods: []
+
+# Default settings (can be overridden via CLI).
+# - max_num_seqs 4 unlocks real concurrency (raising from 2 was ~+45% aggregate
+#   tok/s at C>=4 in our benchmarks). For high-concurrency workloads (6-10 users),
+#   bump to 8 and raise gpu_memory_utilization to 0.85 to fit the KV.
+# - max_model_len 262144 (256K) — jasl validates 131072 (128K) as the GB10 gate;
+#   we extend to 256K because the KV math at gpu_memory_utilization 0.80 gives
+#   us 6.4x concurrency headroom at 256K (verified via vLLM's startup report).
+# - gpu_memory_utilization 0.80 matches the new upstream default (eugr
+#   2026-06-09 bump). KV pool ~17 GiB/rank, ~1.7M-token cluster pool; KV usage
+#   peaked at ~41% under our stress runs, host had ~11 GB margin throughout.
+defaults:
+  port: 8000
+  host: 0.0.0.0
+  tensor_parallel: 2
+  gpu_memory_utilization: 0.80
+  max_model_len: 262144
+  max_num_seqs: 4
+  max_num_batched_tokens: 4176
+
+env:
+  # SERVE_USE_FP4_INDEXER_CACHE=0 is required on sm_12x: the FP4 indexer cache
+  # path requires the sm_100-only DeepGEMM kernel. See jasl HANDOFF.md.
+  SERVE_USE_FP4_INDEXER_CACHE: "0"
+  # Route the FP8 dense linear ops through flashinfer kernels (small ~3-4%
+  # aggregate throughput win in our benchmarks). Will be replaced by
+  # `--moe-backend` flag in vLLM v0.23.
+  VLLM_USE_FLASHINFER_MOE_FP8: "1"
+  # Use TRT-LLM's cross-rank allreduce.
+  VLLM_FLASHINFER_ALLREDUCE_BACKEND: "trtllm"
+
+# The vLLM serve command template.
+# `--enable-expert-parallel` engages MegaMoE, which is required: it externalises
+# the SwiGLU clamp via runtime activation_clamp, bypassing the NVFP4 oracle's
+# clamp-set rejection (only FLASHINFER_TRTLLM is in NVFP4_BACKENDS_WITH_CLAMP,
+# and FLASHINFER_TRTLLM requires sm_100 family).
+# jasl's GB10 README uses `--distributed-executor-backend mp`; that only works
+# for single-node multi-GPU. For 1 GPU per Spark we use `ray`.
+# MTP speculative decoding (num_speculative_tokens=2) gave ~+25% single-stream
+# decode in our benchmarks; tonyd2wild reports ~78% draft acceptance on code/
+# structured output (we measured ~50% on random tokens — content-dependent).
+command: |
+  vllm serve deepseek-ai/DeepSeek-V4-Flash \
+      --host {host} --port {port} \
+      --trust-remote-code \
+      --tensor-parallel-size {tensor_parallel} \
+      --distributed-executor-backend ray \
+      --max-model-len {max_model_len} \
+      --max-num-seqs {max_num_seqs} \
+      --max-num-batched-tokens {max_num_batched_tokens} \
+      --gpu-memory-utilization {gpu_memory_utilization} \
+      --kv-cache-dtype fp8 \
+      --block-size 256 \
+      --enable-expert-parallel \
+      --enable-prefix-caching \
+      --enable-flashinfer-autotune \
+      --speculative-config '{{"method":"mtp","num_speculative_tokens":2}}' \
+      --served-model-name deepseek-v4-flash deepseek-ai/DeepSeek-V4-Flash \
+      --tokenizer-mode deepseek_v4 \
+      --tool-call-parser deepseek_v4 \
+      --enable-auto-tool-choice \
+      --reasoning-parser deepseek_v4 \
+      --reasoning-config '{{"reasoning_parser":"deepseek_v4","reasoning_start_str":"<think>","reasoning_end_str":"</think>"}}' \
+      --default-chat-template-kwargs '{{"thinking":true}}' \
+      --compilation-config '{{"cudagraph_mode":"FULL_AND_PIECEWISE","custom_ops":["all"]}}'
