@@ -7,33 +7,48 @@ import importlib.util
 from pathlib import Path
 
 
-UMA_CONDITION = "current_platform.is_integrated_gpu(device.index)"
-WSL_CONDITION = (
-    f"{UMA_CONDITION} and not (current_platform.is_cuda() and in_wsl())"
-)
-
-
 def patch_mem_utils(source: str) -> str:
     tree = ast.parse(source)
-    measures = [
-        method
+    helpers = [
+        node
         for node in tree.body
-        if isinstance(node, ast.ClassDef) and node.name == "MemorySnapshot"
-        for method in node.body
-        if isinstance(method, ast.FunctionDef) and method.name == "measure"
+        if isinstance(node, ast.FunctionDef) and node.name == "device_memory_info"
     ]
-    if len(measures) != 1:
-        raise ValueError("Expected exactly one MemorySnapshot.measure method")
+    if helpers:
+        # Upstream #65413 shares UMA reporting between profiling and the
+        # extensible KV cache. Patch their common helper so both honor WSL.
+        if len(helpers) != 1:
+            raise ValueError("Expected exactly one device_memory_info function")
+        target = helpers[0]
+        label = "device_memory_info"
+        uma_condition = "current_platform.is_integrated_gpu(index)"
+    else:
+        # Older upstream revisions and fork wheels keep the correction here.
+        measures = [
+            method
+            for node in tree.body
+            if isinstance(node, ast.ClassDef) and node.name == "MemorySnapshot"
+            for method in node.body
+            if isinstance(method, ast.FunctionDef) and method.name == "measure"
+        ]
+        if len(measures) != 1:
+            raise ValueError("Expected exactly one MemorySnapshot.measure method")
+        target = measures[0]
+        label = "MemorySnapshot"
+        uma_condition = "current_platform.is_integrated_gpu(device.index)"
 
-    original = ast.dump(ast.parse(UMA_CONDITION, mode="eval").body)
-    patched = ast.dump(ast.parse(WSL_CONDITION, mode="eval").body)
+    wsl_condition = (
+        f"{uma_condition} and not (current_platform.is_cuda() and in_wsl())"
+    )
+    original = ast.dump(ast.parse(uma_condition, mode="eval").body)
+    patched = ast.dump(ast.parse(wsl_condition, mode="eval").body)
     guards = [
         node
-        for node in measures[0].body
+        for node in target.body
         if isinstance(node, ast.If) and ast.dump(node.test) in (original, patched)
     ]
     if len(guards) != 1:
-        raise ValueError("Expected exactly one known MemorySnapshot UMA guard")
+        raise ValueError(f"Expected exactly one known {label} UMA guard")
 
     guard = guards[0]
     if ast.dump(guard.test) == original:
@@ -43,7 +58,7 @@ def patch_mem_utils(source: str) -> str:
         prefix = lines[condition.lineno - 1][: condition.col_offset]
         suffix = lines[condition.end_lineno - 1][condition.end_col_offset :]
         lines[condition.lineno - 1 : condition.end_lineno] = [
-            f"{prefix}{UMA_CONDITION} and not (\n"
+            f"{prefix}{uma_condition} and not (\n"
             f"{indent}    current_platform.is_cuda() and in_wsl()\n"
             f"{indent}){suffix}"
         ]

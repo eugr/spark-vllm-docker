@@ -4,9 +4,12 @@ Subject: [PATCH] [Bugfix][Spec Decode] Keep SW draft block a divisor of the prim
 Upstream-PR: https://github.com/vllm-project/vllm/pull/60252
 Upstream-Commit: 15787522732a833aa8c6a95bdb59e8b3e3ec4f88
 Integration-Base: 8084f0624dba24aba6ebac62d8e10cc00730a0fe
+Refresh-Base: 790be385c8a69f45ec9a7a85ef00836d1684060f
+
+Match the merged test imports and type narrowing so newer main skips this patch.
 
 diff --git a/tests/v1/attention/test_backend_per_kind.py b/tests/v1/attention/test_backend_per_kind.py
-index 5a32b302f23052c61fcb923603e8ac31c7cb977a..896eac1a3cf95924d7f4106fdb250bcaca9b33bc 100644
+index 5a32b302f23052c61fcb923603e8ac31c7cb977a..8ebd36636bd431d3af0c4799cedfb65f8c6fce50 100644
 --- a/tests/v1/attention/test_backend_per_kind.py
 +++ b/tests/v1/attention/test_backend_per_kind.py
 @@ -5,16 +5,24 @@
@@ -23,7 +26,7 @@ index 5a32b302f23052c61fcb923603e8ac31c7cb977a..896eac1a3cf95924d7f4106fdb250bca
  from vllm.v1.attention.backend import AttentionType, MultipleOf
  from vllm.v1.attention.backends.registry import AttentionBackendEnum
  from vllm.v1.attention.selector import get_attn_spec_kind
-+from vllm.v1.core.kv_cache_utils import unify_kv_cache_spec_page_size
++from vllm.v1.core.kv_cache_planning import unify_kv_cache_spec_page_size
  from vllm.v1.hisparse.runtime import ResolvedHiSparseConfig
 -from vllm.v1.kv_cache_interface import KVCacheSpecKind
 +from vllm.v1.kv_cache_interface import (
@@ -35,7 +38,7 @@ index 5a32b302f23052c61fcb923603e8ac31c7cb977a..896eac1a3cf95924d7f4106fdb250bca
  
  
  @pytest.mark.parametrize(
-@@ -35,6 +43,72 @@ def test_largest_kernel_block_within(supported_sizes, expected):
+@@ -35,6 +43,74 @@ def test_largest_kernel_block_within(supported_sizes, expected):
      assert _largest_kernel_block_within(Backend, 1024, 1024 * 1536, 2048) == expected
  
  
@@ -101,15 +104,17 @@ index 5a32b302f23052c61fcb923603e8ac31c7cb977a..896eac1a3cf95924d7f4106fdb250bca
 +        kv_quant_mode=get_kv_quant_mode("fp8"),
 +    )
 +    unified = unify_kv_cache_spec_page_size({"sw": sw_spec, "full": primary_spec})
-+    assert unified["sw"].block_size == primary_block_size
-+    assert unified["sw"].page_size_padded is None
++    unified_sw = unified["sw"]
++    assert isinstance(unified_sw, SlidingWindowSpec)
++    assert unified_sw.block_size == primary_block_size
++    assert unified_sw.page_size_padded is None
 +
 +
  @pytest.mark.parametrize(
      "signals,expected",
      [
 diff --git a/vllm/model_executor/layers/attention/attention.py b/vllm/model_executor/layers/attention/attention.py
-index 98b7f6509303f5009121012ca2250a7a6742a600..e33cc791e8ab1bc00bdfd2e48c7a89815d6d216d 100644
+index fc23e9791c5be143f7e2c419d09479bfaaa2ced3..b7942dbe8c401118ac6d80e213de6f0aef9e81d0 100644
 --- a/vllm/model_executor/layers/attention/attention.py
 +++ b/vllm/model_executor/layers/attention/attention.py
 @@ -104,6 +104,7 @@ def _largest_kernel_block_within(

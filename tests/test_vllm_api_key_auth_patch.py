@@ -108,6 +108,19 @@ B12X_SOURCE = AUTH_SOURCE.replace(
     '    """Pure ASGI', '    """\n    Pure ASGI',
 ).replace('(e.g. /health).\n\n    """', '(e.g. /health).\n    """')
 
+COHERE_CLI_SOURCE = CLI_SOURCE.replace(
+    '''    Warning: this only authenticates endpoints under the `/v1`, `/v2`, and
+    `/inference` path prefixes. Other endpoints on the same server, including
+    `/invocations` (which exposes the same inference capabilities as `/v1`),
+    remain unauthenticated. Do not rely on `--api-key` alone to secure vLLM;
+    see''',
+    '''    Warning: this only authenticates endpoints under the `/v1`, `/v2`,
+    `/inference`, and `/cohere` path prefixes. Other endpoints on the same
+    server, including `/invocations` (which exposes the same inference
+    capabilities as `/v1`), remain unauthenticated. Do not rely on `--api-key`
+    alone to secure vLLM; see''',
+)
+
 
 class Headers(dict):
     """The case-insensitive lookup contract used from Starlette Headers."""
@@ -216,7 +229,10 @@ class ApiKeyAuthPatchTests(unittest.TestCase):
                 PATCHER.patch_authentication(source)
 
     def test_entry_point_validates_both_files_before_writing(self):
-        for cli_relative in PATCHER.CLI_RELS:
+        for cli_relative, cli_source in (
+            (relative, source) for relative in PATCHER.CLI_RELS
+            for source in (CLI_SOURCE, COHERE_CLI_SOURCE)
+        ):
             with self.subTest(path=cli_relative), tempfile.TemporaryDirectory() as directory:
                 root = Path(directory)
                 auth_path, cli_path = root / PATCHER.AUTH_REL, root / cli_relative
@@ -235,11 +251,12 @@ class ApiKeyAuthPatchTests(unittest.TestCase):
                 self.assertEqual(cli_path.read_text(), "unexpected = True\n")
                 for args in ([str(root)], []):
                     auth_path.write_text(B12X_SOURCE)
-                    cli_path.write_text(CLI_SOURCE)
+                    cli_path.write_text(cli_source)
                     result = subprocess.run([sys.executable, str(PATCH_PATH), *args], cwd=root, capture_output=True, text=True)
                     self.assertEqual(result.returncode, 0, result.stderr)
                     self.assertEqual(auth_path.read_text(), PATCHER.patch_authentication(B12X_SOURCE))
-                    self.assertEqual(cli_path.read_text(), PATCHER.patch_cli_help(CLI_SOURCE))
+                    self.assertEqual(cli_path.read_text(), PATCHER.patch_cli_help(cli_source))
+                    self.assertIn("This authenticates every endpoint", cli_path.read_text())
 
     def test_absent_middleware_is_not_applicable(self):
         with tempfile.TemporaryDirectory() as directory:

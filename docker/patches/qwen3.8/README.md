@@ -20,26 +20,32 @@ available independently.
 
 The vLLM order is:
 
-1. [#59958](https://github.com/vllm-project/vllm/pull/59958): disk-offloaded PLE tables, using #56273's NVFP4 support already in main. This supersedes the earlier #58815-based host-file-gather implementation.
-2. [#59740](https://github.com/vllm-project/vllm/pull/59740) and [#60226](https://github.com/vllm-project/vllm/pull/60226): sparse draft vocabulary, including quantized heads.
-3. [#60068](https://github.com/vllm-project/vllm/pull/60068): adaptive draft depth.
-4. [#54912](https://github.com/vllm-project/vllm/pull/54912): QSA ring sizing.
-5. [#50897](https://github.com/vllm-project/vllm/pull/50897): lookahead-aware prefix hashing.
-6. [#54614](https://github.com/vllm-project/vllm/pull/54614): dynamic NVFP4 linear kernels.
-7. [#54617](https://github.com/vllm-project/vllm/pull/54617): dynamic NVFP4 MoE.
-8. [#60252](https://github.com/vllm-project/vllm/pull/60252): DFlash2 draft cache block sizing.
-9. [#59021](https://github.com/vllm-project/vllm/pull/59021) and [#59025](https://github.com/vllm-project/vllm/pull/59025): separate unquantized linear selection and cuDNN BF16 GEMMs.
-10. The supplied 32,768-token Flash Next draft vocabulary.
-11. [#60646](https://github.com/vllm-project/vllm/pull/60646): CSF-compressed NVFP4 scale loading.
-12. Wheel package-data inclusion for the draft vocabulary.
-13. The local Flash Next FP4 mod from `mods/draft/flash-next-fp4`:
+1. [#59740](https://github.com/vllm-project/vllm/pull/59740) and [#60226](https://github.com/vllm-project/vllm/pull/60226): sparse draft vocabulary, including quantized heads.
+2. [#60068](https://github.com/vllm-project/vllm/pull/60068): adaptive draft depth.
+3. [#54912](https://github.com/vllm-project/vllm/pull/54912): QSA ring sizing.
+4. [#50897](https://github.com/vllm-project/vllm/pull/50897): invalidate stale lookahead hashes on streaming updates. Core and connector hashing are now supplied by upstream #61589 and #64096.
+5. [#54614](https://github.com/vllm-project/vllm/pull/54614): dynamic NVFP4 linear kernels.
+6. [#54617](https://github.com/vllm-project/vllm/pull/54617): dynamic NVFP4 MoE.
+7. [#60252](https://github.com/vllm-project/vllm/pull/60252): DFlash2 draft cache block sizing.
+8. [#59021](https://github.com/vllm-project/vllm/pull/59021) and [#59025](https://github.com/vllm-project/vllm/pull/59025): separate unquantized linear selection and cuDNN BF16 GEMMs.
+9. The supplied 32,768-token Flash Next draft vocabulary.
+10. [#60646](https://github.com/vllm-project/vllm/pull/60646): CSF-compressed NVFP4 scale loading.
+11. Wheel package-data inclusion for the draft vocabulary.
+12. The local Flash Next FP4 mod from `mods/draft/flash-next-fp4`:
     opt-in resident CSF expert scales, ModelOpt dispatch, nested scale loading,
     weight-transfer helpers, and post-load host-heap trimming. Its vocabulary
     path is packaged alongside the identical existing vocabulary.
-14. `17-flash-next-b12x-loader.patch`: opt-in `--load-format b12x` for Flash
+13. `17-flash-next-b12x-loader.patch`: opt-in `--load-format b12x` for Flash
     Next and its embedded MTP draft on Spark, using FlashInfer's checkpoint
     reader and the weight-transfer helpers supplied by patch 16.
+14. [#65182](https://github.com/vllm-project/vllm/pull/65182): reuse MRV2's
+    persistent Mamba2 aligned state indices and accepted-token buffers as CUDA
+    graph inputs, avoiding redundant metadata copies. Frozen at
+    `14d3984b7118db638a188bc4f20b79c0bacfb232`, with upstream aliasing tests.
 
+Disk-offloaded PLE tables from
+[#59958](https://github.com/vllm-project/vllm/pull/59958) are supplied by upstream
+commit `b44a48cef1c08cbdc30a0953c724f18cd434e612`; duplicate patch 01 is retired.
 [#55601](https://github.com/vllm-project/vllm/pull/55601) is already in the
 validated upstream base. Quantized draft heads from
 [#59973](https://github.com/vllm-project/vllm/pull/59973) are supplied by upstream
@@ -59,6 +65,103 @@ Canonical NVFP4 W4A4 MoE from
 upstream commit `397b9607c83cf201f3c44684c555c3698869b6bd`.
 
 ## Integration and refresh
+
+The November 6 refresh fixes pipeline 388, job 711, which stopped in the
+FlashInfer MXFP8 patch on `555dd84ea4d94890c095dddf5144291861368818`. The
+autotuner now records all candidate timings and confirms near ties before
+publishing a winner. The optional first-tactic margin is applied after that
+selection, so both the cached tactic and its selection record agree. The
+SM12x requirement retains upstream's new `batch_invariant` argument. CUPTI
+selection, distributed fallback and ordinary tuning remain intact.
+
+Checking vLLM main `ad457ad7440bf0da7a7a8edd67ba9e66a9dec590` exposed subsequent
+conflicts in patches 01, 03, 06, 07, 14 and 16. Merged #59958 is retired along
+with its backport-only fixtures and four tests; upstream supplies disk offload
+and its newer staging changes. The remaining refreshes preserve ngram defaults,
+streaming's `extend_from_slice` and prefix-cache hit limit, config hash tests,
+EPLB expert filtering and external-weight memory accounting. Host-heap trimming
+still runs after loading and before recalculating the fallback memory budget.
+The API-key helper accepts the revised CLI help mentioning `/cohere`, with
+the same authentication policy and validation before writing either file.
+
+Fresh archives replay the FlashInfer series on the failed revision and main
+`b1cc4f35a5e30bdf378ccb5f6c398ce154375774`, without historical patch-base objects.
+The loader include-order fix and compilation of all 17 changed Python files
+pass on both. All 15 remaining vLLM entries replay: merged patch 09 skips and
+the other 14 apply. All 19 source patchers, CUTLASS pinning and compilation of
+all 81 changed Python files pass. All 39 series regressions, nine API-key
+tests and 109 build checks pass. GPU compilation and inference remain for CI.
+
+The November 4 follow-up refresh catches a new patch 18 conflict after the
+successful pipeline 386, job 708, built vLLM
+`c902b75ac1239b07f1f6816965479765f75726ee`. On main
+`46f36fa294559d080edc61a09e5b57826218a2bf`, upstream's FlashInfer ReplaySSM
+support changed `MambaHybridModelState` initialization. Patch 18 now allocates
+its persistent accepted-token batch after the existing align-mode flag,
+preserving ReplaySSM's query-start tracking, prefill buffer and shared Mamba
+context initialization. The graph-input aliasing and fallback paths remain.
+
+All 16 vLLM entries replay from a fresh archive without historical patch-base
+objects: patches 01 and 09 skip, and the remaining 14 apply. All 19 source
+patchers, CUTLASS pinning and compilation of all 81 changed Python files pass.
+The FlashInfer series and loader include-order helper also pass on
+`9ae6fe46349bb4aff8e2c82b07ce4412f1c69518`; all 17 changed Python files compile.
+All 40 series tests and 109 build checks pass. The new regression covers
+ReplaySSM with and without align mode and speculative decoding, including
+separate batch and per-request acceptance buffers. GPU compilation and
+inference remain for CI.
+
+The November 4 refresh fixes pipeline 386, job 705, which stopped at patch 04
+on vLLM `790be385c8a69f45ec9a7a85ef00836d1684060f`. Upstream moved the shared
+autoregressive decode loop into `AutoRegressiveSpeculator` and moved decode
+graph shapes into `VllmConfig.get_decode_cudagraph_query_lens`. Patch 04 now
+uses those interfaces, preserving metadata construction before confidence
+checks, distributed dispatch, graph specialization and decode hooks. Adaptive
+verification lengths retain their single-request limits; full and fallback
+depths support larger batches within upstream's request and token budgets.
+
+Newer main already includes #60252. Patch 09 now matches its merged test
+imports and type narrowing, allowing the existing reverse-apply check to
+recognize it without changing its runtime code. It remains in the series for
+the failed revision, where that fix is still needed.
+
+All 16 entries replay from fresh archives of the failed revision and main
+`101cfd10011bc104849622709b8f59d7ea9d1ff9`, without historical patch-base
+objects. Patch 01 skips on both; patch 09 also skips on main. All 19 subsequent
+source patchers, including the WSL helper, and CUTLASS pinning pass. All changed
+Python files compile: 83 on the failed revision and 81 on main. All 39 series
+tests pass with CPU tensor dependencies, including adaptive/fixed draft
+forwarding, metadata ordering, fused-decode selection, distributed dispatch
+and graph budgets. All 109 build checks pass. GPU wheel compilation and
+inference remain for CI.
+
+The November 3 refresh fixes pipeline 385, job 702, which stopped at patch 04
+on vLLM `c7a760751977e4e3396d586956d8767a9bc44a82`. Adaptive draft dispatch now
+preserves upstream's `decode_graph_eligible` check, including rejection of short
+prefills. Replaying the remaining series exposed conflicts in patches 06, 08
+and 17. Patch 08 retains the new `refill_derived` import. Patch 17 routes scoped
+checkpoint transfers through upstream's `copy_weight_` helper after its
+integrated-GPU mmap prefaulting, preserving both normal copies and deferred
+loader reads.
+
+Upstream [#64096](https://github.com/vllm-project/vllm/pull/64096), commit
+`75be1384286d6f4c5ca3ad493bc9390159d93f5b`, now supplies connector lookahead
+hashing alongside core [#61589](https://github.com/vllm-project/vllm/pull/61589).
+Patch 06 retains only the streaming-session invalidation fix and its regression.
+The superseded backports and their fixtures are retired, preserving upstream's
+configuration-time connector capability API, multi-token lookahead, Mooncake
+replay handling and prefix-cache tests. Patch 18 adds #65182 without changes to
+its runtime code.
+
+All 16 entries replay from fresh archives of the failed revision and main
+`39dbf518390ddbadf05c6712ee6aefa1c9190219`, without historical patch-base objects:
+merged patch 01 skips and the other 15 apply. All 19 subsequent source patchers,
+CUTLASS pinning and compilation of all 83 changed Python files pass on both
+revisions. All 35 series tests pass with CPU tensor dependencies, including
+graph eligibility, multi-token streaming invalidation, mmap prefaulting and
+Mamba buffer aliasing/fallback padding. The loader suite has 28 passes and one
+GPU-only skip; all 109 build checks pass. GPU wheel compilation and inference
+remain for CI.
 
 The November 2 refresh fixes pipeline 384, job 700,
 which stopped at patch 06 on vLLM `5c8ae7c74aaa99d1f7fbeea942fd7282e3413810`.

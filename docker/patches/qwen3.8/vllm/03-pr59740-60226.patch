@@ -6,6 +6,7 @@ Upstream-Commit: 178caf8dfb0908542ffb7dbf0f72c42f11b99fc0
 Upstream-PR: https://github.com/vllm-project/vllm/pull/60226
 Upstream-Commit: 92ed4c1160e11cd712934eb2525b6df3b8cebb83
 Integration-Base: 564ac0de1b228568cafcbfbe8ccaccc82d6023eb
+Refresh-Base: ad457ad7440bf0da7a7a8edd67ba9e66a9dec590
 
 Combine the latest sparse draft API with #60226 checkpoint-quantized heads.
 Use draft_lm_head_quantization, a fixed rank-256 scorer and TP=1 validation.
@@ -503,13 +504,13 @@ index 0000000000000000000000000000000000000000..a3ca9208eee96cd6d62bf1a42cdb533d
 +    assert reduced > 1.0
 +    assert reduced >= 0.9 * stock
 diff --git a/vllm/config/speculative.py b/vllm/config/speculative.py
-index b777fb6ea138573fba29bc421ac4ede7ae9b2291..5da8aa318851e6b45363df418449b2d601744a49 100644
+index bf51b1e9301cdc5a1f63d9c4bf0a99ae7eddf96f..01da15b0965b210775239b67e94f8ba7d7a986a7 100644
 --- a/vllm/config/speculative.py
 +++ b/vllm/config/speculative.py
-@@ -527,6 +527,24 @@ class SpeculativeConfig:
+@@ -554,6 +554,24 @@ class SpeculativeConfig:
      draft logits to shared tokens only (TLI algorithm). Requires
      method='draft_model'."""
- 
+
 +    draft_token_map: str | None = None
 +    """Path to a list of target token ids that the drafter may propose
 +    (FR-Spec). The drafter's shared lm_head is restricted to these rows, which
@@ -530,11 +531,11 @@ index b777fb6ea138573fba29bc421ac4ede7ae9b2291..5da8aa318851e6b45363df418449b2d6
 +
      # Ngram proposer configuration
      prompt_lookup_max: int | None = Field(default=None, ge=1)
-     """Maximum size of ngram token window when using Ngram proposer, required
-@@ -2087,6 +2105,14 @@ class SpeculativeConfig:
+     """Maximum size of ngram token window when using Ngram proposer. Defaults
+@@ -1711,6 +1729,14 @@ class SpeculativeConfig:
                  "omit it."
              )
- 
+
 +        if self.draft_token_map is None and self.draft_token_map_dynamic_rows > 0:
 +            raise ValueError("draft_token_map_dynamic_rows requires draft_token_map.")
 +
