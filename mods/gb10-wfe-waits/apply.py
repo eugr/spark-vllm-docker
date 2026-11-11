@@ -1,11 +1,12 @@
 """gb10-wfe-waits: park busy-waiting host threads in WFET instead of spinning (aarch64 FEAT_WFxT).
 
 Applied inside every container (head and workers) before the engine starts. Four independent parts; each one
-either applies completely, is already applied, or is skipped with a reason and leaves that file stock:
+either applies completely, is already applied, or is skipped with a reason and leaves the existing file unchanged:
 
   1. b12x RoCE proxy (`b12x/comm/roce/_roce_proxy.c`, standalone b12x or FlashInfer's experimental b12x): the idle
-     doorbell wait arms the exclusive monitor (LDXR) and parks in WFET instead of spinning. b12x compiles the proxy
-     from this source at runtime (cache keyed by source hash), so only the source changes.
+     doorbell wait arms the exclusive monitor (LDXR) and parks in WFET instead of spinning, and after a long idle
+     stretch it naps between polls exactly as the stock loop does. b12x compiles the proxy from this source at
+     runtime (cache keyed by source hash), so only the source changes.
   2. vLLM `spinloop` extension: rebuilt from the bundled spinloop.cpp, which adds an aarch64 branch with the same
      monitor + WFET wait for the shared-memory broadcast queue (EngineCore <-> local workers).
   3. vLLM `shm_broadcast.py`: a reader passes its own read flag to `spinloop()` as well (`rank + 2` instead of
@@ -45,7 +46,7 @@ class Fatal(Exception):
 
 
 def skip(part: str, why: str) -> None:
-    log(f"{part}: SKIPPED, left stock - {why}")
+    log(f"{part}: SKIPPED, unchanged - {why}")
     skipped.append(part)
 
 
@@ -108,6 +109,11 @@ PROXY_HELPERS = r"""// gb10-wfe-waits: idle doorbell wait.  On aarch64 cores wit
 // the core.  The absolute 1 ms deadline bounds every park so the running flag
 // and the CQ drain stay serviced.  B12X_ROCE_WFE=0 restores the spin.
 #if defined(__aarch64__)
+// After this many parks without a doorbell the proxy naps between polls instead,
+// exactly as the unpatched loop does, so a long idle stretch leaves the core to
+// the kernel's idle states: 8192 nominal 1 ms park budgets, about 8.2 s total,
+// excluding loop work and scheduling delays.
+#define ROCE_WFE_IDLE_PARKS 8192
 static inline uint64_t roce_cntvct(void) {
 @@uint64_t t;
 @@__asm__ volatile("isb\n\tmrs %0, cntvct_el0" : "=r"(t)::"memory");
@@ -173,16 +179,20 @@ def patch_proxy_text(text: str) -> str:
              f"{u}// A parked iteration lasts until the next store to the line, an event-stream\n"
              f"{u}// event (~100-130 us on GB10) or the 1 ms deadline; drain the CQs every 8\n"
              f"{u}// parked iterations instead of every 64 spins.\n"
-             f"{u}const uint64_t drain_every = use_wfe ? 8 : 64;\n")
+             f"{u}const uint64_t drain_mask = use_wfe ? 7 : 63;\n")
     text = sub_once(text, r"^[ \t]+const struct timespec nap = \{0, 20000\};\n", lambda mm: setup, "nap")
     text = sub_once(text, r"^([ \t]+)if \(idle % 64 == 0\) \{\n",
-                    lambda mm: f"{mm.group(1)}if (idle % drain_every == 0) {{\n", "idle % 64")
+                    lambda mm: f"{mm.group(1)}if ((idle & drain_mask) == 0) {{\n", "idle % 64")
 
     def wfe_block(mm):
         i = mm.group(1)
         return ("#if defined(__aarch64__)\n"
                 f"{i}if (use_wfe) {{\n"
-                f"{i}{u}roce_wait_change(&ctrl[0], seq, roce_cntvct() + wfe_slice);\n"
+                f"{i}{u}if (idle > ROCE_WFE_IDLE_PARKS) {{\n"
+                f"{i}{u}{u}nanosleep(&nap, NULL);  // a long idle stretch naps, as the unpatched loop does\n"
+                f"{i}{u}}} else {{\n"
+                f"{i}{u}{u}roce_wait_change(&ctrl[0], seq, roce_cntvct() + wfe_slice);\n"
+                f"{i}{u}}}\n"
                 f"{i}{u}continue;\n"
                 f"{i}}}\n"
                 "#endif\n" + mm.group(0))
@@ -202,9 +212,17 @@ def proxy_part() -> None:
     cc = first_tool(os.environ.get("CC"), "gcc", "cc", "clang")
     for f in files:
         text = f.read_text()
-        if "roce_wait_change" in text:
+        if "ROCE_WFE_IDLE_PARKS" in text:
             log(f"roce-proxy: already applied ({f})")
             continue
+        if "roce_wait_change" in text:
+            # an older gb10-wfe-waits parked without the idle nap: re-patch the stock source it kept
+            backup = f.with_name(f.name + ".stock")
+            if not backup.is_file():
+                skip("roce-proxy", f"{f}: patched by an older gb10-wfe-waits, no {backup.name} to re-patch from")
+                continue
+            log(f"roce-proxy: re-patching {f} from {backup.name} (the older patch parked without the idle nap)")
+            text = backup.read_text()
         try:
             new = patch_proxy_text(text)
         except LookupError as e:
