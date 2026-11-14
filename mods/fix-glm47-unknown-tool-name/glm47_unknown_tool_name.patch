@@ -1,0 +1,5 @@
+--- a/parser/glm47_moe.py
++++ b/parser/glm47_moe.py
+@@ -222 +222 @@
+-        validate_tool_names=True,
++        validate_tool_names=False,
