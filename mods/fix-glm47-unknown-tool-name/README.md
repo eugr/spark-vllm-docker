@@ -33,7 +33,7 @@ and the conversation continues normally.
 ## Usage
 
 ```bash
-./run-recipe.sh glm-5.3-flash --solo --apply-mod mods/fix-glm47-unknown-tool-name
+./run-recipe.sh glm-5.3-flash
 ```
 
 Applied at container start; a vLLM restart is required for an already
