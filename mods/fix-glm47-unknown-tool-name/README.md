@@ -32,9 +32,16 @@ and the conversation continues normally.
 
 ## Usage
 
+The mod is wired into the `glm-5.3-flash` recipe's `mods:` list, so the
+plain `./run-recipe.sh glm-5.3-flash` applies it automatically. To opt out,
+remove the `mods/fix-glm47-unknown-tool-name` line from the recipe's
+`mods:` list.
+
+To apply on demand instead (or after opting out):
+
 ```bash
-./run-recipe.sh glm-5.3-flash
+./run-recipe.sh glm-5.3-flash --apply-mod mods/fix-glm47-unknown-tool-name
 ```
 
-Applied at container start; a vLLM restart is required for an already
-running container.
+Both forms are safe together — the mod is idempotent and re-applying is a
+no-op. A vLLM restart is required for an already running container.
