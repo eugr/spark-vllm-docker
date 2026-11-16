@@ -151,6 +151,8 @@ if tool == "rsync" and "-e" in args:
     record["config"] = pathlib.Path(remote[remote.index("-F") + 1]).read_text()
 if tool == "ssh" and args[-1] == "docker load":
     record["bytes"] = len(sys.stdin.buffer.read())
+    host = args[-2].split("@")[-1]
+    pathlib.Path(os.environ["TOPOLOGY_TEST_LOADED"] + "-" + host).write_text("loaded")
 with open(os.environ["TOPOLOGY_TEST_LOG"], "a") as log:
     log.write(json.dumps(record) + "\n")
 if tool == "docker":
@@ -160,13 +162,27 @@ if tool == "docker":
         else:
             print(pathlib.Path(os.environ["TOPOLOGY_TEST_IMAGE"]).read_text())
     elif args[0] == "save":
-        pathlib.Path(args[args.index("-o") + 1]).write_bytes(b"mock image stream")
+        import io, tarfile
+        def entry(name, data):
+            info = tarfile.TarInfo(name)
+            info.size, info.mtime, info.mode = len(data), 0, 0o644
+            tar.addfile(info, io.BytesIO(data))
+        config = json.dumps({"os": "linux", "architecture": "amd64",
+                             "rootfs": {"type": "layers", "diff_ids": ["sha256:" + "0" * 64]}}).encode()
+        manifest = json.dumps([{"Config": "config.json", "RepoTags": ["vllm-node:latest"],
+                                "Layers": ["layer.tar"]}]).encode()
+        with tarfile.open(args[args.index("-o") + 1], "w") as tar:
+            entry("manifest.json", manifest)
+            entry("config.json", config)
+            entry("layer.tar", b"layer\n")
 elif tool == "ssh" and "docker image inspect" in args[-1]:
     if "--format" in args[-1]:
         print("sha256:old" if "-F" in args else "sha256:current")
     else:
         image = json.loads(pathlib.Path(os.environ["TOPOLOGY_TEST_IMAGE"]).read_text())
-        image[0]["Config"]["Cmd"] = ["different-runtime"]
+        host = args[-2].split("@")[-1]
+        if not pathlib.Path(os.environ["TOPOLOGY_TEST_LOADED"] + "-" + host).exists():
+            image[0]["Config"]["Cmd"] = ["different-runtime"]
         print(json.dumps(image))
 elif tool == "ssh" and args[-1].startswith("docker ps"):
     sys.exit(1)
@@ -183,7 +199,10 @@ class IntegrationTests(unittest.TestCase):
         for name in ("autodiscover.sh", "build-and-copy.sh", "hf-download.sh", "hf-cache.py", "cluster_topology.py", "launch-cluster.sh"):
             shutil.copy2(ROOT / name, self.root / name)
         (self.root / "docker").mkdir()
-        shutil.copy2(ROOT / "docker/image_identity.py", self.root / "docker/image_identity.py")
+        # The distribution scripts shell out to every docker/ helper they need; copy the whole directory so a new
+        # helper cannot break these tests the way docker/image_archive.py did.
+        for helper in (ROOT / "docker").glob("*.py"):
+            shutil.copy2(helper, self.root / "docker" / helper.name)
         self.bin = self.root / "bin"
         self.bin.mkdir()
         for tool in ("ssh", "docker", "rsync", "uvx", "sleep"):
@@ -195,13 +214,16 @@ class IntegrationTests(unittest.TestCase):
         self.log = self.root / "calls.jsonl"
         self.env = {**os.environ, "PATH": f"{self.bin}:{os.environ['PATH']}",
                     "TOPOLOGY_TEST_LOG": str(self.log), "HF_HOME": str(self.root / "cache"), "USER": "fixture",
-                    "TOPOLOGY_TEST_IMAGE": str(ROOT / "tests/fixtures/image-identity/classic.json")}
+                    "TOPOLOGY_TEST_IMAGE": str(ROOT / "tests/fixtures/image-identity/classic.json"),
+                    "TOPOLOGY_TEST_LOADED": str(self.root / "loaded")}
         for key in list(self.env):
             if key.startswith("DOTENV_") or key in ("HF_HUB_CACHE", "HUGGINGFACE_HUB_CACHE"):
                 del self.env[key]
         (self.root / "cache/hub/models--org--model").mkdir(parents=True)
 
     def run_script(self, script, *args, ok=True, input=None):
+        for marker in self.root.glob("loaded-*"):
+            marker.unlink()
         result = subprocess.run(["bash", str(self.root / script), *args], cwd=self.root,
                                 env=self.env, capture_output=True, text=True, input=input, timeout=30)
         if ok:
@@ -220,11 +242,15 @@ class IntegrationTests(unittest.TestCase):
     def test_image_inspection_and_stream_use_same_routes(self):
         self.run_script("build-and-copy.sh", "--config", str(self.config), "--no-build", "-c", "--copy-parallel")
         calls = [call for call in self.calls() if call["tool"] == "ssh"]
-        self.assertEqual(len(calls), 9)
+        self.assertEqual(len(calls), 12)
         for call in calls:
             self.assert_route(call)
         self.assertEqual({call["args"][-2] for call in calls}, set(ORDER[1:]))
-        self.assertEqual([call["bytes"] for call in calls if "bytes" in call], [17] * 3)
+        streams = [call["bytes"] for call in calls if "bytes" in call]
+        self.assertEqual(len(streams), 3)
+        self.assertGreater(streams[0], 0)
+        # Every host receives the same saved archive, whatever its size.
+        self.assertEqual(len(set(streams)), 1)
 
     def test_model_permissions_and_rsync_use_same_routes(self):
         self.run_script("hf-download.sh", "--config", str(self.config), "org/model", "-c", "--copy-parallel")
@@ -251,11 +277,13 @@ class IntegrationTests(unittest.TestCase):
                     permissions = [call for call in calls if call["tool"] == "ssh" and call not in inspections + streams]
                     copies = [call for call in calls if call["tool"] == "rsync"]
                     for group in (inspections, streams, permissions, copies):
-                        self.assertEqual(len(group), (count - 1) * (2 if group is inspections else 1))
+                        self.assertEqual(len(group), (count - 1) * (3 if group is inspections else 1))
                         destinations = {call["args"][-1].split(":", 1)[0] if call["tool"] == "rsync"
                                         else call["args"][-2] for call in group}
                         self.assertEqual(destinations, set(nodes[1:]))
-                    self.assertEqual([call["bytes"] for call in streams], [17] * (count - 1))
+                    self.assertEqual(len(streams), count - 1)
+                    self.assertGreater(streams[0]["bytes"], 0)
+                    self.assertEqual(len({call["bytes"] for call in streams}), 1)
                     # Both distribution scripts must use the same entire routing table.
                     configs = {call["config"] for call in inspections + streams + permissions + copies}
                     self.assertEqual(len(configs), 1)
