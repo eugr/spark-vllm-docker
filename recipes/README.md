@@ -335,6 +335,32 @@ To override the cluster recipe with disk offload:
 In cluster mode, each volume mapping is applied to every node. Ensure the local
 path exists with suitable contents and permissions on each host.
 
+### GPT-OSS on Hosts Without Internet Access
+
+Symptom: `openai-gpt-oss-120b` starts and `/v1/models` responds, but the first
+chat or completion request fails. Cause: `openai-harmony` downloads the
+`o200k_base` and `cl100k_base` tiktoken encodings on first use, which fails
+when the host has restricted or no outbound access.
+
+Download the files on a machine with access and copy them to each host:
+
+```bash
+mkdir -p "$HOME/tiktoken-encodings"
+cd "$HOME/tiktoken-encodings"
+curl -fLO https://openaipublic.blob.core.windows.net/encodings/o200k_base.tiktoken
+curl -fLO https://openaipublic.blob.core.windows.net/encodings/cl100k_base.tiktoken
+```
+
+Mount the directory and point `TIKTOKEN_ENCODINGS_BASE` at it:
+
+```bash
+./run-recipe.sh openai-gpt-oss-120b --solo \
+  -v "$HOME/tiktoken-encodings:/tiktoken-encodings:ro" \
+  -e TIKTOKEN_ENCODINGS_BASE=/tiktoken-encodings
+```
+
+The same `-v` and `-e` options work with `launch-cluster.sh` before `exec`.
+
 For a gated Hugging Face model, export the token for host-side downloads and
 also pass it to the container:
 

@@ -30,6 +30,9 @@ defaults:
   max_num_batched_tokens: 8192
 
 # Environment variables to set in the container
+# On hosts without internet access, pre-stage the tiktoken encodings and set
+# TIKTOKEN_ENCODINGS_BASE; see "GPT-OSS on Hosts Without Internet Access" in
+# recipes/README.md.
 env:
   VLLM_USE_FLASHINFER_MOE_MXFP4_MXFP8: "1"
 
