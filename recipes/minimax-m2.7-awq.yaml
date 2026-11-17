@@ -22,7 +22,10 @@ defaults:
   port: 8000
   host: 0.0.0.0
   tensor_parallel: 2
-  gpu_memory_utilization: 0.8
+  # 0.85: at 0.8 the KV cache (~22.5 GiB) is below the ~23.25 GiB needed for
+  # 196608 tokens on 2x Spark, since CUDA-graph memory profiling (vLLM >= 0.21)
+  # lowers the effective budget. 0.85 gives ~28.7 GiB (~240k tokens).
+  gpu_memory_utilization: 0.85
   max_model_len: 196608
 
 # Environment variables
