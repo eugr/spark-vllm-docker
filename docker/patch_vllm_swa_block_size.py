@@ -84,6 +84,13 @@ DIVISOR_CALL = """            sw_block_size = _largest_kernel_block_within(
             )
             return SlidingWindowSpec(
 """
+# The cache-manager API uses a plain AttentionSpec plus a layer configuration;
+# backend constraints may now be resolved for the specific attention layer.
+LAYER_CONFIG_DIVISOR_CALL = DIVISOR_CALL.replace(
+    "                divisor_of=None if shared_page else block_size,\n",
+    "                divisor_of=None if shared_page else block_size,\n"
+    "                layer_name=self.layer_name,\n",
+).replace("            return SlidingWindowSpec(\n", "            spec = AttentionSpec(\n")
 
 
 class PatchError(RuntimeError):
@@ -106,7 +113,9 @@ def patch_source(source: str) -> tuple[str, str]:
         if (
             source.count("    divisor_of: int | None = None,") != 1
             or source.count(DIVISOR_SELECTION) != 1
-            or source.count(DIVISOR_CALL) != 1
+            or sum(source.count(call) for call in (
+                DIVISOR_CALL, LAYER_CONFIG_DIVISOR_CALL
+            )) != 1
             or anchor_count
         ):
             raise PatchError("SWA divisor-aware selection is incomplete or changed")

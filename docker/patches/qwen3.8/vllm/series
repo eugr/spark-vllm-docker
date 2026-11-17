@@ -6,9 +6,9 @@
 06-pr50897.patch
 07-pr54614.patch
 08-pr54617.patch
-09-pr60252.patch
+# PR #60252 merged as 59519ec0ee; upstream supplies draft cache block sizing.
 10-pr59021.patch
-11-pr59025.patch
+# PR #59025 merged as ca3c154d26; upstream supplies cuDNN BF16 GEMMs.
 13-draft-vocab.patch
 14-pr60646.patch
 15-package-draft-vocab.patch

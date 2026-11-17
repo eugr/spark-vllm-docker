@@ -1,10 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-# Upstream excerpt from 624a5ddafd96df23fe2b9f6d4b8f52a08b9fe9ea:
-# vllm/model_executor/layers/quantization/modelopt.py after #59604.
+# Excerpts from upstream b409a4f0d787fdddb75ec2e8ddb6dfcfd36235b7 (with preceding series entries).
+# vllm/model_executor/layers/quantization/modelopt.py
 
-
-class ModelOptMixedPrecisionConfig:
+class ModelOptMixedPrecisionConfig(object):
     def get_quant_method(
         self, layer: torch.nn.Module, prefix: str
     ) -> "QuantizeMethodBase | None":
@@ -39,6 +38,21 @@ class ModelOptMixedPrecisionConfig:
                 f"{quant_algo} requires a linear, embedding or routed experts"
             )
 
+        if (
+            quant_algo == "W4A16_NVFP4"
+            and isinstance(layer, VocabParallelEmbedding)
+            and not isinstance(layer, ParallelLMHead)
+        ):
+            model_config = getattr(
+                get_current_vllm_config_or_none(), "model_config", None
+            )
+            # The language model ties according to its own (text) config.
+            if model_config is not None and getattr(
+                model_config.hf_text_config, "tie_word_embeddings", False
+            ):
+                raise ValueError(_NVFP4_EMBEDDING_TIED)
+            return ModelOptNvFp4EmbeddingMethod()
+
         if isinstance(layer, (LinearBase, ParallelLMHead)):
             # Per-prefix algo -> its sub-config, then the generic linear method.
             # resolve() reads group_size off whichever sub-config it is handed.
@@ -51,6 +65,7 @@ class ModelOptMixedPrecisionConfig:
             return build_linear_method(getattr(self, subcfg_attr), quant_algo, prefix)
 
         if isinstance(layer, RoutedExperts):
+            _reject_int8_pb_wo_moe(quant_algo, prefix)
             if quant_algo in _BLOCK_FP8_MOE_ALGOS:
                 return Fp8MoEMethod(self.fp8_block_config, layer)
             if quant_algo == "FP8":
@@ -62,11 +77,17 @@ class ModelOptMixedPrecisionConfig:
                 return ModelOptNvFp4FusedMoE(
                     quant_config=self.nvfp4_config,
                     moe_config=layer.moe_config,
+                    scale_encoding=self._resolve_layer_field(
+                        prefix, "weight_scale_encoding"
+                    ),
                 )
             if quant_algo == "W4A16_NVFP4":
                 return ModelOptNvFp4FusedMoE(
                     quant_config=self.w4a16_nvfp4_config,
                     moe_config=layer.moe_config,
+                    scale_encoding=self._resolve_layer_field(
+                        prefix, "weight_scale_encoding"
+                    ),
                 )
             if quant_algo == "MXFP8":
                 return ModelOptMxFp8FusedMoE(

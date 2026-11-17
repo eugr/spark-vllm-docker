@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-# Upstream excerpts from 46f36fa294559d080edc61a09e5b57826218a2bf:
+# Excerpts from upstream b409a4f0d787fdddb75ec2e8ddb6dfcfd36235b7 (with preceding series entries).
 # vllm/v1/worker/gpu/model_states/mamba_hybrid.py
 
 class MambaHybridModelState(DefaultModelState):
@@ -22,18 +22,16 @@ class MambaHybridModelState(DefaultModelState):
         # the postprocess copy machinery, so the per-step src columns and the
         # running state_idx are kept GPU-resident.
         self._align_mode = self.cache_config.mamba_cache_mode == "align"
-        self._use_flashinfer_replayssm = vllm_config.use_flashinfer_replayssm
-        if self._use_flashinfer_replayssm:
+        self._use_replayssm_trackers = vllm_config.use_replayssm_trackers
+        if self._use_replayssm_trackers:
             self._is_prefilling_gpu = torch.zeros(
                 self.max_num_reqs, dtype=torch.bool, device=self.device
             )
         self.recoverssm = (
             RecoverSSMState() if self.cache_config.use_kda_recoverssm else None
         )
-        if self._align_mode or self._use_flashinfer_replayssm:
+        if self._align_mode or self._use_replayssm_trackers:
             self._mamba_ctx: MambaSpecDecodeGPUContext | None = None
-            self._mamba_group_ids: list[int] = []
-            self._mamba_spec: MambaSpec | None = None
             self._mamba_state_copy_funcs: MambaStateCopyFuncsByType | None = None
         if self._align_mode:
             self._mamba_state_idx_gpu = torch.zeros(

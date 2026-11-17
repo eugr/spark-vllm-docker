@@ -26,19 +26,18 @@ The vLLM order is:
 4. [#50897](https://github.com/vllm-project/vllm/pull/50897): invalidate stale lookahead hashes on streaming updates. Core and connector hashing are now supplied by upstream #61589 and #64096.
 5. [#54614](https://github.com/vllm-project/vllm/pull/54614): dynamic NVFP4 linear kernels.
 6. [#54617](https://github.com/vllm-project/vllm/pull/54617): dynamic NVFP4 MoE.
-7. [#60252](https://github.com/vllm-project/vllm/pull/60252): DFlash2 draft cache block sizing.
-8. [#59021](https://github.com/vllm-project/vllm/pull/59021) and [#59025](https://github.com/vllm-project/vllm/pull/59025): separate unquantized linear selection and cuDNN BF16 GEMMs.
-9. The supplied 32,768-token Flash Next draft vocabulary.
-10. [#60646](https://github.com/vllm-project/vllm/pull/60646): CSF-compressed NVFP4 scale loading.
-11. Wheel package-data inclusion for the draft vocabulary.
-12. The local Flash Next FP4 mod from `mods/draft/flash-next-fp4`:
+7. [#59021](https://github.com/vllm-project/vllm/pull/59021): separate unquantized linear selection.
+8. The supplied 32,768-token Flash Next draft vocabulary.
+9. [#60646](https://github.com/vllm-project/vllm/pull/60646): CSF-compressed NVFP4 scale loading.
+10. Wheel package-data inclusion for the draft vocabulary.
+11. The local Flash Next FP4 mod from `mods/draft/flash-next-fp4`:
     opt-in resident CSF expert scales, ModelOpt dispatch, nested scale loading,
     weight-transfer helpers, and post-load host-heap trimming. Its vocabulary
     path is packaged alongside the identical existing vocabulary.
-13. `17-flash-next-b12x-loader.patch`: opt-in `--load-format b12x` for Flash
+12. `17-flash-next-b12x-loader.patch`: opt-in `--load-format b12x` for Flash
     Next and its embedded MTP draft on Spark, using FlashInfer's checkpoint
     reader and the weight-transfer helpers supplied by patch 16.
-14. [#65182](https://github.com/vllm-project/vllm/pull/65182): reuse MRV2's
+13. [#65182](https://github.com/vllm-project/vllm/pull/65182): reuse MRV2's
     persistent Mamba2 aligned state indices and accepted-token buffers as CUDA
     graph inputs, avoiding redundant metadata copies. Frozen at
     `14d3984b7118db638a188bc4f20b79c0bacfb232`, with upstream aliasing tests.
@@ -56,6 +55,12 @@ modified a BF16-only warmup workaround that upstream
 The series retains the current full-model autotune path, including cuDNN, and
 does not restore the obsolete 32-token cap or BF16-only pass.
 
+DFlash2 divisor-aware cache sizing from
+[#60252](https://github.com/vllm-project/vllm/pull/60252) and cuDNN BF16 GEMMs from
+[#59025](https://github.com/vllm-project/vllm/pull/59025) are supplied by upstream
+commits `59519ec0ee0bc6b124c60fd50a82e94de98933e1` and
+`ca3c154d26749c2b59d9d99050d2bd631d2c63f7`; duplicate patches 09 and 11 are retired.
+
 The FlashInfer series contains
 [#5943](https://github.com/flashinfer-ai/flashinfer/pull/5943)
 (SM12x CuTe DSL MXFP8 GEMMs), at head
@@ -65,6 +70,30 @@ Canonical NVFP4 W4A4 MoE from
 upstream commit `397b9607c83cf201f3c44684c555c3698869b6bd`.
 
 ## Integration and refresh
+
+The November 16 refresh fixes the FlashInfer patch conflict reproduced in
+pipeline 398, job 733, on `a2e3d1e7075edf57c87248c63f206c3a3b87a185`.
+Upstream added batch-invariant benchmarks and multi-runner CuTe DSL dispatch.
+Patch 02 preserves them while routing SM120/121 to its own kernels before
+SM100 experimental runner selection. Mixed auto-backend lists retain upstream
+CuTe DSL tuning; explicit SM12x CuTe DSL keeps its CUPTI configuration.
+
+Replaying vLLM `b409a4f0d787fdddb75ec2e8ddb6dfcfd36235b7` exposed follow-on
+conflicts in patches 03, 04, 05, 07, 08, 10, 16 and 18. The refresh uses current
+speculative configuration, cache-manager and Mamba interfaces, preserves NVFP4
+embedding dispatch, and retires merged #60252/#59025 and removed Model Runner
+V1/Qwen2MoE hunks. Confidence stopping now uses upstream's separate drafted and
+verified metrics, excluding stale slots without discarding the proposal count
+when verification is shorter. The SWA helper recognizes the merged divisor fix
+through the new per-layer cache API and preserves backend constraints.
+
+Fresh archive replays pass without historical patch-base objects: FlashInfer
+on the failed revision and main `45e0842d4a48b5849422e2f55b04af5e8b7a7163`,
+and all 13 vLLM entries on the revision above. FlashInfer's loader include-order
+fix and compilation of all 17 changed Python files pass on both revisions.
+All 19 vLLM source patchers, CUTLASS pinning and compilation of all 77 changed
+Python files pass. All 39 series regressions, 29 SWA tests and 109 build checks
+pass. GPU compilation and inference remain for CI.
 
 The November 6 refresh fixes pipeline 388, job 711, which stopped in the
 FlashInfer MXFP8 patch on `555dd84ea4d94890c095dddf5144291861368818`. The

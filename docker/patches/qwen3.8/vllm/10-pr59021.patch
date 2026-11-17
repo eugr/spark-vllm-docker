@@ -4,17 +4,18 @@ Subject: [PATCH] [Kernel] Allow steering the unquantized linear backend independ
 Upstream-PR: https://github.com/vllm-project/vllm/pull/59021
 Upstream-Commit: 0d1a683a3471ce352ef5a9aa2d7a9616bd1ac4bf
 Integration-Base: 8084f0624dba24aba6ebac62d8e10cc00730a0fe
+Refresh-Base: b409a4f0d787fdddb75ec2e8ddb6dfcfd36235b7
 
 Preserve upstream RDNA hybrid prefill dequantization settings and validation.
 
 diff --git a/vllm/config/kernel.py b/vllm/config/kernel.py
-index 18ad1321ea956eadffb80648002f40763619cfd1..b6908e95c5537b1bd7c773acb8300c62ffe96114 100644
+index 3e8e5e6d92d414d2d162407cfa460172b46ed978..49b8fcd3197d9b5cca8ed83d0102eb06385bb893 100644
 --- a/vllm/config/kernel.py
 +++ b/vllm/config/kernel.py
-@@ -427,6 +427,11 @@ class KernelConfig:
-     precedence over ``linear_backend``; for example,
-     ``{"nvfp4_w4a16": "humming"}``."""
- 
+@@ -478,6 +478,11 @@ class KernelConfig:
+     precedence over `linear_backend`; for example,
+     `{"nvfp4_w4a16": "humming"}`."""
+
 +    unquantized_linear_backend: LinearBackend = "auto"
 +    """Backend override for unquantized linear layers only, decoupled from
 +    ``linear_backend`` (which also drives the quantized kernel selector).
@@ -23,17 +24,17 @@ index 18ad1321ea956eadffb80648002f40763619cfd1..b6908e95c5537b1bd7c773acb8300c62
      rdna_hybrid_w4a16_prefill_dequant: RDNAHybridW4A16PrefillDequantMode = "disable"
      """Cache a dense dequantized copy of each weight for the RDNA hybrid W4A16
      linear kernel's prefill GEMM. Applies only on gfx11/gfx12 RDNA GPUs, where
-@@ -450,7 +455,7 @@ class KernelConfig:
+@@ -507,7 +512,7 @@ class KernelConfig:
              return value.lower().replace("-", "_")
          return value
- 
+
 -    @field_validator("linear_backend", mode="before")
 +    @field_validator("linear_backend", "unquantized_linear_backend", mode="before")
      @classmethod
      def _normalize_linear_backend(cls, value: Any) -> Any:
          if isinstance(value, str):
 diff --git a/vllm/engine/arg_utils.py b/vllm/engine/arg_utils.py
-index 316881e5d61b2271088d4b6314140c259794efa0..8699f90b5d0feaaa4efb18bec26b9cc6546374a4 100644
+index ee2bd37da5e41772b403007b083b88bfcec06886..ff2466af4a726a8d75361f120b770cbedc465aa5 100644
 --- a/vllm/engine/arg_utils.py
 +++ b/vllm/engine/arg_utils.py
 @@ -573,6 +573,9 @@ class EngineArgs:
@@ -46,7 +47,7 @@ index 316881e5d61b2271088d4b6314140c259794efa0..8699f90b5d0feaaa4efb18bec26b9cc6
      all2all_backend: All2AllBackend = ParallelConfig.all2all_backend
      enable_elastic_ep: bool = ParallelConfig.enable_elastic_ep
      elastic_ep_max_dp_size: int = ParallelConfig.elastic_ep_max_dp_size
-@@ -1856,6 +1859,15 @@ class EngineArgs:
+@@ -1900,6 +1903,15 @@ class EngineArgs:
          kernel_group.add_argument(
              "--sparse-indexer-topk-backend", **sparse_indexer_topk_kwargs
          )
@@ -59,10 +60,10 @@ index 316881e5d61b2271088d4b6314140c259794efa0..8699f90b5d0feaaa4efb18bec26b9cc6
 +        kernel_group.add_argument(
 +            "--unquantized-linear-backend", **unquantized_linear_backend_kwargs
 +        )
- 
+
          # vLLM arguments
          vllm_kwargs = get_kwargs(VllmConfig)
-@@ -2809,6 +2821,10 @@ class EngineArgs:
+@@ -2875,6 +2887,10 @@ class EngineArgs:
              kernel_config.linear_backend = self.linear_backend
          if self.sparse_indexer_topk_backend != "auto":
              kernel_config.sparse_indexer_topk_backend = self.sparse_indexer_topk_backend
@@ -70,14 +71,14 @@ index 316881e5d61b2271088d4b6314140c259794efa0..8699f90b5d0feaaa4efb18bec26b9cc6
 +            kernel_config.unquantized_linear_backend = (
 +                self.unquantized_linear_backend
 +            )
- 
+
          # Transfer top-level ir_op_priority into KernelConfig.ir_op_priority
          for op_name, op_priority in asdict(self.ir_op_priority).items():
 diff --git a/vllm/model_executor/layers/linear.py b/vllm/model_executor/layers/linear.py
-index d3195472d3cd9491a44257f05955ec83a02c6e37..428aefd8730c74c882a1c5001d7041f306a2a2d4 100644
+index 57a95e32057e421c2cd5681d0c3a9585ce52c8ed..b6cb58c68c10ace2e2b30dcf52525eee91ed504d 100644
 --- a/vllm/model_executor/layers/linear.py
 +++ b/vllm/model_executor/layers/linear.py
-@@ -173,6 +173,10 @@ class UnquantizedLinearMethod(LinearMethodBase):
+@@ -174,6 +174,10 @@ class UnquantizedLinearMethod(LinearMethodBase):
          linear_backend = (
              config.kernel_config.linear_backend if config is not None else "auto"
          )
@@ -86,5 +87,5 @@ index d3195472d3cd9491a44257f05955ec83a02c6e37..428aefd8730c74c882a1c5001d7041f3
 +            if unquantized_backend != "auto":
 +                linear_backend = unquantized_backend
          self._gemm_impl = dispatch_unquantized_gemm(linear_backend)
- 
+
      def create_weights(

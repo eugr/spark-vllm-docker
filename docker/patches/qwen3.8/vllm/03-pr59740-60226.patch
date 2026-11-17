@@ -6,19 +6,21 @@ Upstream-Commit: 178caf8dfb0908542ffb7dbf0f72c42f11b99fc0
 Upstream-PR: https://github.com/vllm-project/vllm/pull/60226
 Upstream-Commit: 92ed4c1160e11cd712934eb2525b6df3b8cebb83
 Integration-Base: 564ac0de1b228568cafcbfbe8ccaccc82d6023eb
-Refresh-Base: ad457ad7440bf0da7a7a8edd67ba9e66a9dec590
+Refresh-Base: b409a4f0d787fdddb75ec2e8ddb6dfcfd36235b7
 
 Combine the latest sparse draft API with #60226 checkpoint-quantized heads.
 Use draft_lm_head_quantization, a fixed rank-256 scorer and TP=1 validation.
 Preserve upstream MTP changes without restoring removed fused-expert imports.
 Retain the shared-head helper and defer full-head quantization for sparse maps;
 the sparse loader quantizes only selected rows while sharing validation remains.
+Use the method-specific speculative configuration and current MTP interfaces;
+the retired Model Runner V1 guard is no longer needed.
 
 diff --git a/.buildkite/test_areas/spec_decode.yaml b/.buildkite/test_areas/spec_decode.yaml
-index 1cca6d4160efd80c254c89208d97783d1ba9e92e..571adfc18fa403dc778b739a00dcbd09826e3e4b 100644
+index af310bd1d25b16a721685809d6051dc2bcbf5f74..7d0d9d846c50935a7185dfa7d4bbd62c9f301f21 100644
 --- a/.buildkite/test_areas/spec_decode.yaml
 +++ b/.buildkite/test_areas/spec_decode.yaml
-@@ -223,6 +223,7 @@ steps:
+@@ -169,6 +169,7 @@ steps:
    source_file_dependencies:
      - vllm/v1/spec_decode/
      - vllm/v1/worker/gpu/spec_decode/
@@ -27,17 +29,17 @@ index 1cca6d4160efd80c254c89208d97783d1ba9e92e..571adfc18fa403dc778b739a00dcbd09
      - vllm/transformers_utils/configs/speculators/
      - tests/v1/e2e/spec_decode/
 diff --git a/docs/features/speculative_decoding/README.md b/docs/features/speculative_decoding/README.md
-index 568308e4ef6705ffafca53591744d395b196b1ed..108d6da96dd43f057c87e8341b52e9b5f0958cec 100644
+index 2896a38bb90ff67f8ff80945b70ed0f889ede1c6..5de559f5a558529808496c3898610ab67c13a841 100644
 --- a/docs/features/speculative_decoding/README.md
 +++ b/docs/features/speculative_decoding/README.md
-@@ -95,6 +95,7 @@ only apply to model-based methods such as `draft_model`, `mtp`, `eagle3`, and
- | `fly_entropy_threshold` | `float >= 0` | `0.3` | Minimum target top-k entropy required for FLy to defer a native rejection. |
- | `fly_entropy_top_k` | `integer >= 1` | `3` | Number of largest processed target probabilities used by FLy's entropy gate, capped at the vocabulary size. |
- | `use_heterogeneous_vocab` | `boolean` | `false` | Allow draft and target models with different vocabularies. Builds a token-level intersection at initialisation and constrains draft logits to shared tokens only. Only compatible with `method=draft_model`. Probabilistic draft sampling (`draft_sample_method='probabilistic'`) and `use_local_argmax_reduction` are not supported when this option is enabled. |
+@@ -180,6 +180,7 @@ only apply to model-based methods such as `draft_model`, `mtp`, `eagle3`, and
+ | `fly_window_size` | `integer >= 1` | `min(6, num_speculative_tokens - 1)` | Number of subsequent native acceptance decisions checked by FLy. FLy requires at least two speculative tokens, and the window must be smaller than `num_speculative_tokens`. With `synthetic`, runs FLy's entropy computation without deferring rejections (see [FLy](fly.md#measuring-fly-cost-with-synthetic-acceptance)). |
+ | `fly_entropy_threshold` | `float >= 0` | `0.3` | Minimum normalized top-k entropy, in `[0, 1]`, required for FLy to defer a native rejection. |
+ | `fly_entropy_top_k` | `integer >= 1` | `3` | Number of largest processed target scores renormalized for FLy's entropy gate, capped at the vocabulary size. |
 +| `draft_token_map` | `string` | `None` | Path to a list of target token ids the drafter may propose (`.pt` in SGLang's `--speculative-token-map` format, or a JSON list). Restricts a shared lm_head to those rows to cut drafting cost; verification is unchanged. Only for `mtp` drafters with an unquantized lm_head, on Model Runner V2. See [Reduced draft vocabulary](mtp.md#reduced-draft-vocabulary). |
- 
- !!! note
-     Gemma 4 assistant checkpoints are handled as Gemma 4 MTP speculators, not
+
+ For an EPLB-backed MoE draft, set its redundant expert count with
+ `eplb_config.draft_num_redundant_experts` in addition to configuring
 diff --git a/docs/features/speculative_decoding/mtp.md b/docs/features/speculative_decoding/mtp.md
 index 34d8f9539b74a7ef8edd8252f7244dc37be98d0e..6ceee19ad799885c7f71c385ab651f2dd0d31734 100644
 --- a/docs/features/speculative_decoding/mtp.md
@@ -45,7 +47,7 @@ index 34d8f9539b74a7ef8edd8252f7244dc37be98d0e..6ceee19ad799885c7f71c385ab651f2d
 @@ -67,6 +67,62 @@ vllm serve XiaomiMiMo/MiMo-7B-Base \
      --speculative-config '{"method":"mtp","num_speculative_tokens":1}'
  ```
- 
+
 +## Reduced draft vocabulary
 +
 +MTP heads usually share the target model's lm_head, so every draft token pays
@@ -103,7 +105,7 @@ index 34d8f9539b74a7ef8edd8252f7244dc37be98d0e..6ceee19ad799885c7f71c385ab651f2d
 +lm_head require the ModelOpt NVFP4 format.
 +
  ## Notes
- 
+
  - MTP only works for model families that support MTP in vLLM.
 diff --git a/examples/features/speculative_decoding/build_draft_token_map.py b/examples/features/speculative_decoding/build_draft_token_map.py
 new file mode 100644
@@ -435,10 +437,10 @@ index 0000000000000000000000000000000000000000..cac153a2f15bc7ed3f9ddb3420355dac
 +    rel_err = (logits[kept] - reference[kept]).norm() / reference[kept].norm()
 +    assert rel_err < (0.02 if quant_method == "W4A16_NVFP4" else 0.2)
 diff --git a/tests/model_executor/test_eagle_quantization.py b/tests/model_executor/test_eagle_quantization.py
-index 3f6ca673b628427767c217e9ccccbaff8976f159..924ad0d493c2d4e0fba84394280de5af5d3c5e7d 100644
+index dda088ea066502351cccd446fd4c0f80a5543468..c05299c0501d4c906a55abfc99ab8daa5d4ac3de 100644
 --- a/tests/model_executor/test_eagle_quantization.py
 +++ b/tests/model_executor/test_eagle_quantization.py
-@@ -141,6 +141,7 @@ def test_eagle3_lm_head_receives_quant_config():
+@@ -140,6 +140,7 @@ def test_eagle3_lm_head_receives_quant_config():
          patch("vllm.model_executor.models.llama_eagle3.LlamaModel") as MockModel,
          patch("vllm.model_executor.models.llama_eagle3.ParallelLMHead") as MockLMHead,
          patch("vllm.model_executor.models.llama_eagle3.LogitsProcessor"),
@@ -504,12 +506,12 @@ index 0000000000000000000000000000000000000000..a3ca9208eee96cd6d62bf1a42cdb533d
 +    assert reduced > 1.0
 +    assert reduced >= 0.9 * stock
 diff --git a/vllm/config/speculative.py b/vllm/config/speculative.py
-index bf51b1e9301cdc5a1f63d9c4bf0a99ae7eddf96f..01da15b0965b210775239b67e94f8ba7d7a986a7 100644
+index a7529ebe035b82fbe17f09752fe071f744f70a6f..1d11f352532af1e3af4c73cc4141aedaadaa18e4 100644
 --- a/vllm/config/speculative.py
 +++ b/vllm/config/speculative.py
-@@ -554,6 +554,24 @@ class SpeculativeConfig:
-     draft logits to shared tokens only (TLI algorithm). Requires
-     method='draft_model'."""
+@@ -592,6 +592,24 @@ class SpeculativeConfig:
+     O(2 * tp_size) per token. Only applies to greedy draft selection in
+     non-tree speculation."""
 
 +    draft_token_map: str | None = None
 +    """Path to a list of target token ids that the drafter may propose
@@ -532,9 +534,9 @@ index bf51b1e9301cdc5a1f63d9c4bf0a99ae7eddf96f..01da15b0965b210775239b67e94f8ba7
      # Ngram proposer configuration
      prompt_lookup_max: int | None = Field(default=None, ge=1)
      """Maximum size of ngram token window when using Ngram proposer. Defaults
-@@ -1711,6 +1729,14 @@ class SpeculativeConfig:
-                 "omit it."
-             )
+@@ -1520,6 +1538,14 @@ class SpeculativeConfig:
+                 )
+         config_cls.apply_options(self)
 
 +        if self.draft_token_map is None and self.draft_token_map_dynamic_rows > 0:
 +            raise ValueError("draft_token_map_dynamic_rows requires draft_token_map.")
@@ -544,22 +546,9 @@ index bf51b1e9301cdc5a1f63d9c4bf0a99ae7eddf96f..01da15b0965b210775239b67e94f8ba7
 +                f"draft_token_map requires method 'mtp', got {self.method!r}."
 +            )
 +
-         if self.use_heterogeneous_vocab and self.use_local_argmax_reduction:
-             raise ValueError(
-                 "use_heterogeneous_vocab is not compatible with "
-diff --git a/vllm/config/vllm.py b/vllm/config/vllm.py
-index da0a7008df5cf0460a06bbe90876fb9d5b3bb0a1..879a3992137d8692b687112454d416a7340560c4 100644
---- a/vllm/config/vllm.py
-+++ b/vllm/config/vllm.py
-@@ -3133,6 +3133,8 @@ class VllmConfig:
-                 unsupported.append("xpress speculative decoding")
-             if self.speculative_config.enable_adaptive_verification:
-                 unsupported.append("adaptive draft verification")
-+            if self.speculative_config.draft_token_map is not None:
-+                unsupported.append("speculative draft_token_map")
-             if self.speculative_config.draft_lm_head_quantization is not None:
-                 unsupported.append("draft lm_head quantization")
- 
+         if self.prefill_context_kv_only:
+             if not config_cls.supports_prefill_context_kv_only:
+                 raise ValueError(
 diff --git a/vllm/model_executor/layers/draft_vocab.py b/vllm/model_executor/layers/draft_vocab.py
 new file mode 100644
 index 0000000000000000000000000000000000000000..ec6e77cb380c183a8ceee4bd2fce9e744eba2d2e
@@ -1368,7 +1357,7 @@ index 9284dd59a09bad0e5e63dabb0f1556bdbc0da079..7cc97d94f319a0cedb198c681a7d511b
 --- a/vllm/model_executor/models/deepseek_eagle3.py
 +++ b/vllm/model_executor/models/deepseek_eagle3.py
 @@ -11,6 +11,7 @@ from transformers import DeepseekV2Config, DeepseekV3Config
- 
+
  from vllm.compilation.decorators import support_torch_compile
  from vllm.config import VllmConfig, get_current_vllm_config
 +from vllm.model_executor.layers.draft_vocab import DraftVocab
@@ -1391,7 +1380,7 @@ index 9284dd59a09bad0e5e63dabb0f1556bdbc0da079..7cc97d94f319a0cedb198c681a7d511b
 +            self.logits_processor, vllm_config.model_config.get_vocab_size()
 +        )
 +        self.draft_id_to_target_id = self.draft_vocab.draft_id_to_target_id
- 
+
      def embed_input_ids(
          self,
 @@ -334,25 +331,7 @@ class Eagle3DeepseekV2ForCausalLM(LocalArgmaxMixin, DeepseekV2ForCausalLM):
@@ -1418,11 +1407,11 @@ index 9284dd59a09bad0e5e63dabb0f1556bdbc0da079..7cc97d94f319a0cedb198c681a7d511b
 -        logits_new[:, targets] = logits
 -        return logits_new
 +        return self.draft_vocab.compute_logits(self.lm_head, hidden_states)
- 
+
      def combine_hidden_states(
          self,
 diff --git a/vllm/model_executor/models/gemma4_dspark.py b/vllm/model_executor/models/gemma4_dspark.py
-index 13c868e59b385d829979a524676fbf7f99e533d2..4fce5ce6c3b8b49a66b24a3a4f9e1aebc21c962c 100644
+index 3f603584c6a2a5ba612a86795d920d3af2f1a1c2..82136b0448e246231a96040998dbc650963c3f3e 100644
 --- a/vllm/model_executor/models/gemma4_dspark.py
 +++ b/vllm/model_executor/models/gemma4_dspark.py
 @@ -11,6 +11,7 @@ import torch.nn.functional as F
@@ -1433,18 +1422,18 @@ index 13c868e59b385d829979a524676fbf7f99e533d2..4fce5ce6c3b8b49a66b24a3a4f9e1aeb
  from vllm.model_executor.layers.layernorm import RMSNorm
  from vllm.model_executor.layers.linear import ColumnParallelLinear, ReplicatedLinear
  from vllm.model_executor.layers.logits_processor import LogitsProcessor
-@@ -303,7 +304,8 @@ class Gemma4DSparkForCausalLM(Qwen3DSparkForCausalLM):
+@@ -327,7 +328,8 @@ class Gemma4DSparkForCausalLM(Qwen3DSparkForCausalLM):
              self.config.vocab_size,
              soft_cap=getattr(self.config, "final_logit_softcapping", None),
          )
 -        self.draft_id_to_target_id = None
 +        self.draft_vocab = DraftVocab(self.logits_processor, self.config.vocab_size)
 +        self.draft_id_to_target_id = self.draft_vocab.draft_id_to_target_id
- 
+
      def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
          stacked = [("gate_up_proj", "gate_proj", 0), ("gate_up_proj", "up_proj", 1)]
 diff --git a/vllm/model_executor/models/interfaces.py b/vllm/model_executor/models/interfaces.py
-index 701c24a072d47bf4587743e7faf87db50673cf77..812f2f09e7157b4c84cc4c6123f09f2ef99f36e7 100644
+index fd8bb651c86fc6cb6dd76cac26f4effc555e318d..a4904c908aa4897e2c33a18ea20457d782603b82 100644
 --- a/vllm/model_executor/models/interfaces.py
 +++ b/vllm/model_executor/models/interfaces.py
 @@ -50,6 +50,7 @@ if TYPE_CHECKING:
@@ -1455,16 +1444,16 @@ index 701c24a072d47bf4587743e7faf87db50673cf77..812f2f09e7157b4c84cc4c6123f09f2e
      from vllm.model_executor.layers.fused_moe import MoERunner
      from vllm.model_executor.layers.logits_processor import LogitsProcessor
      from vllm.model_executor.layers.mamba.mamba_utils import (
-@@ -1588,6 +1589,7 @@ class LocalArgmaxMixin:
-         ``self.logits_processor``: LogitsProcessor
-         ``self.lm_head``: ParallelLMHead
-         ``self.draft_id_to_target_id`` (optional): nn.Parameter
-+        ``self.draft_vocab`` (optional): DraftVocab, used instead when present
+@@ -1606,6 +1607,7 @@ class LocalArgmaxMixin:
+         `self.logits_processor`: LogitsProcessor
+         `self.lm_head`: ParallelLMHead
+         `self.draft_id_to_target_id` (optional): nn.Parameter
++        `self.draft_vocab` (optional): DraftVocab, used instead when present
      """
- 
+
      logits_processor: "LogitsProcessor"
-@@ -1595,6 +1597,9 @@ class LocalArgmaxMixin:
- 
+@@ -1613,6 +1615,9 @@ class LocalArgmaxMixin:
+
      def get_top_tokens(self, hidden_states: torch.Tensor) -> torch.Tensor:
          """Vocab-parallel argmax with optional D2T remapping."""
 +        draft_vocab: DraftVocab | None = getattr(self, "draft_vocab", None)
@@ -1474,7 +1463,7 @@ index 701c24a072d47bf4587743e7faf87db50673cf77..812f2f09e7157b4c84cc4c6123f09f2e
              self.lm_head,
              hidden_states,
 diff --git a/vllm/model_executor/models/llama_eagle3.py b/vllm/model_executor/models/llama_eagle3.py
-index 68e21c9dc284246ee2450494a34e123a23ab8ce9..5ef46805496f57267e7dd15136cc2f0f062dedb7 100644
+index b959838242320113869698767e402b3fef2c2d32..3badfc5210aef59a80c1b236fd707838a8f17944 100644
 --- a/vllm/model_executor/models/llama_eagle3.py
 +++ b/vllm/model_executor/models/llama_eagle3.py
 @@ -11,6 +11,7 @@ from transformers import LlamaConfig
@@ -1501,10 +1490,10 @@ index 68e21c9dc284246ee2450494a34e123a23ab8ce9..5ef46805496f57267e7dd15136cc2f0f
 +            self.logits_processor, vllm_config.model_config.get_vocab_size()
 +        )
 +        self.draft_id_to_target_id = self.draft_vocab.draft_id_to_target_id
- 
-         self.use_parallel_drafting = speculative_config.parallel_drafting
- 
-@@ -374,25 +371,7 @@ class Eagle3LlamaForCausalLM(_Eagle3LlamaForCausalLMBase):
+
+     def embed_input_ids(
+         self,
+@@ -365,25 +362,7 @@ class Eagle3LlamaForCausalLM(_Eagle3LlamaForCausalLMBase):
          self,
          hidden_states: torch.Tensor,
      ) -> torch.Tensor | None:
@@ -1528,23 +1517,23 @@ index 68e21c9dc284246ee2450494a34e123a23ab8ce9..5ef46805496f57267e7dd15136cc2f0f
 -        logits_new[:, targets] = logits
 -        return logits_new
 +        return self.draft_vocab.compute_logits(self.lm_head, hidden_states)
- 
+
      def combine_hidden_states(
          self,
 diff --git a/vllm/model_executor/models/qwen3_5_mtp.py b/vllm/model_executor/models/qwen3_5_mtp.py
-index b6b2c3851c916c67deafd6442df32ded2541aea3..2097257f23d368eb932f293172484367debe14cd 100644
+index af2e5b05cf920c09725fd727f24f4bf223d36e6a..383846c6fa699c1a8ca571529810e2b03bbd547b 100644
 --- a/vllm/model_executor/models/qwen3_5_mtp.py
 +++ b/vllm/model_executor/models/qwen3_5_mtp.py
 @@ -12,6 +12,7 @@ from vllm.compilation.decorators import support_torch_compile
  from vllm.config import VllmConfig
- from vllm.distributed import get_pp_group, tensor_model_parallel_all_gather
+ from vllm.distributed import tensor_model_parallel_all_gather
  from vllm.logger import init_logger
 +from vllm.model_executor.layers.draft_vocab import DraftVocab
  from vllm.model_executor.layers.linear import ColumnParallelLinear
  from vllm.model_executor.layers.logits_processor import LogitsProcessor
  from vllm.model_executor.layers.vocab_parallel_embedding import (
-@@ -250,6 +251,12 @@ class Qwen3_5MTP(LocalArgmaxMixin, nn.Module, SupportsMultiModal, SupportsPP):
-             self.lm_head = PPMissingLayer()
+@@ -235,6 +236,12 @@ class Qwen3_5MTP(LocalArgmaxMixin, nn.Module, SupportsMultiModal, SupportsPP):
+             self.lm_head = self.lm_head.tie_weights(self.model.embed_tokens)
 
          self.logits_processor = LogitsProcessor(config.vocab_size)
 +        spec = vllm_config.speculative_config
@@ -1556,7 +1545,7 @@ index b6b2c3851c916c67deafd6442df32ded2541aea3..2097257f23d368eb932f293172484367
 
          self.make_empty_intermediate_tensors = (
              self.model.make_empty_intermediate_tensors
-@@ -305,7 +312,7 @@ class Qwen3_5MTP(LocalArgmaxMixin, nn.Module, SupportsMultiModal, SupportsPP):
+@@ -290,7 +297,7 @@ class Qwen3_5MTP(LocalArgmaxMixin, nn.Module, SupportsMultiModal, SupportsPP):
          hidden_states: torch.Tensor,
          spec_step_idx: int = 0,
      ) -> torch.Tensor | None:
@@ -1565,7 +1554,7 @@ index b6b2c3851c916c67deafd6442df32ded2541aea3..2097257f23d368eb932f293172484367
 
      def get_top_tokens(
          self,
-@@ -332,7 +339,11 @@ class Qwen3_5MTP(LocalArgmaxMixin, nn.Module, SupportsMultiModal, SupportsPP):
+@@ -317,7 +324,11 @@ class Qwen3_5MTP(LocalArgmaxMixin, nn.Module, SupportsMultiModal, SupportsPP):
                  yield name, weight
 
          loader = AutoWeightsLoader(self)
@@ -1579,7 +1568,7 @@ index b6b2c3851c916c67deafd6442df32ded2541aea3..2097257f23d368eb932f293172484367
 
  class Qwen3_5MoeMTP(Qwen3_5MTP, QwenNextMixtureOfExperts):
 diff --git a/vllm/model_executor/models/qwen3_dflash.py b/vllm/model_executor/models/qwen3_dflash.py
-index e5eb0959ac97698f7e081cb88594b2f8cab258b3..83140062cf4b66b5fa125fb190ec317f1e61f22d 100644
+index 605d01a5524f37c3df7492530610697f49e1f6cd..3a045d62d7cabf62ffce1b20bb6ff8d5cbefe7dd 100644
 --- a/vllm/model_executor/models/qwen3_dflash.py
 +++ b/vllm/model_executor/models/qwen3_dflash.py
 @@ -18,6 +18,7 @@ from vllm.distributed import (
@@ -1590,7 +1579,7 @@ index e5eb0959ac97698f7e081cb88594b2f8cab258b3..83140062cf4b66b5fa125fb190ec317f
  from vllm.model_executor.layers.layernorm import RMSNorm
  from vllm.model_executor.layers.linear import (
      QKVParallelLinear,
-@@ -841,14 +842,10 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
+@@ -907,14 +908,10 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
          self.logits_processor = LogitsProcessor(
              self.config.draft_vocab_size, scale=logit_scale
          )
@@ -1606,10 +1595,10 @@ index e5eb0959ac97698f7e081cb88594b2f8cab258b3..83140062cf4b66b5fa125fb190ec317f
 +            self.logits_processor, vllm_config.model_config.get_vocab_size()
 +        )
 +        self.draft_id_to_target_id = self.draft_vocab.draft_id_to_target_id
- 
+
      def embed_input_ids(
          self,
-@@ -878,18 +875,7 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
+@@ -944,18 +941,7 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
          self,
          hidden_states: torch.Tensor,
      ) -> torch.Tensor | None:
@@ -1626,11 +1615,11 @@ index e5eb0959ac97698f7e081cb88594b2f8cab258b3..83140062cf4b66b5fa125fb190ec317f
 -        logits_new[:, targets] = logits
 -        return logits_new
 +        return self.draft_vocab.compute_logits(self.lm_head, hidden_states)
- 
+
      def precompute_and_store_context_kv(
          self,
 diff --git a/vllm/model_executor/models/qwen3_dspark.py b/vllm/model_executor/models/qwen3_dspark.py
-index 6f902170546e98809e59774dee9af9dd2ed1694d..c4dfb4f02b9b16d9f69a8ca65b8e3ed549212a6b 100644
+index f4266ecb9cdd6d896b061c32d2102f6becc1d26c..d9db3a093a75b19553a09a3514b3d882e9b72c20 100644
 --- a/vllm/model_executor/models/qwen3_dspark.py
 +++ b/vllm/model_executor/models/qwen3_dspark.py
 @@ -22,6 +22,7 @@ import torch.nn as nn
@@ -1641,7 +1630,7 @@ index 6f902170546e98809e59774dee9af9dd2ed1694d..c4dfb4f02b9b16d9f69a8ca65b8e3ed5
  from vllm.model_executor.layers.linear import ReplicatedLinear
  from vllm.model_executor.layers.logits_processor import LogitsProcessor
  from vllm.model_executor.layers.quantization import QuantizationConfig
-@@ -264,16 +265,10 @@ class Qwen3DSparkForCausalLM(DFlashQwen3ForCausalLM):
+@@ -261,16 +262,10 @@ class Qwen3DSparkForCausalLM(DFlashQwen3ForCausalLM):
              self.config.draft_vocab_size, scale=logit_scale
          )
          self.target_vocab_size = vllm_config.model_config.get_vocab_size()
@@ -1662,7 +1651,7 @@ index 6f902170546e98809e59774dee9af9dd2ed1694d..c4dfb4f02b9b16d9f69a8ca65b8e3ed5
 
      def get_draft_kv_cache_layer_names(self) -> list[str]:
          return [layer.self_attn.attn.layer_name for layer in self.model.layers]
-@@ -288,10 +283,7 @@ class Qwen3DSparkForCausalLM(DFlashQwen3ForCausalLM):
+@@ -285,10 +280,7 @@ class Qwen3DSparkForCausalLM(DFlashQwen3ForCausalLM):
          return self.logits_processor(self.lm_head, hidden_states, skip_gather=True)
 
      def map_draft_to_target(self, draft_ids: torch.Tensor) -> torch.Tensor:
@@ -1675,7 +1664,7 @@ index 6f902170546e98809e59774dee9af9dd2ed1694d..c4dfb4f02b9b16d9f69a8ca65b8e3ed5
      def markov_embed(self, token_ids: torch.Tensor) -> torch.Tensor:
          return self.model.markov_head.embed(token_ids)
 diff --git a/vllm/model_executor/models/qwen3_eagle3.py b/vllm/model_executor/models/qwen3_eagle3.py
-index 124c1f82cacf0488328d17a9e1d45abf41945b81..f2de475b0b589420cc7787ff56a0119118cd9b84 100644
+index c7877bc966f7dd127735966cb38167641b29acec..d799d60e90a346a140ddd177f3abdb0646cdd924 100644
 --- a/vllm/model_executor/models/qwen3_eagle3.py
 +++ b/vllm/model_executor/models/qwen3_eagle3.py
 @@ -10,6 +10,7 @@ from transformers import Qwen3Config
@@ -1702,10 +1691,10 @@ index 124c1f82cacf0488328d17a9e1d45abf41945b81..f2de475b0b589420cc7787ff56a01191
 +            self.logits_processor, vllm_config.model_config.get_vocab_size()
 +        )
 +        self.draft_id_to_target_id = self.draft_vocab.draft_id_to_target_id
- 
-         self.use_parallel_drafting = speculative_config.parallel_drafting
- 
-@@ -353,25 +350,7 @@ class Eagle3Qwen3ForCausalLM(Qwen3ForCausalLM):
+
+     def embed_input_ids(
+         self,
+@@ -344,25 +341,7 @@ class Eagle3Qwen3ForCausalLM(Qwen3ForCausalLM):
          self,
          hidden_states: torch.Tensor,
      ) -> torch.Tensor | None:
@@ -1729,72 +1718,72 @@ index 124c1f82cacf0488328d17a9e1d45abf41945b81..f2de475b0b589420cc7787ff56a01191
 -        logits_new[:, targets] = logits
 -        return logits_new
 +        return self.draft_vocab.compute_logits(self.lm_head, hidden_states)
- 
+
      def combine_hidden_states(
          self,
 diff --git a/vllm/models/qwen4_exp/amd/mtp.py b/vllm/models/qwen4_exp/amd/mtp.py
-index 7a73ac8f33ed7fda45926c8f0ee531263e80eb5a..36b3a05656b1408a319b0ba4b4fad7d407d7d4c8 100644
+index 41e6bc82dd153d69867da62c52f10cd2ca3440bb..c4de4c8b9ab5e1ecb4199928e57d9b4dc707d445 100644
 --- a/vllm/models/qwen4_exp/amd/mtp.py
 +++ b/vllm/models/qwen4_exp/amd/mtp.py
-@@ -23,6 +23,7 @@ from transformers import Qwen4ExpTextConfig
+@@ -22,6 +22,7 @@ from transformers import Qwen4ExpTextConfig
+
  from vllm.compilation.decorators import support_torch_compile
  from vllm.config import VllmConfig, replace, set_current_vllm_config
- from vllm.distributed import get_pp_group
 +from vllm.model_executor.layers.draft_vocab import DraftVocab
  from vllm.model_executor.layers.layernorm import GemmaRMSNorm
  from vllm.model_executor.layers.linear import ColumnParallelLinear
  from vllm.model_executor.layers.logits_processor import LogitsProcessor
-@@ -433,6 +434,7 @@ class Qwen4ExpMTP(nn.Module, SupportsHCSP, SupportsPP, Qwen4ExpMixtureOfExperts)
-             self.lm_head = PPMissingLayer()
- 
+@@ -426,6 +427,7 @@ class Qwen4ExpMTP(nn.Module, SupportsHCSP, SupportsPP, Qwen4ExpMixtureOfExperts)
+             )
+
          self.logits_processor = LogitsProcessor(config.vocab_size)
 +        self.draft_vocab = DraftVocab(self.logits_processor, config.vocab_size)
          self.make_empty_intermediate_tensors = (
              self.model.make_empty_intermediate_tensors
          )
-@@ -463,7 +465,7 @@ class Qwen4ExpMTP(nn.Module, SupportsHCSP, SupportsPP, Qwen4ExpMixtureOfExperts)
+@@ -456,7 +458,7 @@ class Qwen4ExpMTP(nn.Module, SupportsHCSP, SupportsPP, Qwen4ExpMixtureOfExperts)
      def compute_logits(
          self, hidden_states: torch.Tensor, spec_step_idx: int = 0
      ) -> torch.Tensor | None:
 -        return self.logits_processor(self.lm_head, hidden_states)
 +        return self.draft_vocab.compute_logits(self.lm_head, hidden_states)
- 
+
      def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
          def remap_weight_names():
 diff --git a/vllm/models/qwen4_exp/nvidia/mtp.py b/vllm/models/qwen4_exp/nvidia/mtp.py
-index 30401ca56dcb91171e9e22258b5153a4acd28469..c5e72e08c0e3614937ee291f038bfb8c95713a90 100644
+index 6c5026b0ae376b618bf668c618ae1b1754f2603c..d3d35430783de8fec4bd2babf0d57357eb904fe3 100644
 --- a/vllm/models/qwen4_exp/nvidia/mtp.py
 +++ b/vllm/models/qwen4_exp/nvidia/mtp.py
 @@ -24,6 +24,7 @@ from vllm import envs
  from vllm.config import VllmConfig, replace, set_current_vllm_config
- from vllm.distributed import get_pp_group
  from vllm.forward_context import get_forward_context, is_forward_context_available
+ from vllm.kernels.triton.fused_pre_fc_norms import fused_pre_fc_norms_split
 +from vllm.model_executor.layers.draft_vocab import DraftVocab
  from vllm.model_executor.layers.layernorm import GemmaRMSNorm
  from vllm.model_executor.layers.linear import ColumnParallelLinear
  from vllm.model_executor.layers.logits_processor import LogitsProcessor
-@@ -435,6 +436,7 @@ class Qwen4ExpMTP(nn.Module, SupportsHCSP, SupportsPP, Qwen4ExpMixtureOfExperts)
-             self.lm_head = PPMissingLayer()
- 
+@@ -441,6 +442,7 @@ class Qwen4ExpMTP(nn.Module, SupportsHCSP, SupportsPP, Qwen4ExpMixtureOfExperts)
+             )
+
          self.logits_processor = LogitsProcessor(config.vocab_size)
 +        self.draft_vocab = DraftVocab(self.logits_processor, config.vocab_size)
          self.make_empty_intermediate_tensors = (
              self.model.make_empty_intermediate_tensors
          )
-@@ -465,7 +467,7 @@ class Qwen4ExpMTP(nn.Module, SupportsHCSP, SupportsPP, Qwen4ExpMixtureOfExperts)
+@@ -471,7 +473,7 @@ class Qwen4ExpMTP(nn.Module, SupportsHCSP, SupportsPP, Qwen4ExpMixtureOfExperts)
      def compute_logits(
          self, hidden_states: torch.Tensor, spec_step_idx: int = 0
      ) -> torch.Tensor | None:
 -        return self.logits_processor(self.lm_head, hidden_states)
 +        return self.draft_vocab.compute_logits(self.lm_head, hidden_states)
- 
+
      def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
          def remap_weight_names():
 diff --git a/vllm/v1/worker/gpu/spec_decode/eagle/utils.py b/vllm/v1/worker/gpu/spec_decode/eagle/utils.py
-index 8cba9af864211fc26665e7e6e5c218a40ba3eacc..f7567c863086be08704eaa4541614f6be088d43b 100644
+index 594c3b84e1313ee921d6650346e3b60b98a39a0a..172079329d5711e272b5db3d9cb5e9de9f20ee90 100644
 --- a/vllm/v1/worker/gpu/spec_decode/eagle/utils.py
 +++ b/vllm/v1/worker/gpu/spec_decode/eagle/utils.py
-@@ -47,6 +47,8 @@ def share_target_lm_head(
+@@ -46,6 +46,8 @@ def share_target_lm_head(
      target_lm_head: nn.Module | None,
      quantization: Literal["fp8", "nvfp4"] | None,
      can_share: bool = True,
@@ -1803,7 +1792,7 @@ index 8cba9af864211fc26665e7e6e5c218a40ba3eacc..f7567c863086be08704eaa4541614f6b
  ) -> nn.Module | None:
      """Install the target lm_head, or its quantized copy, on a drafter that
      shares it. Returns the installed head, or None if the drafter keeps its own.
-@@ -64,7 +66,7 @@ def share_target_lm_head(
+@@ -63,7 +65,7 @@ def share_target_lm_head(
              )
          return None
      head = target_lm_head
@@ -1812,7 +1801,7 @@ index 8cba9af864211fc26665e7e6e5c218a40ba3eacc..f7567c863086be08704eaa4541614f6b
          head = quantized_lm_head_copy(target_lm_head, quantization)
      if draft_lm_head is not None:
          del draft_model.lm_head
-@@ -146,6 +148,8 @@ def load_eagle_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mod
+@@ -141,6 +143,8 @@ def load_eagle_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mod
          eagle_model,
          get_target_lm_head(target_model, target_language_model),
          speculative_config.draft_lm_head_quantization,
@@ -1821,7 +1810,7 @@ index 8cba9af864211fc26665e7e6e5c218a40ba3eacc..f7567c863086be08704eaa4541614f6b
      )
      if draft_head is not None:
          # MTP layers route logits through layer.shared_head.head, not
-@@ -159,6 +163,12 @@ def load_eagle_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mod
+@@ -154,6 +158,12 @@ def load_eagle_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mod
                      del sh.head
                      sh.head = draft_head
 

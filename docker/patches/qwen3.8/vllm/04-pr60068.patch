@@ -4,7 +4,7 @@ Subject: [PATCH] [PR #60068] [MRV2][Spec Decode] Opt-in confidence stop for auto
 Upstream-PR: https://github.com/vllm-project/vllm/pull/60068
 Upstream-Commit: 8ae78ccaf8825b3e55ab014e282c769902ca198c
 Integration-Base: 564ac0de1b228568cafcbfbe8ccaccc82d6023eb
-Refresh-Base: 790be385c8a69f45ec9a7a85ef00836d1684060f
+Refresh-Base: b409a4f0d787fdddb75ec2e8ddb6dfcfd36235b7
 
 Preserve both quantized draft-head and adaptive-depth documentation/tests.
 Use #60692's supports_decode_metadata_update API; confidence stopping
@@ -17,6 +17,8 @@ Retain upstream DraftLogitsCache and target attention-metadata reuse.
 Preserve upstream decode_graph_eligible when dispatching adaptive draft batches.
 
 Use the shared autoregressive decode loop and config-level graph shape mapping.
+Use upstream drafted/verified counters, excluding stale confidence-stop slots
+without conflating proposals with tokens admitted for verification.
 
 diff --git a/docs/features/speculative_decoding/mtp.md b/docs/features/speculative_decoding/mtp.md
 index 6ceee19ad799885c7f71c385ab651f2dd0d31734..d4483be1ea5b22408a877fdf6c9b68a3ecdde299 100644
@@ -33,59 +35,11 @@ index 6ceee19ad799885c7f71c385ab651f2dd0d31734..d4483be1ea5b22408a877fdf6c9b68a3
 +  more requests it drafts the fallback depth instead. It waits on the GPU after
 +  every draft step, which costs more than it saves on faster GPUs, so it is
 +  rejected elsewhere; SM120 (RTX PRO 6000, RTX 5090) is untested.
-diff --git a/tests/v1/core/test_scheduler.py b/tests/v1/core/test_scheduler.py
-index 18bb469cd7201985a3f2ab942314d3793b60f8ba..5c6e5371a07199838f8c11b3f3c9f9026b523d74 100644
---- a/tests/v1/core/test_scheduler.py
-+++ b/tests/v1/core/test_scheduler.py
-@@ -2851,6 +2851,43 @@ def test_per_request_spec_decode_subtracts_invalid_drafts():
-     assert payload["acceptance_histogram"] == [0, 0, 1, 0]
- 
- 
-+def test_spec_decode_stats_count_only_verified_drafts():
-+    """When the runner verifies fewer drafts than scheduled, only those count
-+    as proposed, while the rejection rollback still covers every placeholder."""
-+    scheduler = create_scheduler(
-+        num_speculative_tokens=3, per_request_spec_decode_metrics="detailed"
-+    )
-+    [req] = create_requests(num_requests=1, num_tokens=1)
-+    scheduler.add_request(req)
-+    rid = req.request_id
-+
-+    def _mk_output(sampled, num_verified=None):
-+        return ModelRunnerOutput(
-+            req_ids=[rid],
-+            req_id_to_index={rid: 0},
-+            sampled_token_ids=[sampled],
-+            num_verified_spec_tokens=num_verified,
-+        )
-+
-+    scheduler.update_from_output(scheduler.schedule(), _mk_output([0]))
-+    scheduler.update_draft_token_ids(DraftTokenIds([rid], [[1, 2, 3]]))
-+    output = scheduler.schedule()
-+    # 3 scheduled, 2 verified, 1 accepted.
-+    engine_core_outputs = scheduler.update_from_output(
-+        output, _mk_output([1, 9], num_verified=[2])
-+    )
-+
-+    stats = engine_core_outputs[0].scheduler_stats.spec_decoding_stats
-+    assert stats.num_drafts == 1
-+    assert stats.num_draft_tokens == 2
-+    assert stats.num_accepted_tokens == 1
-+    assert stats.num_draft_tokens_per_pos == [1, 1, 0]
-+    payload = req.spec_decode_metrics.to_dict()
-+    assert payload["per_step_drafted"] == [2]
-+    assert payload["per_step_accepted"] == [1]
-+    assert req.num_computed_tokens == 1 + 4 - 2
-+
-+
- def test_per_request_spec_decode_acceptance_disabled_by_default():
-     scheduler = create_scheduler(num_speculative_tokens=3)
-     assert scheduler.spec_decode_metrics_level == "none"
 diff --git a/tests/v1/e2e/spec_decode/mtp/qwen3_5/test_mtp.py b/tests/v1/e2e/spec_decode/mtp/qwen3_5/test_mtp.py
-index 5147097ef2903c0051eee8c50719726da93c26f8..c1205fb03dfd122f0064c642f4131c347cfb2715 100644
+index 561d96a904b8ab6cb82379b697c29c60b741aaf7..24888932620e93a49e3dfbe09b1e82c8c7b447f6 100644
 --- a/tests/v1/e2e/spec_decode/mtp/qwen3_5/test_mtp.py
 +++ b/tests/v1/e2e/spec_decode/mtp/qwen3_5/test_mtp.py
-@@ -223,3 +223,58 @@ def test_mtp_draft_lm_head_quantization_survives_sleep_and_reload(
+@@ -304,3 +304,58 @@ def test_mtp_draft_lm_head_quantization_survives_sleep_and_reload(
              context="after weight reload",
          )
          assert al == pytest.approx(ref_al, rel=0.03)
@@ -145,7 +99,7 @@ index 5147097ef2903c0051eee8c50719726da93c26f8..c1205fb03dfd122f0064c642f4131c34
 +    assert drafts_per_round[None] == 3
 +    assert 1 <= drafts_per_round[0.6] < 4, drafts_per_round
 diff --git a/tests/v1/spec_decode/test_dynamic_sd_cug.py b/tests/v1/spec_decode/test_dynamic_sd_cug.py
-index c1ef03d59fcc15206217088d3452f2e43464f50a..33e6182d432f385e9344e3a1fac127058946de3b 100644
+index eea7efb8a7a5e4a30a6556484d1e5a296c09cbaf..29977e92f2c32807237962e66c8e6b9bc59942ee 100644
 --- a/tests/v1/spec_decode/test_dynamic_sd_cug.py
 +++ b/tests/v1/spec_decode/test_dynamic_sd_cug.py
 @@ -28,6 +28,8 @@ def _create_vllm_config_for_dsd(
@@ -157,7 +111,7 @@ index c1ef03d59fcc15206217088d3452f2e43464f50a..33e6182d432f385e9344e3a1fac12705
  ) -> MagicMock:
      """Create a minimal config that exercises DSD cudagraph dispatch.
 
-@@ -81,6 +83,8 @@ def _create_vllm_config_for_dsd(
+@@ -82,6 +84,8 @@ def _create_vllm_config_for_dsd(
          )
      else:
          speculative_config.num_speculative_tokens_per_batch_size = None
@@ -166,7 +120,7 @@ index c1ef03d59fcc15206217088d3452f2e43464f50a..33e6182d432f385e9344e3a1fac12705
      vllm_config.speculative_config = speculative_config
      # Resolve both kinds of sizes from the deprecated shared ones.
      vllm_config.uniform_decode_query_len = max_decode_query_len
-@@ -454,3 +458,50 @@ def test_dynamic_sd_only_captures_scheduled_query_lengths(monkeypatch):
+@@ -455,3 +459,50 @@ def test_dynamic_sd_only_captures_scheduled_query_lengths(monkeypatch):
                  assert desc.num_tokens == num_tokens
                  assert desc.num_reqs is None
              assert desc.num_active_loras == 0
@@ -375,10 +329,10 @@ index 0000000000000000000000000000000000000000..38c04d98b6367d9efa3a73719beb575e
 +        with pytest.raises(ValueError, match=error):
 +            VllmConfig._verify_draft_confidence_threshold(config)
 diff --git a/tests/v1/worker/test_gpu_target_dependent_ar_speculator.py b/tests/v1/worker/test_gpu_target_dependent_ar_speculator.py
-index 27c841a75754bd5124a91f66a3727a45ba0c67f0..dabc7fe60951cd6014535d12cf40038d1312343e 100644
+index ad6afcfcec41c32b78a279010634938b828991a5..b2ea97ca15544277367f75f886e39aa2bf61021e 100644
 --- a/tests/v1/worker/test_gpu_target_dependent_ar_speculator.py
 +++ b/tests/v1/worker/test_gpu_target_dependent_ar_speculator.py
-@@ -184,6 +184,7 @@ def test_speculator_uses_draft_model_hidden_size(monkeypatch, hc_mult, expected)
+@@ -185,6 +185,7 @@ def test_speculator_uses_draft_model_hidden_size(monkeypatch, hc_mult, expected)
          use_local_argmax_reduction=False,
          draft_sample_method="greedy",
          enable_adaptive_verification=False,
@@ -387,13 +341,13 @@ index 27c841a75754bd5124a91f66a3727a45ba0c67f0..dabc7fe60951cd6014535d12cf40038d
      vllm_config = SimpleNamespace(
          speculative_config=speculative_config,
 diff --git a/vllm/config/speculative.py b/vllm/config/speculative.py
-index 5da8aa318851e6b45363df418449b2d601744a49..75bfe651e41a8f4ffef620eaa65c2e2288068a33 100644
+index 1d11f352532af1e3af4c73cc4141aedaadaa18e4..133de52125db68c103b788e4b3d7f766e810a3f6 100644
 --- a/vllm/config/speculative.py
 +++ b/vllm/config/speculative.py
-@@ -632,6 +632,18 @@ class SpeculativeConfig:
+@@ -697,6 +697,18 @@ class SpeculativeConfig:
      """Whether to adaptively size the draft-verification budget from per-request
      confidence. Currently only supported for method="dspark"."""
- 
+
 +    draft_confidence_threshold: float | None = Field(default=None, gt=0.0, le=1.0)
 +    """While a single request is decoding, stop autoregressive drafting once its
 +    drafter top-1 probability falls below this threshold, treating
@@ -406,14 +360,14 @@ index 5da8aa318851e6b45363df418449b2d601744a49..75bfe651e41a8f4ffef620eaa65c2e22
 +    more than one request is decoding. Required with
 +    draft_confidence_threshold; usually the best fixed depth for the model."""
 +
-     @staticmethod
-     def _acceptance_length_to_rates(length: float, n: int) -> list[float]:
-         """Mean acceptance length to unconditional per-position rates, using
+     prefill_context_kv_only: bool = False
+     """Set on a P/D prefill instance (Model Runner V2, DFlash-based speculators)
+     to only store the drafter's context K/V, which the decode instance reads:
 diff --git a/vllm/config/vllm.py b/vllm/config/vllm.py
-index f5c5f9db850dbbf5736b093b67b84e4119adb2d2..bf5747f8fa063201352c85c1e4b23b2be3c05896 100644
+index 350271e0e95fd998efb79de228a6f64f506218ee..d1b87d9c2128c530170e250b7909cb0fc7e26502 100644
 --- a/vllm/config/vllm.py
 +++ b/vllm/config/vllm.py
-@@ -738,6 +738,23 @@ class VllmConfig:
+@@ -753,6 +753,23 @@ class VllmConfig:
          max_num_seqs = self.scheduler_config.max_num_seqs
          speculative_config = self.speculative_config
          num_new_sampled_tokens = decode_query_len - self.num_speculative_tokens
@@ -437,7 +391,7 @@ index f5c5f9db850dbbf5736b093b67b84e4119adb2d2..bf5747f8fa063201352c85c1e4b23b2b
          if (
              speculative_config is None
              or not speculative_config.uses_dynamic_speculative_decoding()
-@@ -1200,6 +1217,44 @@ class VllmConfig:
+@@ -1190,6 +1207,42 @@ class VllmConfig:
          )
          speculative_config.num_speculative_tokens_per_batch_size = None
 
@@ -459,8 +413,6 @@ index f5c5f9db850dbbf5736b093b67b84e4119adb2d2..bf5747f8fa063201352c85c1e4b23b2b
 +            error = (
 +                "needs draft_confidence_fallback_depth in [1, num_speculative_tokens)"
 +            )
-+        elif not self.use_v2_model_runner:
-+            error = "requires Model Runner V2"
 +        elif self.parallel_config.data_parallel_size > 1:
 +            error = "does not support data parallelism"
 +        elif spec.uses_dynamic_speculative_decoding():
@@ -482,64 +434,19 @@ index f5c5f9db850dbbf5736b093b67b84e4119adb2d2..bf5747f8fa063201352c85c1e4b23b2b
      def _normalize_piecewise_cudagraph_mode(
          self, *, breakable_cudagraph_enabled: bool
      ) -> None:
-@@ -1997,6 +2052,7 @@ class VllmConfig:
+@@ -1914,6 +1967,7 @@ class VllmConfig:
+             )
 
          self._maybe_disable_dynamic_sd_for_data_parallel()
-         self._maybe_disable_dynamic_sd_for_v1()
 +        self._verify_draft_confidence_threshold()
-         self._maybe_override_dynamic_sd_cudagraph_mode()
 
          if (
-diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
-index 0db5e1f6bfc1eefa8d44a2886cbcfd7625d64328..301aae8e43fdeab106d57b9491b74a3a4e72db18 100644
---- a/vllm/v1/core/sched/scheduler.py
-+++ b/vllm/v1/core/sched/scheduler.py
-@@ -2363,9 +2363,15 @@ class Scheduler(SchedulerInterface):
-                         request.num_computed_tokens -= num_rejected
-                     if request.num_output_placeholders > 0:
-                         request.num_output_placeholders -= num_rejected
-+                # Only the verified drafts count as proposed.
-+                num_proposed = num_draft_tokens
-+                if model_runner_output.num_verified_spec_tokens is not None:
-+                    num_proposed = model_runner_output.num_verified_spec_tokens[
-+                        req_index
-+                    ]
-                 spec_decoding_stats = self.make_spec_decoding_stats(
-                     spec_decoding_stats,
--                    num_draft_tokens=num_draft_tokens,
-+                    num_draft_tokens=num_proposed,
-                     num_accepted_tokens=num_accepted,
-                     num_invalid_spec_tokens=scheduler_output.num_invalid_spec_tokens,
-                     request_id=req_id,
-@@ -2374,7 +2380,7 @@ class Scheduler(SchedulerInterface):
-                     # Exclude grammar-invalidated drafts from the proposed
-                     # count, mirroring make_spec_decoding_stats; the accepted
-                     # bucket (j) is unaffected.
--                    adj_draft_tokens = num_draft_tokens
-+                    adj_draft_tokens = num_proposed
-                     if scheduler_output.num_invalid_spec_tokens:
-                         adj_draft_tokens -= (
-                             scheduler_output.num_invalid_spec_tokens.get(req_id, 0)
-diff --git a/vllm/v1/outputs.py b/vllm/v1/outputs.py
-index 93df3badee41fb2ee64c172b18144435fced8a96..1e1948ac35c61255ffac0fff848729166be4b146 100644
---- a/vllm/v1/outputs.py
-+++ b/vllm/v1/outputs.py
-@@ -310,6 +310,10 @@ class ModelRunnerOutput:
-     # ``None`` when ``return_sampling_mask`` is off.
-     sampling_masks: SamplingMaskLists | None = None
- 
-+    # [num_reqs] spec tokens the target verified per request, when the runner
-+    # may verify fewer than were scheduled. None means all of them.
-+    num_verified_spec_tokens: list[int] | None = None
-+
-     @staticmethod
-     def with_kv_conn_output_only(
-         kv_connector_output: KVConnectorOutput | None,
+             self.attention_config.sparse_mla_prefill_workspace_factor is None
 diff --git a/vllm/v1/worker/gpu/model_runner.py b/vllm/v1/worker/gpu/model_runner.py
-index 156f6472474ca03d2902069db99b0bad1de18755..5b3d9570fc749de4673f648e347eaed2e5ef943e 100644
+index 68462b06217b1f59527d1d268278b78cae30b488..77d28f503093225b0ba71492b74942353706623d 100644
 --- a/vllm/v1/worker/gpu/model_runner.py
 +++ b/vllm/v1/worker/gpu/model_runner.py
-@@ -1407,6 +1407,21 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+@@ -1429,6 +1429,21 @@ class GPUModelRunner(LoRAModelRunnerMixin):
              num_draft_tokens_np = np.fromiter(
                  num_drafts_iter, dtype=np.int32, count=num_reqs
              )
@@ -561,7 +468,7 @@ index 156f6472474ca03d2902069db99b0bad1de18755..5b3d9570fc749de4673f648e347eaed2
              if self.adaptive_verification is not None:
                  num_toks = self.adaptive_verification.get_num_tokens(
                      num_tokens_per_req, draft_tokens
-@@ -1857,6 +1872,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+@@ -1879,6 +1894,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
          )
          if batch_req_state is not None:
              num_toks = batch_req_state.num_tokens
@@ -569,20 +476,100 @@ index 156f6472474ca03d2902069db99b0bad1de18755..5b3d9570fc749de4673f648e347eaed2
              if not batch_req_state.decode_graph_eligible:
                  # A query-length bound alone would admit a short prefill.
                  max_query_len = None
-@@ -2296,6 +2312,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
-             prompt_token_id_logprobs_dict=prompt_token_id_logprobs_dict,
-             cudagraph_stats=cudagraph_stats,
-         )
-+        if (
-+            getattr(self.speculator, "confidence_stop", None) is not None
-+            and input_batch.num_draft_tokens_per_req is not None
-+        ):
-+            model_runner_output.num_verified_spec_tokens = (
-+                input_batch.num_draft_tokens_per_req.tolist()
+@@ -2464,6 +2480,15 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+         num_drafted = (draft_tokens != -1).sum(dim=-1)
+         num_bonus_tokens = self.model_state.num_new_sampled_tokens_per_step
+         num_in_forward = input_batch.cu_num_logits.diff() - num_bonus_tokens
++        confidence_stop = getattr(self.speculator, "confidence_stop", None)
++        if confidence_stop is not None:
++            # An early stop leaves stale tokens in unused draft-buffer slots.
++            # Count this round's proposals independently of verification trims.
++            num_proposed = torch.as_tensor(
++                confidence_stop.num_verifiable_drafts(input_batch.idx_mapping_np),
++                device=num_drafted.device,
 +            )
-         pending_aux_output = None
-         if self.aux_output_connector is not None:
-             pending_aux_output = self.aux_output_connector.prepare_output(input_batch)
++            num_drafted = torch.minimum(num_drafted, num_proposed)
+         num_verified = torch.minimum(num_in_forward, num_drafted)
+         return num_drafted, num_verified
+
+diff --git a/vllm/v1/worker/gpu/spec_decode/autoregressive/speculator.py b/vllm/v1/worker/gpu/spec_decode/autoregressive/speculator.py
+index f1e9fd01301de152d9627ce77e6b76cfc29959cd..cc40547aa2f3badc1f04186585df48a92503981c 100644
+--- a/vllm/v1/worker/gpu/spec_decode/autoregressive/speculator.py
++++ b/vllm/v1/worker/gpu/spec_decode/autoregressive/speculator.py
+@@ -1,6 +1,7 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ from abc import abstractmethod
++from functools import partial
+ from typing import Any
+
+ import torch
+@@ -15,6 +16,7 @@ from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
+ from vllm.v1.worker.gpu.spec_decode.autoregressive.cudagraph_utils import (
+     SpeculatorCudaGraphManager,
+ )
++from vllm.v1.worker.gpu.spec_decode.confidence_stop import DraftConfidenceStop
+ from vllm.v1.worker.gpu.spec_decode.speculator import DraftModelSpeculator
+ from vllm.v1.worker.utils import AttentionGroup
+
+@@ -97,7 +99,8 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
+         return None
+
+     def _configure_decode_metadata_update(self) -> None:
+-        if self.num_speculative_steps == 1:
++        # Confidence stopping needs a separate graph for each draft step.
++        if self.num_speculative_steps == 1 or self.confidence_stop is not None:
+             self.supports_decode_metadata_update = False
+             return
+         super()._configure_decode_metadata_update()
+@@ -174,6 +177,7 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
+         seq_lens_cpu_upper_bound: torch.Tensor,
+         is_profile: bool,
+         num_speculative_steps: int,
++        confidence_stop: DraftConfidenceStop | None = None,
+     ) -> None:
+         decode_batch_sync, num_batch_tokens = None, num_reqs
+         if dp_sync_state is not None:
+@@ -212,7 +216,7 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
+         multi_step_decode_fn = (
+             self._run_fused_multi_step_decode
+             if self.supports_decode_metadata_update
+-            else self._multi_step_decode
++            else partial(self._multi_step_decode, confidence_stop=confidence_stop)
+         )
+         multi_step_decode_fn(
+             num_reqs,
+@@ -232,6 +236,7 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
+         num_tokens_across_dp: torch.Tensor | None,
+         seq_lens_cpu_upper_bound: torch.Tensor,
+         num_speculative_steps: int,
++        confidence_stop: DraftConfidenceStop | None = None,
+     ) -> None:
+         positions = self.input_buffers.positions[:num_reqs]
+         query_start_loc = self.input_buffers.query_start_loc[: num_reqs + 1]
+@@ -258,6 +263,10 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
+                     step=step,
+                 )
+
++            # Wait only after building this step's metadata.
++            if confidence_stop is not None and not confidence_stop.should_continue():
++                return
++
+             self.current_draft_step.fill_(step)
+             if batch_desc.cg_mode == CUDAGraphMode.FULL:
+                 assert self.decode_cudagraph_manager is not None
+@@ -272,6 +281,11 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
+                     batch_desc.cg_mode,
+                     num_speculative_steps,
+                 )
++            if confidence_stop is not None:
++                confidence_stop.step_launched()
++
++        if confidence_stop is not None:
++            confidence_stop.end_round()
+
+     def _run_fused_multi_step_decode(
+         self,
 diff --git a/vllm/v1/worker/gpu/spec_decode/confidence_stop.py b/vllm/v1/worker/gpu/spec_decode/confidence_stop.py
 new file mode 100644
 index 0000000000000000000000000000000000000000..ac762b2b38c4c38d815c16befbc8b7b04afe7f65
@@ -674,29 +661,29 @@ index 0000000000000000000000000000000000000000..ac762b2b38c4c38d815c16befbc8b7b0
 +        self._resolve_pending()
 +        return self._num_drafts_np[slots]
 diff --git a/vllm/v1/worker/gpu/spec_decode/speculator.py b/vllm/v1/worker/gpu/spec_decode/speculator.py
-index bcd6bfd608e4e7b088426295fe314f4284f78df6..b2fadcf910b23f963fa0803cbf4a7d176a00096c 100644
+index 8ce2229fcdee99dbcdd4938454c40171bf966d92..7e776235287c5556f8233910d4dd94c3cfee69d9 100644
 --- a/vllm/v1/worker/gpu/spec_decode/speculator.py
 +++ b/vllm/v1/worker/gpu/spec_decode/speculator.py
-@@ -41,6 +41,7 @@ from vllm.v1.worker.gpu.spec_decode.acceptance_estimator import (
+@@ -44,6 +44,7 @@ from vllm.v1.worker.gpu.sample.gumbel import gumbel_sample
+ from vllm.v1.worker.gpu.spec_decode.acceptance_estimator import (
      OnlineAcceptanceEstimator,
  )
- from vllm.v1.worker.gpu.spec_decode.draft_logits import DraftLogitsCache
 +from vllm.v1.worker.gpu.spec_decode.confidence_stop import DraftConfidenceStop
- from vllm.v1.worker.utils import AttentionGroup
- 
- if TYPE_CHECKING:
-@@ -112,6 +113,7 @@ class DraftModelSpeculator(BaseSpeculator):
+ from vllm.v1.worker.gpu.spec_decode.draft_logits import DraftLogitsCache
+ from vllm.v1.worker.utils import (
+     AttentionGroup,
+@@ -166,6 +167,7 @@ class DraftModelSpeculator(BaseSpeculator):
      # Draft prefill runs on the target's batch, so it can reuse the target
      # forward's attention metadata. Otherwise the drafter rebuilds it.
      can_reuse_target_attn_metadata: bool = True
 +    confidence_stop: DraftConfidenceStop | None = None
 
      def __init__(self, vllm_config: VllmConfig, device: torch.device):
-         self.vllm_config = vllm_config
-@@ -209,6 +211,18 @@ class DraftModelSpeculator(BaseSpeculator):
+         assert vllm_config.speculative_config is not None
+@@ -277,6 +279,18 @@ class DraftModelSpeculator(BaseSpeculator):
                  watermark_config.deduplicate_contexts_max_history,
              )
- 
+
 +        threshold = self.speculative_config.draft_confidence_threshold
 +        if threshold is not None:
 +            fallback_depth = self.speculative_config.draft_confidence_fallback_depth
@@ -712,9 +699,9 @@ index bcd6bfd608e4e7b088426295fe314f4284f78df6..b2fadcf910b23f963fa0803cbf4a7d17
          self.supports_mm_inputs = False
          self.pcp_manager: PCPManager | None = None
          # Whether every draft attention builder can refresh its decode metadata
-@@ -538,6 +552,9 @@ class DraftModelSpeculator(BaseSpeculator):
+@@ -623,6 +637,9 @@ class DraftModelSpeculator(BaseSpeculator):
              return self.get_draft_top_tokens(hidden_states, spec_step_idx)
- 
+
          logits = self.compute_draft_logits(hidden_states, spec_step_idx)
 +        if self.confidence_stop is not None:
 +            # Before sampling, which may scale the logits in place.
@@ -723,7 +710,7 @@ index bcd6bfd608e4e7b088426295fe314f4284f78df6..b2fadcf910b23f963fa0803cbf4a7d17
              sampled = self.draft_watermarker.sample(
                  logits,
 diff --git a/vllm/v1/worker/gpu/spec_decode/target_dependent_ar/speculator.py b/vllm/v1/worker/gpu/spec_decode/target_dependent_ar/speculator.py
-index 0035ae3e476b0f1e10445bc8fb0d30bb6dcc5312..346e90ae4f892f8f78d4324d8bc5c5f76c9c1831 100644
+index b409f79a0a11b962e7e0ad2e05857728ce72d0e2..314d94a2d7fa3a0f3fc18c140dee7b6f47be218c 100644
 --- a/vllm/v1/worker/gpu/spec_decode/target_dependent_ar/speculator.py
 +++ b/vllm/v1/worker/gpu/spec_decode/target_dependent_ar/speculator.py
 @@ -246,6 +246,22 @@ class TargetDependentARSpeculator(AutoRegressiveSpeculator):
@@ -759,81 +746,3 @@ index 0035ae3e476b0f1e10445bc8fb0d30bb6dcc5312..346e90ae4f892f8f78d4324d8bc5c5f7
          )
 
          return self.draft_tokens[:num_reqs]
-diff --git a/vllm/v1/worker/gpu/spec_decode/autoregressive/speculator.py b/vllm/v1/worker/gpu/spec_decode/autoregressive/speculator.py
-index d5b8312b5d86b1a14cb5c7e38e5bbc8642314064..91ff42924df4c8956f1f9c6feface177e4004945 100644
---- a/vllm/v1/worker/gpu/spec_decode/autoregressive/speculator.py
-+++ b/vllm/v1/worker/gpu/spec_decode/autoregressive/speculator.py
-@@ -1,6 +1,7 @@
- # SPDX-License-Identifier: Apache-2.0
- # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
- from abc import abstractmethod
-+from functools import partial
- from typing import Any
-
- import torch
-@@ -15,6 +16,7 @@ from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
- from vllm.v1.worker.gpu.spec_decode.autoregressive.cudagraph_utils import (
-     SpeculatorCudaGraphManager,
- )
-+from vllm.v1.worker.gpu.spec_decode.confidence_stop import DraftConfidenceStop
- from vllm.v1.worker.gpu.spec_decode.speculator import DraftModelSpeculator
- from vllm.v1.worker.utils import AttentionGroup
-
-@@ -97,7 +99,8 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
-         return None
-
-     def _configure_decode_metadata_update(self) -> None:
--        if self.num_speculative_steps == 1:
-+        # Confidence stopping needs a separate graph for each draft step.
-+        if self.num_speculative_steps == 1 or self.confidence_stop is not None:
-             self.supports_decode_metadata_update = False
-             return
-         super()._configure_decode_metadata_update()
-@@ -172,6 +175,7 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
-         seq_lens_cpu_upper_bound: torch.Tensor,
-         is_profile: bool,
-         num_speculative_steps: int,
-+        confidence_stop: DraftConfidenceStop | None = None,
-     ) -> None:
-         decode_batch_sync, num_batch_tokens = None, num_reqs
-         if dp_sync_state is not None:
-@@ -210,7 +214,7 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
-         multi_step_decode_fn = (
-             self._run_fused_multi_step_decode
-             if self.supports_decode_metadata_update
--            else self._multi_step_decode
-+            else partial(self._multi_step_decode, confidence_stop=confidence_stop)
-         )
-         multi_step_decode_fn(
-             num_reqs,
-@@ -230,6 +234,7 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
-         num_tokens_across_dp: torch.Tensor | None,
-         seq_lens_cpu_upper_bound: torch.Tensor,
-         num_speculative_steps: int,
-+        confidence_stop: DraftConfidenceStop | None = None,
-     ) -> None:
-         positions = self.input_buffers.positions[:num_reqs]
-         query_start_loc = self.input_buffers.query_start_loc[: num_reqs + 1]
-@@ -256,6 +261,10 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
-                     step=step,
-                 )
-
-+            # Wait only after building this step's metadata.
-+            if confidence_stop is not None and not confidence_stop.should_continue():
-+                return
-+
-             self.current_draft_step.fill_(step)
-             if batch_desc.cg_mode == CUDAGraphMode.FULL:
-                 assert self.decode_cudagraph_manager is not None
-@@ -270,6 +279,11 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
-                     batch_desc.cg_mode,
-                     num_speculative_steps,
-                 )
-+            if confidence_stop is not None:
-+                confidence_stop.step_launched()
-+
-+        if confidence_stop is not None:
-+            confidence_stop.end_round()
-
-     def _run_fused_multi_step_decode(
-         self,
