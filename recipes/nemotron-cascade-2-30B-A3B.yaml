@@ -1,0 +1,55 @@
+description: vLLM serving Nemotron-Cascade-2-30B-A3B on a SINGLE NODE ONLY!
+model: nvidia/Nemotron-Cascade-2-30B-A3B
+container: vllm-node
+mods:
+  - mods/nemotron-nano
+defaults:
+  port: 8000
+  host: 0.0.0.0
+  tensor_parallel: 1
+  gpu_memory_utilization: 0.7
+  max_model_len: 131072
+env:
+  VLLM_USE_FLASHINFER_MOE_FP4: '1'
+  VLLM_FLASHINFER_MOE_BACKEND: throughput
+  HF_TOKEN: "${HF_TOKEN}"
+command: |
+  vllm serve nvidia/Nemotron-Cascade-2-30B-A3B \
+     --max-model-len {max_model_len} \
+     --port {port} --host {host} \
+     --trust-remote-code \
+     --enable-auto-tool-choice  \
+     --tool-call-parser qwen3_coder \
+     --reasoning-parser-plugin nano_v3_reasoning_parser.py \
+     --reasoning-parser nano_v3  \
+     --kv-cache-dtype fp8  \
+     --attention-backend flashinfer  \
+     --load-format fastsafetensors  \
+     --gpu-memory-utilization {gpu_memory_utilization}
+recipe_version: '1'
+name: Nemotron-Cascade-2-30B-A3B
+cluster_only: false
+solo_only: true
+benchmark:
+  framework: llama-benchy
+  args:
+    pp:
+      - 2048
+    tg:
+      - 128
+    depth:
+      - 0
+      - 4096
+      - 8192
+      - 16384
+      - 32768
+      - 65535
+      - 100000
+    enable_prefix_caching: false
+    concurrency:
+      - 1
+      - 2
+      - 5
+      - 10
+    save_result: benchmark_NVIDIA-Nemotron-Cascade-2-30B-A3B.csv
+    format: csv
