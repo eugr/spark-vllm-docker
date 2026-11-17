@@ -1,0 +1,162 @@
+{%- if not add_generation_prompt is defined -%}
+    {%- set add_generation_prompt = false -%}
+{%- endif -%}
+{%- if not enable_thinking is defined -%}
+    {%- set enable_thinking = true -%}
+{%- endif -%}
+{%- if not keep_all_reasoning is defined -%}
+    {%- set keep_all_reasoning = true -%}
+{%- endif -%}
+{%- macro render_extra_keys(json_dict, handled_keys) -%}
+    {%- if json_dict is mapping %}
+        {%- for json_key in json_dict if json_key not in handled_keys %}
+            {%- if json_dict[json_key] is mapping or (json_dict[json_key] is sequence and json_dict[json_key] is not string) %}
+                {{- '\n<' ~ json_key ~ '>' ~ (json_dict[json_key] | tojson | safe) ~ '</' ~ json_key ~ '>' }}
+            {%- else %}
+                {{-'\n<' ~ json_key ~ '>' ~ (json_dict[json_key] | string) ~ '</' ~ json_key ~ '>' }}
+            {%- endif %}
+        {%- endfor %}
+    {%- endif %}
+{%- endmacro -%}
+{%- macro render_content(message_content) -%}
+    {%- if message_content is string -%}
+        {{- message_content -}}
+    {%- else -%}
+        {%- for content in message_content -%}
+            {%- if content['type'] == 'image' or 'image' in content or 'image_url' in content -%}
+                {{- '<|vision_start|><|image_pad|><|vision_end|>' -}}
+            {%- elif content['type'] == 'audio' or 'audio' in content or 'audio_url' in content -%}
+                {{- '<|mimo_audio_start|><|audio_pad|><|mimo_audio_end|>' -}}
+            {%- elif content['type'] == 'video' or 'video' in content or 'video_url' in content -%}
+                {{- '<|vision_start|><|video_pad|><|vision_end|>' -}}
+            {%- elif 'text' in content -%}
+                {{- content['text'] -}}
+            {%- endif -%}
+        {%- endfor -%}
+    {%- endif -%}
+{%- endmacro -%}
+{%- if messages[0]["role"] == "system" %}
+    {%- set system_message = messages[0]["content"] %}
+    {%- set loop_messages = messages[1:] %}
+{%- else %}
+    {%- set loop_messages = messages %}
+{%- endif %}
+{%- set ns = namespace(last_user_index=-1) %}
+{%- for m in loop_messages %}
+    {%- if m.role == 'user' %}
+        {%- set ns.last_user_index = loop.index0 -%}
+    {%- endif %}
+{%- endfor %}
+{%- if not tools is defined %}
+    {%- set tools = [] %}
+{%- endif %}
+{%- if system_message is defined %}
+    {{- "<|im_start|>system\n" + render_content(system_message) }}
+{%- else %}
+    {{- "<|im_start|>system\nYou are MiMo, a helpful AI assistant engineered by Xiaomi." }}
+{%- endif %}
+{%- if tools is iterable and tools | length > 0 %}
+    {{- "\n\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou have access to the following functions:\n\n" }}
+    {{- "<tools>" }}
+    {%- for tool in tools %}
+        {%- if tool.function is defined %}
+            {%- set tool = tool.function %}
+        {%- endif %}
+        {{- "\n<function>\n<name>" ~ tool.name ~ "</name>" }}
+        {%- if tool.description is defined %}
+            {{- '\n<description>' ~ (tool.description | trim) ~ '</description>' }}
+        {%- endif %}
+        {{- '\n<parameters>' }}
+        {%- if tool.parameters is defined and tool.parameters is mapping and tool.parameters.properties is defined and tool.parameters.properties is mapping %}
+            {%- for param_name, param_fields in tool.parameters.properties|items %}
+                {{- '\n<parameter>' }}
+                {{- '\n<name>' ~ param_name ~ '</name>' }}
+                {%- if param_fields.type is defined %}
+                    {{- '\n<type>' ~ (param_fields.type | string) ~ '</type>' }}
+                {%- endif %}
+                {%- if param_fields.description is defined %}
+                    {{- '\n<description>' ~ (param_fields.description | trim) ~ '</description>' }}
+                {%- endif %}
+                {%- set handled_keys = ['name', 'type', 'description'] %}
+                {{- render_extra_keys(param_fields, handled_keys) }}
+                {{- '\n</parameter>' }}
+            {%- endfor %}
+        {%- endif %}
+        {%- set handled_keys = ['type', 'properties'] %}
+        {{- render_extra_keys(tool.parameters, handled_keys) }}
+        {{- '\n</parameters>' }}
+        {%- set handled_keys = ['type', 'name', 'description', 'parameters'] %}
+        {{- render_extra_keys(tool, handled_keys) }}
+        {{- '\n</function>' }}
+    {%- endfor %}
+    {{- "\n</tools>" }}
+    {{- '\n\nFor each function call, output the function name and arguments in the following format:\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>value_1</parameter>\n<parameter=example_parameter_2>This is the value for the second parameter\nthat can span\nmultiple lines</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\n- Use the <think>...</think> block for private planning or synthesis.\n- If you need a tool, close </think> first, then output the <tool_call> block immediately after it.\n- If you do not need a tool or already have the needed information, close </think> and answer the user normally.\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags.\n- Do NOT place <tool_call> or <function=...> blocks inside the <think>...</think> reasoning block.\n- The value enclosed between parameter tags is preserved exactly as-is, including newlines and spaces.\n</IMPORTANT>' }}
+{%- endif %}
+{{- '<|im_end|>' }}
+{%- for message in loop_messages %}
+    {%- if message.content is string %}
+        {%- set content = message.content %}
+    {%- else %}
+        {%- set content = render_content(message.content) %}
+    {%- endif %}
+    {%- if message.role == "assistant" %}
+        {%- if message.reasoning_content is string %}
+            {%- set reasoning_content = message.reasoning_content %}
+        {%- else %}
+            {%- set reasoning_content = '' %}
+            {%- if '</think>' in content %}
+                {%- set reasoning_content = content.split('</think>')[0].split('<think>')[-1] %}
+                {%- set content = content.split('</think>')[-1] %}
+            {%- endif %}
+        {%- endif %}
+        {%- if (keep_all_reasoning or loop.index0 > ns.last_user_index) and reasoning_content -%}
+            {{- '<|im_start|>' + message.role + '\n<think>' + reasoning_content + '</think>' + content }}
+        {%- else %}
+            {{- '<|im_start|>' + message.role + '\n' + content }}
+        {%- endif %}
+        {%- if message.tool_calls is defined and message.tool_calls is iterable and message.tool_calls | length > 0 %}
+            {%- for tool_call in message.tool_calls %}
+                {%- if tool_call.function is defined %}
+                    {%- set tool_call = tool_call.function %}
+                {%- endif %}
+                {{- '<tool_call>\n<function=' + tool_call.name + '>\n' }}
+                {%- if tool_call.arguments is defined %}
+                    {%- for args_name, args_value in tool_call.arguments|items %}
+                        {{- '<parameter=' + args_name + '>' }}
+                        {%- set args_value = args_value | tojson | safe if args_value is mapping or (args_value is sequence and args_value is not string) else args_value | string %}
+                        {{- args_value }}
+                        {{- '</parameter>\n' }}
+                    {%- endfor %}
+                {%- endif %}
+                {{- '</function>\n</tool_call>' }}
+            {%- endfor %}
+        {%- endif %}
+        {{- '<|im_end|>' }}
+    {%- elif message.role == "user" %}
+        {{- '<|im_start|>' + message.role + '\n' + render_content(message.content) + '<|im_end|>' }}
+    {%- elif message.role == "system" %}
+        {{- '<|im_start|>' + message.role + '\n' + render_content(message.content) + '<|im_end|>' }}
+    {%- elif message.role == "tool" %}
+        {%- if loop.previtem and loop.previtem.role != "tool" %}
+            {{- '<|im_start|>tool\n' }}
+        {%- endif %}
+        {{- '<tool_response>\n' }}
+        {{- render_content(message.content) }}
+        {{- '\n</tool_response>\n' }}
+        {%- if not loop.last and loop.nextitem.role != "tool" %}
+            {{- '<|im_end|>' }}
+        {%- elif loop.last %}
+            {{- '<|im_end|>' }}
+        {%- endif %}
+    {%- else %}
+        {{- '<|im_start|>' + message.role + '\n' + render_content(message.content) + '<|im_end|>' }}
+    {%- endif %}
+{%- endfor %}
+{%- if add_generation_prompt %}
+    {{- '<|im_start|>assistant\n' }}
+    {%- if not enable_thinking -%}
+        {{- '<think></think>' -}}
+    {%- else -%}
+        {{- '<think>' -}}
+    {%- endif -%}
+{%- endif %}
