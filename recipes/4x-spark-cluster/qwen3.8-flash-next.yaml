@@ -1,0 +1,44 @@
+# Recipe: Qwen/Qwen3.8-Flash-Next (full BF16 weights) on 4x DGX Spark
+
+recipe_version: "1"
+name: Qwen3.8-Flash-Next-BF16
+description: vLLM serving Qwen3.8-Flash-Next full BF16 weights on quad DGX Spark TP=4 with built-in MTP speculative decoding
+
+model: Qwen/Qwen3.8-Flash-Next
+
+# Container image to use. Qwen4-Exp (qwen4_exp) is not yet in vLLM main.
+container: vllm/vllm-openai:qwen38-flash-next
+pull_image: true
+
+# ~335 GiB BF16 requires a 4-node cluster at TP=4
+cluster_only: true
+
+# The upstream qwen38-flash-next image ships without Ray.
+mods:
+  - mods/install-ray
+
+defaults:
+  port: 8000
+  host: 0.0.0.0
+  tensor_parallel: 4
+  gpu_memory_utilization: 0.85
+  max_model_len: 262144
+  max_num_seqs: 256
+  # Tuned to 3 tokens
+  num_speculative_tokens: 3
+
+command: |
+  vllm serve Qwen/Qwen3.8-Flash-Next \
+    --host {host} \
+    --port {port} \
+    --tensor-parallel-size {tensor_parallel} \
+    --max-model-len {max_model_len} \
+    --max-num-seqs {max_num_seqs} \
+    --gpu-memory-utilization {gpu_memory_utilization} \
+    --enable-prefix-caching \
+    --enforce-eager \
+    --no-enable-flashinfer-autotune \
+    --speculative-config '{{"method":"mtp","num_speculative_tokens":{num_speculative_tokens}}}' \
+    --reasoning-parser qwen3 \
+    --tool-call-parser qwen3_coder \
+    --enable-auto-tool-choice
