@@ -2618,16 +2618,18 @@ To use it, include `--load-format fastsafetensors` when running vLLM:
 InstantTensor is available with `--load-format instanttensor`. Several large-model recipes use it to reduce load-time memory pressure.
 
 Regular and B12X runner builds, including regular `--use-wheels` builds, patch
-InstantTensor to use vLLM's available-memory accounting for its loading-buffer
-budget. This includes reclaimable OS memory on native DGX Spark and preserves
-the existing CUDA-based accounting under WSL. InstantTensor's budget fraction
+InstantTensor to preserve CUDA's available-memory budget under WSL instead of
+using guest RAM availability. InstantTensor's budget fraction
 (`INSTANTTENSOR_MAX_FREE_MEM_USAGE`, default `0.5`), minimum across distributed
 ranks, and buffer-size checks still apply.
 
-InstantTensor 0.2.1 includes native Linux UMA accounting, but does not exclude
-WSL from that path. The patch remains necessary for the WSL policy and supports
-both 0.2.0 and 0.2.1, preserving 0.2.1's budget validation and error handling
-across distributed ranks.
+InstantTensor 0.2.3 moved memory negotiation to `_internal/resources.py` and
+already accounts for native UMA, cgroup limits, ranks sharing a host, and the
+combined host/device buffer budget. The helper preserves that accounting and
+only excludes CUDA-on-WSL from the integrated-memory path, which upstream still
+selects using `is_integrated` alone. Older 0.2.0/0.2.1 layouts continue to use
+vLLM's memory snapshot, with their existing validation and collective error
+handling preserved.
 
 These runners also default to `INSTANTTENSOR_IO_DEPTH=16` to reduce GPU and
 pinned host staging-buffer usage. Override it through a recipe's `env` settings

@@ -874,8 +874,8 @@ RUN --mount=type=cache,id=uv-cache,target=/root/.cache/uv \
 COPY docker/patch_vllm_wsl_cuda_uma.py /tmp/vllm-patches/patch_vllm_wsl_cuda_uma.py
 RUN python3 /tmp/vllm-patches/patch_vllm_wsl_cuda_uma.py --installed
 
-# InstantTensor must share vLLM's available-memory accounting on native UMA
-# and WSL. Apply after all package installs for regular, B12X, and wheel runners.
+# Preserve InstantTensor's native resource budgeting and exclude CUDA-on-WSL
+# from its UMA path. Apply after all installs for regular, B12X, and wheel runners.
 COPY docker/patch_instanttensor_vllm_memory.py /tmp/instanttensor-patches/patch_instanttensor_vllm_memory.py
 RUN python3 /tmp/instanttensor-patches/patch_instanttensor_vllm_memory.py --installed
 

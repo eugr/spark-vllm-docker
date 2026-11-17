@@ -1991,7 +1991,7 @@ test_instanttensor_vllm_memory_patch() {
     if ! python3 "$PROJECT_DIR/tests/test_instanttensor_vllm_memory_patch.py"; then
         fail "InstantTensor memory accounting regression tests failed"
     fi
-    pass "InstantTensor uses vLLM memory accounting and preserves budget checks"
+    pass "InstantTensor preserves native budgets and CUDA-on-WSL memory policy"
 }
 
 test_b12x_moe_tuning_memory_patch() {

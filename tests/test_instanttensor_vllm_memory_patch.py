@@ -2,6 +2,7 @@
 """CPU-only checks for InstantTensor's vLLM memory-accounting patch."""
 
 import importlib.util
+from dataclasses import replace
 import math
 import os
 import subprocess
@@ -86,6 +87,7 @@ SOURCE_UMA = '''class safe_open:
         if avail_bytes < 1:
             raise RuntimeError("Device memory budget is too small for one I/O operation")
 ''' + SOURCE[SOURCE.index("    def _finalize_buffer_size"):]
+SOURCE_RESOURCES = (PROJECT_DIR / "tests/fixtures/instanttensor_023_resources.py").read_text()
 NEIGHBOR = '''
 
 def unrelated_memory_query():
@@ -303,6 +305,152 @@ class InstantTensorUmaVllmMemoryTests(InstantTensorVllmMemoryTests):
     def test_failed_remote_budget_still_rejects_local_load(self):
         with self.assertRaisesRegex(RuntimeError, "too small for one I/O operation"):
             self.make_loader(available=1000, remote_budget=0)
+
+
+class InstantTensorResourceMemoryTests(unittest.TestCase):
+    def setUp(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        self.root = Path(temp.name)
+        self.target = self.root / "instanttensor/_internal/resources.py"
+        self.target.parent.mkdir(parents=True)
+        self.target.write_text(SOURCE_RESOURCES)
+        for name in ("instanttensor", "instanttensor/_internal", "vllm", "torch"):
+            directory = self.root / name
+            directory.mkdir(exist_ok=True)
+            (directory / "__init__.py").write_text(
+                'raise RuntimeError("Patching must not import packages")\n'
+            )
+
+    run_patch = InstantTensorVllmMemoryTests.run_patch
+
+    def test_split_package_is_patched_without_imports_and_only_changes_wsl_policy(self):
+        for installed in (False, True):
+            with self.subTest(installed=installed):
+                self.target.write_text(SOURCE_RESOURCES)
+                result = self.run_patch(installed=installed)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                patched = self.target.read_text()
+                self.assertNotEqual(patched, SOURCE_RESOURCES)
+                self.assertEqual(patched.replace(PATCHER.PATCHED_RESOURCES,
+                                                 PATCHER.ORIGINAL_RESOURCES),
+                                 SOURCE_RESOURCES)
+                result = self.run_patch(installed=installed)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn("already patched", result.stdout)
+                self.assertEqual(self.target.read_text(), patched)
+
+    def test_missing_ambiguous_or_changed_layout_fails_without_writing(self):
+        legacy = self.root / "instanttensor/_impl.py"
+        legacy.write_text(SOURCE)
+        result = self.run_patch(installed=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("expected either _impl.py or _internal/resources.py", result.stderr)
+        self.assertEqual(legacy.read_text(), SOURCE)
+        self.assertEqual(self.target.read_text(), SOURCE_RESOURCES)
+        legacy.unlink()
+        self.target.unlink()
+        result = self.run_patch(installed=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("expected either _impl.py or _internal/resources.py", result.stderr)
+        for source in (SOURCE_RESOURCES.replace("query_rank_resources", "query_resources"),
+                       SOURCE_RESOURCES.replace("torch.cuda.mem_get_info", "new_query"),
+                       SOURCE_RESOURCES + SOURCE_RESOURCES,
+                       SOURCE_RESOURCES + SOURCE):
+            self.target.write_text(source)
+            result = self.run_patch(installed=True)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertEqual(self.target.read_text(), source)
+
+    def load_resources(self, *, patched=True, integrated=True, cuda=True, wsl=False,
+                       free_memory=100, remote=None):
+        # Execute the published resource negotiator with stand-ins only for
+        # device/OS queries and collective transport; retain budget arithmetic.
+        source = PATCHER.patch_memory_query(SOURCE_RESOURCES) if patched else SOURCE_RESOURCES
+        cgroup = ModuleType("instanttensor_test.cgroup")
+        cgroup.get_host_boot_id = lambda: "host"
+        cgroup.CgroupSnapshot = lambda entries, complete: SimpleNamespace(entries=entries)
+        cgroup.query_resources = lambda **kw: cgroup.CgroupSnapshot([
+            SimpleNamespace(key="shared-limit", avail_mem=800, avail_cpus=8),
+        ], True)
+        cgroup.gather_records = Mock(side_effect=lambda local, *args:
+                                     [local] if remote is None else [local, remote(local)])
+        torch = ModuleType("torch")
+        torch.cuda = SimpleNamespace(
+            get_device_properties=Mock(return_value=SimpleNamespace(is_integrated=integrated)),
+            mem_get_info=Mock(return_value=(free_memory, 2000)),
+        )
+        module = ModuleType("instanttensor_test.resources")
+        module.__package__ = "instanttensor_test"
+        package = ModuleType("instanttensor_test")
+        package.cgroup = cgroup
+        modules = {
+            module.__name__: module, "instanttensor_test": package,
+            "instanttensor_test.cgroup": cgroup, "torch": torch,
+            "vllm.platforms": SimpleNamespace(
+                current_platform=SimpleNamespace(is_cuda=lambda: cuda)),
+            "vllm.platforms.interface": SimpleNamespace(in_wsl=lambda: wsl),
+        }
+        context = patch.dict(sys.modules, modules)
+        context.start()
+        self.addCleanup(context.stop)
+        exec(source, module.__dict__)
+        module.os = SimpleNamespace(cpu_count=lambda: 8, sched_getaffinity=lambda _: range(8))
+        module.host_available_bytes = lambda: 1000
+        # Serialization is untouched; use records directly for CPU-only transport.
+        module.encode_rank = module.decode_rank = lambda rank: rank
+        return module, cgroup, torch
+
+    def test_only_cuda_wsl_switches_from_shared_host_budget_to_cuda_budget(self):
+        for integrated, cuda, wsl, expected in (
+            (True, True, False, (200, 200)),  # Native Spark: shared physical RAM.
+            (True, True, True, (400, 50)),    # WSL: guest RAM is not CUDA capacity.
+            (False, True, False, (400, 50)), # Discrete CUDA.
+            (False, True, True, (400, 50)),
+            (True, False, True, (200, 200)), # Preserve non-CUDA policy.
+        ):
+            with self.subTest(integrated=integrated, cuda=cuda, wsl=wsl):
+                for patched in (False, True):
+                    module, _, torch = self.load_resources(
+                        patched=patched, integrated=integrated, cuda=cuda, wsl=wsl,
+                    )
+                    budget = module.negotiate_resources(
+                        None, device="cuda:1", max_free_mem_usage=0.5,
+                    )
+                    # Reproduce the excessive WSL budget before the fix.
+                    wanted = (200, 200) if not patched and integrated else expected
+                    self.assertEqual((budget.avail_mem, budget.avail_device_mem), wanted)
+                    torch.cuda.mem_get_info.assert_called_once_with("cuda:1")
+
+    def test_cgroup_host_sharing_fraction_and_remote_minimum_survive(self):
+        for wsl, expected in ((False, (100, 100)), (True, (200, 30))):
+            module, cgroup, _ = self.load_resources(
+                wsl=wsl, remote=lambda local: replace(local, device_free_mem=60),
+            )
+            budget = module.negotiate_resources(
+                "group", device="cuda:1", max_free_mem_usage=0.5,
+            )
+            self.assertEqual((budget.avail_mem, budget.avail_device_mem), expected)
+            self.assertEqual(budget.avail_cpus, 4)
+            cgroup.gather_records.assert_called_once()
+        module, _, _ = self.load_resources(wsl=True)
+        budget = module.negotiate_resources(None, device="cuda:1", max_free_mem_usage=0.25)
+        self.assertEqual((budget.avail_mem, budget.avail_device_mem), (200, 25))
+
+    def test_query_failure_and_invalid_remote_budget_still_reach_collective(self):
+        for error in (OSError, ValueError, AttributeError, RuntimeError):
+            module, cgroup, torch = self.load_resources(wsl=True)
+            torch.cuda.mem_get_info.side_effect = error("unavailable")
+            with self.assertRaisesRegex(RuntimeError, "Cannot query CUDA resources"):
+                module.negotiate_resources("group", device="cuda:1", max_free_mem_usage=0.5)
+            cgroup.gather_records.assert_called_once()
+        for fraction in (0, -1, 1.1, math.inf, math.nan):
+            module, cgroup, _ = self.load_resources(
+                remote=lambda local: replace(local, max_free_mem_usage=fraction),
+            )
+            with self.assertRaisesRegex(ValueError, "max_free_mem_usage must be finite"):
+                module.negotiate_resources("group", device="cuda:1", max_free_mem_usage=0.5)
+            cgroup.gather_records.assert_called_once()
 
 
 if __name__ == "__main__":
