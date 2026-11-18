@@ -4,7 +4,7 @@ Subject: [PATCH] [Kernel][Quant][MoE] Per-forward NVFP4 W4A4/W4A16 selection for
 Upstream-PR: https://github.com/vllm-project/vllm/pull/54617
 Upstream-Commit: 69d21d81808bcea2de3b97a0b68c97545808a043
 Integration-Base: 8084f0624dba24aba6ebac62d8e10cc00730a0fe
-Refresh-Base: b409a4f0d787fdddb75ec2e8ddb6dfcfd36235b7
+Refresh-Base: f7f17bcfe8aad602a0cfd50a5db02021293afc01
 
 Preserve the expanded upstream MonoKernel documentation.
 
@@ -278,10 +278,10 @@ index 0000000000000000000000000000000000000000..bb58ef9015b5678c21be7faee78073ed
 +    assert err.mean() < 2.5e-1, f"mean rel err {err.mean():.3e}"
 +    assert torch.equal(outs[0], outs[2])
 diff --git a/vllm/config/kernel.py b/vllm/config/kernel.py
-index f605911ee6b4d10c20e7b4666da6e10987840912..3e8e5e6d92d414d2d162407cfa460172b46ed978 100644
+index 63c74e032f76864812b36244530285b487b887fc..ffcb3f4c10915ee59cdde4518cc3e75763c06648 100644
 --- a/vllm/config/kernel.py
 +++ b/vllm/config/kernel.py
-@@ -131,6 +131,7 @@ MoEBackend = Literal[
+@@ -137,6 +137,7 @@ MoEBackend = Literal[
      "flashinfer_cutedsl",
      "flashinfer_moe_ep_cutedsl",
      "flashinfer_b12x",
@@ -289,7 +289,7 @@ index f605911ee6b4d10c20e7b4666da6e10987840912..3e8e5e6d92d414d2d162407cfa460172
      "b12x",
      "flashinfer_moe_ep_mega_deep_gemm",
      "marlin",
-@@ -340,6 +341,17 @@ class KernelConfig:
+@@ -346,6 +347,17 @@ class KernelConfig:
      "latency_specialized"}'`, the specialized decode of RFC #60904: setting
      either one enables the model's specialized decode, whichever it reads."""
 
@@ -307,8 +307,8 @@ index f605911ee6b4d10c20e7b4666da6e10987840912..3e8e5e6d92d414d2d162407cfa460172
      moe_backend: MoEBackend = "auto"
      """Backend for MoE expert computation kernels. Available options:
 
-@@ -360,6 +372,9 @@ class KernelConfig:
-       parallelism and NVSHMEM
+@@ -366,6 +378,9 @@ class KernelConfig:
+       weights on Hopper; requires expert parallelism and NVSHMEM
      - "flashinfer_b12x": Use FlashInfer CuteDSL fused MoE for SM12x
        (RTX Pro 6000 / DGX Spark)
 +    - "flashinfer_cutile": Use FlashInfer unified-MoE cuTile kernels for NVFP4
@@ -747,7 +747,7 @@ index 0000000000000000000000000000000000000000..61e1ff5e6f934face65d0675f817d382
 +            topk_weights.float().contiguous(),
 +        )
 diff --git a/vllm/model_executor/layers/fused_moe/oracle/nvfp4.py b/vllm/model_executor/layers/fused_moe/oracle/nvfp4.py
-index bfe79a343a812383d569e72e4fc066b5280df5f7..e8b35343931e26b81600db0eb09567387893c91c 100644
+index 597ee775a3d23ff4fb3ed643ead91fec8965d59e..2e760a628334950365c3c70194be6ac9a9cbe115 100644
 --- a/vllm/model_executor/layers/fused_moe/oracle/nvfp4.py
 +++ b/vllm/model_executor/layers/fused_moe/oracle/nvfp4.py
 @@ -38,6 +38,7 @@ from vllm.model_executor.layers.quantization.utils.nvfp4_emulation_utils import

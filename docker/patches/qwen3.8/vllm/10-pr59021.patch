@@ -2,7 +2,7 @@ From: schopde-nvidia
 Subject: [PATCH] [Kernel] Allow steering the unquantized linear backend independently
 
 Upstream-PR: https://github.com/vllm-project/vllm/pull/59021
-Upstream-Commit: 0d1a683a3471ce352ef5a9aa2d7a9616bd1ac4bf
+Upstream-Commit: 7563f2b33f213c7ed6dfd2377f14b8da084fbfb4
 Integration-Base: 8084f0624dba24aba6ebac62d8e10cc00730a0fe
 Refresh-Base: b409a4f0d787fdddb75ec2e8ddb6dfcfd36235b7
 

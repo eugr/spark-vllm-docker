@@ -1,6 +1,6 @@
 # Copyright (c) 2026 by FlashInfer team.
 # SPDX-License-Identifier: Apache-2.0
-# Upstream excerpts from b1cc4f35a5e30bdf378ccb5f6c398ce154375774:
+# Upstream excerpts from e65caf5cbb90cbc1a6e90ad6aab1c38ff8132291:
 # flashinfer/autotuner/autotuner.py
 
 class AutoTuner:
@@ -27,6 +27,10 @@ class AutoTuner:
                                 self._tie_tolerance,
                             )
                             _, runner_id, tactic = measured[winner]
+                            # Publish and look up coverage using the prepared runners.
+                            profiling_candidates = _ProfilingCandidates.from_runners(
+                                runners, inputs
+                            )
                             cache_key = self._get_cache_key(
                                 custom_op,
                                 runners[runner_id],
@@ -52,6 +56,7 @@ class AutoTuner:
                                 self._selection_record(
                                     [t for t, _, _ in measured], winner
                                 ),
+                                profiling_candidates=profiling_candidates,
                             )
                             self.stats.tuned_op_successful_configs[custom_op] = (
                                 self.stats.tuned_op_successful_configs.get(custom_op, 0)

@@ -804,7 +804,7 @@ class PatchSeriesTests(unittest.TestCase):
             project="flashinfer",
         )
         namespace = {"functools": functools, "statistics": statistics,
-                     "logger": Mock(), "_tune_process_group": None}
+                     "_ProfilingCandidates": Mock(), "logger": Mock(), "_tune_process_group": None}
         exec("from __future__ import annotations\n" + updated, namespace)
         cases = [
             # Initial times, margin, tie tolerance, confirmation times, winner.
@@ -833,6 +833,10 @@ class PatchSeriesTests(unittest.TestCase):
                     SimpleNamespace(get_opt_shapes=lambda: ()), "gemm", [],
                 )
                 args = tuner._cache_profile_result.call_args.args
+                self.assertIs(
+                    tuner._cache_profile_result.call_args.kwargs["profiling_candidates"],
+                    namespace["_ProfilingCandidates"].from_runners.return_value,
+                )
                 self.assertEqual(args[3], winner)
                 self.assertEqual(args[4]["time_ms"], times[winner])
                 self.assertEqual(args[4]["candidates"], sum(t < float("inf") for t in times))
@@ -1217,6 +1221,7 @@ class PatchSeriesTests(unittest.TestCase):
         class Rows:
             def __init__(self, weights, quantization):
                 self.weights = weights
+                self.quant_method = SimpleNamespace(apply=lambda rows, x: rows(x))
             def __call__(self, x):
                 return x @ self.weights.T
 
