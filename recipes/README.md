@@ -1,5 +1,40 @@
 # Recipes
 
+## NVIDIA Local AI Inference Recipes
+
+`run-nvidia-recipe.sh` accepts a local NVIDIA recipe YAML file, an HTTPS raw
+YAML URL, or a GitHub `blob` URL. It converts the NVIDIA `runtime.image` and
+`serve.command` fields into this repository's recipe format, then passes the
+result to `run-recipe.sh`. For example:
+
+```bash
+./run-nvidia-recipe.sh https://github.com/NVIDIA/local-ai-inference-recipes/blob/main/models/qwen/qwen3.8-27b/dgx-spark-2gpu/linux/vllm/128gb/nvfp4/recipe.yaml --dry-run --config /dev/null -n 10.0.0.1,10.0.0.2
+./run-nvidia-recipe.sh ./nvidia-recipe.yaml --solo -t my-vllm-image
+./run-nvidia-recipe.sh ./nvidia-recipe.yaml --export ./converted.yaml
+./run-nvidia-recipe.sh ./nvidia-recipe.yaml --export
+```
+
+The NVIDIA image is used by default. `-t IMAGE` overrides it.
+`--remap-container` maps `eugr/spark-vllm-b12x:*` to `vllm-node-b12x`,
+`eugr/spark-vllm:*` to `vllm-node`, and every other image to `vllm-node`.
+An explicit `-t` takes precedence over the mapping. `--export FILE` writes a
+standalone internal recipe and refuses to overwrite an existing file.
+`--export` without a filename prints the YAML to stdout. Neither form launches
+the recipe. Other launch options pass through to `run-recipe.sh`.
+
+The translator uses the main `serve.command`, transfers simple `export KEY=VALUE`
+lines to recipe environment variables, and removes vLLM rank, master, headless,
+and distributed-backend flags supplied by our launcher. It sets solo or cluster
+constraints from `topology.node_count`; one-node recipes launch in solo mode by
+default. For a cluster dry run, provide synthetic nodes and `--config /dev/null`
+so the command does not read your local cluster configuration.
+
+The converted recipe tracks the main checkpoint for the runner's model cache
+check. If the NVIDIA recipe uses a separate draft checkpoint, download that
+model separately before launching. For an unmodified NVIDIA image, the runner
+pulls it when missing and copies it to cluster workers. Remapped or overridden
+local images follow the normal build workflow.
+
 Recipes provide a **one-click solution** for deploying models with pre-configured settings. Each recipe is a YAML file that specifies:
 
 - HuggingFace model to download
@@ -139,6 +174,7 @@ command: |
 # Optional fields
 description: What this recipe does
 model: org/model-name              # HuggingFace model ID for --setup downloads
+pull_image: false                 # Pull an upstream image; copy to workers instead of building
 cluster_only: false                # Set to true if model requires cluster mode
 build_args:                        # Extra args for build-and-copy.sh
   - --exp-mxfp4                    # e.g., for MXFP4 Dockerfile
