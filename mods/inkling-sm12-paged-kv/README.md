@@ -44,6 +44,10 @@ CUTLASS DSL APIs, CUDA 12.8+, and SM12x. It imports the complete vendored
 package before patching Inkling, so an incompatible bundle fails without
 changing model dispatch. Reapplying the same mod is safe.
 
+The patcher accepts both layouts of `fa4_rel_attention.py`: the module-level
+`inkling_fa4_rel_attention` function of vLLM up to 0.27.1, and the
+`InklingFA4RelAttentionKernel.kernel` method that replaced it.
+
 For cross-node TP on GB10, use the regular PIECEWISE CUDA-graph path and skip
 FULL graph capture:
 
