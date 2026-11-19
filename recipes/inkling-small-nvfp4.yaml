@@ -17,6 +17,9 @@ container: vllm-node
 # Required patches and memory-pressure handling
 mods:
   - mods/inkling-sm12-paged-kv
+  # Must follow inkling-sm12-paged-kv: fixes out-of-bounds reads in its kernel that crash
+  # the engine (Xid 31) when more than one request is batched.
+  - mods/fix-inkling-fa4-sm120-varlen-oob
   - mods/drop-caches
   - mods/instanttensor-hybrid-draft-loader
 
