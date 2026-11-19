@@ -1,0 +1,324 @@
+Subject: [PATCH] Compare distributed FP8 cuBLASLt tactics by algorithm configuration
+
+cuBLASLt can return different bytes in opaque algorithm descriptors for the
+same FP8 configuration on different tensor-parallel ranks. Compare the library
+version, device capability, operand dtypes and all nine published configuration
+attributes during distributed autotuning. Keep rank-local descriptors for
+profiling, execution and cache persistence. Preserve candidate ordering and
+use exact descriptor agreement if configuration decoding fails.
+
+Base: flashinfer-ai/flashinfer e65caf5cbb90cbc1a6e90ad6aab1c38ff8132291
+Series predecessor: 02-pr5943.patch
+
+diff --git a/csrc/flashinfer_gemm_binding.cu b/csrc/flashinfer_gemm_binding.cu
+index 7641ebcc679ec63a8ce6f96ba0a19eac964c2904..10ee2ebfe0780307b06ba7a8ee285e5479b22ffe 100644
+--- a/csrc/flashinfer_gemm_binding.cu
++++ b/csrc/flashinfer_gemm_binding.cu
+@@ -14,6 +14,12 @@
+  * limitations under the License.
+  */
+ 
++#include <cublasLt.h>
++#include <tvm/ffi/container/array.h>
++
++#include <cstring>
++#include <initializer_list>
++
+ #include "tvm_ffi_utils.h"
+ 
+ void bmm_fp8(TensorView A, TensorView B, TensorView D, TensorView A_scale, TensorView B_scale,
+@@ -31,6 +37,41 @@ void CutlassSegmentGEMM(TensorView workspace_buffer, TensorView all_problems, Te
+                         TensorView w_ptr, TensorView y_ptr, TensorView x_ld, TensorView w_ld,
+                         TensorView y_ld, TensorView empty_x_data, bool weight_column_major);
+ 
++// cuBLASLt descriptors are opaque. Two ranks can get different serialized bytes
++// for the same algorithm configuration. Keep the descriptor intact for replay.
++static ffi::Array<int64_t> cublaslt_algo_config_key(TensorView desc) {
++  CHECK_CPU(desc);
++  CHECK_CONTIGUOUS(desc);
++  CHECK_INPUT_TYPE(desc, dl_uint8);
++  cublasLtMatmulAlgo_t algo;
++  TVM_FFI_ICHECK_EQ(desc.numel(), sizeof(algo));
++  std::memcpy(&algo, desc.data_ptr(), sizeof(algo));
++
++  ffi::Array<int64_t> key{static_cast<int64_t>(cublasLtGetVersion())};
++  auto append = [&](auto value, std::initializer_list<cublasLtMatmulAlgoConfigAttributes_t> attrs) {
++    for (auto attr : attrs) {
++      size_t written = 0;
++      if (cublasLtMatmulAlgoConfigGetAttribute(&algo, attr, &value, sizeof(value), &written) !=
++              CUBLAS_STATUS_SUCCESS ||
++          written != sizeof(value)) {
++        return false;
++      }
++      key.push_back(value);
++    }
++    return true;
++  };
++  if (!append(uint32_t{}, {CUBLASLT_ALGO_CONFIG_ID, CUBLASLT_ALGO_CONFIG_TILE_ID,
++                           CUBLASLT_ALGO_CONFIG_SPLITK_NUM, CUBLASLT_ALGO_CONFIG_REDUCTION_SCHEME,
++                           CUBLASLT_ALGO_CONFIG_CTA_SWIZZLING, CUBLASLT_ALGO_CONFIG_CUSTOM_OPTION,
++                           CUBLASLT_ALGO_CONFIG_STAGES_ID}) ||
++      !append(uint16_t{},
++              {CUBLASLT_ALGO_CONFIG_INNER_SHAPE_ID, CUBLASLT_ALGO_CONFIG_CLUSTER_SHAPE_ID})) {
++    return {};
++  }
++  return key;
++}
++
++TVM_FFI_DLL_EXPORT_TYPED_FUNC(cublaslt_algo_config_key, cublaslt_algo_config_key);
+ TVM_FFI_DLL_EXPORT_TYPED_FUNC(cutlass_segment_gemm, CutlassSegmentGEMM);
+ TVM_FFI_DLL_EXPORT_TYPED_FUNC(bmm_fp8, bmm_fp8);
+ TVM_FFI_DLL_EXPORT_TYPED_FUNC(bmm_fp8_get_algos, bmm_fp8_get_algos);
+diff --git a/flashinfer/autotuner/autotuner.py b/flashinfer/autotuner/autotuner.py
+index 55863b689c519fba6a06d87cc68a26475ef6ebd6..15bfb53cd91ac7ce5b42899f0ba33d84172464f1 100644
+--- a/flashinfer/autotuner/autotuner.py
++++ b/flashinfer/autotuner/autotuner.py
+@@ -882,6 +882,10 @@ class TunableRunner(ABC):
+     # Some runners signal retryable discovery failures with an empty list.
+     _retry_empty_tactics = False
+ 
++    def get_tuning_group_key(self, tactic: Any, inputs: list[torch.Tensor]) -> Any:
++        """Identify a tactic across ranks. Execution and persistence use the local tactic."""
++        return tactic
++
+     @abstractmethod
+     def get_valid_tactics(
+         self, inputs: list[torch.Tensor], profile: OptimizationProfile
+@@ -1469,6 +1473,9 @@ def _all_ranks_hit_cache(
+         return local_hit
+     if local_hit:
+         try:
++            # Decode rank-local keys inside the error guard and only for distributed hits.
++            if callable(selection):
++                selection = selection()
+             # Invalid persisted selections remain cache misses, not fatal plans.
+             json.dumps(_tactic_to_json(selection), allow_nan=False)
+         except Exception:
+@@ -3448,12 +3455,14 @@ class AutoTuner:
+                         profiling_candidates=profiling_candidates,
+                         validation_profile=p,
+                     )
+-                    selection = (
+-                        (runner_id, type(runners[runner_id]).__name__, tactic)
+-                        if is_cache_hit
+-                        else None
+-                    )
+-                    if not _all_ranks_hit_cache(is_cache_hit, selection):
++                    if not _all_ranks_hit_cache(
++                        is_cache_hit,
++                        lambda: (
++                            runner_id,
++                            type(runners[runner_id]).__name__,
++                            runners[runner_id].get_tuning_group_key(tactic, inputs),
++                        ),
++                    ):
+                         if _tune_process_group is not None:
+                             self._discard_profile_cache(
+                                 custom_op,
+@@ -3540,6 +3549,7 @@ class AutoTuner:
+                             runner_preparation_oom = False
+                             runner_error = None
+                             valid_tactics = []
++                            candidate_keys = []
+                             retry_tactics = False
+                             try:
+                                 valid_tactics = r.get_valid_tactics(tensors, p)
+@@ -3557,6 +3567,11 @@ class AutoTuner:
+                                     and -1 not in valid_tactics
+                                 ):
+                                     valid_tactics = [-1, *valid_tactics]
++                                if _tune_process_group is not None:
++                                    candidate_keys = [
++                                        r.get_tuning_group_key(t, inputs)
++                                        for t in valid_tactics
++                                    ]
+                             except (torch.cuda.OutOfMemoryError, MemoryError):
+                                 runner_preparation_oom = True
+                                 tensors = None
+@@ -3573,7 +3588,7 @@ class AutoTuner:
+                             if _sync_oom_across_tune_group(
+                                 runner_preparation_oom,
+                                 phase=("candidates", custom_op, _step, r_id),
+-                                selection=(valid_tactics, retry_tactics),
++                                selection=(candidate_keys, retry_tactics),
+                                 error=runner_error,
+                             ):
+                                 tensors = None
+@@ -3830,9 +3845,14 @@ class AutoTuner:
+                     runner_id, tactic = incomplete_winner
+             if _tune_process_group is not None:
+                 # Rank-local inputs can reject a winner after profile agreement.
+-                selection = (runner_id, type(runners[runner_id]).__name__, tactic)
+                 if not _all_ranks_hit_cache(
+-                    has_selection, selection, phase=("final_selection", custom_op)
++                    has_selection,
++                    lambda: (
++                        runner_id,
++                        type(runners[runner_id]).__name__,
++                        runners[runner_id].get_tuning_group_key(tactic, inputs),
++                    ),
++                    phase=("final_selection", custom_op),
+                 ):
+                     return runners[0], -1
+             return runners[runner_id], tactic
+@@ -4148,7 +4168,11 @@ class AutoTuner:
+             cached = ranked_cache.get(cache_key)
+             if _all_ranks_hit_cache(
+                 cached is not None and cached[0] == policy,
+-                (type(runner).__name__, k, cached[1][:k]) if cached else None,
++                lambda: (
++                    type(runner).__name__,
++                    k,
++                    [runner.get_tuning_group_key(t, inputs) for t in cached[1][:k]],
++                ),
+             ):
+                 assert cached is not None
+                 return list(cached[1][:k])
+@@ -4201,9 +4225,14 @@ class AutoTuner:
+             runner_preparation_oom = False
+             runner_error = None
+             valid_tactics = []
++            candidate_keys = []
+             try:
+                 valid_tactics = runner.get_valid_tactics(tensors, profile)
+                 valid_tactics = self._blocklist.filter(custom_op, runner, valid_tactics)
++                if _tune_process_group is not None:
++                    candidate_keys = [
++                        runner.get_tuning_group_key(t, inputs) for t in valid_tactics
++                    ]
+             except (torch.cuda.OutOfMemoryError, MemoryError):
+                 if _tune_process_group is None:
+                     raise
+@@ -4220,7 +4249,7 @@ class AutoTuner:
+             if _sync_oom_across_tune_group(
+                 runner_preparation_oom,
+                 phase=("ranking_candidates", custom_op),
+-                selection=valid_tactics,
++                selection=candidate_keys,
+                 error=runner_error,
+             ):
+                 tensors = None
+diff --git a/flashinfer/gemm/gemm_base.py b/flashinfer/gemm/gemm_base.py
+index f73ce712a1ca1fff4bc2aa04c3382ae6a7fd5bf6..17f058d4d3af3ca843b206937c66b49942997297 100644
+--- a/flashinfer/gemm/gemm_base.py
++++ b/flashinfer/gemm/gemm_base.py
+@@ -358,6 +358,20 @@ def get_gemm_module():
+             def validate_tactic(self, inputs: List[torch.Tensor], tactic) -> bool:
+                 return tactic == -1 or _is_cublaslt_algo_tactic(tactic)
+ 
++            def get_tuning_group_key(self, tactic, inputs):
++                if tactic == -1:
++                    return tactic
++                config = module.cublaslt_algo_config_key(_cublaslt_algo_tensor(tactic))
++                # An unreadable descriptor must still pass the original bytewise check.
++                if not len(config):
++                    return tactic
++                return (
++                    "cublaslt_config",
++                    get_compute_capability(inputs[0].device),
++                    tuple(map(str, self.get_cache_key_extras(inputs))),
++                    *config,
++                )
++
+             def _get_algos(self, inputs) -> List[tuple]:
+                 # Enumerate at the bucketed M that keys the tuned tactic, so the
+                 # candidates are the same for every M of the bucket.
+diff --git a/tests/autotuner/test_autotuner_cublaslt_tactics.py b/tests/autotuner/test_autotuner_cublaslt_tactics.py
+index 5793ead614b0186e9c116dce4b2103b93d400ff5..4912a41ef7b0c7db9915a6b736377ab3803aa8a3 100644
+--- a/tests/autotuner/test_autotuner_cublaslt_tactics.py
++++ b/tests/autotuner/test_autotuner_cublaslt_tactics.py
+@@ -403,6 +403,40 @@ def _runner_and_inputs(backend, m):
+     return problem, runner, inputs
+ 
+ 
++def test_fp8_tuning_group_key_uses_cublaslt_configuration():
++    _skip_unless_backend("cublas")
++    _, runner, inputs = _runner_and_inputs("cublas", 1)
++    assert runner.get_tuning_group_key(-1, inputs) == -1
++    tactics = runner.get_valid_tactics(inputs, None)
++    assert tactics
++    key = runner.get_tuning_group_key(tactics[0], inputs)
++    assert key[0] == "cublaslt_config"
++    if key[3] != 130101 or _compute_capability() != 121:
++        pytest.skip(
++            "recorded opaque descriptors are specific to cuBLASLt 13.1.1 on GB10"
++        )
++
++    # Two ranks enumerated matching configurations with distinct serialized bytes.
++    left = (
++        77309411395,
++        4294967332,
++        0,
++        7,
++        558783366299649,
++        120259084316,
++        292058693646,
++        0,
++    )
++    right = (*left[:4], 558783604064257, *left[5:])
++    different = (1387274436675, 4294967332, 0, 29, *left[4:])
++    assert runner.get_tuning_group_key(left, inputs) == runner.get_tuning_group_key(
++        right, inputs
++    )
++    assert runner.get_tuning_group_key(left, inputs) != runner.get_tuning_group_key(
++        different, inputs
++    )
++
++
+ @pytest.mark.parametrize("backend", ["cublas", "cublaslt"])
+ def test_invalid_descriptor_runs_heuristic_default(
+     backend, descriptor_runs, monkeypatch
+diff --git a/tests/autotuner/test_autotuner_distributed_phases.py b/tests/autotuner/test_autotuner_distributed_phases.py
+index 896462328b680ce1723e8492e1cd1ac3198ce6a9..369615323663989d0069dbdf0e0835ef387ec41b 100644
+--- a/tests/autotuner/test_autotuner_distributed_phases.py
++++ b/tests/autotuner/test_autotuner_distributed_phases.py
+@@ -40,9 +40,15 @@ class Inner(TunableRunner):
+         return inputs[0]
+ 
+ class Runner(Inner):
++    def get_tuning_group_key(self, tactic, inputs):
++        if case in ("local_tactics", "ranking_local_tactics"):
++            return tactic - 10 * rank
++        return super().get_tuning_group_key(tactic, inputs)
+     def get_cache_key_extras(self, inputs):
+         return (rank,)
+     def get_valid_tactics(self, inputs, profile):
++        if case in ("local_tactics", "ranking_local_tactics"):
++            return [10 * rank, 10 * rank + 1]
+         if case in ("nested_same", "nested_empty") or (case == "nested_different" and rank == 1):
+             AutoTuner.get().rank_tactics("inner", [Inner()], config, inputs, k=2)
+         if rank == 1:
+@@ -99,7 +105,7 @@ cases = ["op", "runner_order", "skip", "profiles", "profile_error", "policy",
+          "candidate_encoding", "input_error", "prepare_error", "nested_different",
+          "ranking_candidates", "ranking_input_error", "ranking_prepare_error",
+          "ranking_profile_error", "candidate_iterator", "nested_empty", "ranking_k",
+-         "method", "local_shapes", "nested_same", "all_skip"]
++         "method", "local_shapes", "local_tactics", "ranking_local_tactics", "nested_same", "all_skip"]
+ try:
+     for case in cases:
+         tuner = AutoTuner()
+@@ -112,15 +118,21 @@ try:
+             runners = [Runner(), Other()] if rank == 0 else [Other(), Runner()]
+         cfg = TuningConfig(use_cuda_graph=case == "policy" and rank == 1, use_cold_l2_cache=False)
+         skipped = {op} if case == "all_skip" or (case == "skip" and rank == 1) else set()
+-        expected_failure = case not in ("local_shapes", "nested_same", "all_skip")
++        expected_failure = case not in ("local_shapes", "local_tactics", "ranking_local_tactics", "nested_same", "all_skip")
+         failed = False
+         try:
+             with autotune(True, skip_ops=skipped):
+                 if case.startswith("ranking_") or (case == "method" and rank == 1):
+-                    tuner.rank_tactics(op, runners, cfg, inputs, k=1 if case == "ranking_k" and rank == 1 else 2)
++                    ranked = tuner.rank_tactics(op, runners, cfg, inputs, k=1 if case == "ranking_k" and rank == 1 else 2)
++                    if case == "ranking_local_tactics":
++                        assert ranked == [10 * rank, 10 * rank + 1]
++                        count = len(calls)
++                        assert tuner.rank_tactics(op, runners, cfg, inputs, k=2) == ranked
++                        assert len(calls) == count
+                 else:
+                     _, tactic = tuner.choose_one(op, runners, cfg, inputs)
+-                    assert tactic == (-1 if case == "all_skip" else 0)
++                    expected = 10 * rank if case == "local_tactics" else 0
++                    assert tactic == (-1 if case == "all_skip" else expected)
+                     count = len(calls)
+                     assert tuner.choose_one(op, runners, cfg, inputs)[1] == tactic
+                     assert len(calls) == count, "warm hit profiled again"

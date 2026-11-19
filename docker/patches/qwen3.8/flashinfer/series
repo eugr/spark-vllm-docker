@@ -1,2 +1,3 @@
 # PR #5863 merged as 397b9607c83cf201f3c44684c555c3698869b6bd.
 02-pr5943.patch
+03-cublaslt-fp8-rank-agreement.patch
