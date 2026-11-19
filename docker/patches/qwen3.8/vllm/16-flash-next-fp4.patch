@@ -3,7 +3,7 @@ Subject: [PATCH] Flash Next FP4 resident CSF scales and loading helpers
 Source-Patch: mods/draft/flash-next-fp4/flash-next-fp4-local.patch
 Source-SHA256: 80192a2d8213d7852d7c10eb982235a71da0f672d117478b8e83bb67b9df0462
 Integration-Base: 8084f0624dba24aba6ebac62d8e10cc00730a0fe
-Refresh-Base: b409a4f0d787fdddb75ec2e8ddb6dfcfd36235b7
+Refresh-Base: 392ed873c7fed4c41fafaad022f83f7d0fe9f57a
 
 Preserve the worker's VMM driver import alongside the host-heap trim helper.
 
@@ -440,7 +440,7 @@ index a92ac0d9be9cf2500d66d0335cdbaa5e85dc118f..dbbd2b2fa3860e4efdccca52fed477b7
                      if param_name.endswith(("w13_bias", "w2_bias")):
                          continue
 diff --git a/vllm/model_executor/layers/quantization/modelopt.py b/vllm/model_executor/layers/quantization/modelopt.py
-index ca4efdfd65f11329b9724fa38888a92d08035863..0402f1f4ba493b12571a024bed6b4c4cd63629eb 100644
+index fb81767e68f171be5dda6c8c0dc4faaa4f8655a4..e1e154811f69c3431ae8f0bc66874d9dfeb97e85 100644
 --- a/vllm/model_executor/layers/quantization/modelopt.py
 +++ b/vllm/model_executor/layers/quantization/modelopt.py
 @@ -1957,6 +1957,7 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfigBase):
@@ -451,9 +451,9 @@ index ca4efdfd65f11329b9724fa38888a92d08035863..0402f1f4ba493b12571a024bed6b4c4c
 
          block_sizes = {
              int(layer_info.get("group_size", 128))
-@@ -2198,6 +2199,21 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfigBase):
-
-         return None
+@@ -2382,6 +2383,21 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfigBase):
+             f"{sorted(entries, key=str)}."
+         )
 
 +    def _resolve_weight_scale_encoding(self, prefix: str) -> str | None:
 +        for candidate in self._quantized_layer_prefix_candidates(prefix):
