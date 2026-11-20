@@ -186,6 +186,25 @@ repair_cache_ownership() {
     done
 }
 
+sh_quote() {
+    # SSH hands remote commands to the user's login shell, which may be dash or
+    # another POSIX sh. Bash's printf %q can emit $'...' quoting that those
+    # shells do not understand, so use plain single quotes instead.
+    local quoted="${1//\'/\'\\\'\'}"
+    printf "'%s'" "$quoted"
+}
+
+remote_bash_command() {
+    # Build "bash -c <script> -- <args>" that any POSIX login shell parses identically.
+    local command arg
+    command="bash -c $(sh_quote "$1") --"
+    shift
+    for arg in "$@"; do
+        command+=" $(sh_quote "$arg")"
+    done
+    printf '%s' "$command"
+}
+
 prepare_remote_cache() {
     local host="$1" remote_script remote_command
     local ssh_args=(-o BatchMode=yes)
@@ -196,7 +215,7 @@ prepare_remote_cache() {
     fi
     # Pass the script as an argument, leaving stdin available for sudo's password.
     printf -v remote_script '%s\nrepair_cache_ownership "$@"' "$(declare -f repair_cache_ownership)"
-    printf -v remote_command 'bash -c %q -- %q %q' "$remote_script" "$HF_CACHE_DIR" "$HUB_PATH"
+    remote_command=$(remote_bash_command "$remote_script" "$HF_CACHE_DIR" "$HUB_PATH")
     echo "Checking cache ownership on ${SSH_USER}@${host}..."
     if ! cluster_copy_ssh "$host" "${ssh_args[@]}" "$remote_command"; then
         echo "Error: Cache preparation failed on ${SSH_USER}@${host}." >&2
@@ -241,15 +260,12 @@ copy_model_to_host() {
 }
 
 remote_cache_action() {
-    local host="$1" remote_command remote_script arg
+    local host="$1" remote_command remote_script
     shift
     # Prepare uvx in the same shell that starts Python so PATH changes survive.
     # The Python helper still arrives on stdin; no repo checkout is needed.
     printf -v remote_script '%s\nensure_uvx || exit 1\nexec python3 - "$@"' "$(declare -f ensure_uvx)"
-    printf -v remote_command 'bash -c %q --' "$remote_script"
-    for arg in "$@"; do
-        printf -v remote_command '%s %q' "$remote_command" "$arg"
-    done
+    remote_command=$(remote_bash_command "$remote_script" "$@")
     cluster_copy_ssh "$host" -o BatchMode=yes -T "$remote_command" < "$CACHE_HELPER"
 }
 
