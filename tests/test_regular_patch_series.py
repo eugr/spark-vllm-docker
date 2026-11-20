@@ -363,6 +363,7 @@ class PatchSeriesTests(unittest.TestCase):
             for bind in (False, True):
                 with self.subTest(depth=depth, bind=bind):
                     builder = cls.__new__(cls)
+                    builder.num_speculative_blocks = depth
                     builder.use_spec_decode = depth > 0
                     builder.decode_cudagraph_max_bs = 8
                     builder.compilation_config = SimpleNamespace(
@@ -380,6 +381,12 @@ class PatchSeriesTests(unittest.TestCase):
                             self.assertIs(builder.decode_num_accepted_tokens, accepted)
                         with self.assertRaises(AssertionError):
                             builder.bind_mrv2_graph_inputs(aligned[:2], accepted)
+                        if depth:
+                            # ReplaySSM reserves no per-draft state blocks.
+                            builder.num_speculative_blocks = 0
+                            builder.bind_mrv2_graph_inputs(aligned[:, :1], accepted)
+                            self.assertIs(builder.state_indices_tensor_d, aligned)
+                            self.assertIs(builder.decode_num_accepted_tokens, accepted)
                     expected = aligned[:2].clone()
                     # Aliased graph inputs must avoid even an in-place self-copy.
                     guard = (patch.object(torch.Tensor, "copy_", side_effect=AssertionError(
@@ -420,13 +427,13 @@ class PatchSeriesTests(unittest.TestCase):
         namespace = {"torch": torch, "DefaultModelState": DefaultModelState,
                      "RecoverSSMState": recover}
         exec("from __future__ import annotations\n" + updated, namespace)
-        for mode in ("align", "none"):
+        for prefix_caching in (False, True):
             for depth in (0, 2):
                 for replay in (False, True):
-                    with self.subTest(mode=mode, depth=depth, replay=replay):
+                    with self.subTest(prefix_caching=prefix_caching, depth=depth, replay=replay):
                         config = SimpleNamespace(
                             cache_config=SimpleNamespace(
-                                mamba_cache_mode=mode, use_kda_recoverssm=replay,
+                                enable_prefix_caching=prefix_caching, use_kda_recoverssm=replay,
                             ),
                             num_speculative_tokens=depth,
                             use_replayssm_trackers=replay,
@@ -443,11 +450,11 @@ class PatchSeriesTests(unittest.TestCase):
                             )
                         else:
                             self.assertFalse(hasattr(state, "_is_prefilling_gpu"))
-                        if mode == "align" or replay:
+                        if prefix_caching or replay:
                             self.assertIsNone(state._mamba_ctx)
                             self.assertIsNone(state._mamba_state_copy_funcs)
                         batch = state._mamba_num_accepted_tokens_batch
-                        if mode == "align" and depth:
+                        if prefix_caching and depth:
                             torch.testing.assert_close(batch, torch.ones(4, dtype=torch.int32))
                             # Batch ordering must not overwrite per-request acceptance counts.
                             self.assertNotEqual(batch.data_ptr(), state.num_accepted_tokens_gpu.data_ptr())

@@ -4,7 +4,7 @@ Subject: [PATCH] [Kernel][Quant][MoE] Per-forward NVFP4 W4A4/W4A16 selection for
 Upstream-PR: https://github.com/vllm-project/vllm/pull/54617
 Upstream-Commit: 69d21d81808bcea2de3b97a0b68c97545808a043
 Integration-Base: 8084f0624dba24aba6ebac62d8e10cc00730a0fe
-Refresh-Base: f7f17bcfe8aad602a0cfd50a5db02021293afc01
+Refresh-Base: 0fda86a35419c9c70dbfada224c838c10fbb62ad
 
 Preserve the expanded upstream MonoKernel documentation.
 
@@ -278,7 +278,7 @@ index 0000000000000000000000000000000000000000..bb58ef9015b5678c21be7faee78073ed
 +    assert err.mean() < 2.5e-1, f"mean rel err {err.mean():.3e}"
 +    assert torch.equal(outs[0], outs[2])
 diff --git a/vllm/config/kernel.py b/vllm/config/kernel.py
-index 63c74e032f76864812b36244530285b487b887fc..ffcb3f4c10915ee59cdde4518cc3e75763c06648 100644
+index 614d91c04390b5b3cc816c9f16b5a4f305288651..2da8d06e489d3753907daf9a3ba59f6673692678 100644
 --- a/vllm/config/kernel.py
 +++ b/vllm/config/kernel.py
 @@ -137,6 +137,7 @@ MoEBackend = Literal[
@@ -289,7 +289,7 @@ index 63c74e032f76864812b36244530285b487b887fc..ffcb3f4c10915ee59cdde4518cc3e757
      "b12x",
      "flashinfer_moe_ep_mega_deep_gemm",
      "marlin",
-@@ -346,6 +347,17 @@ class KernelConfig:
+@@ -348,6 +349,17 @@ class KernelConfig:
      "latency_specialized"}'`, the specialized decode of RFC #60904: setting
      either one enables the model's specialized decode, whichever it reads."""
 
@@ -307,8 +307,8 @@ index 63c74e032f76864812b36244530285b487b887fc..ffcb3f4c10915ee59cdde4518cc3e757
      moe_backend: MoEBackend = "auto"
      """Backend for MoE expert computation kernels. Available options:
 
-@@ -366,6 +378,9 @@ class KernelConfig:
-       weights on Hopper; requires expert parallelism and NVSHMEM
+@@ -369,6 +381,9 @@ class KernelConfig:
+       or MXFP4 weights on Hopper; requires expert parallelism and NVSHMEM
      - "flashinfer_b12x": Use FlashInfer CuteDSL fused MoE for SM12x
        (RTX Pro 6000 / DGX Spark)
 +    - "flashinfer_cutile": Use FlashInfer unified-MoE cuTile kernels for NVFP4
