@@ -42,6 +42,10 @@ If you want to build only the runner from precompiled vLLM and FlashInfer wheels
 
 Similarly, `--rebuild-flashinfer`, `--flashinfer-ref`, and `--apply-flashinfer-pr` control the FlashInfer build and force the local build path.
 
+Source builds include FlashInfer's [cuDNN Frontend 1.33 output fix](https://github.com/flashinfer-ai/flashinfer/pull/9765)
+and lift vLLM's [temporary frontend cap](https://github.com/vllm-project/vllm/pull/68566)
+before building the vLLM wheel.
+
 Local builds include a CUDA-on-WSL memory-reporting fix in both compiled vLLM
 wheels and runners built with `--use-wheels`. On integrated NVIDIA GPUs under
 WSL, vLLM keeps CUDA's reported free memory instead of replacing it with guest

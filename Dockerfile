@@ -241,6 +241,11 @@ RUN set -eux; \
 COPY docker/patch_flashinfer_b12x_loader_include_order.py /tmp/patch_flashinfer_b12x_loader_include_order.py
 RUN "$FLASHINFER_BUILD_PYTHON" /tmp/patch_flashinfer_b12x_loader_include_order.py .
 
+# FlashInfer #9765 accepts the extra graph output added in cuDNN FE 1.33.
+# Backport for source refs predating the fix; fixed refs remain unchanged.
+COPY docker/patch_vllm_cudnn_frontend.py /tmp/patch_vllm_cudnn_frontend.py
+RUN "$FLASHINFER_BUILD_PYTHON" /tmp/patch_vllm_cudnn_frontend.py flashinfer .
+
 # FlashInfer #5240 reuses checksum-verified cubins from the cache mount below.
 COPY docker/build_flashinfer_jit_providers.sh /tmp/build_flashinfer_jit_providers.sh
 RUN --mount=type=cache,id=uv-cache,target=/root/.cache/uv \
@@ -664,6 +669,10 @@ RUN python3 /tmp/vllm-patches/patch_vllm_b12x_scale_swizzle.py .
 # WSL guest RAM does not describe CUDA's allocation budget on UMA devices.
 # Keep the fix in exported wheels as well as the runner below.
 RUN python3 /tmp/vllm-patches/patch_vllm_wsl_cuda_uma.py .
+
+# vLLM #68566 capped FE solely for FlashInfer's unpacking bug, fixed above.
+# Correct exported wheel metadata too, without pinning either source project.
+RUN python3 /tmp/vllm-patches/patch_vllm_cudnn_frontend.py vllm .
 
 # Prepare build requirements. Upstream moved the Torch helper under tools/;
 # keep supporting older refs and forks with the root-level helper.

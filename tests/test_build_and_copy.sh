@@ -1822,6 +1822,13 @@ test_build_dependency_updates() {
     pass "FlashInfer wheels build with the selected settings"
 }
 
+test_cudnn_frontend_compat() {
+    if ! python3 "$PROJECT_DIR/tests/test_cudnn_frontend_compat.py"; then
+        fail "cuDNN frontend compatibility tests failed"
+    fi
+    pass "FlashInfer and vLLM source builds support cuDNN frontend 1.33"
+}
+
 test_copied_vllm_git_index_is_refreshed_before_patch_apply() {
     local source_repo="$TMP_BASE/git-index-source"
     local copied_repo="$TMP_BASE/git-index-copy"
@@ -1957,8 +1964,8 @@ test_dockerfile_externalizes_vllm_source_patches() {
             fail "Dockerfile does not execute external patch: $patch_name"
         fi
     done
-    if [ "$patch_count" -ne 19 ]; then
-        fail "Expected 19 external vLLM patch scripts, found $patch_count"
+    if [ "$patch_count" -ne 20 ]; then
+        fail "Expected 20 external vLLM patch scripts, found $patch_count"
     fi
     if ! python3 -c '
 from pathlib import Path
@@ -2129,6 +2136,7 @@ test_dockerfile_pins_cutlass_dsl_47_everywhere
 test_dockerfile_uses_profiled_named_wheel_contexts
 test_dockerfile_omits_standalone_b12x
 test_build_dependency_updates
+test_cudnn_frontend_compat
 test_copied_vllm_git_index_is_refreshed_before_patch_apply
 test_dockerfile_applies_flashinfer_prs_without_merging_branch_history
 test_dockerfile_uses_prepared_python_for_flashinfer_builds
