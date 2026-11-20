@@ -16,6 +16,8 @@ SORT_ORDER=size:desc
 LIST_OPTIONS=false
 MODEL_NAME=""
 REVISION=""
+MAX_WORKERS=""
+MAX_WORKERS_SOURCE=""
 CACHE_HELPER="$(dirname "$(realpath "${BASH_SOURCE[0]}")")/hf-cache.py"
 
 # Help function
@@ -33,6 +35,7 @@ usage() {
     echo "  --revision <revision>      : Back up/delete one cached commit (hash, unique prefix, branch, or tag)."
     echo "  --format console|csv|json|md : Listing output format (default: console)."
     echo "  --sort <order>             : hf cache ls sort order (default: size:desc)."
+    echo "  --max-workers <n>          : Limit parallel download connections (default: hf's own; env: HF_MAX_WORKERS)."
     echo "  -c, --copy-to [hosts]       : Include peers. Omit hosts to use COPY_HOSTS from .env or autodiscovery."
     echo "      --copy-to-host          : Alias for --copy-to (backwards compatibility)."
     echo "      --copy-parallel         : With -c, copy to all resolved hosts concurrently."
@@ -359,6 +362,7 @@ while [[ "$#" -gt 0 ]]; do
         --backup-dir) require_value "$@"; BACKUP_DIR="$2"; shift ;;
         --format) require_value "$@"; OUTPUT_FORMAT="$2"; LIST_OPTIONS=true; shift ;;
         --sort) require_value "$@"; SORT_ORDER="$2"; LIST_OPTIONS=true; shift ;;
+        --max-workers) require_value "$@"; MAX_WORKERS="$2"; shift ;;
         -u|--user) require_value "$@"; SSH_USER="$2"; shift ;;
         --config) require_value "$@"; CONFIG_FILE="$2"; CONFIG_FILE_SET=true; shift ;;
         -h|--help) usage ;;
@@ -400,6 +404,15 @@ esac
     || fail "Backups are listed on the head node; omit -c."
 [[ -z "$REVISION" || "$ACTION" == backup || "$ACTION" == delete ]] \
     || fail "--revision requires --backup or --delete."
+[[ -z "$MAX_WORKERS" || "$ACTION" == download ]] \
+    || fail "--max-workers requires a download."
+# The environment only fills in for downloads, so it cannot break other actions.
+if [[ "$ACTION" == download && -z "$MAX_WORKERS" && -n "${HF_MAX_WORKERS:-}" ]]; then
+    MAX_WORKERS="$HF_MAX_WORKERS"
+    MAX_WORKERS_SOURCE=HF_MAX_WORKERS
+fi
+[[ -z "$MAX_WORKERS" || "$MAX_WORKERS" =~ ^[1-9][0-9]*$ ]] \
+    || fail "${MAX_WORKERS_SOURCE:---max-workers} must be a positive integer (got '$MAX_WORKERS')."
 [[ "$PARALLEL_COPY" == false || ( "$COPY_TO_FLAG" == true && ( "$ACTION" == download || "$ACTION" == restore ) ) ]] \
     || fail "--copy-parallel requires -c and a download or restore."
 python3 "$CACHE_HELPER" validate --model "$MODEL_NAME" --revision "$REVISION" --format "$OUTPUT_FORMAT" --sort "$SORT_ORDER"
@@ -497,7 +510,14 @@ if [[ "$ACTION" == restore ]]; then
     DOWNLOAD_TIME=$(($(date +%s) - DOWNLOAD_START))
 else
     echo "Downloading model '$MODEL_NAME' using uvx..."
-    if uvx hf download "$MODEL_NAME"; then
+    download_cmd=(uvx hf download "$MODEL_NAME")
+    # Fewer connections keep large downloads from overwhelming consumer routers;
+    # without a limit, leave hf's own default untouched.
+    if [[ -n "$MAX_WORKERS" ]]; then
+        download_cmd+=(--max-workers "$MAX_WORKERS")
+        echo "Limiting download to $MAX_WORKERS parallel worker(s)."
+    fi
+    if "${download_cmd[@]}"; then
         DOWNLOAD_END=$(date +%s)
         DOWNLOAD_TIME=$((DOWNLOAD_END - DOWNLOAD_START))
         printf "Download completed in %02d:%02d:%02d\n" $((DOWNLOAD_TIME/3600)) $((DOWNLOAD_TIME%3600/60)) $((DOWNLOAD_TIME%60))
