@@ -1989,7 +1989,7 @@ builds use PyTorch 2.14.0 and torchvision 0.29.0. Both use torchaudio 2.11.0.
 | :--- | :--- |
 | `-t, --tag <tag>` | Local image tag (default: `vllm-node`; auto-set to `vllm-node-tf5` with `--tf5`, `vllm-node-mxfp4` with `--exp-mxfp4`, or `vllm-node-b12x` with `--exp-b12x`) |
 | `--use-wheels` | Build only the runner image from downloaded or local precompiled wheels; never implicitly compile missing wheels. Incompatible with `--exp-b12x`. |
-| `--gpu-arch <arch>` | Target GPU architecture for wheel/source builds. Non-default targets rebuild FlashInfer unless the local cache is marked for that architecture. The default `12.1a` still uses the prebuilt image unless another build-forcing flag is set. |
+| `--gpu-arch '<arch> ...'` | Target GPU architectures for wheel/source builds. Pass a quoted space-separated list such as `'10.3a 12.0a 12.1a'` for one ARM64 image supporting DGX Station, RTX Pro 6000 Blackwell and DGX Spark. Non-default targets rebuild FlashInfer unless the local cache matches the list. The default `12.1a` uses the prebuilt image unless another build-forcing flag is set. |
 | `--rebuild-flashinfer` | Skip prebuilt wheel download; force a fresh local FlashInfer build |
 | `--rebuild-vllm` | Force rebuild vLLM from source |
 | `--force-flashinfer-download` | Force download upstream FlashInfer wheels, skipping cached wheel checks; unsupported for B12X |

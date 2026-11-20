@@ -165,13 +165,21 @@ add_copy_hosts() {
     done
 }
 
-# Convert --gpu-arch value (e.g. 12.0, 12.0f, 12.1a) to NCCL NVCC_GENCODE format.
+# NCCL builds generic device code for each compute capability. Torch and
+# FlashInfer also consume the architecture feature suffix (e.g. 10.3a).
 gpu_arch_to_nccl_gencode() {
-    local arch="$1"
-    # Strip optional feature suffix (12.1a -> 12.1, 12.0f -> 12.0).
-    arch="${arch%[a-z]}"
-    local sm="${arch//./}"
-    echo "-gencode=arch=compute_${sm},code=sm_${sm}"
+    local arch sm
+    local -a flags=()
+    local -A seen=()
+    for arch in "$@"; do
+        arch="${arch%[af]}"
+        sm="${arch//./}"
+        if [[ ! ${seen[$sm]+set} ]]; then
+            flags+=("-gencode=arch=compute_${sm},code=sm_${sm}")
+            seen[$sm]=1
+        fi
+    done
+    echo "${flags[*]}"
 }
 
 prepare_local_vllm_source() {
@@ -677,7 +685,7 @@ usage() {
     echo "Usage: $0 [OPTIONS]"
     echo "  -t, --tag <tag>               : Local image tag (default: 'vllm-node'; preset tags: 'vllm-node-tf5', 'vllm-node-mxfp4', or 'vllm-node-b12x')"
     echo "  --use-wheels                  : Build only the runner from precompiled wheels; never implicitly build source."
-    echo "  --gpu-arch <arch>             : GPU architecture for NCCL, wheel, and source builds (default: '${DEFAULT_GPU_ARCH_LIST}')"
+    echo "  --gpu-arch '<arch> ...'       : GPU architectures for NCCL, wheel, and source builds (default: '${DEFAULT_GPU_ARCH_LIST}')"
     echo "  --rebuild-flashinfer          : Force rebuild of FlashInfer wheels (ignore cached wheels)"
     echo "  --rebuild-vllm                : Force rebuild of vLLM wheels (ignore cached wheels)"
     echo "  --force-flashinfer-download   : Force download of upstream FlashInfer wheels (unsupported for B12X)"
@@ -733,7 +741,16 @@ while [[ "$#" -gt 0 ]]; do
     case $1 in
         -t|--tag) IMAGE_TAG="$2"; IMAGE_TAG_SET=true; shift ;;
         --use-wheels) USE_WHEELS=true ;;
-        --gpu-arch) GPU_ARCH_LIST="$2"; GPU_ARCH_SET=true; shift ;;
+        --gpu-arch)
+            GPU_ARCH_LIST="${2:-}"
+            if [[ ! $GPU_ARCH_LIST =~ ^[[:blank:]]*[0-9]+\.[0-9]+[af]?([[:blank:]]+[0-9]+\.[0-9]+[af]?)*[[:blank:]]*$ ]]; then
+                echo "Error: --gpu-arch requires a quoted space-separated list such as '10.3a 12.0a 12.1a'." >&2
+                exit 1
+            fi
+            read -ra gpu_archs <<< "$GPU_ARCH_LIST"
+            GPU_ARCH_LIST="${gpu_archs[*]}"
+            GPU_ARCH_SET=true
+            shift ;;
         --rebuild-flashinfer) REBUILD_FLASHINFER=true ;;
         --rebuild-vllm) REBUILD_VLLM=true ;;
         --force-flashinfer-download) FORCE_FLASHINFER_DOWNLOAD=true ;;
@@ -1188,7 +1205,8 @@ if [ "$EXP_MXFP4" = false ]; then
     COMMON_BUILD_FLAGS+=("--build-arg" "TORCHAUDIO_VERSION=$TORCHAUDIO_VERSION")
     COMMON_BUILD_FLAGS+=("--build-arg" "CUTLASS_DSL_VERSION=$CUTLASS_DSL_VERSION")
 fi
-NCCL_NVCC_GENCODE="$(gpu_arch_to_nccl_gencode "$GPU_ARCH_LIST")"
+read -ra gpu_archs <<< "$GPU_ARCH_LIST"
+NCCL_NVCC_GENCODE="$(gpu_arch_to_nccl_gencode "${gpu_archs[@]}")"
 COMMON_BUILD_FLAGS+=("--build-arg" "NCCL_NVCC_GENCODE=$NCCL_NVCC_GENCODE")
 if [ -n "$NETWORK_ARG" ]; then
     COMMON_BUILD_FLAGS+=("--network" "$NETWORK_ARG")
@@ -1430,11 +1448,13 @@ if [ "$NO_BUILD" = false ]; then
                 VLLM_CMD+=("--build-arg" "VLLM_PRS=$VLLM_PRS")
             fi
 
-            if [ "$EXP_B12X" = true ]; then
+            if [ "$EXP_B12X" = true ] || (( ${#gpu_archs[@]} > 1 )); then
                 # Preserve selected Blackwell subarchitectures. This prevents
                 # 10.3a and 12.1a from being reduced to plain sm_100/sm_120
                 # without overriding explicit family-target selections.
                 VLLM_CMD+=("--build-arg" "VLLM_PRESERVE_SM12X_TARGET=1")
+            fi
+            if [ "$EXP_B12X" = true ]; then
                 VLLM_CMD+=("--build-arg" "VLLM_PATCH_B12X_C128A_ALIGNMENT=1")
             fi
 
