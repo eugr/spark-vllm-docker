@@ -1,0 +1,92 @@
+--- a/parser/glm47_moe.py
++++ b/parser/glm47_moe.py
+@@ -60,8 +60,14 @@
+     re.DOTALL,
+ )
+ 
+ 
++# A tool name that cannot be a real tool-call name: prose the model wrote
++# after a stray tool-call opener. OpenAI tool names match
++# [A-Za-z0-9_-]{1,64}; anything else that reaches a name slot is a phantom.
++_PHANTOM_NAME_RE = re.compile(r"^[A-Za-z0-9_.\-]{1,128}$")
++
++
+ def _glm47_arg_converter(raw_args: str, partial: bool) -> str:
+     params: dict[str, object] = {}
+     pos = 0
+ 
+@@ -262,14 +268,74 @@
+         if name is not None:
+             name = name.strip()
+         super()._emit_name_delta(idx, deltas, name)
+ 
++    def _is_phantom_name(self, name: str) -> bool:
++        return bool(name) and _PHANTOM_NAME_RE.fullmatch(name) is None
++
++    def _accept_tool_name(self, name: str) -> bool:
++        if self._is_phantom_name(name):
++            return False
++        return super()._accept_tool_name(name)
++
++    def _rescue_phantom_slot(self, slot) -> None:
++        # A slot holding prose instead of a tool name (the model wrote a
++        # stray opener followed by text that is not a tool call): move the
++        # text into the deferred-content channel so the engine emits it as
++        # regular content instead of dropping it or turning it into a
++        # bogus tool call.
++        name = slot.name.strip()
++        if not name or slot.name_sent or not self._is_phantom_name(name):
++            return
++        text = name
++        args = slot.args.strip()
++        if args:
++            # Render the phantom's argument structure readably: strip the
++            # structural arg markers, keep key/value text ("city Tokyo").
++            args = args.replace(ARG_KEY_START, "").replace(ARG_KEY_END, " ")
++            args = args.replace(ARG_VALUE_START, "").replace(ARG_VALUE_END, " ")
++            text += " " + args.strip()
++        self._deferred_content += text
++        # The engine overwrites deferred content with whitespace-only
++        # content in some delta batches; marking the message as having
++        # non-whitespace content prevents that overwrite from dropping
++        # the rescued text.
++        self._content_has_nonws = True
++        slot.name = ""
++        slot._args_parts.clear()
++        slot._args_joined = ""
++
+     def _handle_tool_end(self, event, deltas) -> None:
+         idx = event.tool_index
+         if 0 <= idx < len(self._tool_slots):
+             self._tool_slots[idx].name = self._tool_slots[idx].name.strip()
++            self._rescue_phantom_slot(self._tool_slots[idx])
+         super()._handle_tool_end(event, deltas)
+ 
++    def finish_streaming(self):
++        # A phantom whose opener is never closed never fires TOOL_CALL_END,
++        # so sweep every slot before the engine's final flush.
++        for slot in self._tool_slots:
++            self._rescue_phantom_slot(slot)
++        return super().finish_streaming()
++
++    def _single_pass_parse(self, text, token_ids, initial_state=None):
++        # parse() calls the engine finish directly and bypasses
++        # finish_streaming, and the single-pass delta batch suppresses the
++        # deferred-content gate whenever a real tool call produced deltas,
++        # so sweep unsent phantom slots and flush leftover deferred content
++        # into the returned content here.
++        reasoning, content, tool_call_info = super()._single_pass_parse(
++            text, token_ids, initial_state
++        )
++        for slot in self._tool_slots:
++            self._rescue_phantom_slot(slot)
++        leftover = self._deferred_content
++        self._deferred_content = ""
++        if leftover:
++            content = ((content or "") + leftover) or None
++        return reasoning, content, tool_call_info
++
+     def extract_content_ids(self, input_ids: list[int]) -> list[int]:
+         if not self.thinking_enabled:
+             return input_ids
+         return super().extract_content_ids(input_ids)
