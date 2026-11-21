@@ -71,6 +71,7 @@ jobs:
         chmod +x tests/test_recipes.sh tests/test_launch_cluster_image_sync.sh
         chmod +x tests/test_launch_cluster_vllm_pr.sh
         chmod +x tests/test_launch_cluster_earlyoom.sh
+        chmod +x tests/test_launch_cluster_remote_quoting.sh
     
     - name: Test Qwen3-Next AutoRound compatibility mod
       run: python3 tests/test_qwen3_next_autoround_mod.py
@@ -103,6 +104,7 @@ jobs:
         ./tests/test_launch_cluster_image_sync.sh
         ./tests/test_launch_cluster_vllm_pr.sh
         ./tests/test_launch_cluster_earlyoom.sh
+        ./tests/test_launch_cluster_remote_quoting.sh
         python3 tests/test_launch_cluster_networking.py
 
     - name: Test Docker image identity and distribution
