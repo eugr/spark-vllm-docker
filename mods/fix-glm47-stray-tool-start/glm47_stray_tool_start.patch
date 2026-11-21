@@ -1,0 +1,15 @@
+--- a/parser/glm47_moe.py
++++ b/parser/glm47_moe.py
+@@ -187,8 +187,12 @@
+             (ParserState.CONTENT, "TOOL_START"): Transition(
+                 ParserState.TOOL_NAME,
+                 (EventType.TOOL_CALL_START,),
+             ),
++            (ParserState.TOOL_NAME, "TOOL_START"): Transition(
++                ParserState.TOOL_NAME,
++                (EventType.TOOL_CALL_END, EventType.TOOL_CALL_START),
++            ),
+             (ParserState.TOOL_NAME, "TOOL_END"): Transition(
+                 ParserState.CONTENT,
+                 (EventType.TOOL_CALL_END,),
+             ),

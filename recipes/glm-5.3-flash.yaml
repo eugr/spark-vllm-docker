@@ -13,7 +13,8 @@ build_args:
 
 cluster_only: true
 
-mods: []
+mods:
+  - mods/fix-glm47-stray-tool-start
 
 defaults:
   port: 8000

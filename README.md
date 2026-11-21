@@ -2420,6 +2420,10 @@ The repository includes several pre-configured mods in the `mods/` directory:
 
 - **fix-Salyut1-GLM-4.7-NVFP4/**: Fixes the GLM4MoE parser for Salyut1/GLM-4.7-NVFP4 fused QKV quantization.
 - **fix-glm-4.7-flash-AWQ/**: Applies GLM-4.7-Flash-AWQ compatibility and performance fixes.
+- **fix-glm47-stray-tool-start/**: Adds the missing `(TOOL_NAME, "TOOL_START")` recovery
+  transition to the glm47 tool-call parser so a stray tool-call opener inside prose closes
+  the phantom call and a following real tool call still parses, instead of truncating the
+  rest of the message (tracked upstream: vllm-project/vllm#60703).
 - **fix-qwen3.5-chat-template/** and **fix-qwen3.6-chat-template/**: Install fixed chat templates used by the Qwen3.5 and Qwen3.6 recipes.
 - **fix-qwen3.5-autoround/**, **fix-qwen3-next-autoround/**, and **fix-qwen35-tp4-marlin/**: Model-specific Qwen AutoRound and Marlin compatibility fixes.
 - **fix-qwen3-coder-next/**: Qwen3-Coder-Next runtime and performance fixes.
