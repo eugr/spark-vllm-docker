@@ -39,6 +39,15 @@ def _is_cors_preflight(scope: Scope, headers: Headers) -> bool:
     )
 '''
 
+LEGACY_PATH = '''        root_path = scope.get("root_path", "")
+        url_path = scope["path"].removeprefix(root_path)
+'''
+
+ROUTER_PATH = '''        # Use Starlette's own segment-boundary-aware root_path stripping
+        # so the auth guard agrees with the router on the effective path.
+        url_path = get_route_path(scope)
+'''
+
 OLD_CALL = '''    def __call__(self, scope: Scope, receive: Receive, send: Send) -> Awaitable[None]:
         if (
             scope["type"] not in ("http", "websocket")
@@ -132,9 +141,13 @@ def replace_blocks(source: str, replacements: tuple[tuple[str, str], ...]) -> st
 
 
 def patch_authentication(source: str) -> str:
+    old_call, new_call = OLD_CALL, NEW_CALL
+    if ROUTER_PATH in source:
+        old_call = old_call.replace(LEGACY_PATH, ROUTER_PATH)
+        new_call = new_call.replace(LEGACY_PATH, ROUTER_PATH)
     patched = replace_blocks(source, (
         (OLD_GUARD, NEW_GUARD),
-        (OLD_CALL, NEW_CALL),
+        (old_call, new_call),
         (OLD_NOTES, NEW_NOTES),
     ))
     compile(patched, str(AUTH_REL), "exec")

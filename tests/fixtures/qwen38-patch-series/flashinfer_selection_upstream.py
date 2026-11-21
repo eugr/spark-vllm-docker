@@ -1,11 +1,11 @@
 # Copyright (c) 2026 by FlashInfer team.
 # SPDX-License-Identifier: Apache-2.0
-# Upstream excerpts from e65caf5cbb90cbc1a6e90ad6aab1c38ff8132291:
+# Upstream excerpts from 9bd0a68c94687ad920d2de04284370397a073798:
 # flashinfer/autotuner/autotuner.py
 
 class AutoTuner:
     def select(self, measured, min_time, tuning_config, runners, tensors, p,
-               custom_op, inputs, prepared_input_batches=None, kwargs=None):
+               custom_op, inputs, prepared_input_batches=None, kwargs=None, tactic_keys=()):
         runner_id = 0
         # Retain the original nesting depth for the vendored source hunk.
         if True:
@@ -27,9 +27,10 @@ class AutoTuner:
                                 self._tie_tolerance,
                             )
                             _, runner_id, tactic = measured[winner]
-                            # Publish and look up coverage using the prepared runners.
+                            # Publish and look up coverage using the prepared runners'
+                            # hashes, but the pool signatures read before enumeration.
                             profiling_candidates = _ProfilingCandidates.from_runners(
-                                runners, inputs
+                                runners, inputs, tactic_keys
                             )
                             cache_key = self._get_cache_key(
                                 custom_op,

@@ -133,6 +133,13 @@ class Headers(dict):
 
 
 class ApiKeyAuthPatchTests(unittest.TestCase):
+    def test_current_middleware_preserves_starlette_route_path(self):
+        source = AUTH_SOURCE.replace(PATCHER.LEGACY_PATH, PATCHER.ROUTER_PATH)
+        updated = PATCHER.patch_authentication(source)
+        self.assertIn("url_path = get_route_path(scope)", updated)
+        self.assertNotIn("removeprefix", updated)
+        self.assertIn("probe_path not in UNGUARDED_PATHS", updated)
+
     def middleware(self, source):
         tree = ast.parse(PATCHER.patch_authentication(source))
         tree.body = [n for n in tree.body if not isinstance(n, (ast.Import, ast.ImportFrom))]

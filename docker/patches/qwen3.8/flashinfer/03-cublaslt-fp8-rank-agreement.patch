@@ -7,11 +7,11 @@ attributes during distributed autotuning. Keep rank-local descriptors for
 profiling, execution and cache persistence. Preserve candidate ordering and
 use exact descriptor agreement if configuration decoding fails.
 
-Base: flashinfer-ai/flashinfer e65caf5cbb90cbc1a6e90ad6aab1c38ff8132291
+Base: flashinfer-ai/flashinfer 9bd0a68c94687ad920d2de04284370397a073798
 Series predecessor: 02-pr5943.patch
 
 diff --git a/csrc/flashinfer_gemm_binding.cu b/csrc/flashinfer_gemm_binding.cu
-index 7641ebcc679ec63a8ce6f96ba0a19eac964c2904..10ee2ebfe0780307b06ba7a8ee285e5479b22ffe 100644
+index 673af309a1f9..3e466f8bc992 100644
 --- a/csrc/flashinfer_gemm_binding.cu
 +++ b/csrc/flashinfer_gemm_binding.cu
 @@ -14,6 +14,12 @@
@@ -27,7 +27,7 @@ index 7641ebcc679ec63a8ce6f96ba0a19eac964c2904..10ee2ebfe0780307b06ba7a8ee285e54
  #include "tvm_ffi_utils.h"
  
  void bmm_fp8(TensorView A, TensorView B, TensorView D, TensorView A_scale, TensorView B_scale,
-@@ -31,6 +37,41 @@ void CutlassSegmentGEMM(TensorView workspace_buffer, TensorView all_problems, Te
+@@ -32,6 +38,41 @@ void CutlassSegmentGEMM(TensorView workspace_buffer, TensorView all_problems, Te
                          TensorView w_ptr, TensorView y_ptr, TensorView x_ld, TensorView w_ld,
                          TensorView y_ld, TensorView empty_x_data, bool weight_column_major);
  
@@ -70,10 +70,10 @@ index 7641ebcc679ec63a8ce6f96ba0a19eac964c2904..10ee2ebfe0780307b06ba7a8ee285e54
  TVM_FFI_DLL_EXPORT_TYPED_FUNC(bmm_fp8, bmm_fp8);
  TVM_FFI_DLL_EXPORT_TYPED_FUNC(bmm_fp8_get_algos, bmm_fp8_get_algos);
 diff --git a/flashinfer/autotuner/autotuner.py b/flashinfer/autotuner/autotuner.py
-index 55863b689c519fba6a06d87cc68a26475ef6ebd6..15bfb53cd91ac7ce5b42899f0ba33d84172464f1 100644
+index d0528c6cd558..e3d19274f8fc 100644
 --- a/flashinfer/autotuner/autotuner.py
 +++ b/flashinfer/autotuner/autotuner.py
-@@ -882,6 +882,10 @@ class TunableRunner(ABC):
+@@ -884,6 +884,10 @@ class TunableRunner(ABC):
      # Some runners signal retryable discovery failures with an empty list.
      _retry_empty_tactics = False
  
@@ -84,7 +84,7 @@ index 55863b689c519fba6a06d87cc68a26475ef6ebd6..15bfb53cd91ac7ce5b42899f0ba33d84
      @abstractmethod
      def get_valid_tactics(
          self, inputs: list[torch.Tensor], profile: OptimizationProfile
-@@ -1469,6 +1473,9 @@ def _all_ranks_hit_cache(
+@@ -1532,6 +1536,9 @@ def _all_ranks_hit_cache(
          return local_hit
      if local_hit:
          try:
@@ -94,7 +94,7 @@ index 55863b689c519fba6a06d87cc68a26475ef6ebd6..15bfb53cd91ac7ce5b42899f0ba33d84
              # Invalid persisted selections remain cache misses, not fatal plans.
              json.dumps(_tactic_to_json(selection), allow_nan=False)
          except Exception:
-@@ -3448,12 +3455,14 @@ class AutoTuner:
+@@ -3516,12 +3523,14 @@ class AutoTuner:
                          profiling_candidates=profiling_candidates,
                          validation_profile=p,
                      )
@@ -115,7 +115,7 @@ index 55863b689c519fba6a06d87cc68a26475ef6ebd6..15bfb53cd91ac7ce5b42899f0ba33d84
                          if _tune_process_group is not None:
                              self._discard_profile_cache(
                                  custom_op,
-@@ -3540,6 +3549,7 @@ class AutoTuner:
+@@ -3608,6 +3617,7 @@ class AutoTuner:
                              runner_preparation_oom = False
                              runner_error = None
                              valid_tactics = []
@@ -123,7 +123,7 @@ index 55863b689c519fba6a06d87cc68a26475ef6ebd6..15bfb53cd91ac7ce5b42899f0ba33d84
                              retry_tactics = False
                              try:
                                  valid_tactics = r.get_valid_tactics(tensors, p)
-@@ -3557,6 +3567,11 @@ class AutoTuner:
+@@ -3625,6 +3635,11 @@ class AutoTuner:
                                      and -1 not in valid_tactics
                                  ):
                                      valid_tactics = [-1, *valid_tactics]
@@ -135,7 +135,7 @@ index 55863b689c519fba6a06d87cc68a26475ef6ebd6..15bfb53cd91ac7ce5b42899f0ba33d84
                              except (torch.cuda.OutOfMemoryError, MemoryError):
                                  runner_preparation_oom = True
                                  tensors = None
-@@ -3573,7 +3588,7 @@ class AutoTuner:
+@@ -3641,7 +3656,7 @@ class AutoTuner:
                              if _sync_oom_across_tune_group(
                                  runner_preparation_oom,
                                  phase=("candidates", custom_op, _step, r_id),
@@ -144,7 +144,7 @@ index 55863b689c519fba6a06d87cc68a26475ef6ebd6..15bfb53cd91ac7ce5b42899f0ba33d84
                                  error=runner_error,
                              ):
                                  tensors = None
-@@ -3830,9 +3845,14 @@ class AutoTuner:
+@@ -3899,9 +3914,14 @@ class AutoTuner:
                      runner_id, tactic = incomplete_winner
              if _tune_process_group is not None:
                  # Rank-local inputs can reject a winner after profile agreement.
@@ -161,10 +161,10 @@ index 55863b689c519fba6a06d87cc68a26475ef6ebd6..15bfb53cd91ac7ce5b42899f0ba33d84
                  ):
                      return runners[0], -1
              return runners[runner_id], tactic
-@@ -4148,7 +4168,11 @@ class AutoTuner:
+@@ -4223,7 +4243,11 @@ class AutoTuner:
              cached = ranked_cache.get(cache_key)
              if _all_ranks_hit_cache(
-                 cached is not None and cached[0] == policy,
+                 cached is not None and cached[0] == shortlist_identity,
 -                (type(runner).__name__, k, cached[1][:k]) if cached else None,
 +                lambda: (
 +                    type(runner).__name__,
@@ -174,7 +174,7 @@ index 55863b689c519fba6a06d87cc68a26475ef6ebd6..15bfb53cd91ac7ce5b42899f0ba33d84
              ):
                  assert cached is not None
                  return list(cached[1][:k])
-@@ -4201,9 +4225,14 @@ class AutoTuner:
+@@ -4283,9 +4307,14 @@ class AutoTuner:
              runner_preparation_oom = False
              runner_error = None
              valid_tactics = []
@@ -189,7 +189,7 @@ index 55863b689c519fba6a06d87cc68a26475ef6ebd6..15bfb53cd91ac7ce5b42899f0ba33d84
              except (torch.cuda.OutOfMemoryError, MemoryError):
                  if _tune_process_group is None:
                      raise
-@@ -4220,7 +4249,7 @@ class AutoTuner:
+@@ -4302,7 +4331,7 @@ class AutoTuner:
              if _sync_oom_across_tune_group(
                  runner_preparation_oom,
                  phase=("ranking_candidates", custom_op),
@@ -199,10 +199,10 @@ index 55863b689c519fba6a06d87cc68a26475ef6ebd6..15bfb53cd91ac7ce5b42899f0ba33d84
              ):
                  tensors = None
 diff --git a/flashinfer/gemm/gemm_base.py b/flashinfer/gemm/gemm_base.py
-index f73ce712a1ca1fff4bc2aa04c3382ae6a7fd5bf6..17f058d4d3af3ca843b206937c66b49942997297 100644
+index a0b15c3d802d..ef8feb33abbd 100644
 --- a/flashinfer/gemm/gemm_base.py
 +++ b/flashinfer/gemm/gemm_base.py
-@@ -358,6 +358,20 @@ def get_gemm_module():
+@@ -385,6 +385,20 @@ def get_gemm_module():
              def validate_tactic(self, inputs: List[torch.Tensor], tactic) -> bool:
                  return tactic == -1 or _is_cublaslt_algo_tactic(tactic)
  
@@ -224,7 +224,7 @@ index f73ce712a1ca1fff4bc2aa04c3382ae6a7fd5bf6..17f058d4d3af3ca843b206937c66b499
                  # Enumerate at the bucketed M that keys the tuned tactic, so the
                  # candidates are the same for every M of the bucket.
 diff --git a/tests/autotuner/test_autotuner_cublaslt_tactics.py b/tests/autotuner/test_autotuner_cublaslt_tactics.py
-index 5793ead614b0186e9c116dce4b2103b93d400ff5..4912a41ef7b0c7db9915a6b736377ab3803aa8a3 100644
+index 5793ead614b0..4912a41ef7b0 100644
 --- a/tests/autotuner/test_autotuner_cublaslt_tactics.py
 +++ b/tests/autotuner/test_autotuner_cublaslt_tactics.py
 @@ -403,6 +403,40 @@ def _runner_and_inputs(backend, m):
@@ -269,7 +269,7 @@ index 5793ead614b0186e9c116dce4b2103b93d400ff5..4912a41ef7b0c7db9915a6b736377ab3
  def test_invalid_descriptor_runs_heuristic_default(
      backend, descriptor_runs, monkeypatch
 diff --git a/tests/autotuner/test_autotuner_distributed_phases.py b/tests/autotuner/test_autotuner_distributed_phases.py
-index 896462328b680ce1723e8492e1cd1ac3198ce6a9..369615323663989d0069dbdf0e0835ef387ec41b 100644
+index 896462328b68..369615323663 100644
 --- a/tests/autotuner/test_autotuner_distributed_phases.py
 +++ b/tests/autotuner/test_autotuner_distributed_phases.py
 @@ -40,9 +40,15 @@ class Inner(TunableRunner):

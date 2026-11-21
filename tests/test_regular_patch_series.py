@@ -803,6 +803,25 @@ class PatchSeriesTests(unittest.TestCase):
             batch.num_draft_tokens_per_req = counts
             self.assertEqual(runner._get_num_drafted_and_verified(batch), (None, None))
 
+    def test_shortlist_hit_requires_matching_policy_and_pool_and_compares_group_keys(self):
+        _, updated = self.apply_upstream_excerpt(
+            "03-cublaslt-fp8-rank-agreement.patch", "flashinfer/autotuner/autotuner.py",
+            "flashinfer_shortlist_upstream.py", ("== shortlist_identity",),
+            project="flashinfer",
+        )
+        agreement = Mock(side_effect=lambda hit, key: hit and key()[2] == ["shared"])
+        namespace = {"_all_ranks_hit_cache": agreement}
+        exec(updated, namespace)
+        tuner, runner = Mock(), Mock()
+        tuner._profiling_policy.return_value = "policy"
+        tuner._ranked_cache.return_value = {"cache": (("policy", "pool"), ["local"])}
+        runner.get_tuning_group_key.return_value = "shared"
+        lookup = namespace["lookup"]
+        self.assertIsNone(lookup(tuner, runner, [], 1, None, "changed pool", "cache"))
+        runner.get_tuning_group_key.assert_not_called()
+        self.assertEqual(lookup(tuner, runner, [], 1, None, "pool", "cache"), ["local"])
+        runner.get_tuning_group_key.assert_called_once_with("local", [])
+
     def test_flashinfer_margin_preserves_tie_confirmation_and_selection_record(self):
         _, updated = self.apply_upstream_excerpt(
             "02-pr5943.patch", "flashinfer/autotuner/autotuner.py",

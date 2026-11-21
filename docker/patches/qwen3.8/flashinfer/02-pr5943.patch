@@ -5,7 +5,7 @@ Upstream-PR: https://github.com/flashinfer-ai/flashinfer/pull/5943
 Upstream-Commit: 15c5c8d21388c118558c8370299204aa4b110ced
 Integration-Base: 431c9687f3bb9a048e194c74a178d7cfb02b1585
 Autotuner-Integration-Base: b1cc4f35a5e30bdf378ccb5f6c398ce154375774
-Refresh-Base: e65caf5cbb90cbc1a6e90ad6aab1c38ff8132291
+Refresh-Base: 9bd0a68c94687ad920d2de04284370397a073798
 
 Preserve upstream cold-chain and individual timing, dataclass overrides,
 and SM107 low-M GEMM dispatch. Preserve collective CUPTI fallback and
@@ -16,7 +16,7 @@ and benchmarks. Keep SM12x on its own runner before SM100 experimental dispatch,
 and preserve CuTe DSL tuning when auto selection includes several backends.
 
 diff --git a/benchmarks/routines/flashinfer_benchmark_utils.py b/benchmarks/routines/flashinfer_benchmark_utils.py
-index 3b080c3791b359784ecb2c0cbf56cc2ccd1903f3..31691511ac9eb2a8077c3d99e515f78b4e52e667 100644
+index 3b080c3791b3..31691511ac9e 100644
 --- a/benchmarks/routines/flashinfer_benchmark_utils.py
 +++ b/benchmarks/routines/flashinfer_benchmark_utils.py
 @@ -648,8 +648,8 @@ routine_cc_to_supported_backends = {
@@ -31,7 +31,7 @@ index 3b080c3791b359784ecb2c0cbf56cc2ccd1903f3..31691511ac9eb2a8077c3d99e515f78b
      "tinygemm_bf16": {
          "7.5": [],
 diff --git a/benchmarks/routines/gemm.py b/benchmarks/routines/gemm.py
-index 56c44b59cf42a88f02ab9731920d3e956703c02c..6d0358de91081cb7b0c9dc96273992a8ce604c60 100644
+index 56c44b59cf42..6d0358de9108 100644
 --- a/benchmarks/routines/gemm.py
 +++ b/benchmarks/routines/gemm.py
 @@ -2038,6 +2038,7 @@ def testMmMxfp8(args):
@@ -41,7 +41,7 @@ index 56c44b59cf42a88f02ab9731920d3e956703c02c..6d0358de91081cb7b0c9dc96273992a8
 +        "b12x",
      ]
      res = []
-
+ 
 @@ -2118,6 +2119,7 @@ def testMmMxfp8(args):
              "cudnn",
              "auto",
@@ -51,10 +51,10 @@ index 56c44b59cf42a88f02ab9731920d3e956703c02c..6d0358de91081cb7b0c9dc96273992a8
          input_mxfp8, mat2_mxfp8, input_scale, mat2_scale = inputs
          if backend == "batch_invariant":
 diff --git a/flashinfer/autotuner/autotuner.py b/flashinfer/autotuner/autotuner.py
-index 5a53231bb2bb1e0a88b18233b47ff81eccec1c9e..55863b689c519fba6a06d87cc68a26475ef6ebd6 100644
+index 460462640a6d..d0528c6cd558 100644
 --- a/flashinfer/autotuner/autotuner.py
 +++ b/flashinfer/autotuner/autotuner.py
-@@ -607,6 +607,16 @@ class TuningConfig:
+@@ -609,6 +609,16 @@ class TuningConfig:
              Cold-L2 profiling uses a separate measurement path. This
              choice is recorded as tuning provenance because it can change the
              winner; ordinary lookup can still consume that winner.
@@ -69,18 +69,18 @@ index 5a53231bb2bb1e0a88b18233b47ff81eccec1c9e..55863b689c519fba6a06d87cc68a2647
 +            (by convention its untuned default) unless another candidate is
 +            faster by more than this fraction. ``0.0`` selects the minimum.
      """
-
+ 
      dynamic_tensor_specs: tuple[DynamicTensorSpec, ...] = ()
-@@ -628,6 +638,8 @@ class TuningConfig:
+@@ -630,6 +640,8 @@ class TuningConfig:
      # (e.g. token_selected_experts in MoE workloads).
      inputs_pre_hook: Callable | None = None
      use_cuda_graph_individual_timing: bool = False
 +    timer: str | None = None
 +    first_tactic_margin: float = 0.0
-
+ 
      @property
      def uses_cold_chain(self) -> bool:
-@@ -3710,6 +3722,20 @@ class AutoTuner:
+@@ -3778,6 +3790,20 @@ class AutoTuner:
                                  ),
                                  self._tie_tolerance,
                              )
@@ -99,9 +99,9 @@ index 5a53231bb2bb1e0a88b18233b47ff81eccec1c9e..55863b689c519fba6a06d87cc68a2647
 +                                ):
 +                                    winner = first_choice
                              _, runner_id, tactic = measured[winner]
-                             # Publish and look up coverage using the prepared runners.
-                             profiling_candidates = _ProfilingCandidates.from_runners(
-@@ -4583,9 +4609,16 @@ class AutoTuner:
+                             # Publish and look up coverage using the prepared runners'
+                             # hashes, but the pool signatures read before enumeration.
+@@ -4665,9 +4691,16 @@ class AutoTuner:
          # fallback).
          profile_exc: Optional[BaseException] = None
          try:
@@ -121,8 +121,8 @@ index 5a53231bb2bb1e0a88b18233b47ff81eccec1c9e..55863b689c519fba6a06d87cc68a2647
              use_cupti = False
              cupti_error = None
              if cupti_requested:
-@@ -4836,7 +4869,7 @@ class AutoTuner:
-
+@@ -4918,7 +4951,7 @@ class AutoTuner:
+ 
              spans_ms = _cupti_measure_spans(
                  run_iteration,
 -                self.repeat,
@@ -131,13 +131,13 @@ index 5a53231bb2bb1e0a88b18233b47ff81eccec1c9e..55863b689c519fba6a06d87cc68a2647
                  check_ready=check_ready,
                  prepare=prepare,
 diff --git a/flashinfer/gemm/gemm_base.py b/flashinfer/gemm/gemm_base.py
-index db011dc5aa949665e5670d30228ca0528626bad2..f73ce712a1ca1fff4bc2aa04c3382ae6a7fd5bf6 100644
+index 1583c7bf76a6..a0b15c3d802d 100644
 --- a/flashinfer/gemm/gemm_base.py
 +++ b/flashinfer/gemm/gemm_base.py
-@@ -6992,12 +6992,14 @@ def _check_mm_mxfp8_problem_size(
+@@ -7128,12 +7128,14 @@ def _check_mm_mxfp8_problem_size(
              f"K dimension mismatch in mm_mxfp8. got {a.shape[1]=}, {b.shape[0]=}"
          )
-
+ 
 -    # The output may contain NaN/Inf if the dimensions are too small
 -    min_n = 128
 +    # The output may contain NaN/Inf if the dimensions are too small. The SM12x
@@ -151,11 +151,11 @@ index db011dc5aa949665e5670d30228ca0528626bad2..f73ce712a1ca1fff4bc2aa04c3382ae6
 +            f"mm_mxfp8 requires n >= {min_n} and k >= {min_k}. "
              f"got m={a.shape[0]}, n={b.shape[1]}, k={a.shape[1]}."
          )
-
-@@ -7149,18 +7151,31 @@ def _trtllm_gemm_mxfp8_requirement(
+ 
+@@ -7285,18 +7287,31 @@ def _trtllm_gemm_mxfp8_requirement(
      return True
-
-
+ 
+ 
 -@supported_compute_capability([100, 103, 107])
 +@supported_compute_capability([100, 103, 107, 120, 121])
  def _cute_dsl_gemm_mxfp8_requirement(
@@ -191,7 +191,7 @@ index db011dc5aa949665e5670d30228ca0528626bad2..f73ce712a1ca1fff4bc2aa04c3382ae6
      # CuTe DSL MXFP8 path currently expects swizzled 1D block scales
      # in F8_128x4 layout for both A and B.
      if a_descale.ndim != 1 or b_descale.ndim != 1:
-@@ -7398,6 +7413,11 @@ def _cute_dsl_gemm_mxfp8_runner(
+@@ -7534,6 +7549,11 @@ def _cute_dsl_gemm_mxfp8_runner(
      low_m_only: bool = False,
  ):
      """``low_m_only``: only the M <= 32 narrow-tile / split-K tactics (SM107)."""
@@ -201,9 +201,9 @@ index db011dc5aa949665e5670d30228ca0528626bad2..f73ce712a1ca1fff4bc2aa04c3382ae6
 +        return get_runner()
 +
      import cutlass
-
+ 
      from .kernels.dense_blockscaled_gemm_sm100 import (
-@@ -8203,6 +8223,9 @@ def _cute_dsl_mxfp8_runners(
+@@ -8339,6 +8359,9 @@ def _cute_dsl_mxfp8_runners(
      inputs: List[torch.Tensor],
  ) -> List[TunableRunner]:
      """Runners of ``mm_mxfp8(backend="cute-dsl")``; ``[0]`` is the untuned default."""
@@ -211,19 +211,19 @@ index db011dc5aa949665e5670d30228ca0528626bad2..f73ce712a1ca1fff4bc2aa04c3382ae6
 +        return [_cute_dsl_gemm_mxfp8_runner(sm_major, sm_minor, enable_pdl, out_dtype)]
 +
      from ..cute_dsl.availability import is_cute_dsl_experimental_available
-
+ 
      # Older DSLs lack cutlass.experimental; only the block-scaled runner remains.
-@@ -8506,7 +8529,8 @@ def mm_mxfp8(
-
+@@ -8642,7 +8665,8 @@ def mm_mxfp8(
+ 
      out: Optional[torch.Tensor]
          Out tensor, shape (m, n), bf16 or fp16. If provided, the result is written
 -        into it (supported by the CUTLASS, cuDNN, b12x, and cutedsl_low_latency backends).
 +        into it (supported by the CUTLASS, cuDNN, b12x, cutedsl_low_latency, and SM12x
 +        cute-dsl backends).
          Defaults to ``None``.
-
+ 
      out_dtype: torch.dtype
-@@ -8527,7 +8551,17 @@ def mm_mxfp8(
+@@ -8663,7 +8687,17 @@ def mm_mxfp8(
            small-M decode tiles. It requires CUDA 13+, nvidia-cutlass-dsl >=
            4.6.0, 1D swizzled 128x4 scales, and K divisible by 128.
          - The ``"cute-dsl"`` backend currently requires swizzled 1D scales
@@ -242,10 +242,10 @@ index db011dc5aa949665e5670d30228ca0528626bad2..f73ce712a1ca1fff4bc2aa04c3382ae6
          - The ``"cutedsl_low_latency"`` backend requires SM100/SM103, ``M <= 8``,
            ``K % 128 == 0``, and swizzled 1D scales in the 128x4 layout.
          - The ``"trtllm"`` requires b to be quantized with 128x4 swizzle layout and shuffled.
-@@ -8659,11 +8693,12 @@ def mm_mxfp8(
-
+@@ -8795,11 +8829,12 @@ def mm_mxfp8(
+ 
      tuner = AutoTuner.get()
-
+ 
 -    tuning_config = (
 -        _MM_MXFP8_CUTE_DSL_TUNING_CONFIG
 -        if "cute-dsl" in backends or backends == ["cutedsl_low_latency"]
@@ -257,13 +257,13 @@ index db011dc5aa949665e5670d30228ca0528626bad2..f73ce712a1ca1fff4bc2aa04c3382ae6
 +        tuning_config = _MM_MXFP8_CUTE_DSL_TUNING_CONFIG
 +    else:
 +        tuning_config = _MM_MXFP8_TUNING_CONFIG
-
+ 
      runner, tactic = tuner.choose_one(
          custom_op="mxfp8_gemm",
-@@ -10778,6 +10813,17 @@ _BMM_MXFP8_CUTE_DSL_TUNING_CONFIG = TuningConfig(
+@@ -10914,6 +10949,17 @@ _BMM_MXFP8_CUTE_DSL_TUNING_CONFIG = TuningConfig(
      use_cold_l2_cache=True,
  )
-
+ 
 +# The SM12x cute-dsl candidates include kernels of a few microseconds, which a
 +# CUDA-event window around one graph replay cannot rank. Time them by CUPTI
 +# kernel span instead, and keep the runner's feature default (listed first)
@@ -275,19 +275,19 @@ index db011dc5aa949665e5670d30228ca0528626bad2..f73ce712a1ca1fff4bc2aa04c3382ae6
 +    first_tactic_margin=0.03,
 +)
 +
-
+ 
  @backend_requirement(
      {
 diff --git a/flashinfer/gemm/kernels/sm12x_mxfp8/__init__.py b/flashinfer/gemm/kernels/sm12x_mxfp8/__init__.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..624a232a6dbef4ee33897a83f4af7e961c9b1f29
+index 000000000000..624a232a6dbe
 --- /dev/null
 +++ b/flashinfer/gemm/kernels/sm12x_mxfp8/__init__.py
 @@ -0,0 +1 @@
 +"""SM120 / SM121 MXFP8 GEMM kernels behind ``mm_mxfp8(..., backend="cute-dsl")``."""
 diff --git a/flashinfer/gemm/kernels/sm12x_mxfp8/common.py b/flashinfer/gemm/kernels/sm12x_mxfp8/common.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..0a320a0361e06b5e156ce17d6907186b2a94f0c8
+index 000000000000..0a320a0361e0
 --- /dev/null
 +++ b/flashinfer/gemm/kernels/sm12x_mxfp8/common.py
 @@ -0,0 +1,33 @@
@@ -326,7 +326,7 @@ index 0000000000000000000000000000000000000000..0a320a0361e06b5e156ce17d6907186b
 +    return ceil_div(rows, 128) * 128 * ceil_div(k // 32, 4) * 4
 diff --git a/flashinfer/gemm/kernels/sm12x_mxfp8/compile_pool.py b/flashinfer/gemm/kernels/sm12x_mxfp8/compile_pool.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..383c14c0dffb5ca5620011e7313c839fcdb1f618
+index 000000000000..383c14c0dffb
 --- /dev/null
 +++ b/flashinfer/gemm/kernels/sm12x_mxfp8/compile_pool.py
 @@ -0,0 +1,185 @@
@@ -517,7 +517,7 @@ index 0000000000000000000000000000000000000000..383c14c0dffb5ca5620011e7313c839f
 +    _main()
 diff --git a/flashinfer/gemm/kernels/sm12x_mxfp8/gemv.py b/flashinfer/gemm/kernels/sm12x_mxfp8/gemv.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..7f958efcb8bba680a656bf3eed6860f57360da55
+index 000000000000..7f958efcb8bb
 --- /dev/null
 +++ b/flashinfer/gemm/kernels/sm12x_mxfp8/gemv.py
 @@ -0,0 +1,352 @@
@@ -875,7 +875,7 @@ index 0000000000000000000000000000000000000000..7f958efcb8bba680a656bf3eed6860f5
 +        )
 diff --git a/flashinfer/gemm/kernels/sm12x_mxfp8/persistent.py b/flashinfer/gemm/kernels/sm12x_mxfp8/persistent.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..3f7aaabde5e8b0adb58afb4171cdef050b40b25d
+index 000000000000..3f7aaabde5e8
 --- /dev/null
 +++ b/flashinfer/gemm/kernels/sm12x_mxfp8/persistent.py
 @@ -0,0 +1,960 @@
@@ -1841,7 +1841,7 @@ index 0000000000000000000000000000000000000000..3f7aaabde5e8b0adb58afb4171cdef05
 +                                ptx.stg_b16(addr + 2, (p >> 16) & 0xFFFF)
 diff --git a/flashinfer/gemm/kernels/sm12x_mxfp8/pingpong.py b/flashinfer/gemm/kernels/sm12x_mxfp8/pingpong.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..f72a26fff9dd5f9a8ea2a89f0504a991a45907bd
+index 000000000000..f72a26fff9dd
 --- /dev/null
 +++ b/flashinfer/gemm/kernels/sm12x_mxfp8/pingpong.py
 @@ -0,0 +1,982 @@
@@ -2829,7 +2829,7 @@ index 0000000000000000000000000000000000000000..f72a26fff9dd5f9a8ea2a89f0504a991
 +            self.epilog_sync_barrier_wg1.arrive_and_wait()
 diff --git a/flashinfer/gemm/kernels/sm12x_mxfp8/policy.py b/flashinfer/gemm/kernels/sm12x_mxfp8/policy.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..e5cc5d6eb775d1fba11c12e41fea69dcc06a943e
+index 000000000000..e5cc5d6eb775
 --- /dev/null
 +++ b/flashinfer/gemm/kernels/sm12x_mxfp8/policy.py
 @@ -0,0 +1,405 @@
@@ -3240,7 +3240,7 @@ index 0000000000000000000000000000000000000000..e5cc5d6eb775d1fba11c12e41fea69dc
 +    return True
 diff --git a/flashinfer/gemm/kernels/sm12x_mxfp8/ptx.py b/flashinfer/gemm/kernels/sm12x_mxfp8/ptx.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..7c7436e8263ae0faf54550021713fef228eda9a6
+index 000000000000..7c7436e8263a
 --- /dev/null
 +++ b/flashinfer/gemm/kernels/sm12x_mxfp8/ptx.py
 @@ -0,0 +1,485 @@
@@ -3731,7 +3731,7 @@ index 0000000000000000000000000000000000000000..7c7436e8263ae0faf54550021713fef2
 +    )
 diff --git a/flashinfer/gemm/kernels/sm12x_mxfp8/runner.py b/flashinfer/gemm/kernels/sm12x_mxfp8/runner.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..15cd1c85cc23c36074efb0b77bcd623e6f05f253
+index 000000000000..15cd1c85cc23
 --- /dev/null
 +++ b/flashinfer/gemm/kernels/sm12x_mxfp8/runner.py
 @@ -0,0 +1,386 @@
@@ -4123,7 +4123,7 @@ index 0000000000000000000000000000000000000000..15cd1c85cc23c36074efb0b77bcd623e
 +    return Sm12xMxfp8GemmRunner()
 diff --git a/flashinfer/gemm/kernels/sm12x_mxfp8/skinny.py b/flashinfer/gemm/kernels/sm12x_mxfp8/skinny.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..54c659f6d22d17066876fa2631e4f755c5ec001d
+index 000000000000..54c659f6d22d
 --- /dev/null
 +++ b/flashinfer/gemm/kernels/sm12x_mxfp8/skinny.py
 @@ -0,0 +1,868 @@
@@ -4996,13 +4996,13 @@ index 0000000000000000000000000000000000000000..54c659f6d22d17066876fa2631e4f755
 +            stream=stream,
 +        )
 diff --git a/tests/autotuner/test_autotuner_core.py b/tests/autotuner/test_autotuner_core.py
-index 0c9f7aeb0d8462f7082ee1c4c80ec45bb385d973..062493c7bb044322153f47d8ad9be77cd3c7291d 100644
+index 1217a0d03d35..4ea80279e1c8 100644
 --- a/tests/autotuner/test_autotuner_core.py
 +++ b/tests/autotuner/test_autotuner_core.py
-@@ -707,6 +707,49 @@ def test_choose_one_retries_incomplete_runner_comparison(monkeypatch, failure):
+@@ -706,6 +706,49 @@ def test_choose_one_retries_incomplete_runner_comparison(monkeypatch, failure):
          assert profiled == []
-
-
+ 
+ 
 +@pytest.mark.parametrize(
 +    "times,expected",
 +    [
@@ -5049,26 +5049,26 @@ index 0c9f7aeb0d8462f7082ee1c4c80ec45bb385d973..062493c7bb044322153f47d8ad9be77c
  @pytest.mark.parametrize("phase", ("forward", "precompile"))
  def test_choose_one_recovers_from_memory_error_during_preparation(monkeypatch, phase):
      class PreparationMemoryErrorRunner(DummyRunner):
-@@ -1772,6 +1815,8 @@ def test_tuning_overrides_preserve_tensor_initializers():
+@@ -1771,6 +1814,8 @@ def test_tuning_overrides_preserve_tensor_initializers():
          ),
          tensor_initializers=((0, initializer),),
          profiling_repeat=100,
 +        timer="cupti",
 +        first_tactic_margin=0.03,
      )
-
+ 
      with autotune(tune_mode=False, tuning_buckets=(100, 200)):
-@@ -1779,6 +1824,8 @@ def test_tuning_overrides_preserve_tensor_initializers():
-
+@@ -1778,6 +1823,8 @@ def test_tuning_overrides_preserve_tensor_initializers():
+ 
      assert overridden.tensor_initializers == config.tensor_initializers
      assert overridden.profiling_repeat == 100
 +    assert overridden.timer == "cupti"
 +    assert overridden.first_tactic_margin == 0.03
-
-
+ 
+ 
  def test_tuning_config_profiling_repeat_override(monkeypatch):
 diff --git a/tests/gemm/test_mm_mxfp8.py b/tests/gemm/test_mm_mxfp8.py
-index 0d29cebb311902c8b77c7abaa9cc8d4fc72b88ed..a2e1fd9d31495cec4967b4051f6bb355ff9458d7 100644
+index 0d29cebb3119..a2e1fd9d3149 100644
 --- a/tests/gemm/test_mm_mxfp8.py
 +++ b/tests/gemm/test_mm_mxfp8.py
 @@ -266,6 +266,8 @@ def test_mm_mxfp8_cute_dsl_narrow_tiles_only_within_32_tokens():
@@ -5082,7 +5082,7 @@ index 0d29cebb311902c8b77c7abaa9cc8d4fc72b88ed..a2e1fd9d31495cec4967b4051f6bb355
          assert narrow == [], (m, n, narrow)
 diff --git a/tests/gemm/test_mm_mxfp8_sm12x_cute.py b/tests/gemm/test_mm_mxfp8_sm12x_cute.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..89db505027e5d7e49a0b060a01f20eb3aa5bd344
+index 000000000000..89db505027e5
 --- /dev/null
 +++ b/tests/gemm/test_mm_mxfp8_sm12x_cute.py
 @@ -0,0 +1,378 @@
