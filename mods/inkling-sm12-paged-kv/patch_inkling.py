@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import ast
 import sys
+import textwrap
 from pathlib import Path
 
 MARKER = "# spark-vllm mod: inkling-sm12-paged-kv v1"
@@ -93,6 +94,11 @@ MODDED_DISPATCH = """    else:
         }
 """
 
+# vLLM newer than 0.27.1 (vllm-project/vllm#49315) moved this code into
+# InklingFA4RelAttentionKernel.kernel, one indentation level deeper.
+CLASS_UPSTREAM_DISPATCH = textwrap.indent(UPSTREAM_DISPATCH, "    ")
+CLASS_MODDED_DISPATCH = textwrap.indent(MODDED_DISPATCH, "    ")
+
 
 def replace_once(text: str, old: str, new: str, label: str) -> str:
     count = text.count(old)
@@ -110,11 +116,24 @@ def validate_shape(text: str) -> None:
         "_use_sheared_bias",
         "_get_score_mod",
         "inkling_fa4_num_splits",
-        "inkling_fa4_rel_attention",
     }
     missing = sorted(required - functions)
     if missing:
         raise ValueError(f"unexpected Inkling FA4 module; missing {', '.join(missing)}")
+    if "inkling_fa4_rel_attention" in functions:
+        return
+    # vLLM newer than 0.27.1: the entry point is a method of the kernel class.
+    for node in tree.body:
+        if isinstance(node, ast.ClassDef) and node.name == "InklingFA4RelAttentionKernel":
+            methods = {
+                item.name for item in node.body if isinstance(item, ast.FunctionDef)
+            }
+            if "kernel" in methods:
+                return
+    raise ValueError(
+        "unexpected Inkling FA4 module; missing inkling_fa4_rel_attention "
+        "and InklingFA4RelAttentionKernel.kernel"
+    )
 
 
 def patched_text(text: str) -> str:
@@ -134,6 +153,13 @@ def patched_text(text: str) -> str:
     if UPSTREAM_DISPATCH in text:
         text = replace_once(
             text, UPSTREAM_DISPATCH, MODDED_DISPATCH, "standard FA4 dispatch block"
+        )
+    elif CLASS_UPSTREAM_DISPATCH in text:
+        text = replace_once(
+            text,
+            CLASS_UPSTREAM_DISPATCH,
+            CLASS_MODDED_DISPATCH,
+            "kernel-class FA4 dispatch block",
         )
     elif LEGACY_UPSTREAM_DISPATCH in text:
         text = replace_once(
