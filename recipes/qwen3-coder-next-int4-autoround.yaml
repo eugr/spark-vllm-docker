@@ -14,10 +14,6 @@ solo_only: true
 # Container image to use
 container: vllm-node
 
-# Mod required to fix autoround weight loading issues
-mods:
-  - mods/fix-qwen3-next-autoround
-
 # Default settings (can be overridden via CLI)
 defaults:
   port: 8000
