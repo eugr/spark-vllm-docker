@@ -847,8 +847,8 @@ RUN --mount=type=bind,from=vllm_wheels,target=/workspace/vllm-wheels \
 # Setup environment for runtime
 ARG TORCH_CUDA_ARCH_LIST="12.1a"
 ENV TORCH_CUDA_ARCH_LIST=${TORCH_CUDA_ARCH_LIST}
-ARG FLASHINFER_CUDA_ARCH_LIST="12.1a"
-ENV FLASHINFER_CUDA_ARCH_LIST=${FLASHINFER_CUDA_ARCH_LIST}
+# FlashInfer selects its installed provider from the GPUs visible to the server.
+# The build-stage architecture list also includes GPUs on other runners.
 ENV TRITON_PTXAS_PATH=/usr/local/cuda/bin/ptxas
 ENV TIKTOKEN_ENCODINGS_BASE=$VLLM_BASE_DIR/tiktoken_encodings
 ENV PATH=$VLLM_BASE_DIR:$PATH

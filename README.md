@@ -685,6 +685,8 @@ For a multi-target vLLM source build, the builder resolves each kernel's support
 architectures separately for each requested GPU and combines the resulting compiler
 targets. With `--gpu-arch '10.3a 12.0a 12.1a'`, this preserves the native Spark
 and RTX Pro variants of SM12x CUTLASS kernels alongside Station's SM10x kernels.
+FlashInfer also builds providers for the requested targets. At inference time it
+detects the GPUs visible to the process and selects the matching providers.
 
 The source-build KV-cache cleanup is now embedded directly in the Dockerfile, while `mods/kv-cache-prealloc-cleanup` keeps only the runtime policy tweaks.
 
