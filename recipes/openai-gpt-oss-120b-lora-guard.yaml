@@ -1,0 +1,61 @@
+# Recipe: OpenAI GPT-OSS 120B
+# OpenAI's open source 120B MoE model with MXFP4 quantization support
+
+recipe_version: "1"
+name: OpenAI GPT-OSS 120B
+description: vLLM serving openai/gpt-oss-120b with MXFP4 quantization, FlashInfer and gpt-oss-120b-lora-guard
+
+# HuggingFace model to download (optional, for --download-model)
+model: openai/gpt-oss-120b
+
+# Container image to use
+container: vllm-node-mxfp4
+
+# Build arguments for build-and-copy.sh
+build_args:
+  - --exp-mxfp4
+
+# Runtime patch to skip unsupported fused-MoE LoRA injection on MXFP4 CUTLASS.
+mods:
+  - mods/fix-gpt-oss-mxfp4-lora-hotpath
+
+# Provide adapter mount externally at launch time, e.g.:
+# VLLM_SPARK_EXTRA_DOCKER_ARGS="-v /path/to/lora_adapter_delta:/lora-adapters/lora_adapter_delta"
+
+# Default settings (can be overridden via CLI)
+defaults:
+  port: 8000
+  host: 0.0.0.0
+  tensor_parallel: 1
+  gpu_memory_utilization: 0.50
+  max_num_batched_tokens: 8192
+
+# Environment variables to set in the container
+env:
+  VLLM_USE_FLASHINFER_MOE_MXFP4_MXFP8: "1"
+
+# The vLLM serve command template
+# Uses MXFP4 quantization for memory efficiency.
+# This recipe is tuned for attention-path LoRA on single-GB10 hotpath.
+command: |
+  vllm serve openai/gpt-oss-120b \
+      --tool-call-parser openai \
+      --reasoning-parser openai_gptoss \
+      --enable-auto-tool-choice \
+      --tensor-parallel-size {tensor_parallel} \
+      --no-enable-expert-parallel \
+      --gpu-memory-utilization {gpu_memory_utilization} \
+      --enable-prefix-caching \
+      --load-format fastsafetensors \
+      --quantization mxfp4 \
+      --mxfp4-backend CUTLASS \
+      --mxfp4-layers qkv,o,lm_head \
+      --attention-backend FLASHINFER \
+      --kv-cache-dtype fp8 \
+      --max-num-batched-tokens {max_num_batched_tokens} \
+      --enable-lora \
+      --max-loras 1 \
+      --max-lora-rank 64 \
+      --lora-modules gpt-oss-120b-lora-guard=/lora-adapters/lora_adapter_delta \
+      --host {host} \
+      --port {port}
