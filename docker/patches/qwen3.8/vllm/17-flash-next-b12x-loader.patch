@@ -753,10 +753,10 @@ index 680e587285c8be9b2e27e1672d33cb0bc2fabfd6..049f0eac249afc6d5495f69dcf5c867d
              # move indexing boundaries
              boundary += shard_size
 diff --git a/vllm/model_executor/model_loader/__init__.py b/vllm/model_executor/model_loader/__init__.py
-index 226caebe1cd49fac95d9f66ec14e4c7aab71f9c8..fc7fb868d84365c7b8231efbf393012ab548a520 100644
+index ef97147378e34e780f4361c47474a355c53a973e..7125914eba2b7320aeb4ed7dce6ca8f18d5ec7c8 100644
 --- a/vllm/model_executor/model_loader/__init__.py
 +++ b/vllm/model_executor/model_loader/__init__.py
-@@ -32,6 +32,7 @@ logger = init_logger(__name__)
+@@ -38,6 +38,7 @@ logger = init_logger(__name__)
  # if a new load format is added here
  LoadFormats = Literal[
      "auto",
@@ -764,9 +764,9 @@ index 226caebe1cd49fac95d9f66ec14e4c7aab71f9c8..fc7fb868d84365c7b8231efbf393012a
      "hf",
      "dummy",
      "fastsafetensors",
-@@ -123,6 +124,10 @@ def register_model_loader(load_format: str):
- def get_model_loader(load_config: LoadConfig) -> BaseModelLoader:
-     """Get a model loader based on the load format."""
+@@ -131,6 +132,10 @@ def register_model_loader(load_format: str):
+ def get_model_loader_cls(load_config: LoadConfig) -> type[BaseModelLoader]:
+     """Get the model loader class for the load format."""
      load_format = load_config.load_format
 +    if load_format == "b12x" and load_format not in _LOAD_FORMAT_TO_MODEL_LOADER:
 +        from vllm.model_executor.model_loader.b12x_loader import B12xModelLoader
@@ -774,7 +774,7 @@ index 226caebe1cd49fac95d9f66ec14e4c7aab71f9c8..fc7fb868d84365c7b8231efbf393012a
 +        _LOAD_FORMAT_TO_MODEL_LOADER[load_format] = B12xModelLoader
      if load_format not in _LOAD_FORMAT_TO_MODEL_LOADER:
          raise ValueError(f"Load format `{load_format}` is not supported")
-     return _LOAD_FORMAT_TO_MODEL_LOADER[load_format](load_config)
+     return _LOAD_FORMAT_TO_MODEL_LOADER[load_format]
 diff --git a/vllm/model_executor/model_loader/b12x_loader.py b/vllm/model_executor/model_loader/b12x_loader.py
 new file mode 100644
 index 0000000000000000000000000000000000000000..6d256786f34b3f0384a5cf98ed56409ea5de9762

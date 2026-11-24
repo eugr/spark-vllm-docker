@@ -1221,11 +1221,10 @@ class PatchSeriesTests(unittest.TestCase):
         # This file is wholly added by patch 03; execute its production class
         # with CPU linear stand-ins instead of importing CUDA kernel packages.
         path = "vllm/model_executor/layers/draft_vocab.py"
-        patch_text = (PROJECT / "docker/patches/qwen3.8/vllm/03-pr59740-60226.patch").read_text()
-        section = next(s for s in re.split(r"(?m)(?=^diff --git )", patch_text)
-                       if s.startswith(f"diff --git a/{path} "))
-        source = "\n".join(line[1:] for line in section.splitlines()
-                           if line.startswith("+") and not line.startswith("+++"))
+        series = PROJECT / "docker/patches/qwen3.8/vllm"
+        for name in ("03-pr59740-60226.patch", "21-pr60226-static-rows.patch"):
+            self.git("apply", "--include=" + path, str(series / name))
+        source = (self.source / path).read_text()
         nodes = [n for n in ast.parse(source).body
                  if getattr(n, "name", None) in {"DraftVocab", "scatter_draft_logits",
                                                  "gather_rows_gemv", "load_draft_token_map"}]
@@ -1293,6 +1292,7 @@ class PatchSeriesTests(unittest.TestCase):
         namespace["load_draft_token_ids"] = Mock(return_value=ids)
         config = SimpleNamespace(
             speculative_config=SimpleNamespace(draft_token_map="vocab.json",
+                                               draft_token_map_static_rows=None,
                                                draft_token_map_dynamic_rows=3,
                                                draft_lm_head_quantization="nvfp4"),
             model_config=SimpleNamespace(hf_text_config=SimpleNamespace(eos_token_id=0),
@@ -1301,6 +1301,28 @@ class PatchSeriesTests(unittest.TestCase):
         namespace["load_draft_token_map"](SimpleNamespace(draft_vocab=vocab, lm_head=head), config)
         namespace["load_draft_token_ids"].assert_called_once_with("vocab.json", [0, 1, 2])
         vocab.load_token_map.assert_called_once_with(head, ids, 3, "nvfp4")
+
+        head = Head(weights.bfloat16())
+        prefix_head = Head(head.weight[:4], quantized=True)
+        quantize = Mock(return_value=prefix_head)
+        register = Mock()
+        lm_head_module = SimpleNamespace(
+            quantized_lm_head_copy=quantize, register_lm_head_refresh=register)
+        config.speculative_config = SimpleNamespace(
+            draft_token_map_static_rows=4, draft_token_map_dynamic_rows=0)
+        model = SimpleNamespace(draft_vocab=cls(processor, 20), lm_head=head)
+        with patch.dict("sys.modules", {
+            "vllm.model_executor.layers.quantization.online.lm_head": lm_head_module
+        }):
+            namespace["load_draft_token_map"](model, config)
+        quantize.assert_called_once_with(head, "nvfp4", num_rows=4)
+        register.assert_called_once_with(model, model.draft_vocab.refresh)
+        hidden = hidden.bfloat16()
+        logits = model.draft_vocab.compute_logits(head, hidden)
+        torch.testing.assert_close(logits[:, :4], hidden @ head.weight[:4].T)
+        self.assertTrue(torch.isneginf(logits[:, 4:]).all())
+        torch.testing.assert_close(
+            model.draft_vocab.get_top_tokens(head, hidden), logits.argmax(dim=-1))
 
     def test_confidence_stop_preserves_watermarked_and_sharded_sampling(self):
         _, updated = self.apply_upstream_excerpt(
