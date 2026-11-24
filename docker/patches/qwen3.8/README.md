@@ -41,6 +41,12 @@ The vLLM order is:
     persistent Mamba2 aligned state indices and accepted-token buffers as CUDA
     graph inputs, avoiding redundant metadata copies. Frozen at
     `26490d2c7b9646bb722e20873e0127a52f10417d`, with upstream aliasing tests.
+14. Gather MLA prefill queries before latent expansion under decode context
+    parallelism. Set `mla_dcp_query_gather_min_tokens` to a positive threshold
+    to enable it. The default is zero. [vLLM #66906](https://github.com/vllm-project/vllm/pull/66906)
+15. Enable decode context parallelism in the FlashInfer sparse MLA backend on
+    SM120 and SM121 with BF16 queries and a packed FP8 KV cache.
+    [vLLM #66909](https://github.com/vllm-project/vllm/pull/66909)
 
 Disk-offloaded PLE tables from
 [#59958](https://github.com/vllm-project/vllm/pull/59958) are supplied by upstream

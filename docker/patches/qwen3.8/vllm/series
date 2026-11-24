@@ -15,3 +15,5 @@
 16-flash-next-fp4.patch
 17-flash-next-b12x-loader.patch
 18-pr65182.patch
+19-pr66906.patch
+20-pr66909.patch
