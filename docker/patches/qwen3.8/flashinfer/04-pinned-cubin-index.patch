@@ -1,0 +1,65 @@
+diff --git a/flashinfer/artifacts.py b/flashinfer/artifacts.py
+index 745a9b958d6d6acb2d683f53a805827e5387bea0..ed572d26a467eeed6533c2966a20ca38bd638bce 100644
+--- a/flashinfer/artifacts.py
++++ b/flashinfer/artifacts.py
+@@ -210,19 +210,15 @@ class CheckSumHash:
+ def get_checksums(subdirs):
+     checksums = {}
+     for subdir in subdirs:
+-        uri = safe_urljoin(
+-            FLASHINFER_CUBINS_REPOSITORY, safe_urljoin(subdir, "checksums.txt")
+-        )
+-        checksum_path = FLASHINFER_CUBIN_DIR / safe_urljoin(subdir, "checksums.txt")
+-        if not download_file(uri, checksum_path) and not checksum_path.is_file():
+-            # Without this the next open() fails with a bare FileNotFoundError on
+-            # the local cache path, which hides the real cause: the artifact pin
+-            # is unreachable (typo'd/unpublished pin, or network/mirror failure).
+-            raise RuntimeError(
+-                f"Failed to fetch the checksum manifest for artifact pin '{subdir}' "
+-                f"from {uri}. Check that the pin exists in "
+-                f"{FLASHINFER_CUBINS_REPOSITORY} and is reachable."
+-            )
++        manifest = safe_urljoin(subdir, "checksums.txt")
++        checksum_path = FLASHINFER_CUBIN_DIR / manifest
++        digest = CheckSumHash.map_checksums[manifest]
++        if not checksum_path.is_file() or not verify_cubin(str(checksum_path), digest):
++            uri = safe_urljoin(FLASHINFER_CUBINS_REPOSITORY, manifest)
++            if not download_file(uri, checksum_path):
++                raise RuntimeError(f"Failed to fetch the checksum manifest for {subdir} from {uri}")
++            if not verify_cubin(str(checksum_path), digest):
++                raise RuntimeError(f"Checksum mismatch for artifact manifest {manifest}")
+         with open(checksum_path, "r") as f:
+             for line in f:
+                 sha256, filename = line.strip().split()
+@@ -247,7 +243,6 @@ def _get_host_cpu_arch() -> str:
+ 
+ 
+ def get_subdir_file_list() -> Generator[tuple[str, str], None, None]:
+-    base = FLASHINFER_CUBINS_REPOSITORY
+     cpu_arch = _get_host_cpu_arch()
+ 
+     cubin_dirs = [
+@@ -285,16 +280,16 @@ def get_subdir_file_list() -> Generator[tuple[str, str], None, None]:
+         ],
+     )
+ 
+-    # All the actual kernel cubin's.
++    # The pinned manifests cover every top-level cubin and recursive header
++    # that the wheel packages. They can be enumerated with the network offline.
+     for cubin_dir in cubin_dirs:
+         checksum_path = safe_urljoin(cubin_dir, "checksums.txt")
+         yield (checksum_path, CheckSumHash.map_checksums[checksum_path])
+-        for name in get_available_cubin_files(safe_urljoin(base, cubin_dir)):
+-            full_path = safe_urljoin(cubin_dir, name)
+-            yield (full_path, checksums[full_path])
+-        for name in get_available_header_files(safe_urljoin(base, cubin_dir)):
+-            full_path = safe_urljoin(cubin_dir, name)
+-            yield (full_path, checksums[full_path])
++    for path, digest in checksums.items():
++        if path.endswith(".h") or (
++            path.endswith(".cubin") and path.rpartition("/")[0] + "/" in cubin_dirs
++        ):
++            yield (path, digest)
+ 
+ 
+ # Outer retry-loop backoff bounds. ``download_file`` already spends its own

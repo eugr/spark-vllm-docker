@@ -1,0 +1,407 @@
+#!/usr/bin/env python3
+"""CPU-only checks for #53007's fallback and the primary-size optimization."""
+
+import importlib.util
+import math
+import subprocess
+import sys
+import tempfile
+import unittest
+from dataclasses import dataclass
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
+
+
+PROJECT_DIR = Path(__file__).resolve().parents[1]
+PATCHER_PATH = PROJECT_DIR / "docker/patch_vllm_swa_block_size.py"
+SPEC = importlib.util.spec_from_file_location("swa_patcher", PATCHER_PATH)
+assert SPEC is not None and SPEC.loader is not None
+PATCHER = importlib.util.module_from_spec(SPEC)
+SPEC.loader.exec_module(PATCHER)
+
+# Relevant excerpts from vllm-project/vllm@86aca6619 attention.py.
+# The surrounding model and tensor objects are replaced with CPU stand-ins.
+# MultipleOf is supplied below instead of importing vLLM.
+UPSTREAM = '''
+def _largest_kernel_block_within(
+    attn_backend, per_token_bytes, page_budget, fallback,
+):
+    sizes = attn_backend.get_supported_kernel_block_sizes()
+    max_block_size = page_budget // per_token_bytes
+    candidates = [s for s in sizes if isinstance(s, int)]
+    candidates.extend(
+        max(s.base, max_block_size // s.base * s.base)
+        for s in sizes
+        if isinstance(s, MultipleOf)
+    )
+    if not candidates:
+        return fallback
+    smallest = min(candidates)
+    fitting = [b for b in candidates if b * per_token_bytes <= page_budget]
+    return max(fitting) if fitting else smallest
+
+
+class Attention:
+    def get_kv_cache_spec(self, vllm_config):
+        block_size = vllm_config.cache_config.block_size
+        if self.sliding_window is not None:
+            shared_page = vllm_config.cache_config.skip_page_size_padded
+            sw_per_token = self.attn_backend.customize_spec(
+                SlidingWindowSpec(
+                    block_size=1,
+                    num_kv_heads=self.num_kv_heads,
+                    head_size=self.head_size,
+                    head_size_v=self.head_size_v,
+                    dtype=self.kv_cache_torch_dtype,
+                    kv_quant_mode=1,
+                    sliding_window=self.sliding_window,
+                )
+            ).real_page_size_bytes
+            page_budget = shared_page or sw_per_token * block_size
+            sw_block_size = _largest_kernel_block_within(
+                self.attn_backend, sw_per_token, page_budget, block_size
+            )
+            return SlidingWindowSpec(
+                block_size=sw_block_size,
+                num_kv_heads=self.num_kv_heads,
+                head_size=self.head_size,
+                head_size_v=self.head_size_v,
+                dtype=self.kv_cache_torch_dtype,
+                kv_quant_mode=1,
+                sliding_window=self.sliding_window,
+                page_size_padded=shared_page,
+            )
+        return "full attention unchanged"
+'''
+
+# #53175's API changes, as present in vllm-project/vllm@e430f7421ff0.
+# Keep the same CPU fixture around the updated upstream selector and call.
+UPSTREAM_WITH_SPEC = UPSTREAM.replace(
+    "    attn_backend, per_token_bytes, page_budget, fallback,\n",
+    "    attn_backend, per_token_bytes, page_budget, fallback, kv_cache_spec=None,\n",
+).replace(
+    "sizes = attn_backend.get_supported_kernel_block_sizes()",
+    "sizes = attn_backend.get_supported_kernel_block_sizes(kv_cache_spec)",
+).replace(
+    "            sw_per_token = self.attn_backend.customize_spec(\n",
+    "            kv_cache_spec = self.attn_backend.customize_spec(\n",
+).replace(
+    "            ).real_page_size_bytes\n",
+    "            )\n"
+    "            sw_per_token = kv_cache_spec.real_page_size_bytes\n",
+).replace(
+    "                self.attn_backend, sw_per_token, page_budget, block_size\n",
+    "                self.attn_backend,\n"
+    "                sw_per_token,\n"
+    "                page_budget,\n"
+    "                block_size,\n"
+    "                kv_cache_spec,\n",
+)
+
+# #60252: preserve exact page divisibility instead of always choosing the
+# smallest kernel when the primary size is unsupported.
+UPSTREAM_WITH_DIVISOR = UPSTREAM_WITH_SPEC.replace(
+    "    attn_backend, per_token_bytes, page_budget, fallback, kv_cache_spec=None,\n",
+    "    attn_backend, per_token_bytes, page_budget, fallback, kv_cache_spec=None,\n"
+    "    divisor_of: int | None = None,\n",
+).replace(
+    "    return max(fitting) if fitting else smallest\n",
+    "    if divisor_of is not None:\n"
+    "        dividing = [b for b in fitting if divisor_of % b == 0]\n"
+    "        dividing.extend(\n"
+    "            b\n"
+    "            for s in sizes\n"
+    "            if isinstance(s, MultipleOf)\n"
+    "            for b in range(s.base, max_block_size + 1, s.base)\n"
+    "            if divisor_of % b == 0\n"
+    "        )\n"
+    "        if dividing:\n"
+    "            return max(dividing)\n"
+    "    return max(fitting) if fitting else smallest\n",
+).replace(
+    "                kv_cache_spec,\n",
+    "                kv_cache_spec,\n"
+    "                divisor_of=None if shared_page else block_size,\n",
+)
+
+
+class SWADivisorSelectionTests(unittest.TestCase):
+    def test_layer_config_api_keeps_divisibility_and_per_layer_constraints(self):
+        source = (PROJECT_DIR / "tests/fixtures/qwen38-patch-series/"
+                  "swa_layer_config_upstream.py").read_text()
+        patched, message = PATCHER.patch_source(source)
+        self.assertEqual(patched, source)
+        self.assertIn("#60252", message)
+        namespace = {
+            "AttentionSpec": SlidingWindowSpec,
+            "AttentionType": SimpleNamespace(ENCODER_ONLY=0, ENCODER=1, DECODER=2),
+            "get_kv_quant_mode": lambda _: 1,
+            "SlidingWindowManager": SimpleNamespace(layer_config=lambda spec, **kw:
+                                                      SimpleNamespace(spec=spec, **kw)),
+        }
+        exec(patched, namespace)
+        layer = namespace["Attention"]()
+        layer.attn_type = 2
+        layer.layer_name = "draft.attention"
+        layer.kv_cache_dtype = layer.kv_cache_torch_dtype = "fp8"
+        layer.num_kv_heads = 8
+        layer.head_size = layer.head_size_v = 128
+        layer.sliding_window = 2048
+        per_layer = Mock(return_value=[16, 32, 64])
+        general = Mock(side_effect=AssertionError("ignored per-layer constraints"))
+        layer.attn_backend = SimpleNamespace(
+            get_supported_kernel_block_sizes_for_layers=per_layer,
+            get_supported_kernel_block_sizes=general,
+            customize_spec=lambda spec: spec, is_mla=lambda: False,
+        )
+        with patch.dict("sys.modules", {
+            "vllm.v1.attention.backend": SimpleNamespace(MultipleOf=MultipleOf),
+        }):
+            for primary, shared_page, expected in ((1648, None, 16),
+                                                   (1536, None, 64),
+                                                   (1648, 32 * 2048, 32)):
+                config = SimpleNamespace(cache_config=SimpleNamespace(
+                    block_size=primary, skip_page_size_padded=shared_page,
+                ))
+                result = layer.get_kv_cache_config(config)
+                self.assertEqual(result.spec.block_size, expected)
+                self.assertEqual(result.sliding_window, 2048)
+                self.assertEqual(per_layer.call_args.args[1], [layer.layer_name])
+        with self.assertRaises(PATCHER.PatchError):
+            PATCHER.patch_source(source.replace(
+                "divisor_of=None if shared_page else block_size", "divisor_of=None",
+            ))
+
+    def test_divisor_fix_is_kept_without_layering_old_fallback(self):
+        patched, message = PATCHER.patch_source(UPSTREAM_WITH_DIVISOR)
+        self.assertEqual(patched, UPSTREAM_WITH_DIVISOR)
+        self.assertIn("#60252", message)
+        self.assertNotIn(PATCHER.MARKER, patched)
+        for sizes, primary, expected in [
+            ([16, 32, 64], 1648, 16),
+            ([16, 32, 64], 1536, 64),
+            ([MultipleOf(16)], 1648, 1648),
+        ]:
+            with self.subTest(sizes=sizes, primary=primary):
+                self.assertEqual(
+                    select_spec(patched, sizes, primary=primary).block_size, expected
+                )
+
+    def test_incomplete_divisor_fix_is_rejected(self):
+        for source in [
+            UPSTREAM_WITH_DIVISOR.replace("    divisor_of: int | None = None,\n", ""),
+            UPSTREAM_WITH_DIVISOR.replace("return max(dividing)", "return min(dividing)"),
+            UPSTREAM_WITH_DIVISOR.replace(
+                "divisor_of=None if shared_page else block_size", "divisor_of=None"
+            ),
+            UPSTREAM_WITH_DIVISOR + UPSTREAM_WITH_DIVISOR,
+        ]:
+            with self.subTest(source=source):
+                with self.assertRaises(PATCHER.PatchError):
+                    PATCHER.patch_source(source)
+
+
+@dataclass(frozen=True)
+class MultipleOf:
+    base: int
+
+
+class SlidingWindowSpec(SimpleNamespace):
+    @property
+    def real_page_size_bytes(self):
+        return self.block_size * self.num_kv_heads * (self.head_size + self.head_size_v)
+
+
+def select_spec(
+    source, sizes, primary=1648, shared_page=None, kv_heads=8, window=2048,
+    customize_spec=None,
+):
+    namespace = {"MultipleOf": MultipleOf, "SlidingWindowSpec": SlidingWindowSpec}
+    exec(compile(source, "attention_fixture.py", "exec"), namespace)
+    layer = namespace["Attention"]()
+    layer.attn_backend = SimpleNamespace(
+        get_supported_kernel_block_sizes=(
+            sizes if callable(sizes) else lambda kv_cache_spec=None: sizes
+        ),
+        customize_spec=customize_spec or (lambda spec: spec),
+        is_mla=lambda: False,
+    )
+    layer.attn_type = 2
+    layer.kv_cache_dtype = "fp8"
+    layer.num_kv_heads = kv_heads
+    layer.head_size = layer.head_size_v = 128
+    layer.kv_cache_torch_dtype = "fp8"
+    layer.sliding_window = window
+    config = SimpleNamespace(cache_config=SimpleNamespace(
+        block_size=primary, skip_page_size_padded=shared_page,
+    ))
+    return layer.get_kv_cache_spec(config)
+
+
+def qwen_cache_geometry(spec):
+    # The other hybrid groups impose a 1648 * 2048-byte physical page.
+    common_page = 1648 * 2 * 4 * 256
+    natural_page = spec.real_page_size_bytes
+    block_size = spec.block_size
+    if common_page % natural_page == 0:
+        block_size *= common_page // natural_page
+    # Otherwise vLLM pads the bytes but leaves the token count unchanged.
+    pool_bytes = 5 * common_page
+    draft_blocks = math.ceil((2048 - 1 + 2 * 16384) / block_size) + 1
+    target_blocks = 4 * math.ceil(262144 / 1648)
+    mamba_blocks = 10 * (2 + 8)
+    required_gib = (draft_blocks + target_blocks + mamba_blocks) * pool_bytes / 2**30
+    return block_size, draft_blocks, required_gib
+
+
+class SWABlockFallbackTests(unittest.TestCase):
+    upstream = UPSTREAM
+
+    def setUp(self):
+        self.patched, _ = PATCHER.patch_source(self.upstream)
+
+    def test_qwen_dflash_capacity_regression(self):
+        before = select_spec(self.upstream, [16, 32, 64])
+        after = select_spec(self.patched, [16, 32, 64])
+        self.assertEqual(before.block_size, 64)
+        self.assertEqual(after.block_size, 16)
+        self.assertEqual(qwen_cache_geometry(before), (64, 545, 20.195770263671875))
+        self.assertEqual(qwen_cache_geometry(after), (1648, 23, 11.991729736328125))
+
+    def test_kimi_primary_size_optimization_is_preserved(self):
+        # #53007's original case: 1152 B/token target, 1024 B/token SWA,
+        # primary 1536. Scaling a 16-token SWA page would instead yield 1728.
+        before = select_spec(self.upstream, [MultipleOf(16)], primary=1536, kv_heads=4)
+        after = select_spec(self.patched, [MultipleOf(16)], primary=1536, kv_heads=4)
+        self.assertEqual(vars(after), vars(before))
+        self.assertEqual(after.block_size, 1536)
+        self.assertEqual(math.lcm(1536, after.block_size), 1536)
+        old_block = 16 * (1536 * 1152 // (16 * 1024))
+        self.assertEqual(math.lcm(1536, old_block), 13824)
+
+    def test_supported_discrete_primary_is_preserved(self):
+        for primary in [16, 32, 64]:
+            with self.subTest(primary=primary):
+                spec = select_spec(self.patched, [16, 32, 64], primary=primary)
+                self.assertEqual(spec.block_size, primary)
+
+    def test_multipleof_fallback_uses_base_not_rounded_candidate(self):
+        spec = select_spec(self.patched, [MultipleOf(16)], primary=1650)
+        self.assertEqual(spec.block_size, 16)
+
+    def test_mixed_backend_declarations(self):
+        for primary, expected in [(1536, 1536), (1650, 16)]:
+            with self.subTest(primary=primary):
+                spec = select_spec(self.patched, [64, MultipleOf(16)], primary=primary)
+                self.assertEqual(spec.block_size, expected)
+
+    def test_explicit_skip_quant_padding_keeps_largest_fit(self):
+        for sizes in [[16, 32, 64], [MultipleOf(16)], [64, MultipleOf(16)]]:
+            for page in [16 * 2048, 48 * 2048, 1648 * 2048]:
+                with self.subTest(sizes=sizes, page=page):
+                    before = select_spec(self.upstream, sizes, shared_page=page)
+                    after = select_spec(self.patched, sizes, shared_page=page)
+                    self.assertEqual(vars(before), vars(after))
+
+    def test_empty_backend_declaration_keeps_fallback(self):
+        self.assertEqual(select_spec(self.patched, []).block_size, 1648)
+
+    def test_full_attention_is_untouched(self):
+        self.assertEqual(select_spec(self.patched, [16, 32, 64], window=None),
+                         "full attention unchanged")
+
+    def test_patch_is_idempotent(self):
+        patched_again, message = PATCHER.patch_source(self.patched)
+        self.assertEqual(patched_again, self.patched)
+        self.assertIn("already present", message)
+
+    def test_pre_pr_and_missing_selector_are_skipped(self):
+        legacy = UPSTREAM.replace(
+            "            page_budget = shared_page or sw_per_token * block_size\n", ""
+        ).replace(
+            "self.attn_backend, sw_per_token, page_budget, block_size",
+            "self.attn_backend, sw_per_token, shared_page, block_size",
+        )
+        for source in [legacy, "class Attention: pass\n"]:
+            with self.subTest(source=source):
+                self.assertEqual(PATCHER.patch_source(source)[0], source)
+
+    def test_partial_or_changed_sources_are_rejected(self):
+        for source in [
+            self.upstream.replace(
+                "page_budget = shared_page or", "page_budget = other or"
+            ),
+            self.upstream + self.upstream,
+            UPSTREAM + UPSTREAM_WITH_SPEC,
+            self.patched + self.upstream,
+            self.patched + "\n# " + PATCHER.MARKER,
+            self.patched.replace("if shared_page is None", "if shared_page"),
+        ]:
+            with self.subTest(source=source):
+                with self.assertRaises(PATCHER.PatchError):
+                    PATCHER.patch_source(source)
+
+    def test_cli_and_failed_patch_leave_files_consistent(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            target = root / PATCHER.TARGET_REL
+            command = [sys.executable, str(PATCHER_PATH), str(root)]
+            missing = subprocess.run(command, capture_output=True, text=True)
+            self.assertEqual(missing.returncode, 0, missing.stderr)
+            self.assertIn("not applicable", missing.stdout)
+            target.parent.mkdir(parents=True)
+            target.write_text(self.upstream)
+            for _ in range(2):
+                result = subprocess.run(command, capture_output=True, text=True)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(target.read_text(), self.patched)
+            unknown = self.upstream.replace(
+                "page_budget = shared_page or", "page_budget = other or"
+            )
+            target.write_text(unknown)
+            result = subprocess.run(command, capture_output=True, text=True)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertEqual(target.read_text(), unknown)
+
+
+class SWABlockSpecFallbackTests(SWABlockFallbackTests):
+    upstream = UPSTREAM_WITH_SPEC
+
+    def test_fallback_uses_the_same_customized_spec_as_the_selector(self):
+        customized = []
+        queried = []
+
+        def customize(spec):
+            customized_spec = SlidingWindowSpec(**{**vars(spec), "head_size": 512})
+            customized.append(customized_spec)
+            return customized_spec
+
+        def supported_sizes(kv_cache_spec=None):
+            queried.append(kv_cache_spec)
+            if kv_cache_spec is not None and kv_cache_spec.head_size == 512:
+                return [64, 128]
+            return [16, 32, 64]
+
+        result = select_spec(self.patched, supported_sizes, customize_spec=customize)
+        self.assertEqual(result.block_size, 64)
+        self.assertEqual(len(customized), 1)
+        self.assertEqual(len(queried), 2)
+        self.assertTrue(all(spec is customized[0] for spec in queried))
+
+    def test_changed_or_partially_patched_spec_argument_is_rejected(self):
+        for source in [
+            self.upstream.replace(
+                "                kv_cache_spec,\n", "                None,\n"
+            ),
+            self.patched.replace(
+                "                    kv_cache_spec\n", "                    None\n"
+            ),
+        ]:
+            with self.subTest(source=source):
+                with self.assertRaises(PATCHER.PatchError):
+                    PATCHER.patch_source(source)
+
+
+if __name__ == "__main__":
+    unittest.main()

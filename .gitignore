@@ -1,5 +1,23 @@
 .env
+.env-*
 build-metadata.yaml
 .DS_STORE
+
+# Python bytecode and tool caches
+**/__pycache__/
+**/*.py[cod]
+**/.pytest_cache/
+**/.mypy_cache/
+**/.ruff_cache/
+
 .wheel-cache/
-__pycache__/
+mods/draft
+recipes/backups
+recipes/draft
+tests/draft
+benchmark-plots
+memory-profiles/
+backup-wheels
+.codex
+wheels
+artifacts

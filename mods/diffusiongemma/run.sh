@@ -26,17 +26,16 @@ PATCH_EXCLUDES=(
 has_upstream_diffusiongemma_support() {
   local model_file="$PYTHON_ROOT/vllm/model_executor/models/diffusion_gemma.py"
   local model_registry="$PYTHON_ROOT/vllm/model_executor/models/registry.py"
-  local config_registry="$PYTHON_ROOT/vllm/transformers_utils/config.py"
   local diffusion_config="$PYTHON_ROOT/vllm/config/diffusion.py"
 
   [ -f "$model_file" ] || return 1
   [ -f "$model_registry" ] || return 1
-  [ -f "$config_registry" ] || return 1
   [ -f "$diffusion_config" ] || return 1
 
   grep -q "class DiffusionGemmaForConditionalGeneration" "$model_file" || return 1
   grep -q "DiffusionGemmaForBlockDiffusion" "$model_registry" || return 1
-  grep -q "diffusion_gemma" "$config_registry" || return 1
+  # Current vLLM uses Transformers' native DiffusionGemmaConfig, so the old
+  # transformers_utils/config.py registry entry is no longer required.
   grep -q "class DiffusionConfig" "$diffusion_config" || return 1
   grep -q "self_conditioning_embeds" "$model_file" || return 1
 }

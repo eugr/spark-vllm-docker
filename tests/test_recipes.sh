@@ -495,6 +495,13 @@ test_launch_cluster_help() {
         log_verbose "$output"
     fi
 
+    if echo "$output" | grep -q -- "--apply-vllm-pr"; then
+        log_pass "--help documents launch-time --apply-vllm-pr"
+    else
+        log_fail "--help does not document launch-time --apply-vllm-pr"
+        log_verbose "$output"
+    fi
+
     if echo "$output" | grep -q -- "Do not pass --distributed-executor-backend"; then
         log_pass "--help documents automatic vLLM multiprocessing orchestration"
     else
@@ -786,6 +793,54 @@ test_launch_cmd_cli_apply_mod_passthrough() {
     fi
 }
 
+# Test: CLI --apply-vllm-pr is passed to launch-cluster.sh in mixed layer order
+test_launch_cmd_cli_apply_vllm_pr_passthrough() {
+    log_test "Launch command includes ordered runtime vLLM PR layers"
+
+    recipe_name=$(find_solo_recipe)
+    if [[ -z "$recipe_name" ]]; then
+        log_skip "No solo-capable recipes found"
+        return
+    fi
+
+    output=$("$PROJECT_DIR/run-recipe.py" "$recipe_name" --dry-run --solo \
+        --apply-mod mods/use-official-vllm \
+        --apply-vllm-pr 12345 \
+        --apply-mod mods/gpu-mem-util-gb \
+        --apply-vllm-pr 23456 2>&1)
+    launch_cmd=$(extract_launch_cmd "$output")
+    vllm_cmd=$(extract_vllm_command "$output")
+
+    if echo "$launch_cmd" | grep -q -- \
+        "--apply-mod mods/use-official-vllm --apply-vllm-pr 12345 --apply-mod mods/gpu-mem-util-gb --apply-vllm-pr 23456" \
+        && ! echo "$vllm_cmd" | grep -q -- "--apply-vllm-pr"; then
+        log_pass "CLI runtime PR flags preserve launch layer order"
+    else
+        log_fail "CLI --apply-vllm-pr passthrough or ordering failed"
+        log_verbose "Launch cmd: $launch_cmd"
+        log_verbose "vLLM cmd: $vllm_cmd"
+    fi
+
+    if "$PROJECT_DIR/run-recipe.py" "$recipe_name" --dry-run --solo \
+        --apply-vllm-pr invalid > /dev/null 2>&1; then
+        log_fail "Invalid runtime vLLM PR reference was accepted"
+    else
+        log_pass "Invalid runtime vLLM PR reference is rejected"
+    fi
+
+    local pr_url="https://github.com/local-inference-lab/vllm/pull/669"
+    output=$("$PROJECT_DIR/run-recipe.py" "$recipe_name" --dry-run --solo \
+        --apply-vllm-pr "${pr_url}/" 2>&1)
+    launch_cmd=$(extract_launch_cmd "$output")
+    if echo "$launch_cmd" | grep -Fq -- "--apply-vllm-pr ${pr_url}" \
+        && ! echo "$launch_cmd" | grep -Fq -- "${pr_url}/ "; then
+        log_pass "Full runtime vLLM PR URL is normalized and passed through"
+    else
+        log_fail "Full runtime vLLM PR URL passthrough failed"
+        log_verbose "Launch cmd: $launch_cmd"
+    fi
+}
+
 # Test: Daemon mode flag is passed through
 test_launch_cmd_daemon_flag() {
     log_test "Launch command includes -d flag in daemon mode"
@@ -906,17 +961,21 @@ test_launch_cmd_env_passthrough() {
     fi
 }
 
-# Test: no -e flags when none specified
+# Test: no -e flags when neither recipe nor CLI specifies environment variables
 test_launch_cmd_no_env_by_default() {
     log_test "Launch command omits -e when no env vars specified"
-    
-    recipe_name=$(find_solo_recipe)
-    if [[ -z "$recipe_name" ]]; then
-        log_skip "No solo-capable recipes found"
-        return
-    fi
-    
-    output=$("$PROJECT_DIR/run-recipe.py" "$recipe_name" --dry-run --solo 2>&1)
+
+    local temp_recipe
+    temp_recipe=$(mktemp)
+    cat > "$temp_recipe" <<'EOF'
+recipe_version: "1"
+name: Empty environment
+container: test-image
+env: {}
+command: echo test
+EOF
+    output=$("$PROJECT_DIR/run-recipe.py" "$temp_recipe" --config /dev/null --dry-run --solo 2>&1)
+    rm -f "$temp_recipe"
     launch_cmd=$(extract_launch_cmd "$output")
     
     if echo "$launch_cmd" | grep -q " -e "; then
@@ -1047,8 +1106,12 @@ test_launch_cmd_earlyoom_passthrough() {
         --earlyoom --earlyoom-args "-M 786432,196608 -s 100 -r 120" 2>&1)
     launch_cmd=$(extract_launch_cmd "$output")
 
-    if echo "$launch_cmd" | grep -q "\-\-earlyoom" && \
-       echo "$launch_cmd" | grep -q "\-\-earlyoom-args -M 786432,196608 -s 100 -r 120"; then
+    if python3 -c '
+import shlex, sys
+args = shlex.split(sys.argv[1])
+sys.exit(not ("--earlyoom" in args and "--earlyoom-args" in args
+              and args[args.index("--earlyoom-args") + 1] == "-M 786432,196608 -s 100 -r 120"))
+' "$launch_cmd"; then
         log_pass "Launch command includes --earlyoom and custom args"
     else
         log_fail "--earlyoom flags not found in launch command"
@@ -1223,7 +1286,7 @@ verify_cluster_args() {
     fi
     
     # Use fake nodes for cluster mode
-    output=$("$PROJECT_DIR/run-recipe.py" "$recipe_name" --dry-run -n "10.0.0.1,10.0.0.2" 2>&1)
+    output=$("$PROJECT_DIR/run-recipe.py" "$recipe_name" --config /dev/null --dry-run -n "10.0.0.1,10.0.0.2" 2>&1)
     vllm_cmd=$(extract_vllm_command "$output")
     
     local all_passed=true
@@ -1570,6 +1633,7 @@ main() {
     test_launch_cmd_container_image
     test_launch_cmd_mods
     test_launch_cmd_cli_apply_mod_passthrough
+    test_launch_cmd_cli_apply_vllm_pr_passthrough
     test_launch_cmd_daemon_flag
     test_launch_cmd_nccl_debug
     test_launch_cmd_launch_script
@@ -1598,6 +1662,9 @@ main() {
     test_readme_gpt_oss_cluster
     test_readme_minimax_cluster
     test_readme_glm_flash_cluster
+    verify_cluster_args "qwen3.8-flash-next-nvfp4-cluster" \
+        "$QWEN38_FLASH_NEXT_CLUSTER_TP" \
+        "${QWEN38_FLASH_NEXT_CLUSTER_ARGS[@]}"
     echo ""
     
     # launch-cluster.sh tests

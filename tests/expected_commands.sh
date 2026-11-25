@@ -61,7 +61,7 @@ MINIMAX_ARGS=(
     "--host 0.0.0.0"
     "--gpu-memory-utilization 0.8"
     "--max-model-len 128000"
-    "--load-format fastsafetensors"
+    "--load-format instanttensor"
     "--enable-auto-tool-choice"
     "--tool-call-parser minimax_m2"
     "--reasoning-parser minimax_m2"
@@ -81,3 +81,10 @@ GLM_FLASH_AWQ_CLUSTER_TP="1"
 # minimax-m2-awq cluster mode (2 nodes = tp 2)
 MINIMAX_CLUSTER_TP="2"
 MINIMAX_CLUSTER_ARGS=()
+
+# Qwen3.8 Flash Next cluster: device PLE is part of the generated command.
+# recipes/README.md: Environment Variables and Volumes
+QWEN38_FLASH_NEXT_CLUSTER_TP="2"
+QWEN38_FLASH_NEXT_CLUSTER_ARGS=(
+    "--additional-config '{\"ple_table_memory\":\"device\"}'"
+)

@@ -13,27 +13,28 @@ build_args:
 
 cluster_only: true
 
-mods:
-  - mods/instanttensor-hybrid-draft-loader
+mods: []
+#  - mods/instanttensor-hybrid-draft-loader
 #   - mods/drop-caches
 
 defaults:
   port: 8000
   host: 0.0.0.0
   tensor_parallel: 2
-  gpu_memory_utilization: 0.85
+  # Leave room for host and distributed-worker allocations in Spark's shared RAM.
+  gpu_memory_utilization: 0.8
   max_model_len: auto
   block_size: 256
   max_num_seqs: 8
   max_num_batched_tokens: 8192
-  max_cudagraph_capture_size: 64
+  max_cudagraph_capture_size: 48
   num_speculative_tokens: 5
 
 env:
   CUTE_DSL_ARCH: "sm_121a"
   VLLM_USE_AOT_COMPILE: "1"
   VLLM_USE_BREAKABLE_CUDAGRAPH: "0"
-  VLLM_USE_MEGA_AOT_ARTIFACT: "-1"
+  VLLM_USE_MEGA_AOT_ARTIFACT: "1"
   VLLM_MEMORY_PROFILE_INCLUDE_ATTN: "1"
   VLLM_USE_FLASHINFER_SAMPLER: "1"
   VLLM_USE_B12X_WO_PROJECTION: "1"
@@ -66,10 +67,10 @@ command: |
       --reasoning-config '{{"reasoning_parser":"deepseek_v4","reasoning_start_str":"","reasoning_end_str":""}}' \
       --default-chat-template-kwargs.thinking=true \
       --default-chat-template-kwargs.reasoning_effort=high \
-      --load-format instanttensor \
+      --load-format b12x \
       --moe-backend b12x \
       --linear-backend b12x \
-      --attention-backend B12X_MLA_SPARSE \
+      --attention-backend B12X \
       --max-cudagraph-capture-size {max_cudagraph_capture_size} \
       --compilation-config '{{"cudagraph_mode":"FULL_AND_PIECEWISE","custom_ops":["all"]}}' \
-      --speculative-config '{{"method":"dspark","num_speculative_tokens":{num_speculative_tokens},"draft_sample_method":"probabilistic","attention_backend":"B12X_MLA_SPARSE"}}'
+      --speculative-config '{{"method":"dspark","num_speculative_tokens":{num_speculative_tokens},"draft_sample_method":"probabilistic","attention_backend":"B12X"}}'

@@ -1,0 +1,42 @@
+# Recipe: NVIDIA Nemotron 3.5 Bolt 74B-A9B-24GB
+# Single DGX Spark with the LiLiCorr draft model and DFlash speculation.
+
+recipe_version: "1"
+name: NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB
+description: vLLM serving NVIDIA Nemotron 3.5 Bolt 24GB on one DGX Spark with LiLiCorr DFlash speculative decoding
+
+model: nvidia/NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB
+container: vllm-node
+solo_only: true
+
+defaults:
+  port: 8000
+  host: 0.0.0.0
+  tensor_parallel: 1
+  gpu_memory_utilization: 0.8
+  max_model_len: "auto"
+  max_num_seqs: 8
+  max_num_batched_tokens: 8192
+  num_speculative_tokens: 7
+
+command: |
+  vllm serve nvidia/NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB \
+    --host {host} \
+    --port {port} \
+    --tensor-parallel-size {tensor_parallel} \
+    --kv-cache-dtype fp8 \
+    --max-num-seqs {max_num_seqs} \
+    --trust-remote-code \
+    --max-model-len {max_model_len} \
+    --gpu-memory-utilization {gpu_memory_utilization} \
+    --max-num-batched-tokens {max_num_batched_tokens} \
+    --speculative_config.model nvidia/NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB-LiLiCorr \
+    --speculative_config.method dflash \
+    --speculative_config.num_speculative_tokens {num_speculative_tokens} \
+    --load-format instanttensor \
+    --enable-auto-tool-choice \
+    --tool-call-parser qwen3_coder \
+    --reasoning-parser nemotron_v3 \
+    --enable-mamba-shared-prefix-checkpoint \
+    --block-size 64 \
+    --prefix-match-unit 64

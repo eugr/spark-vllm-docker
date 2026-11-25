@@ -1,0 +1,33 @@
+[
+  {
+    "Id": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "RepoTags": ["vllm-node:latest"],
+    "RepoDigests": ["example/runner@sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"],
+    "Architecture": "arm64",
+    "Os": "linux",
+    "Variant": "",
+    "Config": {
+      "Env": ["PATH=/usr/local/bin:/usr/bin:/bin", "VLLM_WORKER_MULTIPROC_METHOD=spawn"],
+      "Cmd": ["bash"],
+      "Entrypoint": null,
+      "WorkingDir": "/workspace",
+      "User": "",
+      "Labels": {"example.version": "1", "example.empty": ""},
+      "ExposedPorts": {"8000/tcp": {}},
+      "Volumes": {"/data": {}},
+      "OnBuild": null,
+      "ArgsEscaped": false
+    },
+    "RootFS": {
+      "Type": "layers",
+      "Layers": [
+        "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+        "sha256:2222222222222222222222222222222222222222222222222222222222222222"
+      ]
+    },
+    "GraphDriver": {"Name": "overlay2", "Data": {"UpperDir": "/example/overlay2/upper"}},
+    "Size": 1024,
+    "DockerVersion": "27.5.1",
+    "Metadata": {"LastTagTime": "2026-10-01T00:00:00Z"}
+  }
+]

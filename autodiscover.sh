@@ -49,6 +49,54 @@ load_env_if_exists() {
 # Load .env file
 load_env_if_exists
 
+# Copy operations share one resolver. Authentication remains in the existing
+# SSH configuration; legacy configs keep their original direct SSH behavior.
+cluster_copy_ssh() {
+    local host="$1"
+    shift
+    if [[ -n "${DOTENV_CLUSTER_LINKS:-}" ]]; then
+        python3 "$SCRIPT_DIR/cluster_topology.py" ssh --target "$host" --user "$SSH_USER" -- "$@"
+    else
+        local command="${@: -1}"
+        ssh "${@:1:$(( $# - 1 ))}" "${SSH_USER}@${host}" "$command"
+    fi
+}
+
+cluster_copy_rsync() {
+    local host="$1" source="$2" destination="$3"
+    if [[ -n "${DOTENV_CLUSTER_LINKS:-}" ]]; then
+        python3 "$SCRIPT_DIR/cluster_topology.py" rsync --target "$host" --user "$SSH_USER" -- "$source" "$destination"
+    else
+        rsync -av -s --mkpath --progress --copy-unsafe-links "$source" "${SSH_USER}@${host}:$destination"
+    fi
+}
+
+# Discover the graph on all management nodes, including nodes not directly
+# attached to the head. The helper verifies each candidate link in both directions.
+detect_topology() {
+    local result
+    result=$(python3 "$SCRIPT_DIR/cluster_topology.py" discover --nodes "$NODES_ARG" --head "$LOCAL_IP") || return 1
+    if [[ "$(printf '%s\n' "$result" | sed -n '3p')" == ring ]]; then
+        apply_topology_result "$result"
+    fi
+}
+
+apply_topology_result() {
+    local result="$1" kind
+    NODES_ARG=$(printf '%s\n' "$result" | sed -n '1p')
+    export DOTENV_CLUSTER_NODES="$NODES_ARG"
+    export DOTENV_CLUSTER_LINKS="$(printf '%s\n' "$result" | sed -n '2p')"
+    export DOTENV_LOCAL_IP="$LOCAL_IP"
+    kind=$(printf '%s\n' "$result" | sed -n '3p')
+    IFS=',' read -ra PEER_NODES <<< "${NODES_ARG#*,}"
+    [[ "$NODES_ARG" == "$LOCAL_IP" ]] && PEER_NODES=()
+    COPY_PEER_NODES=("${PEER_NODES[@]}")
+    if [[ "$kind" == ring ]]; then
+        export DOTENV_CONTAINER_NCCL_ALGO=Ring
+    fi
+    echo "  Verified $kind topology across $(( ${#PEER_NODES[@]} + 1 )) nodes."
+}
+
 # Mesh mode flag (set by detect_interfaces)
 MESH_MODE="false"
 
@@ -312,6 +360,13 @@ detect_nodes() {
 # In non-mesh mode: COPY_PEER_NODES = PEER_NODES (same network)
 # In mesh mode: scan enp* interfaces (direct IB-attached) for GB10 peers
 detect_copy_hosts() {
+    if [[ "${FORCE_DISCOVER:-false}" == true ]]; then
+        unset DOTENV_CLUSTER_LINKS
+    fi
+    if [[ -n "${DOTENV_CLUSTER_LINKS:-}" && "${FORCE_DISCOVER:-false}" != true ]]; then
+        COPY_PEER_NODES=("${PEER_NODES[@]}")
+        return 0
+    fi
     if [[ "$MESH_MODE" == "false" ]]; then
         COPY_PEER_NODES=("${PEER_NODES[@]}")
         return 0
@@ -357,6 +412,12 @@ detect_copy_hosts() {
         done < <(sort "$temp_file")
         rm -f "$temp_file"
     fi
+    # Only inspect a larger graph when the legacy scan found indirect peers.
+    # Two-node, triangle, and switch-connected clusters keep their existing path.
+    if [[ ${#PEER_NODES[@]} -ge 3 && ${#COPY_PEER_NODES[@]} -lt ${#PEER_NODES[@]} ]]; then
+        detect_topology || return 1
+    fi
+
 }
 
 # Save discovered configuration to .env
@@ -408,17 +469,30 @@ save_config() {
         return 1
     fi
 
-    # Per-node confirmation for COPY_HOSTS
-    echo ""
-    echo "Select nodes for COPY_HOSTS (build/model distribution):"
+    # Revalidate after node selection, before opening/truncating the config.
+    # A selected subset may break a ring even though all its nodes are reachable
+    # through management SSH. Copy routes must cover every selected worker.
+    if [[ -n "${DOTENV_CLUSTER_LINKS:-}" ]]; then
+        local result selected_nodes
+        selected_nodes=$(IFS=,; echo "${selected_cluster[*]}")
+        result=$(python3 "$SCRIPT_DIR/cluster_topology.py" select --nodes "$selected_nodes" --head "$LOCAL_IP") || return 1
+        apply_topology_result "$result"
+        IFS=',' read -ra selected_cluster <<< "$NODES_ARG"
+    fi
+
+    # Legacy configurations can still select independent COPY_HOSTS.
     local selected_copy=()
-    for node in "${COPY_PEER_NODES[@]}"; do
+    if [[ -z "${DOTENV_CLUSTER_LINKS:-}" ]]; then
+      echo ""
+      echo "Select nodes for COPY_HOSTS (build/model distribution):"
+      for node in "${COPY_PEER_NODES[@]}"; do
         read -r -p "  Include $node in COPY_HOSTS? [Y/n]: " r
         r="${r,,}"
         if [[ ! "$r" =~ ^(n|no)$ ]]; then
             selected_copy+=("$node")
         fi
-    done
+      done
+    fi
 
     # Write .env
     {
@@ -430,11 +504,17 @@ save_config() {
         echo "LOCAL_IP=$LOCAL_IP"
         echo "ETH_IF=$ETH_IF"
         echo "IB_IF=$IB_IF"
+        if [[ -n "${DOTENV_CLUSTER_LINKS:-}" ]]; then
+            printf "CLUSTER_LINKS='%s'\n" "$DOTENV_CLUSTER_LINKS"
+        fi
         if [[ "$MESH_MODE" == "true" ]]; then
             echo "# Mesh mode NCCL settings"
             echo "CONTAINER_NCCL_NET_PLUGIN=none"
             echo "CONTAINER_NCCL_IB_SUBNET_AWARE_ROUTING=1"
             echo "CONTAINER_NCCL_IB_MERGE_NICS=0"
+        fi
+        if [[ "${DOTENV_CONTAINER_NCCL_ALGO:-}" == Ring && -n "${DOTENV_CLUSTER_LINKS:-}" ]]; then
+            echo "CONTAINER_NCCL_ALGO=Ring"
         fi
     } > "$env_file"
     echo ""

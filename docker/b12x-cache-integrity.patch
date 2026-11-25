@@ -1,0 +1,472 @@
+Subject: [PATCH] Validate and durably publish CuTe cache artifacts
+
+Base: local-inference-lab/b12x 4f3028b19c1d8290dc72b6f483aba40de23eae5a
+
+Reject incomplete or damaged object/manifest pairs before preparation marks
+them available. Reuse the existing locked compilation path for repair, and
+fsync temporary files and directory entries when publishing cache artifacts.
+
+diff --git a/b12x/_lib/cache_integrity.py b/b12x/_lib/cache_integrity.py
+new file mode 100644
+--- /dev/null
++++ b/b12x/_lib/cache_integrity.py
+@@ -0,0 +1,110 @@
++"""Integrity checks and durable publication for the CuTe object cache."""
++
++from __future__ import annotations
++
++import hashlib
++import json
++import os
++import stat
++import tempfile
++from contextlib import suppress
++from functools import lru_cache
++from pathlib import Path
++
++
++def _file_identity(path: Path) -> tuple[int, ...]:
++    info = path.stat()
++    if not stat.S_ISREG(info.st_mode):
++        raise ValueError("cache entry is not a regular file")
++    return (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
++
++
++@lru_cache(maxsize=8192)
++def _validate_object(
++    object_path: Path,
++    manifest_path: Path,
++    cache_key: str,
++    object_identity: tuple[int, ...],
++    manifest_identity: tuple[int, ...],
++) -> bool:
++    # The identities participate in the memo key. Replacing or rewriting either
++    # file invalidates the result, including same-size edits and repaired files.
++    manifest = json.loads(manifest_path.read_text())
++    if not isinstance(manifest, dict) or manifest.get("cache_key") != cache_key:
++        return False
++    size = manifest.get("object_bytes")
++    digest = manifest.get("object_sha256")
++    if type(size) is not int or size <= 0 or size != object_identity[2]:
++        return False
++    if not isinstance(digest, str) or len(digest) != 64:
++        return False
++    checksum = hashlib.sha256()
++    with object_path.open("rb") as stream:
++        while chunk := stream.read(1024 * 1024):
++            checksum.update(chunk)
++    return checksum.hexdigest() == digest
++
++
++def valid_object(object_path: Path, manifest_path: Path, cache_key: str) -> bool:
++    """Treat incomplete or corrupt object/manifest pairs as cache misses.
++
++    This checks stored bytes, not CUDA loadability or kernel correctness. A
++    concurrent publisher may cause a miss; the compiler rechecks under its
++    existing per-key lock before rebuilding. No cache files are removed here.
++    """
++    try:
++        object_identity = _file_identity(object_path)
++        manifest_identity = _file_identity(manifest_path)
++        valid = _validate_object(
++            object_path, manifest_path, cache_key, object_identity, manifest_identity,
++        )
++        return (valid and object_identity == _file_identity(object_path)
++                and manifest_identity == _file_identity(manifest_path))
++    except (OSError, ValueError, UnicodeError):
++        return False
++
++
++def _fsync_directory(path: Path) -> None:
++    descriptor = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
++    try:
++        os.fsync(descriptor)
++    finally:
++        os.close(descriptor)
++
++
++def _mkdir_durable(path: Path) -> None:
++    if path.is_dir():
++        return
++    _mkdir_durable(path.parent)
++    try:
++        path.mkdir()
++    except FileExistsError:
++        if not path.is_dir():
++            raise
++    # Persist new shard directories as well as files within those shards.
++    _fsync_directory(path.parent)
++
++
++def atomic_write_bytes(path: Path, data: bytes) -> None:
++    """Publish a complete, fsynced file, then persist its directory entry.
++
++    Writers must hold the compiler's per-key lock across object and manifest
++    publication. Publish the manifest last; readers reject incomplete pairs.
++    """
++    _mkdir_durable(path.parent)
++    temporary = None
++    try:
++        with tempfile.NamedTemporaryFile(
++            dir=path.parent, prefix=f".{path.name}.", suffix=".tmp", delete=False,
++        ) as stream:
++            temporary = stream.name
++            stream.write(data)
++            stream.flush()
++            os.fsync(stream.fileno())
++        os.replace(temporary, path)
++        temporary = None
++        _fsync_directory(path.parent)
++    finally:
++        if temporary is not None:
++            with suppress(OSError):
++                os.unlink(temporary)
+diff --git a/b12x/_lib/compile_plan.py b/b12x/_lib/compile_plan.py
+--- a/b12x/_lib/compile_plan.py
++++ b/b12x/_lib/compile_plan.py
+@@ -138,4 +138,4 @@
+     if program.dialect == "cute":
+-        from .compiler import _cache_object_path
+-        return _cache_object_path(program.key).is_file()
++        from .compiler import _valid_cute_compile_cache
++        return _valid_cute_compile_cache(program.key)
+     if program.dialect == "triton":
+diff --git a/b12x/_lib/compiler.py b/b12x/_lib/compiler.py
+--- a/b12x/_lib/compiler.py
++++ b/b12x/_lib/compiler.py
+@@ -23,2 +23,3 @@
+ from typing import Any
++from .cache_integrity import _mkdir_durable, atomic_write_bytes, valid_object
+ 
+@@ -2481,4 +2482,2 @@
+ ) -> None:
+-    manifest_path = _cache_manifest_path(cache_key)
+-    manifest_path.parent.mkdir(parents=True, exist_ok=True)
+     manifest = _build_compile_manifest(
+@@ -2486,28 +2485,13 @@
+     )
+-    tmp_name: str | None = None
+-    try:
+-        with tempfile.NamedTemporaryFile(
+-            mode="w",
+-            encoding="utf-8",
+-            dir=manifest_path.parent,
+-            prefix=f".{manifest_path.name}.",
+-            suffix=".tmp",
+-            delete=False,
+-        ) as tmp_file:
+-            tmp_name = tmp_file.name
+-            json.dump(
+-                manifest,
+-                tmp_file,
+-                sort_keys=True,
+-                separators=(",", ":"),
+-                ensure_ascii=True,
+-                allow_nan=False,
+-            )
+-            tmp_file.write("\n")
+-        os.replace(tmp_name, manifest_path)
+-        tmp_name = None
+-    finally:
+-        if tmp_name is not None:
+-            with suppress(OSError):
+-                os.unlink(tmp_name)
++    data = json.dumps(
++        manifest, sort_keys=True, separators=(",", ":"),
++        ensure_ascii=True, allow_nan=False,
++    ) + "\n"
++    atomic_write_bytes(_cache_manifest_path(cache_key), data.encode("utf-8"))
++
++
++def _valid_cute_compile_cache(cache_key: str) -> bool:
++    return valid_object(
++        _cache_object_path(cache_key), _cache_manifest_path(cache_key), cache_key,
++    )
+ 
+@@ -2535,3 +2519,3 @@
+     lock_path = _cache_lock_path(cache_key)
+-    lock_path.parent.mkdir(parents=True, exist_ok=True)
++    _mkdir_durable(lock_path.parent)
+     with open(lock_path, "w") as lock_file:
+@@ -2559,2 +2543,6 @@
+             shutil.copy2(object_path, staged_object)
++            # Validate the bytes actually handed to CUTLASS. Its loader can
++            # modify this private copy; it must never modify the cached object.
++            if not valid_object(staged_object, _cache_manifest_path(cache_key), cache_key):
++                return None
+             module = ExternalBinaryModule(str(staged_object))
+@@ -2576,8 +2564,4 @@
+     object_path = _cache_object_path(cache_key)
+-    object_path.parent.mkdir(parents=True, exist_ok=True)
+-    tmp_path = object_path.with_suffix(".tmp")
+     object_bytes = compiled.dump_to_object(_cache_prefix(cache_key))
+-    with open(tmp_path, "wb") as f:
+-        f.write(object_bytes)
+-    os.replace(tmp_path, object_path)
++    atomic_write_bytes(object_path, object_bytes)
+     if cache_payload is not None and func is not None:
+diff --git a/tests/_lib/test_compile_cache_integrity.py b/tests/_lib/test_compile_cache_integrity.py
+new file mode 100644
+--- /dev/null
++++ b/tests/_lib/test_compile_cache_integrity.py
+@@ -0,0 +1,260 @@
++"""CPU-only regression tests for interrupted/corrupt CuTe cache entries.
++
++Load the stdlib helper directly and execute the real compiler entry points with
++mock CUDA boundaries. This exercises preparation and recompile decisions without
++initializing B12X, CUTLASS, Torch, or a GPU.
++"""
++
++from __future__ import annotations
++
++import ast
++from collections import namedtuple
++from contextlib import contextmanager, nullcontext, suppress
++import hashlib
++import importlib.util
++import json
++import os
++from pathlib import Path
++import shutil
++import sys
++import tempfile
++from threading import RLock
++from types import ModuleType, SimpleNamespace
++import unittest
++from unittest.mock import Mock, patch
++
++
++LIB = Path(__file__).resolve().parents[2] / "b12x/_lib"
++spec = importlib.util.spec_from_file_location("cache_integrity", LIB / "cache_integrity.py")
++integrity = importlib.util.module_from_spec(spec)
++spec.loader.exec_module(integrity)
++
++
++def load_functions(path, names, namespace):
++    nodes = [node for node in ast.parse(path.read_text()).body
++             if isinstance(node, ast.FunctionDef) and node.name in names]
++    assert {node.name for node in nodes} == set(names)
++    future = ast.parse("from __future__ import annotations").body
++    exec(compile(ast.Module(body=future + nodes, type_ignores=[]), str(path), "exec"), namespace)
++
++
++class CompileCacheIntegrityTests(unittest.TestCase):
++    def setUp(self):
++        temporary = tempfile.TemporaryDirectory()
++        self.addCleanup(temporary.cleanup)
++        self.root = Path(temporary.name)
++        integrity._validate_object.cache_clear()
++        payload = ("test-compile-payload",)
++        self.key = hashlib.sha256(repr(payload).encode()).hexdigest()
++        self.obj = self.root / self.key[:2] / (self.key + ".o")
++        self.manifest = self.obj.with_suffix(".json")
++        self.obj.parent.mkdir()
++        self.data = b"compiled object fixture"
++        self.compiled = SimpleNamespace(dump_to_object=lambda _: self.data)
++        self.compile_kernel = Mock(return_value=self.compiled)
++        self.loader = Mock(return_value=SimpleNamespace(**{
++            "b12x_cute_" + self.key: self.compiled,
++        }))
++        self.modules = {name: ModuleType(name) for name in (
++            "b12x", "b12x._lib", "b12x._lib.compiler", "b12x._lib.compile_plan",
++            "b12x._lib.runtime_control", "cutlass", "cutlass.cute",
++            "cutlass.base_dsl", "cutlass.base_dsl.export",
++            "cutlass.base_dsl.export.external_binary_module",
++        )}
++        self.modules["cutlass"].cute = self.modules["cutlass.cute"]
++        self.modules["cutlass.cute"].compile = Mock()
++        self.modules["cutlass.base_dsl.export.external_binary_module"].ExternalBinaryModule = self.loader
++        self.modules["b12x._lib.runtime_control"].raise_if_kernel_resolution_frozen = Mock()
++        self.program_type = namedtuple("ProgramKey", "dialect key name")
++        plan = self.modules["b12x._lib.compile_plan"]
++        plan.ProgramKey = self.program_type
++        plan.DeferredCuTeKernel = object
++        plan.planning = lambda: False
++        plan.record_program = Mock()
++        plan.tag_compiled = lambda compiled, program: compiled
++        self.module = self.modules["b12x._lib.compiler"]
++        self.namespace = self.module.__dict__
++        self.memory = {}
++        self.namespace.update(
++            __package__="b12x._lib", Path=Path, os=os, json=json, hashlib=hashlib,
++            tempfile=tempfile, shutil=shutil, contextmanager=contextmanager,
++            nullcontext=nullcontext, suppress=suppress,
++            atomic_write_bytes=integrity.atomic_write_bytes,
++            _mkdir_durable=integrity._mkdir_durable, valid_object=integrity.valid_object,
++            _cute_compile_cache_dir=lambda: self.root,
++            _build_compile_manifest=lambda key, payload, func, data, **kw: {
++                "cache_key": key, "object_bytes": len(data),
++                "object_sha256": hashlib.sha256(data).hexdigest(),
++            },
++            _compile_memory_cache_key=lambda *args: "memory-key",
++            _compile_disk_cache_payload=lambda *args: payload,
++            _cute_compile_disk_cache_enabled_for_payload=lambda *args: True,
++            _memory_cache_get=self.memory.get,
++            _memory_cache_put=self.memory.__setitem__,
++            _cute_compile_post_engine_start_log_enabled=lambda: False,
++            _cute_compile_log_enabled=lambda: False,
++            _compile_target_name=lambda func: "test.kernel",
++            _call_cute_compile=self.compile_kernel,
++            _MEMORY_CACHE_LOCK=RLock(), _DISK_CACHE_HITS=0, _COMPILE_MISSES=0,
++            _OFFLINE_CUTE_NO_JIT=False,
++        )
++        load_functions(LIB / "compiler.py", (
++            "_cache_prefix", "_cache_object_path", "_cache_manifest_path", "_cache_lock_path",
++            "_write_compile_manifest", "_valid_cute_compile_cache", "_ensure_cute_compile_manifest",
++            "_disk_cache_key_lock", "_load_cute_compile_from_disk", "_store_cute_compile_to_disk",
++            "compile",
++        ), self.namespace)
++        plan.__dict__.update(__package__="b12x._lib", _RESIDENT_PROGRAMS=set(), Path=Path)
++        load_functions(LIB / "compile_plan.py", ("compiled_program_available",), plan.__dict__)
++        self.available = plan.compiled_program_available
++        self.program = self.program_type("cute", self.key, "test.kernel")
++        modules_patch = patch.dict(sys.modules, self.modules)
++        modules_patch.start()
++        self.addCleanup(modules_patch.stop)
++
++    def write_pair(self):
++        self.obj.write_bytes(self.data)
++        self.manifest.write_text(json.dumps({
++            "cache_key": self.key, "object_bytes": len(self.data),
++            "object_sha256": hashlib.sha256(self.data).hexdigest(),
++        }))
++
++    def test_valid_cache_reused_without_compilation(self):
++        self.write_pair()
++        self.assertTrue(self.available(self.program))
++        self.assertIs(self.module.compile(object()), self.compiled)
++        self.compile_kernel.assert_not_called()
++
++    def test_corruption_is_unavailable_and_recompiled(self):
++        corruptions = {
++            "empty_manifest": lambda: self.manifest.write_bytes(b""),
++            "nul_manifest": lambda: self.manifest.write_bytes(b"\0" * 64),
++            "malformed_manifest": lambda: self.manifest.write_text("{"),
++            "missing_manifest": self.manifest.unlink,
++            "missing_object": self.obj.unlink,
++            "empty_object": lambda: self.obj.write_bytes(b""),
++            "truncated_object": lambda: self.obj.write_bytes(self.data[:3]),
++            "same_size_corruption": lambda: self.obj.write_bytes(b"x" * len(self.data)),
++        }
++        for name, corrupt in corruptions.items():
++            with self.subTest(name=name):
++                self.write_pair()
++                self.assertTrue(self.available(self.program))
++                corrupt()
++                self.assertFalse(self.available(self.program))
++                self.memory.clear()
++                self.compile_kernel.reset_mock()
++                self.assertIs(self.module.compile(object()), self.compiled)
++                self.compile_kernel.assert_called_once()
++                self.assertTrue(self.available(self.program))
++
++    def test_invalid_manifest_fields_are_misses(self):
++        for field, value in (("cache_key", "wrong"), ("object_bytes", True),
++                             ("object_bytes", -1), ("object_sha256", None),
++                             ("object_sha256", "x" * 64)):
++            with self.subTest(field=field, value=value):
++                self.write_pair()
++                data = json.loads(self.manifest.read_text())
++                data[field] = value
++                self.manifest.write_text(json.dumps(data))
++                self.assertFalse(self.available(self.program))
++        self.manifest.write_text("[]")
++        self.assertFalse(self.available(self.program))
++
++    def test_checksums_memoized_but_rewrites_rechecked(self):
++        self.write_pair()
++        with patch.object(integrity.hashlib, "sha256", wraps=hashlib.sha256) as sha:
++            self.assertTrue(self.available(self.program))
++            self.assertTrue(self.available(self.program))
++            self.assertEqual(sha.call_count, 1)
++            info = self.obj.stat()
++            self.obj.write_bytes(b"x" * len(self.data))
++            os.utime(self.obj, ns=(info.st_atime_ns, info.st_mtime_ns))
++            self.assertFalse(self.available(self.program))
++            self.assertEqual(sha.call_count, 2)
++
++    def test_staged_copy_is_validated_and_canonical_object_is_not_modified(self):
++        self.write_pair()
++        def mutate_copy(path):
++            Path(path).write_bytes(b"loader changed this private copy")
++            return SimpleNamespace(**{"b12x_cute_" + self.key: self.compiled})
++        self.loader.side_effect = mutate_copy
++        self.assertIs(self.module._load_cute_compile_from_disk(self.key), self.compiled)
++        self.assertEqual(self.obj.read_bytes(), self.data)
++        self.assertTrue(self.available(self.program))
++        def corrupt_copy(source, target):
++            Path(target).write_bytes(b"bad staged object")
++        self.loader.reset_mock()
++        with patch.object(shutil, "copy2", side_effect=corrupt_copy):
++            self.assertIsNone(self.module._load_cute_compile_from_disk(self.key))
++        self.loader.assert_not_called()
++
++    def test_interrupted_publication_is_rebuilt_and_healthy_neighbor_is_untouched(self):
++        self.write_pair()
++        neighbor = self.obj.parent / "other.o"
++        neighbor.write_bytes(b"keep this")
++        self.data = b"new object with a different checksum"
++        with patch.object(self.module, "_write_compile_manifest", side_effect=OSError("crash")):
++            with self.assertRaises(OSError):
++                self.module._store_cute_compile_to_disk(
++                    self.key, self.compiled, cache_payload=(1,), func=object(),
++                )
++        self.assertFalse(self.available(self.program))
++        self.module.compile(object())
++        self.assertTrue(self.available(self.program))
++        self.assertEqual(neighbor.read_bytes(), b"keep this")
++
++    def test_compiler_rechecks_after_another_writer_repairs_the_entry(self):
++        self.obj.write_bytes(b"corrupt")
++        @contextmanager
++        def repaired_by_other_writer(key):
++            self.write_pair()
++            yield
++        with patch.object(self.module, "_disk_cache_key_lock", repaired_by_other_writer):
++            self.module.compile(object())
++        self.compile_kernel.assert_not_called()
++        self.assertTrue(self.available(self.program))
++
++    def test_publication_fsyncs_file_before_rename_then_directory(self):
++        events = []
++        real_fsync, real_replace = os.fsync, os.replace
++        def fsync(fd):
++            events.append("fsync")
++            real_fsync(fd)
++        def replace(source, target):
++            events.append("replace")
++            real_replace(source, target)
++        with patch.object(os, "fsync", fsync), patch.object(os, "replace", replace):
++            self.module._store_cute_compile_to_disk(
++                self.key, self.compiled, cache_payload=(1,), func=object(),
++            )
++        self.assertEqual(events, ["fsync", "replace", "fsync"] * 2)
++        self.assertTrue(self.available(self.program))
++
++    def test_failure_before_rename_preserves_previous_file_and_cleans_temporary(self):
++        self.write_pair()
++        with patch.object(os, "fsync", side_effect=OSError("disk failure")):
++            with self.assertRaises(OSError):
++                integrity.atomic_write_bytes(self.obj, b"replacement")
++        self.assertEqual(self.obj.read_bytes(), self.data)
++        self.assertEqual(list(self.obj.parent.glob("*.tmp")), [])
++
++    def test_new_cache_directory_entries_are_synced(self):
++        target = self.root / "new" / "shard" / "object.o"
++        with patch.object(integrity, "_fsync_directory", wraps=integrity._fsync_directory) as sync:
++            integrity.atomic_write_bytes(target, self.data)
++        self.assertEqual([call.args[0] for call in sync.call_args_list],
++                         [self.root, self.root / "new", self.root / "new/shard"])
++
++    def test_preparation_metadata_is_not_scanned(self):
++        selection = self.root / "preparation" / "selection.json"
++        selection.parent.mkdir()
++        selection.write_text('{"identity":{},"records":{}}')
++        self.write_pair()
++        self.assertTrue(self.available(self.program))
++        self.module.compile(object())
++        self.assertEqual(selection.read_text(), '{"identity":{},"records":{}}')
++
++
++if __name__ == "__main__":
++    unittest.main()

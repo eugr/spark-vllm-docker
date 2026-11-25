@@ -1,0 +1,91 @@
+From: schopde-nvidia
+Subject: [PATCH] [Kernel] Allow steering the unquantized linear backend independently
+
+Upstream-PR: https://github.com/vllm-project/vllm/pull/59021
+Upstream-Commit: 7563f2b33f213c7ed6dfd2377f14b8da084fbfb4
+Integration-Base: 8084f0624dba24aba6ebac62d8e10cc00730a0fe
+Refresh-Base: b409a4f0d787fdddb75ec2e8ddb6dfcfd36235b7
+
+Preserve upstream RDNA hybrid prefill dequantization settings and validation.
+
+diff --git a/vllm/config/kernel.py b/vllm/config/kernel.py
+index 3e8e5e6d92d414d2d162407cfa460172b46ed978..49b8fcd3197d9b5cca8ed83d0102eb06385bb893 100644
+--- a/vllm/config/kernel.py
++++ b/vllm/config/kernel.py
+@@ -478,6 +478,11 @@ class KernelConfig:
+     precedence over `linear_backend`; for example,
+     `{"nvfp4_w4a16": "humming"}`."""
+
++    unquantized_linear_backend: LinearBackend = "auto"
++    """Backend override for unquantized linear layers only, decoupled from
++    ``linear_backend`` (which also drives the quantized kernel selector).
++    "auto" (default) falls back to ``linear_backend``."""
++
+     rdna_hybrid_w4a16_prefill_dequant: RDNAHybridW4A16PrefillDequantMode = "disable"
+     """Cache a dense dequantized copy of each weight for the RDNA hybrid W4A16
+     linear kernel's prefill GEMM. Applies only on gfx11/gfx12 RDNA GPUs, where
+@@ -507,7 +512,7 @@ class KernelConfig:
+             return value.lower().replace("-", "_")
+         return value
+
+-    @field_validator("linear_backend", mode="before")
++    @field_validator("linear_backend", "unquantized_linear_backend", mode="before")
+     @classmethod
+     def _normalize_linear_backend(cls, value: Any) -> Any:
+         if isinstance(value, str):
+diff --git a/vllm/engine/arg_utils.py b/vllm/engine/arg_utils.py
+index ee2bd37da5e41772b403007b083b88bfcec06886..ff2466af4a726a8d75361f120b770cbedc465aa5 100644
+--- a/vllm/engine/arg_utils.py
++++ b/vllm/engine/arg_utils.py
+@@ -573,6 +573,9 @@ class EngineArgs:
+     sparse_indexer_topk_backend: SparseIndexerTopkBackend = (
+         KernelConfig.sparse_indexer_topk_backend
+     )
++    unquantized_linear_backend: LinearBackend = (
++        KernelConfig.unquantized_linear_backend
++    )
+     all2all_backend: All2AllBackend = ParallelConfig.all2all_backend
+     enable_elastic_ep: bool = ParallelConfig.enable_elastic_ep
+     elastic_ep_max_dp_size: int = ParallelConfig.elastic_ep_max_dp_size
+@@ -1900,6 +1903,15 @@ class EngineArgs:
+         kernel_group.add_argument(
+             "--sparse-indexer-topk-backend", **sparse_indexer_topk_kwargs
+         )
++        unquantized_linear_backend_kwargs = kernel_kwargs[
++            "unquantized_linear_backend"
++        ]
++        unquantized_linear_backend_kwargs["type"] = lambda s: s.lower().replace(
++            "-", "_"
++        )
++        kernel_group.add_argument(
++            "--unquantized-linear-backend", **unquantized_linear_backend_kwargs
++        )
+
+         # vLLM arguments
+         vllm_kwargs = get_kwargs(VllmConfig)
+@@ -2875,6 +2887,10 @@ class EngineArgs:
+             kernel_config.linear_backend = self.linear_backend
+         if self.sparse_indexer_topk_backend != "auto":
+             kernel_config.sparse_indexer_topk_backend = self.sparse_indexer_topk_backend
++        if self.unquantized_linear_backend != "auto":
++            kernel_config.unquantized_linear_backend = (
++                self.unquantized_linear_backend
++            )
+
+         # Transfer top-level ir_op_priority into KernelConfig.ir_op_priority
+         for op_name, op_priority in asdict(self.ir_op_priority).items():
+diff --git a/vllm/model_executor/layers/linear.py b/vllm/model_executor/layers/linear.py
+index 57a95e32057e421c2cd5681d0c3a9585ce52c8ed..b6cb58c68c10ace2e2b30dcf52525eee91ed504d 100644
+--- a/vllm/model_executor/layers/linear.py
++++ b/vllm/model_executor/layers/linear.py
+@@ -174,6 +174,10 @@ class UnquantizedLinearMethod(LinearMethodBase):
+         linear_backend = (
+             config.kernel_config.linear_backend if config is not None else "auto"
+         )
++        if config is not None:
++            unquantized_backend = config.kernel_config.unquantized_linear_backend
++            if unquantized_backend != "auto":
++                linear_backend = unquantized_backend
+         self._gemm_impl = dispatch_unquantized_gemm(linear_backend)
+
+     def create_weights(

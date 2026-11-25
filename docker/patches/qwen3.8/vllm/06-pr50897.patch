@@ -1,0 +1,72 @@
+Subject: [PATCH] [PR #50897] Invalidate stale lookahead hashes on streaming updates
+
+Upstream-PR: https://github.com/vllm-project/vllm/pull/50897
+Upstream-Commit: 7f7139246af9793d0cfb2a1be60068a5fba5604c
+Integration-Base: c7a760751977e4e3396d586956d8767a9bc44a82
+Refresh-Base: ad457ad7440bf0da7a7a8edd67ba9e66a9dec590
+Merged-Dependency: #61589 at 2fb320d8304381e224dd27fbf8c13c30b4e1020f
+Merged-Dependency: #64096 at 75be1384286d6f4c5ca3ad493bc9390159d93f5b
+
+Upstream supplies core and connector lookahead hashing, including the
+configuration-time classmethod capability API and multi-token lookahead.
+Retain only the streaming-session invalidation fix and its regression test.
+
+diff --git a/tests/v1/streaming_input/test_scheduler_streaming.py b/tests/v1/streaming_input/test_scheduler_streaming.py
+index 5258fc7e0a3e6b944a9ab1600c6eef7b36e077c1..7df972e48e1e7b537c2aa707430e24647b8fca1e 100644
+--- a/tests/v1/streaming_input/test_scheduler_streaming.py
++++ b/tests/v1/streaming_input/test_scheduler_streaming.py
+@@ -436,6 +436,39 @@ class TestStreamingScheduler(unittest.TestCase):
+             "block_hashes[0] still fingerprints the discarded sampled token"
+         )
+
++    def test_update_request_as_session_drops_stale_lookahead_hashes(self):
++        """A lookahead hash also covers the token after its block, so the
++        discarded sampled token invalidates the hash of the block before it."""
++        init_none_hash(sha256)
++        scheduler = create_scheduler()
++        scheduler.num_hash_lookahead_tokens = 1
++        hash_block_size = scheduler.hash_block_size
++
++        def make_session(token_ids: list[int]) -> Request:
++            return Request(
++                request_id="session",
++                prompt_token_ids=list(token_ids),
++                sampling_params=SamplingParams(max_tokens=16),
++                pooling_params=None,
++                block_hasher=get_request_block_hasher(hash_block_size, sha256, True),
++                resumable=True,
++            )
++
++        prompt = list(range(1, hash_block_size + 1))
++        session = make_session(prompt)
++        session.append_output_token_ids(999)
++        assert len(session.block_hashes) == 1
++        stale_hash = session.block_hashes[0]
++        session.num_computed_tokens = len(prompt)
++
++        update = StreamingUpdate.from_request(
++            DummyRequest(request_id="session", prompt_token_ids=[42])
++        )
++        scheduler._update_request_as_session(session, update)
++
++        assert session.block_hashes == make_session(prompt + [42]).block_hashes
++        assert session.block_hashes[0] != stale_hash
++
+     def test_streaming_e2e_lifecycle(self):
+         """Comprehensive integration test covering complete streaming request lifecycle
+         including scheduler state management and aliasing bug prevention.
+diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
+index 858ae1fe6a842eb7e4df037a7a4277fe932880bf..c46d2b50a757110c806a3d4db41656dd2d416d16 100644
+--- a/vllm/v1/core/sched/scheduler.py
++++ b/vllm/v1/core/sched/scheduler.py
+@@ -1964,7 +1964,9 @@ class Scheduler(SchedulerInterface):
+         keep_end = session.num_tokens - 1
+         assert keep_end >= session.num_computed_tokens
+         del session._all_token_ids[keep_end:]
+-        del session.block_hashes[keep_end // self.hash_block_size :]
++        # A lookahead hash also covers tokens after its block.
++        num_hashed_tokens = keep_end - self.num_hash_lookahead_tokens
++        del session.block_hashes[max(num_hashed_tokens, 0) // self.hash_block_size :]
+         session._output_token_ids.clear()
+         assert session.prompt_token_ids is not None
+         # Extend prompt with kept output tokens.

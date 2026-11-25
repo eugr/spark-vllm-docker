@@ -1,0 +1,75 @@
+# Recipe: GLM-5.3-Flash-FP4-Local
+# GLM 5.3 Flash using the B12X-optimized serving stack on a dual DGX Spark cluster
+
+recipe_version: "1"
+name: GLM-5.3-Flash-FP4-Local
+description: vLLM serving nvidia/GLM-5.3-Flash-FP4-Local on a dual DGX Spark cluster
+
+model: nvidia/GLM-5.3-Flash-FP4-Local
+container: vllm-node-b12x
+
+build_args:
+  - --exp-b12x
+
+cluster_only: true
+
+mods: []
+
+defaults:
+  port: 8000
+  host: 0.0.0.0
+  tensor_parallel: 2
+  decode_context_parallel: 1
+  block_size: 256
+  max_model_len: 500000
+  max_num_seqs: 4
+  max_num_batched_tokens: 4096
+  num_speculative_tokens: 5
+  kv_cache_memory_bytes: 8G
+  gpu_memory_utilization: 0.8
+
+env:
+  # Bound cached CUDA reservations during A16 preparation on Spark's shared RAM.
+  PYTORCH_ALLOC_CONF: "per_process_memory_fraction:0.8"
+  CUTE_DSL_ARCH: "sm_121a"
+  SAFETENSORS_FAST_GPU: "1"
+  VLLM_ENABLE_ROCE_ALLREDUCE: "1"
+  VLLM_ROCE_ALLREDUCE_MAX_SIZE: "2MB"
+  NCCL_BUFFSIZE: "1048576"
+  NCCL_MAX_CTAS: "8"
+  VLLM_WORKER_MULTIPROC_METHOD: "spawn"
+  VLLM_SSM_CONV_STATE_LAYOUT: "DS"
+  VLLM_USE_AOT_COMPILE: "1"
+  VLLM_USE_MEGA_AOT_ARTIFACT: "1"
+  VLLM_USE_V2_MODEL_RUNNER: "1"
+  VLLM_ENABLE_PCIE_ALLREDUCE: "0"
+  B12X_POLICY_MODE: "auto"
+  VLLM_B12X_MOE_FP4_FORCE_A16: "1"
+  B12X_W4A16_A4_PREFILL: "1"
+
+command: |
+  vllm serve nvidia/GLM-5.3-Flash-FP4-Local \
+    --host {host} \
+    --port {port} \
+    --tensor-parallel-size {tensor_parallel} \
+    --decode-context-parallel-size {decode_context_parallel} \
+    --mamba-cache-mode align \
+    --enable-prefix-caching \
+    --enable-chunked-prefill \
+    --dtype bfloat16 \
+    --kv-cache-dtype fp8 \
+    --quantization modelopt_mixed \
+    --attention-backend B12X \
+    --block-size {block_size} \
+    --moe-backend b12x \
+    --linear-backend b12x \
+    --no-enable-flashinfer-autotune \
+    --load-format b12x \
+    --max-model-len {max_model_len} \
+    --max-num-seqs {max_num_seqs} \
+    --max-num-batched-tokens {max_num_batched_tokens} \
+    --speculative-config '{{"method":"mtp","num_speculative_tokens":{num_speculative_tokens},"moe_backend":"humming","attention_backend":"B12X"}}' \
+    --reasoning-parser glm45 \
+    --tool-call-parser glm47 \
+    --enable-auto-tool-choice \
+    --gpu-memory-utilization {gpu_memory_utilization}

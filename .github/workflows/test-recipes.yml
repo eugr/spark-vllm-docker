@@ -7,7 +7,18 @@ on:
       - 'run-recipe.py'
       - 'run-recipe.sh'
       - 'launch-cluster.sh'
+      - 'autodiscover.sh'
+      - 'cluster_topology.py'
+      - 'setup-cluster.sh'
+      - 'setup-cluster.py'
+      - 'setup_cluster_node.py'
+      - 'build-and-copy.sh'
+      - 'Dockerfile'
+      - 'docker/**'
+      - 'hf-download.sh'
+      - 'hf-cache.py'
       - 'recipes/**'
+      - 'mods/memory-profile/**'
       - 'tests/**'
       - '.github/workflows/test-recipes.yml'
   pull_request:
@@ -15,7 +26,18 @@ on:
       - 'run-recipe.py'
       - 'run-recipe.sh'
       - 'launch-cluster.sh'
+      - 'autodiscover.sh'
+      - 'cluster_topology.py'
+      - 'setup-cluster.sh'
+      - 'setup-cluster.py'
+      - 'setup_cluster_node.py'
+      - 'build-and-copy.sh'
+      - 'Dockerfile'
+      - 'docker/**'
+      - 'hf-download.sh'
+      - 'hf-cache.py'
       - 'recipes/**'
+      - 'mods/memory-profile/**'
       - 'tests/**'
       - '.github/workflows/test-recipes.yml'
   workflow_dispatch:
@@ -39,17 +61,58 @@ jobs:
     - name: Install dependencies
       run: |
         python -m pip install --upgrade pip
-        pip install pyyaml
+        pip install pyyaml 'matplotlib>=3.6'
     
     - name: Make scripts executable
       run: |
         chmod +x run-recipe.py run-recipe.sh launch-cluster.sh
         chmod +x tests/test_recipes.sh tests/test_launch_cluster_image_sync.sh
+        chmod +x tests/test_launch_cluster_vllm_pr.sh
+        chmod +x tests/test_launch_cluster_earlyoom.sh
     
+    - name: Test per-device CUDA kernel target selection
+      run: python3 tests/test_blackwell_target_union.py
+
+    - name: Test Hugging Face cache ownership repair
+      run: python3 tests/test_hf_download_permissions.py
+
+    - name: Test ring discovery and routed distribution
+      run: python3 tests/test_cluster_topology.py
+
+    - name: Test cluster setup and restore without live nodes
+      run: |
+        bash -n setup-cluster.sh
+        python3 tests/test_setup_cluster.py
+
+    - name: Test Hugging Face cache management and copies
+      run: |
+        python3 tests/test_hf_cache_management.py
+        bash tests/test_hf_download_copy.sh
+
+    - name: Test memory profiling mod
+      run: |
+        python3 tests/test_memory_profile_mod.py
+        python3 tests/test_memory_capacity.py
+
     - name: Run recipe integration tests
       run: |
+        python3 tests/test_run_recipe.py
         ./tests/test_recipes.sh -v
         ./tests/test_launch_cluster_image_sync.sh
+        ./tests/test_launch_cluster_vllm_pr.sh
+        ./tests/test_launch_cluster_earlyoom.sh
+        python3 tests/test_launch_cluster_networking.py
+
+    - name: Test Docker image identity and distribution
+      run: |
+        python3 tests/test_image_identity.py
+        bash tests/test_build_and_copy.sh
+
+    - name: Test source patch series and B12X source fixes
+      run: |
+        python3 tests/test_regular_patch_series.py
+        python3 tests/test_vllm_b12x_scale_swizzle.py
+        python3 tests/test_flashinfer_b12x_loader_include_order_patch.py
     
     - name: Verify all recipes with dry-run
       run: |

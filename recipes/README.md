@@ -1,5 +1,40 @@
 # Recipes
 
+## NVIDIA Local AI Inference Recipes
+
+`run-nvidia-recipe.sh` accepts a local NVIDIA recipe YAML file, an HTTPS raw
+YAML URL, or a GitHub `blob` URL. It converts the NVIDIA `runtime.image` and
+`serve.command` fields into this repository's recipe format, then passes the
+result to `run-recipe.sh`. For example:
+
+```bash
+./run-nvidia-recipe.sh https://github.com/NVIDIA/local-ai-inference-recipes/blob/main/models/qwen/qwen3.8-27b/dgx-spark-2gpu/linux/vllm/128gb/nvfp4/recipe.yaml --dry-run --config /dev/null -n 10.0.0.1,10.0.0.2
+./run-nvidia-recipe.sh ./nvidia-recipe.yaml --solo -t my-vllm-image
+./run-nvidia-recipe.sh ./nvidia-recipe.yaml --export ./converted.yaml
+./run-nvidia-recipe.sh ./nvidia-recipe.yaml --export
+```
+
+The NVIDIA image is used by default. `-t IMAGE` overrides it.
+`--remap-container` maps `eugr/spark-vllm-b12x:*` to `vllm-node-b12x`,
+`eugr/spark-vllm:*` to `vllm-node`, and every other image to `vllm-node`.
+An explicit `-t` takes precedence over the mapping. `--export FILE` writes a
+standalone internal recipe and refuses to overwrite an existing file.
+`--export` without a filename prints the YAML to stdout. Neither form launches
+the recipe. Other launch options pass through to `run-recipe.sh`.
+
+The translator uses the main `serve.command`, transfers simple `export KEY=VALUE`
+lines to recipe environment variables, and removes vLLM rank, master, headless,
+and distributed-backend flags supplied by our launcher. It sets solo or cluster
+constraints from `topology.node_count`; one-node recipes launch in solo mode by
+default. For a cluster dry run, provide synthetic nodes and `--config /dev/null`
+so the command does not read your local cluster configuration.
+
+The converted recipe tracks the main checkpoint for the runner's model cache
+check. If the NVIDIA recipe uses a separate draft checkpoint, download that
+model separately before launching. For an unmodified NVIDIA image, the runner
+pulls it when missing and copies it to cluster workers. Remapped or overridden
+local images follow the normal build workflow.
+
 Recipes provide a **one-click solution** for deploying models with pre-configured settings. Each recipe is a YAML file that specifies:
 
 - HuggingFace model to download
@@ -28,6 +63,27 @@ Recipes provide a **one-click solution** for deploying models with pre-configure
 ./run-recipe.sh --discover
 ./run-recipe.sh minimax-m2-awq --setup
 ```
+
+### Nemotron 3.5 on a Single DGX Spark
+
+These recipes use the standard `vllm-node` image and require `--solo`:
+
+- [Nemotron 3.5 Super VL NVFP4](nemotron-3.5-super-vl-nvfp4.yaml):
+  `nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4`, with image and video input.
+- [Nemotron 3.5 Bolt 24GB](nemotron-3.5-bolt-24gb.yaml):
+  `nvidia/NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB`.
+
+Both use their corresponding LiLiCorr draft model with DFlash and seven
+speculative tokens, FP8 KV cache, InstantTensor loading, automatic context
+length, eight concurrent sequences, and GPU memory utilization of `0.8`.
+
+```bash
+./run-recipe.sh nemotron-3.5-super-vl-nvfp4 --solo --setup
+./run-recipe.sh nemotron-3.5-bolt-24gb --solo --setup
+```
+
+Run one recipe at a time. Omit `--setup` when the image and model are already
+available, or use `--dry-run` instead to inspect the generated command.
 
 ## Cluster Node Discovery
 
@@ -118,6 +174,7 @@ command: |
 # Optional fields
 description: What this recipe does
 model: org/model-name              # HuggingFace model ID for --setup downloads
+pull_image: false                 # Pull an upstream image; copy to workers instead of building
 cluster_only: false                # Set to true if model requires cluster mode
 build_args:                        # Extra args for build-and-copy.sh
   - --exp-mxfp4                    # e.g., for MXFP4 Dockerfile
@@ -140,6 +197,7 @@ The `build_args` field passes flags to `build-and-copy.sh`:
 | Flag | Description |
 |------|-------------|
 | `--exp-mxfp4` | Use MXFP4 Dockerfile (for MXFP4 quantized models) |
+| `--exp-b12x` | Use the B12X image profile, which defaults to the `vllm-node-b12x` tag |
 | `--use-wheels` | Build the runner image from prebuilt or local wheels instead of pulling `eugr/spark-vllm:latest` |
 
 ### Parameter Substitution
@@ -197,6 +255,8 @@ Launch options:
   --name NAME                 Override container name
   --nccl-debug LEVEL          NCCL debug level (VERSION, WARN, INFO, TRACE)
   --apply-mod PATH            Apply an extra mod directory or zip (repeatable)
+  --apply-vllm-pr PR_OR_URL   Apply a vLLM PR number or full GitHub PR URL
+                              (repeatable, runtime-only, ordered with --apply-mod)
   -p, --publish HOST:CONTAINER
                               Publish a container port in solo mode (repeatable)
   -v, --volume LOCAL:CONTAINER
@@ -208,7 +268,7 @@ Launch options:
   --ib-if IFACE               Override InfiniBand interface
   -e VAR=VALUE                Pass environment variable to container (repeatable)
   -j N                        Number of parallel build jobs
-  --no-cache-dirs             Do not mount ~/.cache/vllm, ~/.cache/flashinfer, ~/.triton
+  --no-cache-dirs             Do not mount ~/.cache/vllm, ~/.cache/flashinfer, ~/.cache/b12x, ~/.triton, ~/.tilelang
   --keep-entrypoint           Keep the Docker image entrypoint
   --earlyoom                  Run earlyoom as the container foreground process
   --earlyoom-args ARGS        Arguments passed to earlyoom
@@ -233,11 +293,69 @@ Other:
   --earlyoom --earlyoom-args "-M 786432,196608 -s 100 -r 120"
 ```
 
+`--apply-vllm-pr` is a launch option, including when combined with `--setup`.
+It creates an ephemeral runtime mod and does not pass the PR to the image build.
+Bare numbers select PRs from `vllm-project/vllm`. A full public
+`https://github.com/OWNER/REPO/pull/NUMBER` URL downloads the PR from the named
+repository instead.
+It accepts Python/package-only changes under `vllm/`; tests, docs, CI files,
+and `setup.py` are ignored. The container must already provide dependencies
+declared by an ignored `setup.py` change. PRs that modify native code or other
+build/source-tree files must use `build-and-copy.sh --apply-vllm-pr` instead.
+Recipe-declared mods are applied first, then command-line `--apply-mod` and
+`--apply-vllm-pr` layers in their specified order:
+
+```bash
+./run-recipe.sh my-recipe --solo \
+  --apply-mod mods/use-official-vllm \
+  --apply-vllm-pr https://github.com/local-inference-lab/vllm/pull/669 \
+  --apply-mod mods/my-followup-fix
+```
+
 ## Environment Variables and Volumes
 
 Both `run-recipe.sh` and `launch-cluster.sh` accept repeatable `-e VAR=VALUE`
 container environment variables and repeatable `-v LOCAL:CONTAINER` Docker
 volume mappings. Put `launch-cluster.sh` options before `exec`.
+
+Recipe `env:` entries are passed to every container using `-e`, so they are also
+available to mods and Ray workers. Explicit `run-recipe.sh -e VAR=VALUE` arguments
+override recipe values; if a variable is repeated, the last CLI value wins.
+These values override saved `CONTAINER_*` settings as well. Put recipe overrides
+before the `--` separator for extra vLLM arguments.
+
+The [Qwen3.8 Flash Next solo recipe](qwen3.8-flash-next-nvfp4-solo.yaml) and
+[GLM 5.3 Flash recipe](glm-5.3-flash.yaml)
+set `PYTORCH_ALLOC_CONF=per_process_memory_fraction:0.8` to cap total PyTorch
+CUDA reservation, including cached memory, during A16 weight preparation on
+Spark's shared RAM. This preserves A16 decode and compressed scales. The cap
+also applies during serving and is separate from vLLM's
+`--gpu-memory-utilization` budget; increasing `--gpu-mem` does not raise it.
+Override it explicitly with `-e PYTORCH_ALLOC_CONF=per_process_memory_fraction:VALUE`
+when tuning memory use. This setting is specific to these recipes.
+
+B12X source builds also limit each autotuning batch to one challenger plus
+the incumbent. This bounds simultaneous trial buffers for large vision shapes
+while retaining autotuning and image/video support. It can increase tuning time.
+
+The DeepSeek V4 Flash 0731 and Vision recipes use `gpu_memory_utilization: 0.8`
+to leave room for host and distributed-worker allocations in Spark's shared
+RAM. A higher budget can fail vLLM's free-memory check on a worker before
+weights load, leaving the head with a Gloo peer-disconnect error. Override with
+`--gpu-mem VALUE` only when every node has enough free memory at startup.
+
+The Qwen3.8 Flash Next cluster recipe includes
+`--additional-config '{"ple_table_memory":"device"}'` in its command, so a
+normal recipe launch allocates PLE tables on the GPU. This explicit setting
+takes precedence over `VLLM_PLE_TABLE_MEMORY` environment overrides.
+
+To override the cluster recipe with disk offload:
+
+```bash
+./run-recipe.sh qwen3.8-flash-next-nvfp4-cluster \
+  -e B12X_DISK_BACKEND=io_uring \
+  -- --additional-config '{"ple_table_memory":"disk"}'
+```
 
 ```bash
 ./run-recipe.sh my-recipe --solo \

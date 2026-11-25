@@ -1,0 +1,32 @@
+diff --git a/vllm/config/speculative.py b/vllm/config/speculative.py
+--- a/vllm/config/speculative.py
++++ b/vllm/config/speculative.py
+@@ -1077,6 +1077,10 @@
+                     "dspark" in self.draft_model_config.model.lower()
+                     or "Qwen3DSparkModel" in self.draft_model_config.architectures
+                     or "Gemma4DSparkModel" in self.draft_model_config.architectures
++                    or (
++                        "DSparkDraftModel" in self.draft_model_config.architectures
++                        and self.draft_model_config.hf_config.model_type == "qwen3"
++                    )
+                 ):
+                     self.method = "dspark"
+                 elif self.draft_model_config.hf_config.model_type == "medusa":
+@@ -1150,7 +1154,16 @@
+                         self.draft_model_config.hf_config = eagle_config
+                         self.update_arch_()
+ 
+-                if self.method == "dspark" and (
++                if (
++                    self.method == "dspark"
++                    and "DSparkDraftModel" in self.draft_model_config.architectures
++                    and self.draft_model_config.hf_config.model_type == "qwen3"
++                ):
++                    self.draft_model_config.hf_config.architectures = [
++                        "Qwen3DSparkModel"
++                    ]
++                    self.update_arch_()
++                elif self.method == "dspark" and (
+                     "Qwen3DSparkModel" not in self.draft_model_config.architectures
+                     and "Gemma4DSparkModel" not in self.draft_model_config.architectures
+                     and "K3DSparkModel" not in self.draft_model_config.architectures
