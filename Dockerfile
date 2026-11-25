@@ -4,8 +4,8 @@
 ARG BUILD_JOBS=16
 ARG CUDA_IMAGE=nvidia/cuda:13.0.2-devel-ubuntu24.04
 ARG NCCL_NVCC_GENCODE="-gencode=arch=compute_121,code=sm_121"
-ARG TORCH_VERSION=2.13.0
-ARG TORCHVISION_VERSION=0.28.0
+ARG TORCH_VERSION=2.14.0
+ARG TORCHVISION_VERSION=0.29.0
 ARG TORCHAUDIO_VERSION=2.11.0
 ARG CUTLASS_DSL_VERSION=4.7.0
 
@@ -240,6 +240,11 @@ RUN set -eux; \
 # Remove once supported refs include the upstream fix.
 COPY docker/patch_flashinfer_b12x_loader_include_order.py /tmp/patch_flashinfer_b12x_loader_include_order.py
 RUN "$FLASHINFER_BUILD_PYTHON" /tmp/patch_flashinfer_b12x_loader_include_order.py .
+
+# FlashInfer #9765 accepts the extra graph output added in cuDNN FE 1.33.
+# Backport for source refs predating the fix; fixed refs remain unchanged.
+COPY docker/patch_vllm_cudnn_frontend.py /tmp/patch_vllm_cudnn_frontend.py
+RUN "$FLASHINFER_BUILD_PYTHON" /tmp/patch_vllm_cudnn_frontend.py flashinfer .
 
 # FlashInfer #5240 reuses checksum-verified cubins from the cache mount below.
 COPY docker/build_flashinfer_jit_providers.sh /tmp/build_flashinfer_jit_providers.sh
@@ -665,6 +670,10 @@ RUN python3 /tmp/vllm-patches/patch_vllm_b12x_scale_swizzle.py .
 # Keep the fix in exported wheels as well as the runner below.
 RUN python3 /tmp/vllm-patches/patch_vllm_wsl_cuda_uma.py .
 
+# vLLM #68566 capped FE solely for FlashInfer's unpacking bug, fixed above.
+# Correct exported wheel metadata too, without pinning either source project.
+RUN python3 /tmp/vllm-patches/patch_vllm_cudnn_frontend.py vllm .
+
 # Prepare build requirements. Upstream moved the Torch helper under tools/;
 # keep supporting older refs and forks with the root-level helper.
 RUN --mount=type=cache,id=uv-cache,target=/root/.cache/uv \
@@ -697,10 +706,11 @@ RUN --mount=type=cache,id=uv-cache,target=/root/.cache/uv \
 
 # Resolve after PRs and source patches: stable-ABI vLLM requires its declared
 # DeepGEMM fork/pin; older refs retain the SM121 regression workaround.
+# Check its build-time Torch header requirement before starting compilation.
 COPY docker/prepare_deepgemm.py /tmp/prepare_deepgemm.py
 RUN --mount=type=cache,id=repo-cache,target=/repo-cache,sharing=locked \
     python3 /tmp/prepare_deepgemm.py . /repo-cache "$DEEPGEMM_SRC_DIR" \
-        --repo "$DEEPGEMM_REPO" --ref "$DEEPGEMM_REF"
+        --repo "$DEEPGEMM_REPO" --ref "$DEEPGEMM_REF" --torch-version "$TORCH_VERSION"
 
 # Final Compilation
 RUN --mount=type=cache,id=ccache,target=/root/.ccache \
@@ -837,8 +847,8 @@ RUN --mount=type=bind,from=vllm_wheels,target=/workspace/vllm-wheels \
 # Setup environment for runtime
 ARG TORCH_CUDA_ARCH_LIST="12.1a"
 ENV TORCH_CUDA_ARCH_LIST=${TORCH_CUDA_ARCH_LIST}
-ARG FLASHINFER_CUDA_ARCH_LIST="12.1a"
-ENV FLASHINFER_CUDA_ARCH_LIST=${FLASHINFER_CUDA_ARCH_LIST}
+# FlashInfer selects its installed provider from the GPUs visible to the server.
+# The build-stage architecture list also includes GPUs on other runners.
 ENV TRITON_PTXAS_PATH=/usr/local/cuda/bin/ptxas
 ENV TIKTOKEN_ENCODINGS_BASE=$VLLM_BASE_DIR/tiktoken_encodings
 ENV PATH=$VLLM_BASE_DIR:$PATH
@@ -873,8 +883,8 @@ RUN --mount=type=cache,id=uv-cache,target=/root/.cache/uv \
 COPY docker/patch_vllm_wsl_cuda_uma.py /tmp/vllm-patches/patch_vllm_wsl_cuda_uma.py
 RUN python3 /tmp/vllm-patches/patch_vllm_wsl_cuda_uma.py --installed
 
-# InstantTensor must share vLLM's available-memory accounting on native UMA
-# and WSL. Apply after all package installs for regular, B12X, and wheel runners.
+# Preserve InstantTensor's native resource budgeting and exclude CUDA-on-WSL
+# from its UMA path. Apply after all installs for regular, B12X, and wheel runners.
 COPY docker/patch_instanttensor_vllm_memory.py /tmp/instanttensor-patches/patch_instanttensor_vllm_memory.py
 RUN python3 /tmp/instanttensor-patches/patch_instanttensor_vllm_memory.py --installed
 

@@ -18,7 +18,6 @@ on:
       - 'hf-download.sh'
       - 'hf-cache.py'
       - 'recipes/**'
-      - 'mods/fix-qwen3-next-autoround/**'
       - 'mods/memory-profile/**'
       - 'tests/**'
       - '.github/workflows/test-recipes.yml'
@@ -38,7 +37,6 @@ on:
       - 'hf-download.sh'
       - 'hf-cache.py'
       - 'recipes/**'
-      - 'mods/fix-qwen3-next-autoround/**'
       - 'mods/memory-profile/**'
       - 'tests/**'
       - '.github/workflows/test-recipes.yml'
@@ -72,8 +70,8 @@ jobs:
         chmod +x tests/test_launch_cluster_vllm_pr.sh
         chmod +x tests/test_launch_cluster_earlyoom.sh
     
-    - name: Test Qwen3-Next AutoRound compatibility mod
-      run: python3 tests/test_qwen3_next_autoround_mod.py
+    - name: Test per-device CUDA kernel target selection
+      run: python3 tests/test_blackwell_target_union.py
 
     - name: Test Hugging Face cache ownership repair
       run: python3 tests/test_hf_download_permissions.py

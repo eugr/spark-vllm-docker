@@ -1,8 +1,20 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Excerpts from upstream b409a4f0d787fdddb75ec2e8ddb6dfcfd36235b7 (with preceding series entries).
+# vllm/models/qwen4_exp/common/qsa_indexer.py
 
-# Excerpt from upstream deacc3670153845db2f013ea24085d6eaf338874, after #64110.
-# Unrelated metadata and base-class methods are omitted.
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""Paged indexer cache ownership and metadata for Qwen4Exp QSA.
+
+Each QSA layer keeps a fixed circular buffer of raw index keys (the
+compressor state) and one compressed key. MRoPE models pack exact three-axis
+positions beside the raw keys; text models derive group positions from
+logical positions. The compressor state uses one block per request, while
+    the compressed owner uses `MLAAttentionSpec.tokens_per_state` so its block
+table follows the main KV-cache lifecycle. Their physical tensor storage is
+shared by the generic cache-layout planner.
+"""
 
 import math
 from dataclasses import dataclass
@@ -29,17 +41,20 @@ from vllm.v1.attention.backends.utils import (
     PAD_SLOT_ID,
     split_decodes_and_prefills,
 )
+from vllm.v1.core.single_type_kv_cache_manager import (
+    CircularBufferManager,
+    FullAttentionManager,
+)
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
-    CircularBufferSpec,
+    KVCacheLayerConfig,
     KVCacheLayout,
-    KVCacheSpec,
     MLAAttentionSpec,
 )
 
 
 def canonical_qsa_rope_positions(positions: torch.Tensor) -> torch.Tensor:
-    """Return exact per-token positions as ``[tokens, 1, 3]`` int64 rows."""
+    """Return exact per-token positions as `[tokens, 1, 3]` int64 rows."""
     if positions.ndim == 1:
         positions = positions.unsqueeze(0).expand(3, -1)
     elif positions.ndim != 2 or positions.shape[0] not in (1, 3):
@@ -48,8 +63,7 @@ def canonical_qsa_rope_positions(positions: torch.Tensor) -> torch.Tensor:
         positions = positions.expand(3, -1)
     return positions.transpose(0, 1).unsqueeze(1).to(torch.int64)
 
-
-class _QSAIndexerCache(nn.Module, AttentionLayerBase):
+class _QSAIndexerCache:
     def get_attn_backend(self) -> type[AttentionBackend]:
         return QSAIndexerBackend
 
@@ -85,7 +99,7 @@ class QSARawKeyCache(_QSAIndexerCache):
             return None
         return self.kv_cache[..., self.rope_position_offset :].view(torch.int64)
 
-    def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
+    def get_kv_cache_config(self, vllm_config: VllmConfig) -> KVCacheLayerConfig:
         # Hold the open group's committed keys plus every row a speculative
         # step stores before acceptance is known, rounded up to whole groups so
         # the ring divides the attention block size (it joins the LCM that sets
@@ -97,12 +111,11 @@ class QSARawKeyCache(_QSAIndexerCache):
             f"QSA ring capacity {capacity} must divide the attention block "
             f"size {self.cache_config.block_size}"
         )
-        return CircularBufferSpec(
+        spec = AttentionSpec(
             block_size=capacity,
             num_kv_heads=1,
             head_size=self.head_size,
             head_size_v=0,
             dtype=self.dtype,
         )
-
-
+        return CircularBufferManager.layer_config(spec)

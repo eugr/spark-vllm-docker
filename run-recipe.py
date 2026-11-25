@@ -244,6 +244,7 @@ def load_recipe(recipe_path: Path) -> dict[str, Any]:
     recipe.setdefault("env", {})
     recipe.setdefault("cluster_only", False)
     recipe.setdefault("solo_only", False)
+    recipe.setdefault("pull_image", False)
 
     # Validate recipe version compatibility
     # EXTENSIBILITY: When adding new schema versions, update SUPPORTED_VERSIONS
@@ -1249,8 +1250,27 @@ Examples:
             print(f"Error: {exc}")
             return 1
 
+    # External images declared by translated recipes are pulled, then copied
+    # to workers. Do not pass their tags to our local Docker build.
+    if recipe.get("pull_image") and not args.download_only:
+        image_exists = check_image_exists(container)
+        if args.dry_run:
+            if args.force_build or not image_exists:
+                print(f"Would pull container: {container}")
+            if copy_targets:
+                print(f"Would check/copy container to: {', '.join(copy_targets)}")
+        else:
+            if args.force_build or not image_exists:
+                print(f"Pulling container '{container}'...")
+                if subprocess.run(["docker", "pull", container]).returncode != 0:
+                    print("Error: Failed to pull container image")
+                    return 1
+            if copy_targets and not build_image(container, copy_targets, copy_only=True):
+                print("Error: Failed to copy container image to workers")
+                return 1
+
     # --- Build Phase ---
-    if args.build_only or args.setup or args.force_build:
+    if (args.build_only or args.setup or args.force_build) and not recipe.get("pull_image"):
         if args.dry_run:
             image_exists = check_image_exists(container)
             if args.force_build or not image_exists:

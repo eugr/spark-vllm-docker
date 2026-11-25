@@ -1,0 +1,386 @@
+Subject: [PATCH] [PR #66906] [Perf][MLA][DCP] Gather prefill queries before latent expansion
+Upstream-PR: https://github.com/vllm-project/vllm/pull/66906
+Upstream-Commit: 517ec5a29259ba06ec7986dc933ef0182667e8ec
+Integration-Base: 341b2b31f3219701e6f309426b481e5e13a6ad7e
+
+diff --git a/.buildkite/test_areas/distributed.yaml b/.buildkite/test_areas/distributed.yaml
+index fa320108c849d33b184360f44846932b82d5814c..caaccc3e75938b575f308b7d502a4b5c07edbeaf 100644
+--- a/.buildkite/test_areas/distributed.yaml
++++ b/.buildkite/test_areas/distributed.yaml
+@@ -605,6 +605,7 @@ steps:
+     - pytest -v -s tests/distributed/test_dcp_direct_a2a_lse_reduce.py -k direct_a2a_matches_reference
+     - pytest -v -s tests/v1/attention/test_shardq.py
+     - pytest -v -s tests/distributed/test_dcp_a2a.py -k v_up_proj
++    - pytest -v -s tests/distributed/test_mla_query_gather.py
+     - pytest -v -s tests/v1/distributed/test_dbo.py
+     - VLLM_ALLOW_INSECURE_SERIALIZATION=1 pytest -v -s tests/distributed/test_weight_transfer.py
+     - VLLM_ALLOW_INSECURE_SERIALIZATION=1 pytest -v -s tests/distributed/test_weight_transfer_m2n.py
+diff --git a/docs/serving/context_parallel_deployment.md b/docs/serving/context_parallel_deployment.md
+index 9bcf787cf791aeb3a647aff4caea922a985a767b..a84cd83bc2fb3917207d94efba9d001e0ef81481 100644
+--- a/docs/serving/context_parallel_deployment.md
++++ b/docs/serving/context_parallel_deployment.md
+@@ -69,6 +69,38 @@ In short, for decode context parallel, try to increase `-tp` size until you get
+ 
+ Decode context parallel is supported in vLLM, for both MLA and GQA models. Some attention backends also support the combination of decode context parallel and MTP (multi-token prediction) to further accelerate the decoding phase.
+ 
++### Gather MLA queries before latent expansion
++
++For MLA backends that use the absorbed MQA path for prefill, DCP normally gathers
++queries after expanding their NoPE dimension to `kv_lora_rank`. When that dimension
++is larger than `qk_nope_head_dim`, gathering first can reduce communication:
++
++```bash
++vllm serve MODEL -tp 8 -dcp 8 \
++    --attention-config '{"mla_dcp_query_gather_min_tokens": 2048}'
++```
++
++The default is `0` (disabled). A positive value enables the optimization for MQA
++batches with at least that many query tokens, including mixed prefill/decode
++batches. Dense MHA prefill and queries already replicated by the model retain
++their existing paths. It requires DCP greater than one, FP16/BF16 query projection,
++`qk_nope_head_dim < kv_lora_rank`, and a path without quantized query input or
++head padding. PCP, AMX, and AITER FP4/FP8 projection paths retain their existing
++behavior.
++
++Eligible batches prepare queries during normal forward execution, keeping the
++regular gather outside query/indexer overlap.
++
++The per-rank query payload changes from
++`tokens * local_heads * (kv_lora_rank + qk_rope_head_dim)` to
++`tokens * local_heads * (qk_nope_head_dim + qk_rope_head_dim)` elements. Each rank
++stores all DCP ranks' query up-projection weights and projects all gathered heads.
++The additional replicated weight tensor per layer contains
++`dcp_size * local_heads * qk_nope_head_dim * kv_lora_rank` elements, unless those
++weights are already replicated. The local weights are retained for smaller
++batches. This trades memory and projection work for less communication; benchmark
++the threshold on the intended hardware and workload.
++
+ ## Technical Discussions
+ 
+ The main discussions happen in the `#sig-context-parallel` channel of [vLLM Slack](https://slack.vllm.ai/).
+diff --git a/tests/distributed/test_mla_query_gather.py b/tests/distributed/test_mla_query_gather.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..69676b457c229dc80d1c40fcd17b7c22134b66ce
+--- /dev/null
++++ b/tests/distributed/test_mla_query_gather.py
+@@ -0,0 +1,230 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Query-gather ordering, using real MLA layers and distributed groups."""
++
++from pathlib import Path
++
++import pytest
++import torch
++import torch.multiprocessing as mp
++
++from vllm.config import (
++    AttentionConfig,
++    CacheConfig,
++    KernelConfig,
++    ParallelConfig,
++    SchedulerConfig,
++    VllmConfig,
++    set_current_vllm_config,
++)
++from vllm.distributed import (
++    cleanup_dist_env_and_memory,
++    get_dcp_group,
++    init_distributed_environment,
++    initialize_model_parallel,
++)
++from vllm.forward_context import set_forward_context
++from vllm.model_executor.layers.attention.mla_attention import (
++    MLAAttention,
++    MLACommonMetadata,
++)
++from vllm.model_executor.layers.linear import ColumnParallelLinear
++from vllm.v1.attention.backends.mla.prefill.cpu_sdpa import CPUSDPAMLAPrefillBackend
++from vllm.v1.attention.backends.mla.triton_mla import TritonMLABackend
++
++
++def _make_layer(
++    config, rank, world_size, rope_dim, qrep, prefix, num_heads=8, nope_dim=128
++):
++    with set_current_vllm_config(config):
++        projection = ColumnParallelLinear(
++            512,
++            world_size * num_heads * (nope_dim + 128),
++            bias=False,
++            prefix=prefix + ".kv_b",
++        ).cuda()
++        # Different weights on each rank expose head-ordering mistakes.
++        torch.manual_seed(42 + rank)
++        projection.weight.normal_(std=0.02)
++        layer = MLAAttention(
++            num_heads=num_heads,
++            scale=(nope_dim + rope_dim) ** -0.5,
++            qk_nope_head_dim=nope_dim,
++            qk_rope_head_dim=rope_dim,
++            v_head_dim=128,
++            q_lora_rank=None,
++            kv_lora_rank=512,
++            kv_b_proj=projection,
++            dcp_q_replicate=qrep,
++            cache_config=config.cache_config,
++            attn_backend=TritonMLABackend,
++            prefill_backend_cls=CPUSDPAMLAPrefillBackend,
++            prefix=prefix,
++        )
++        layer.process_weights_after_loading()
++        return layer
++
++
++def _query_tensor(query):
++    return torch.cat(query, dim=-1) if isinstance(query, tuple) else query
++
++
++def _check_prepared_query(config, rank, world_size):
++    """Narrow gathering defers preparation and its KV write until normal forward."""
++    torch.set_default_dtype(torch.bfloat16)
++    config.attention_config = AttentionConfig()
++    baseline = _make_layer(config, rank, world_size, 64, False, "overlap.base")
++    config.attention_config = AttentionConfig(mla_dcp_query_gather_min_tokens=1)
++    candidate = _make_layer(config, rank, world_size, 64, False, "overlap.new")
++    q = torch.randn(4, 8, 192, device="cuda")
++    kv = torch.randn(4, 512, device="cuda")
++    pe = torch.randn(4, 1, 64, device="cuda")
++    cache = torch.zeros(1, 1, 16, 576, device="cuda")
++    candidate.bind_kv_cache(cache)
++    slots = torch.arange(4, device="cuda", dtype=torch.int64)
++    metadata = MLACommonMetadata(
++        num_reqs=1,
++        max_query_len=4,
++        max_seq_len=4,
++        num_actual_tokens=4,
++        query_start_loc=torch.tensor([0, 4], device="cuda", dtype=torch.int32),
++        slot_mapping=slots,
++        num_decodes=0,
++        num_decode_tokens=0,
++        num_prefills=1,
++    )
++    expected = _query_tensor(baseline._prepare_mqa_query(q, False))
++    with set_forward_context(
++        {candidate.layer_name: metadata},
++        config,
++        num_tokens=4,
++        slot_mapping={candidate.layer_name: slots},
++    ):
++        prepared = candidate.prepare_mqa_query(q, kv, pe)
++    if world_size > 1:
++        assert prepared is None
++        assert torch.count_nonzero(cache) == 0
++        prepared = _query_tensor(candidate._prepare_mqa_query(q, False))
++    else:
++        assert prepared is not None
++        torch.testing.assert_close(cache[0, 0, :4, :512], kv, rtol=0, atol=0)
++    torch.testing.assert_close(prepared, expected, rtol=0, atol=0)
++
++
++@torch.inference_mode()
++def _worker(rank, world_size, init_method, local_rank=None):
++    local_rank = rank if local_rank is None else local_rank
++    torch.accelerator.set_device_index(local_rank)
++    config = VllmConfig(
++        parallel_config=ParallelConfig(
++            tensor_parallel_size=world_size,
++            decode_context_parallel_size=world_size,
++            disable_custom_all_reduce=True,
++            distributed_executor_backend="external_launcher",
++        ),
++        cache_config=CacheConfig(cache_dtype="auto"),
++        scheduler_config=SchedulerConfig(
++            max_model_len=8192, max_num_batched_tokens=8192, is_encoder_decoder=False
++        ),
++        kernel_config=KernelConfig(enable_jit_warmup=False),
++    )
++    with set_current_vllm_config(config):
++        init_distributed_environment(
++            world_size=world_size,
++            rank=rank,
++            local_rank=local_rank,
++            distributed_init_method=init_method,
++        )
++        initialize_model_parallel(
++            tensor_model_parallel_size=world_size,
++            decode_context_model_parallel_size=world_size,
++        )
++    try:
++        for dtype in (torch.bfloat16, torch.float16):
++            torch.set_default_dtype(dtype)
++            for nope_dim, rope_dim in ((64, 64), (128, 64), (128, 0)):
++                for qrep in (False, True):
++                    suffix = f"{dtype}.{nope_dim}.{rope_dim}.{qrep}"
++                    config.attention_config = AttentionConfig()
++                    baseline = _make_layer(
++                        config,
++                        rank,
++                        world_size,
++                        rope_dim,
++                        qrep,
++                        "base." + suffix,
++                        nope_dim=nope_dim,
++                    )
++                    config.attention_config = AttentionConfig(
++                        mla_dcp_query_gather_min_tokens=2048
++                    )
++                    candidate = _make_layer(
++                        config,
++                        rank,
++                        world_size,
++                        rope_dim,
++                        qrep,
++                        "new." + suffix,
++                        nope_dim=nope_dim,
++                    )
++                    assert candidate.dcp_query_gather_min_tokens == (
++                        2048 if world_size > 1 else 0
++                    )
++                    assert (candidate.W_UK_T_dcp_qrep is not None) == (
++                        qrep or world_size > 1
++                    )
++                    for rows in (1, 2047, 2048, 2049, 8192):
++                        q = torch.randn(rows, 8, nope_dim + rope_dim, device="cuda")
++                        if qrep:
++                            q = get_dcp_group().all_gather(q, dim=1)
++                        expected = _query_tensor(baseline._prepare_mqa_query(q, qrep))
++                        with torch.profiler.profile(
++                            activities=[torch.profiler.ProfilerActivity.CPU],
++                            record_shapes=True,
++                        ) as profile:
++                            actual = _query_tensor(
++                                candidate._prepare_mqa_query(q, qrep)
++                            )
++                        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
++                        bmm = [e for e in profile.events() if e.name == "aten::bmm"]
++                        assert len(bmm) == 1
++                        replicated = qrep or (world_size > 1 and rows >= 2048)
++                        assert bmm[0].input_shapes[0][0] == (
++                            8 * world_size if replicated else 8
++                        )
++
++                    # Replay with changed inputs and reloaded weights: neither
++                    # the gathered query nor the replicated weights may go stale.
++                    with get_dcp_group().graph_capture() as context:
++                        for _ in range(3):
++                            candidate._prepare_mqa_query(q, qrep)
++                        graph = torch.cuda.CUDAGraph()
++                        with torch.cuda.graph(graph, stream=context.stream):
++                            captured = _query_tensor(
++                                candidate._prepare_mqa_query(q, qrep)
++                            )
++                    q.mul_(0.5)
++                    expected = _query_tensor(baseline._prepare_mqa_query(q, qrep))
++                    graph.replay()
++                    torch.testing.assert_close(captured, expected, rtol=0, atol=0)
++
++                    weight = candidate.W_UK_T_dcp_qrep
++                    weight_ptr = None if weight is None else weight.data_ptr()
++                    for layer in (baseline, candidate):
++                        layer.kv_b_proj.weight.mul_(0.5)
++                        layer.process_weights_after_loading()
++                    if weight_ptr is not None:
++                        assert candidate.W_UK_T_dcp_qrep.data_ptr() == weight_ptr
++                    expected = _query_tensor(baseline._prepare_mqa_query(q, qrep))
++                    graph.replay()
++                    torch.testing.assert_close(captured, expected, rtol=0, atol=0)
++
++        _check_prepared_query(config, rank, world_size)
++    finally:
++        cleanup_dist_env_and_memory()
++
++
++@pytest.mark.parametrize("world_size", [1, 2])
++def test_mla_query_gather(world_size: int, tmp_path: Path):
++    init_method = f"file://{tmp_path / 'dist_init'}"
++    mp.spawn(_worker, args=(world_size, init_method), nprocs=world_size, join=True)
+diff --git a/vllm/config/attention.py b/vllm/config/attention.py
+index eb171e4c736d4fa073ea4d2030e28572ccf35bf0..cb623d685380570fa690a4dd959424ff199248c6 100644
+--- a/vllm/config/attention.py
++++ b/vllm/config/attention.py
+@@ -181,6 +181,14 @@ class AttentionConfig:
+     When False (default), pure prefill batches use forward_mha when implemented.
+     Set to True to always use the MQA path."""
+ 
++    mla_dcp_query_gather_min_tokens: int = Field(default=0, ge=0)
++    """Gather MLA queries before their latent projection for MQA batches of at
++    least this size under DCP. Zero (default) disables this optimization. It
++    reduces communication when qk_nope_head_dim < kv_lora_rank, at the cost of
++    replicating the query up-projection weights and computation across DCP ranks.
++    Applies to unquantized query projection without PCP or head padding; dense
++    MHA prefill and queries already replicated by the model are unchanged."""
++
+     sparse_mla_prefill_workspace_factor: int | None = Field(default=None, ge=2)
+     """Sparse MLA prefill workspace size, in multiples of `max_model_len`.
+     FlashMLA sparse gathers a prefill step's context KV into this workspace and
+diff --git a/vllm/model_executor/layers/attention/mla_attention.py b/vllm/model_executor/layers/attention/mla_attention.py
+index 4b30893da7747e50af767be5ab70d0fff62911c3..76923e87369b0a24a7b11f3f1031e2923d119021 100644
+--- a/vllm/model_executor/layers/attention/mla_attention.py
++++ b/vllm/model_executor/layers/attention/mla_attention.py
+@@ -831,6 +831,25 @@ class MLAAttention(nn.Module, AttentionLayerBase):
+             )
+         )
+ 
++        self.dcp_query_gather_min_tokens = 0
++        if (
++            self.dcp_manager is not None
++            and not self.use_pcp
++            and self.q_pad_num_heads is None
++            and not self.is_amx_bmm_enabled
++            and not self.is_aiter_triton_fp4_bmm_enabled
++            and not self.is_aiter_triton_fp8_bmm_enabled
++            and not (
++                is_quantized_kv_cache(self.kv_cache_dtype)
++                and self.impl.supports_quant_query_input
++            )
++            and dtype in (torch.float16, torch.bfloat16)
++            and self.qk_nope_head_dim < self.kv_lora_rank
++        ):
++            self.dcp_query_gather_min_tokens = (
++                vllm_config.attention_config.mla_dcp_query_gather_min_tokens
++            )
++
+         # Attributes for forward_impl method
+         self._vllm_config = get_current_vllm_config()
+         self._chunked_prefill_workspace_size: int | None = None
+@@ -1407,7 +1426,11 @@ class MLAAttention(nn.Module, AttentionLayerBase):
+             return None
+         if self.impl.dcp_world_size > 1:
+             assert self.dcp_manager is not None
+-            if q.shape[0] > self.dcp_manager.direct_query_gather_max_tokens:
++            if (
++                q.shape[0] > self.dcp_manager.direct_query_gather_max_tokens
++                or 0 < self.dcp_query_gather_min_tokens <= q.shape[0]
++            ):
++                # Narrow gathering uses the regular collective, outside overlap.
+                 return None
+             # DCP ShardQ steps do not gather the query.
+             if getattr(attn_metadata, "dcp_gathered_context", None) is not None:
+@@ -1446,6 +1469,16 @@ class MLAAttention(nn.Module, AttentionLayerBase):
+     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+         """Absorb the MQA query (and, with `gather_query`, DCP-gather it)."""
+         fp8_attention = is_quantized_kv_cache(self.kv_cache_dtype)
++        if (
++            not qrep_decode
++            and self.dcp_query_gather_min_tokens > 0
++            and mqa_q.shape[0] >= self.dcp_query_gather_min_tokens
++        ):
++            # Move the collective before W_UK_T expands the NoPE dimension.
++            # The replicated weights preserve rank-major head ordering.
++            mqa_q = get_dcp_group().all_gather(mqa_q, dim=1)
++            qrep_decode = True
++
+         mqa_q_nope, mqa_q_pe = mqa_q.split(
+             [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1
+         )
+@@ -1680,7 +1713,9 @@ class MLAAttention(nn.Module, AttentionLayerBase):
+             replace_parameter(self, "W_UV", W_UV.transpose(0, 1))
+             # Convert from (L, N, P) to (N, P, L)
+             replace_parameter(self, "W_UK_T", W_UK.permute(1, 2, 0))
+-            if self.dcp_q_replicate:
++            if self.dcp_q_replicate or (
++                self.dcp_manager is not None and self.dcp_query_gather_min_tokens > 0
++            ):
+                 replace_parameter(
+                     self,
+                     "W_UK_T_dcp_qrep",

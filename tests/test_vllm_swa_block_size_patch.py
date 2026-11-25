@@ -10,6 +10,7 @@ import unittest
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
 
 PROJECT_DIR = Path(__file__).resolve().parents[1]
@@ -126,6 +127,52 @@ UPSTREAM_WITH_DIVISOR = UPSTREAM_WITH_SPEC.replace(
 
 
 class SWADivisorSelectionTests(unittest.TestCase):
+    def test_layer_config_api_keeps_divisibility_and_per_layer_constraints(self):
+        source = (PROJECT_DIR / "tests/fixtures/qwen38-patch-series/"
+                  "swa_layer_config_upstream.py").read_text()
+        patched, message = PATCHER.patch_source(source)
+        self.assertEqual(patched, source)
+        self.assertIn("#60252", message)
+        namespace = {
+            "AttentionSpec": SlidingWindowSpec,
+            "AttentionType": SimpleNamespace(ENCODER_ONLY=0, ENCODER=1, DECODER=2),
+            "get_kv_quant_mode": lambda _: 1,
+            "SlidingWindowManager": SimpleNamespace(layer_config=lambda spec, **kw:
+                                                      SimpleNamespace(spec=spec, **kw)),
+        }
+        exec(patched, namespace)
+        layer = namespace["Attention"]()
+        layer.attn_type = 2
+        layer.layer_name = "draft.attention"
+        layer.kv_cache_dtype = layer.kv_cache_torch_dtype = "fp8"
+        layer.num_kv_heads = 8
+        layer.head_size = layer.head_size_v = 128
+        layer.sliding_window = 2048
+        per_layer = Mock(return_value=[16, 32, 64])
+        general = Mock(side_effect=AssertionError("ignored per-layer constraints"))
+        layer.attn_backend = SimpleNamespace(
+            get_supported_kernel_block_sizes_for_layers=per_layer,
+            get_supported_kernel_block_sizes=general,
+            customize_spec=lambda spec: spec, is_mla=lambda: False,
+        )
+        with patch.dict("sys.modules", {
+            "vllm.v1.attention.backend": SimpleNamespace(MultipleOf=MultipleOf),
+        }):
+            for primary, shared_page, expected in ((1648, None, 16),
+                                                   (1536, None, 64),
+                                                   (1648, 32 * 2048, 32)):
+                config = SimpleNamespace(cache_config=SimpleNamespace(
+                    block_size=primary, skip_page_size_padded=shared_page,
+                ))
+                result = layer.get_kv_cache_config(config)
+                self.assertEqual(result.spec.block_size, expected)
+                self.assertEqual(result.sliding_window, 2048)
+                self.assertEqual(per_layer.call_args.args[1], [layer.layer_name])
+        with self.assertRaises(PATCHER.PatchError):
+            PATCHER.patch_source(source.replace(
+                "divisor_of=None if shared_page else block_size", "divisor_of=None",
+            ))
+
     def test_divisor_fix_is_kept_without_layering_old_fallback(self):
         patched, message = PATCHER.patch_source(UPSTREAM_WITH_DIVISOR)
         self.assertEqual(patched, UPSTREAM_WITH_DIVISOR)

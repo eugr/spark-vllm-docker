@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-# Excerpt from upstream c4f2bb4abbdbad9ed5b0a71acd0bd585056eeab8.
+# Excerpt from upstream b409a4f0d787fdddb75ec2e8ddb6dfcfd36235b7.
 from __future__ import annotations
 
 class KernelConfig:
@@ -8,8 +8,8 @@ class KernelConfig:
         default=None, min_length=1
     )
     """Backend overrides keyed by linear quantization scheme. Overrides take
-    precedence over ``linear_backend``; for example,
-    ``{"nvfp4_w4a16": "humming"}``."""
+    precedence over `linear_backend`; for example,
+    `{"nvfp4_w4a16": "humming"}`."""
 
     rdna_hybrid_w4a16_prefill_dequant: RDNAHybridW4A16PrefillDequantMode = "disable"
     """Cache a dense dequantized copy of each weight for the RDNA hybrid W4A16

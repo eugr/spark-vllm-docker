@@ -374,6 +374,17 @@ test_non_default_gpu_arch_uses_wheel_build() {
     pass "non-default gpu arch rebuilds FlashInfer for regular builds"
 }
 
+test_multi_arch_regular_build() {
+    setup_fixture
+    local archs="10.3a 12.0a 12.1a"
+    run_build --gpu-arch "$archs" || fail "multi-architecture regular build failed"
+    assert_log_contains "TORCH_CUDA_ARCH_LIST=$archs --build-arg FLASHINFER_CUDA_ARCH_LIST=$archs"
+    assert_log_contains 'NCCL_NVCC_GENCODE=-gencode=arch=compute_103,code=sm_103 -gencode=arch=compute_120,code=sm_120 -gencode=arch=compute_121,code=sm_121'
+    assert_log_contains '^docker build --target vllm-export .*VLLM_PRESERVE_SM12X_TARGET=1'
+    assert_log_not_contains 'VLLM_PATCH_B12X_C128A_ALIGNMENT=1'
+    pass "regular multi-architecture builds target Spark, Station and RTX Pro"
+}
+
 test_default_prebuilt_ignores_local_flashinfer_arch() {
     setup_fixture
     printf '12.0f\n' > "$FIXTURE_DIR/.wheel-cache/flashinfer/regular/.flashinfer-arch"
@@ -941,6 +952,10 @@ test_regular_rebuild_enables_flashinfer_patch_series() {
     run_build --rebuild-vllm --rebuild-flashinfer || fail "regular source rebuild failed"
     assert_log_contains '^docker build --target flashinfer-export .*FLASHINFER_APPLY_REGULAR_PATCHES=1'
     assert_log_contains '^docker build --target vllm-export .*VLLM_APPLY_PRESET_PRS=1'
+    local target
+    for target in '--target flashinfer-export' '--target vllm-export' '-t vllm-node'; do
+        assert_log_contains "^docker build $target .*--build-arg TORCH_VERSION=2.14.0 --build-arg TORCHVISION_VERSION=0.29.0 --build-arg TORCHAUDIO_VERSION=2.11.0"
+    done
     pass "regular source rebuild enables both checked-in patch series"
 }
 
@@ -1753,8 +1768,8 @@ test_dockerfile_uses_configurable_torch_versions() {
         fail "Dockerfile does not preserve the selected Torch-family versions during later installs"
     fi
     for expected in \
-        'ARG TORCH_VERSION=2.13.0' \
-        'ARG TORCHVISION_VERSION=0.28.0' \
+        'ARG TORCH_VERSION=2.14.0' \
+        'ARG TORCHVISION_VERSION=0.29.0' \
         'ARG TORCHAUDIO_VERSION=2.11.0'; do
         if ! grep -Fq "$expected" "$PROJECT_DIR/Dockerfile"; then
             fail "Dockerfile is missing Torch-family default: $expected"
@@ -1805,6 +1820,13 @@ test_build_dependency_updates() {
         fail "FlashInfer dependency build regression tests failed"
     fi
     pass "FlashInfer wheels build with the selected settings"
+}
+
+test_cudnn_frontend_compat() {
+    if ! python3 "$PROJECT_DIR/tests/test_cudnn_frontend_compat.py"; then
+        fail "cuDNN frontend compatibility tests failed"
+    fi
+    pass "FlashInfer and vLLM source builds support cuDNN frontend 1.33"
 }
 
 test_copied_vllm_git_index_is_refreshed_before_patch_apply() {
@@ -1942,8 +1964,8 @@ test_dockerfile_externalizes_vllm_source_patches() {
             fail "Dockerfile does not execute external patch: $patch_name"
         fi
     done
-    if [ "$patch_count" -ne 19 ]; then
-        fail "Expected 19 external vLLM patch scripts, found $patch_count"
+    if [ "$patch_count" -ne 20 ]; then
+        fail "Expected 20 external vLLM patch scripts, found $patch_count"
     fi
     if ! python3 -c '
 from pathlib import Path
@@ -1987,7 +2009,7 @@ test_instanttensor_vllm_memory_patch() {
     if ! python3 "$PROJECT_DIR/tests/test_instanttensor_vllm_memory_patch.py"; then
         fail "InstantTensor memory accounting regression tests failed"
     fi
-    pass "InstantTensor uses vLLM memory accounting and preserves budget checks"
+    pass "InstantTensor preserves native budgets and CUDA-on-WSL memory policy"
 }
 
 test_b12x_moe_tuning_memory_patch() {
@@ -2023,6 +2045,7 @@ test_tf5_uses_prebuilt_tf5_tag
 test_custom_tag_uses_prebuilt_custom_tag
 test_default_gpu_arch_stays_prebuilt
 test_non_default_gpu_arch_uses_wheel_build
+test_multi_arch_regular_build
 test_default_prebuilt_ignores_local_flashinfer_arch
 test_regular_build_rebuilds_mismatched_cached_flashinfer_arch
 test_regular_build_reuses_matching_cached_flashinfer_arch
@@ -2113,6 +2136,7 @@ test_dockerfile_pins_cutlass_dsl_47_everywhere
 test_dockerfile_uses_profiled_named_wheel_contexts
 test_dockerfile_omits_standalone_b12x
 test_build_dependency_updates
+test_cudnn_frontend_compat
 test_copied_vllm_git_index_is_refreshed_before_patch_apply
 test_dockerfile_applies_flashinfer_prs_without_merging_branch_history
 test_dockerfile_uses_prepared_python_for_flashinfer_builds
