@@ -1146,6 +1146,18 @@ test_launch_cmd_earlyoom_rejects_keep_entrypoint() {
 # These tests verify that recipe dry-run output matches the expected commands
 # documented in README.md. Expected values are defined in expected_commands.sh
 
+test_dflash2_compressed_lm_head_mod() {
+    log_test "DFlash2 compressed-tensors LM-head mod is repeatable"
+
+    local output
+    if output=$("$PROJECT_DIR/tests/test_dflash2_compressed_lm_head_mod.sh" 2>&1); then
+        log_pass "DFlash2 compressed-tensors LM-head mod is repeatable"
+    else
+        log_fail "DFlash2 compressed-tensors LM-head mod failed"
+        log_verbose "$output"
+    fi
+}
+
 # Helper: Extract the generated launch script from dry-run output
 extract_vllm_command() {
     # Extract lines between "Generated Launch Script" and "What would be executed"
@@ -1240,6 +1252,39 @@ test_readme_minimax() {
         "$MINIMAX_MODEL" \
         "$MINIMAX_CONTAINER" \
         "${MINIMAX_ARGS[@]}"
+}
+
+# Test: Qwen3.8 NVFP4 DFlash2 matches the documented experimental configuration
+test_readme_qwen38_dflash2() {
+    verify_recipe_args "qwen3.8-27b-nvfp4-dflash2-fp8-head" \
+        "$QWEN38_DFLASH2_MODEL" \
+        "$QWEN38_DFLASH2_CONTAINER" \
+        "${QWEN38_DFLASH2_ARGS[@]}"
+}
+
+# Test: Qwen3.8 DFlash2 builds the upstream PR and applies the FP8-head mod
+test_readme_qwen38_dflash2_integration() {
+    log_test "README match: qwen3.8 DFlash2 build and mod integration"
+
+    local recipe_file="$PROJECT_DIR/recipes/qwen3.8-27b-nvfp4-dflash2-fp8-head.yaml"
+    if [[ ! -f "$recipe_file" ]]; then
+        log_skip "qwen3.8-27b-nvfp4-dflash2-fp8-head.yaml not found"
+        return
+    fi
+
+    local output
+    local launch_cmd
+    output=$(run_recipe_dry_run "qwen3.8-27b-nvfp4-dflash2-fp8-head" "solo")
+    launch_cmd=$(extract_launch_cmd "$output")
+
+    if echo "$output" | grep -qF -- "Build args: $QWEN38_DFLASH2_BUILD_ARG" \
+        && recipe_has_mod "$recipe_file" "$QWEN38_DFLASH2_MOD" \
+        && echo "$launch_cmd" | grep -qF -- "--apply-mod $QWEN38_DFLASH2_MOD"; then
+        log_pass "README match: qwen3.8 DFlash2 build and mod integration"
+    else
+        log_fail "README match: qwen3.8 DFlash2 build or mod mismatch"
+        log_verbose "$output"
+    fi
 }
 
 # Test: glm-4.7-flash-awq mod launch args match the recipe
@@ -1614,6 +1659,7 @@ main() {
     test_list_recipes
     test_recipe_version_required
     test_all_recipes_load
+    test_dflash2_compressed_lm_head_mod
     echo ""
     
     # Dry-run tests
@@ -1654,6 +1700,8 @@ main() {
     test_readme_glm_flash_awq
     test_readme_gpt_oss
     test_readme_minimax
+    test_readme_qwen38_dflash2
+    test_readme_qwen38_dflash2_integration
     test_readme_glm_flash_mod
     echo ""
     

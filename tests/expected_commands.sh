@@ -68,6 +68,33 @@ MINIMAX_ARGS=(
 )
 
 # ==============================================================================
+# qwen3.8-27b-nvfp4-dflash2-fp8-head
+# README Reference: DFlash2 with compressed-tensors FP8 lm_head
+# ==============================================================================
+QWEN38_DFLASH2_MODEL="unsloth/Qwen3.8-27B-NVFP4"
+QWEN38_DFLASH2_CONTAINER="vllm-node-dflash2"
+QWEN38_DFLASH2_MOD="mods/dflash2-compressed-lm-head"
+QWEN38_DFLASH2_BUILD_ARG="--apply-vllm-pr 52816"
+QWEN38_DFLASH2_ARGS=(
+    "--port 8000"
+    "--host 0.0.0.0"
+    "--tensor-parallel-size 1"
+    "--gpu-memory-utilization 0.8"
+    "--max-model-len 262144"
+    "--max-num-seqs 4"
+    "--max-num-batched-tokens 8192"
+    "--kv-cache-dtype fp8"
+    "--attention-backend flashinfer"
+    "--load-format fastsafetensors"
+    "--enable-chunked-prefill"
+    "--enable-prefix-caching"
+    "--speculative-config '{\"method\":\"dflash\",\"model\":\"incoai/Qwen3.8-27B-DFlash2\",\"num_speculative_tokens\":7}'"
+    "--enable-auto-tool-choice"
+    "--tool-call-parser qwen3_xml"
+    "--reasoning-parser qwen3"
+)
+
+# ==============================================================================
 # Cluster Mode Expected Arguments
 # These are arguments that should appear ONLY in cluster mode
 # Note: Tests use 2 nodes, so tensor_parallel = 2 (1 GPU per node)

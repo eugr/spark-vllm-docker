@@ -199,6 +199,14 @@ The `build_args` field passes flags to `build-and-copy.sh`:
 | `--exp-mxfp4` | Use MXFP4 Dockerfile (for MXFP4 quantized models) |
 | `--exp-b12x` | Use the B12X image profile, which defaults to the `vllm-node-b12x` tag |
 | `--use-wheels` | Build the runner image from prebuilt or local wheels instead of pulling `eugr/spark-vllm:latest` |
+| `--apply-vllm-pr PR` | Build vLLM with a specific upstream pull request (experimental recipes) |
+
+For example, the single-Spark Qwen3.8 DFlash2 recipe keeps the target's FP8
+`lm_head` and uses a separate image built from the pending DFlash2 pull request:
+
+```bash
+./run-recipe.sh qwen3.8-27b-nvfp4-dflash2-fp8-head --solo --setup
+```
 
 ### Parameter Substitution
 

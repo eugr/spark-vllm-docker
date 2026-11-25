@@ -544,6 +544,35 @@ external B12X package, matching the B12X support being integrated into upstream
 vLLM. The experimental `--exp-b12x` profile continues to install the same
 package for its maintained fork.
 
+### 2026-08-20
+
+#### Qwen3.8-27B NVFP4 + DFlash2 with an FP8 LM head
+
+Added the experimental `qwen3.8-27b-nvfp4-dflash2-fp8-head` recipe. It builds an
+isolated `vllm-node-dflash2` image with vLLM
+[#52816](https://github.com/vllm-project/vllm/pull/52816), serves
+`unsloth/Qwen3.8-27B-NVFP4`, and drafts with
+`incoai/Qwen3.8-27B-DFlash2` using seven speculative tokens.
+
+The recipe applies `mods/dflash2-compressed-lm-head` at launch. The mod permits
+the checkpoint's compressed-tensors FP8 `lm_head` in DFlash2's candidate
+selector and leaves the quantized `quant_method.apply()` path unchanged; it
+does not materialize a BF16 head.
+
+```bash
+./run-recipe.sh qwen3.8-27b-nvfp4-dflash2-fp8-head --solo --setup
+```
+
+`--setup` downloads the target model ahead of time. The DFlash2 draft model is
+downloaded into the mounted Hugging Face cache when vLLM first starts. Because
+the upstream support is still an open PR, use `--force-build` to refresh the
+experimental image after the PR changes.
+
+The recipe reserves 80% of Spark unified memory for the vLLM executor. The
+combined NVFP4 target and DFlash2 draft exceed a 50% executor budget before any
+KV-cache blocks are allocated; 80% leaves KV-cache capacity while retaining
+20% for the host and supporting services.
+
 ### 2026-08-19
 
 #### Launch-time vLLM PR application

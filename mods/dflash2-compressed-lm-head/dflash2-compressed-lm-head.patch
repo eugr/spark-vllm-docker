@@ -1,0 +1,29 @@
+diff --git a/vllm/model_executor/models/qwen3_dflash2.py b/vllm/model_executor/models/qwen3_dflash2.py
+--- a/vllm/model_executor/models/qwen3_dflash2.py
++++ b/vllm/model_executor/models/qwen3_dflash2.py
+@@ -19,6 +19,9 @@ from vllm.model_executor.layers.linear import (
+     UnquantizedLinearMethod,
+ )
+ from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
++from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors import (
++    CompressedTensorsLinearMethod,
++)
+ from vllm.model_executor.layers.vocab_parallel_embedding import (
+     UnquantizedEmbeddingMethod,
+ )
+@@ -307,9 +310,13 @@ class DFlash2Qwen3ForCausalLM(DFlashQwen3ForCausalLM):
+     ) -> tuple[torch.Tensor, torch.Tensor]:
+         if not isinstance(
+             self.lm_head.quant_method,
+-            (UnquantizedEmbeddingMethod, UnquantizedLinearMethod),
++            (
++                CompressedTensorsLinearMethod,
++                UnquantizedEmbeddingMethod,
++                UnquantizedLinearMethod,
++            ),
+         ):
+             raise ValueError(
+-                "DFlash2 requires an unquantized target LM head for candidate TopK; "
++                "DFlash2 requires an unquantized or compressed-tensors target LM head; "
+                 f"got {type(self.lm_head.quant_method).__name__}."
+             )
