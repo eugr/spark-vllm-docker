@@ -2710,6 +2710,45 @@ For the ready-to-run Prometheus and Grafana monitoring stack, including
 speculative decoding and MTP panels, see
 [Visualizing vLLM metrics](docs/METRICS.md).
 
+### Compare vLLM configurations
+
+- [`benchmark-code-generation.py`](benchmark-code-generation.py) runs four coding
+  tasks and can show per-task results.
+- [`benchmark-model-configs.py`](benchmark-model-configs.py) repeats one prompt to
+  compare latency, decode throughput, and output consistency.
+
+Run these commands from the repository root with Inkling 2 Mini already serving.
+Both scripts default to `http://127.0.0.1:8000/v1` and discover the model from
+`/v1/models`. If the server is on another host or port, add
+`--base-url http://SPARK_IP:PORT/v1` to each `run` command.
+
+```bash
+python3 benchmark-code-generation.py run \
+  --label baseline --results /tmp/inkling-code.json --runs-per-task 1
+python3 benchmark-model-configs.py run \
+  --label baseline --results /tmp/inkling-configs.json --runs 3
+```
+
+For the second configuration, restart the same recipe with its existing settings
+and append `-- --enforce-eager` to the launch command. When the server is ready,
+record the second run and compare the saved results.
+
+```bash
+python3 benchmark-code-generation.py run \
+  --label eager --results /tmp/inkling-code.json
+python3 benchmark-model-configs.py run \
+  --label eager --results /tmp/inkling-configs.json --runs 3
+
+python3 benchmark-code-generation.py compare --details \
+  --results /tmp/inkling-code.json
+python3 benchmark-model-configs.py compare \
+  --results /tmp/inkling-configs.json
+```
+
+The first run fixes the workload for each results file. Reuse the same file with
+a unique label for each configuration. Use a fresh file to change the workload
+or start a new baseline.
+
 ## 10\. Downloading Models
 
 The `hf-download.sh` script downloads, lists, removes, backs up, and restores
