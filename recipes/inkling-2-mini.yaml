@@ -1,0 +1,28 @@
+# Inkling 2 Mini on one DGX Spark with the bundled DSpark draft model.
+recipe_version: "1"
+name: Inkling 2 Mini
+description: Serve Thinking Machines Inkling 2 Mini with text and image inputs on one DGX Spark
+
+model: thinkingmachines/Inkling-2-Mini
+container: vllm/vllm-openai:inkling-2-mini
+pull_image: true
+solo_only: true
+
+defaults:
+  port: 8000
+  host: 0.0.0.0
+  tensor_parallel: 1
+  max_model_len: 262144
+  gpu_memory_utilization: 0.8
+
+command: |
+  vllm serve thinkingmachines/Inkling-2-Mini \
+    --host {host} \
+    --port {port} \
+    --tensor-parallel-size {tensor_parallel} \
+    --max-model-len {max_model_len} \
+    --gpu-memory-utilization {gpu_memory_utilization} \
+    --reasoning-parser inkling \
+    --enable-auto-tool-choice \
+    --tool-call-parser inkling \
+    --speculative-config '{{"method":"dspark","num_speculative_tokens":7,"draft_sample_method":"probabilistic"}}'

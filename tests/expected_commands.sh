@@ -68,6 +68,24 @@ MINIMAX_ARGS=(
 )
 
 # ==============================================================================
+# inkling-2-mini
+# README Reference: Inkling 2 Mini on a Single DGX Spark
+# ==============================================================================
+INKLING_2_MINI_MODEL="thinkingmachines/Inkling-2-Mini"
+INKLING_2_MINI_CONTAINER="vllm/vllm-openai:inkling-2-mini"
+INKLING_2_MINI_ARGS=(
+    "--port 8000"
+    "--host 0.0.0.0"
+    "--tensor-parallel-size 1"
+    "--max-model-len 262144"
+    "--gpu-memory-utilization 0.8"
+    "--reasoning-parser inkling"
+    "--enable-auto-tool-choice"
+    "--tool-call-parser inkling"
+    "--speculative-config '{\"method\":\"dspark\",\"num_speculative_tokens\":7,\"draft_sample_method\":\"probabilistic\"}'"
+)
+
+# ==============================================================================
 # qwen3.8-27b-nvfp4-dflash2-fp8-head
 # README Reference: DFlash2 with compressed-tensors FP8 lm_head
 # ==============================================================================

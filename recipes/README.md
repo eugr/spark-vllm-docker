@@ -64,6 +64,25 @@ Recipes provide a **one-click solution** for deploying models with pre-configure
 ./run-recipe.sh minimax-m2-awq --setup
 ```
 
+### Inkling 2 Mini on a Single DGX Spark
+
+The [Inkling 2 Mini recipe](inkling-2-mini.yaml) serves text and image inputs from
+the official Thinking Machines checkpoint. It uses one GPU (TP1), a 262,144-token
+context, the Inkling reasoning parser, and seven DSpark draft tokens with
+probabilistic sampling. The draft is bundled with the checkpoint.
+[vLLM's Spark configuration](https://github.com/vllm-project/vllm/blob/main/recipes/models/thinkingmachines/Inkling-2-Mini.yaml)
+
+Setup pulls the prebuilt `vllm/vllm-openai:inkling-2-mini` image and downloads the
+checkpoint. The recipe sets vLLM's GPU memory utilization to `0.8` to leave
+headroom on Spark's shared memory.
+[vLLM's Inkling 2 Mini deployment guide](https://vllm.ai/blog/2026-11-20-inkling2-mini)
+
+```bash
+./run-recipe.sh inkling-2-mini --solo --setup
+```
+
+Automatic tool calling is enabled by default with the Inkling tool parser.
+
 ### Nemotron 3.5 on a Single DGX Spark
 
 These recipes use the standard `vllm-node` image and require `--solo`:

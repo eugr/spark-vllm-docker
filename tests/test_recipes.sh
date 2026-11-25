@@ -1254,6 +1254,13 @@ test_readme_minimax() {
         "${MINIMAX_ARGS[@]}"
 }
 
+test_readme_inkling_2_mini() {
+    verify_recipe_args "inkling-2-mini" \
+        "$INKLING_2_MINI_MODEL" \
+        "$INKLING_2_MINI_CONTAINER" \
+        "${INKLING_2_MINI_ARGS[@]}"
+}
+
 # Test: Qwen3.8 NVFP4 DFlash2 matches the documented experimental configuration
 test_readme_qwen38_dflash2() {
     verify_recipe_args "qwen3.8-27b-nvfp4-dflash2-fp8-head" \
@@ -1700,6 +1707,7 @@ main() {
     test_readme_glm_flash_awq
     test_readme_gpt_oss
     test_readme_minimax
+    test_readme_inkling_2_mini
     test_readme_qwen38_dflash2
     test_readme_qwen38_dflash2_integration
     test_readme_glm_flash_mod
