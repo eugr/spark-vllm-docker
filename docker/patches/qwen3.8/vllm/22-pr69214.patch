@@ -1,0 +1,4384 @@
+Subject: [PATCH] [PR #69214] Add Dory-1.5 model support
+Upstream-PR: https://github.com/vllm-project/vllm/pull/69214
+Upstream-Commit: 32a8447fc1d8ca022092d50789e058cf3f66854b
+Integration-Base: 08c497efa9a5213f2903670655f040977ba03fbd
+
+diff --git a/.buildkite/test_areas/models_basic.yaml b/.buildkite/test_areas/models_basic.yaml
+index 109a41605e61c1c07b209768c47391c133851f5e..58f19c34b0936d68116bfc22aa2b405ad5df3d3b 100644
+--- a/.buildkite/test_areas/models_basic.yaml
++++ b/.buildkite/test_areas/models_basic.yaml
+@@ -230,6 +230,34 @@ steps:
+       - pytest -v -s models/hy_v4/test_flash_dp_config.py
+       - pytest -v -s models/test_dsv4_mono_decode.py
+ 
++- label: ":nvidia: (H100) Dory1.5 inference"
++  key: dory1-5-inference
++  timeout_in_minutes: 60
++  device: h100
++  source_file_dependencies:
++  - vllm/model_executor/models/dory1_5.py
++  - vllm/model_executor/models/nemotron_h.py
++  - vllm/model_executor/kernels/linear/mxfp8/marlin.py
++  - vllm/model_executor/kernels/linear/nvfp4/marlin.py
++  - vllm/transformers_utils/configs/dory1_5.py
++  - vllm/model_executor/layers/mamba/
++  - tests/models/test_dory1_5.py
++  - vllm/v1/engine/core.py
++  - vllm/v1/engine/input_processor.py
++  - vllm/v1/worker/gpu/cudagraph_utils.py
++  - vllm/v1/worker/gpu/model_states/interface.py
++  - vllm/v1/attention/backends/gdn_attn.py
++  commands:
++    - pytest -v -s models/test_dory1_5.py -m "not slow_test"
++
++- label: ":nvidia: (H100) [Nightly] Dory1.5 inference"
++  key: dory1-5-inference-nightly
++  optional: true
++  timeout_in_minutes: 60
++  device: h100
++  commands:
++    - pytest -v -s models/test_dory1_5.py
++
+ - label: ":nvidia: (B200) Inkling"
+   key: inkling-unit-tests-b200
+   automatic_shard: true
+@@ -649,6 +677,8 @@ steps:
+   - tests/models/test_qwen3_5_mtp_config.py
+   - tests/models/test_qwen3_5.py
+   - tests/models/test_dory.py
++  - tests/models/test_dory1_5.py
++  - tests/transformers_utils/test_dory1_5_config.py
+   - tests/models/test_alice_ai.py
+   - tests/models/test_alice_ai_config.py
+   - tests/models/test_indexer_logits_dtype_config.py
+@@ -686,6 +716,8 @@ steps:
+       models/test_dspark_mla.py
+       models/transformers/test_layer_registry.py
+       models/test_dory.py
++      models/test_dory1_5.py::test_loop_table_reload_preserves_captured_storage
++      transformers_utils/test_dory1_5_config.py
+       models/test_alice_ai.py
+       models/test_alice_ai_config.py
+       models/test_indexer_logits_dtype_config.py
+diff --git a/docs/models/supported_models.md b/docs/models/supported_models.md
+index 296c2b1900afa7427acd6e636842b87389c3eb8c..4c631e92e75964987b54e057b9a28640c794be76 100644
+--- a/docs/models/supported_models.md
++++ b/docs/models/supported_models.md
+@@ -404,6 +404,7 @@ th {
+ | `DeepseekV4ForCausalLM` | DeepSeek-V4 | `deepseek-ai/DeepSeek-V4-Flash`, `deepseek-ai/DeepSeek-V4-Pro`, etc. | | ✅︎ |
+ | `DomynEdgeForCausalLM` | Domyn Edge | `domyn/Domyn-Edge-Base`, `domyn/Domyn-Edge-SFT`, etc. | | |
+ | `DoryForCausalLM` | Dory | `nvidia/NVIDIA-Nemotron-Labs-Dory1.0-4B-BF16` | | |
++| `Dory1_5ForCausalLM` | Dory1.5 | `nvidia/NVIDIA-Nemotron-Labs-Dory1.5-4B-BF16`, `nvidia/NVIDIA-Nemotron-Labs-Dory1.5-4B-NVFP4` | | |
+ | `DotsOCRForCausalLM` | [dots_ocr](../usage/troubleshooting.md#gpu-cpu-synchronization-errors) | `rednote-hilab/dots.ocr` | ✅︎ | ✅︎ |
+ | `Ernie4_5_MoeForCausalLM` | Ernie4.5MoE | `baidu/ERNIE-4.5-21B-A3B-PT`, `baidu/ERNIE-4.5-300B-A47B-PT`, etc. | ✅︎ | ✅︎ |
+ | `ExaoneMoeForCausalLM` | K-EXAONE, K-EXAONE-2 | `LGAI-EXAONE/K-EXAONE-236B-A23B`, `LGAI-EXAONE/K-EXAONE-2.0-750B-A37B`, etc. | | |
+diff --git a/tests/kernels/mamba/test_gated_delta_product.py b/tests/kernels/mamba/test_gated_delta_product.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..e3cb2f0db0e6fb463577b6ed0dd8027924d050f0
+--- /dev/null
++++ b/tests/kernels/mamba/test_gated_delta_product.py
+@@ -0,0 +1,325 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
++"""GDP decode must apply every update and preserve unrelated request state."""
++
++import pytest
++import torch
++import torch.nn.functional as F
++
++from vllm.model_executor.layers.mamba.ops.causal_conv1d import causal_conv1d_fn
++from vllm.model_executor.layers.mamba.ops.causal_conv1d_prefill import (
++    causal_conv1d_prefill,
++)
++from vllm.model_executor.layers.mamba.ops.gated_delta_product import (
++    fused_recurrent_gated_delta_product,
++)
++from vllm.model_executor.layers.mamba.ops.gdp_chunk_prefill import (
++    gdp_chunk_prefill,
++    gdp_chunk_prefill_supported,
++)
++from vllm.third_party.flash_linear_attention.ops import chunk_gated_delta_rule
++from vllm.third_party.flash_linear_attention.ops.index import (
++    prepare_chunk_indices,
++    prepare_chunk_offsets,
++)
++from vllm.third_party.flash_linear_attention.ops.l2norm import l2norm_fwd
++
++requires_gdp_chunk_prefill = pytest.mark.skipif(
++    not gdp_chunk_prefill_supported(1, 64, 32),
++    reason="GDP chunk prefill is not supported on this platform",
++)
++
++
++@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
++@pytest.mark.parametrize("steps", [1, 3])
++def test_decode_matches_delta_product_and_preserves_null_state(dtype, steps):
++    torch.manual_seed(42)
++    n, groups, heads, key_dim, value_dim = 3, 2, 4, 64, 32
++    state = torch.randn(4, heads, value_dim, key_dim, device="cuda") * 0.1
++    expected_state = state.clone()
++    indices = torch.tensor([2, 0, 1], device="cuda", dtype=torch.int32)
++    a_log = torch.randn(heads, device="cuda")
++    dt_bias = torch.randn(heads, device="cuda", dtype=dtype)
++    width = steps * heads * value_dim + (steps + 1) * groups * key_dim
++    for _ in range(2):
++        # Column slices exercise the strides used by the merged projection.
++        projected = torch.randn(
++            n, width + (steps + 1) * heads, device="cuda", dtype=dtype
++        )
++        conv, b, a = projected.split([width, steps * heads, heads], dim=-1)
++        output = torch.empty(n, heads, value_dim, device="cuda", dtype=dtype)
++        fused_recurrent_gated_delta_product(
++            conv,
++            b,
++            a,
++            a_log,
++            dt_bias,
++            state,
++            output,
++            num_householder=steps,
++            num_groups=groups,
++            num_heads=heads,
++            state_dim=key_dim,
++            head_dim=value_dim,
++            ssm_state_indices=indices,
++        )
++        values, keys, queries = conv.float().split(
++            [steps * heads * value_dim, steps * groups * key_dim, groups * key_dim], -1
++        )
++        values = values.view(n, steps, heads, value_dim)
++        keys = keys.view(n, steps, groups, key_dim).repeat_interleave(
++            heads // groups, 2
++        )
++        queries = queries.view(n, groups, key_dim).repeat_interleave(heads // groups, 1)
++        keys = keys * torch.rsqrt(keys.square().sum(-1, keepdim=True) + 1e-6)
++        queries = queries * torch.rsqrt(queries.square().sum(-1, keepdim=True) + 1e-6)
++        beta = b.float().view(n, steps, heads).sigmoid()
++        decay = (-a_log.exp() * F.softplus(a.float() + dt_bias.float())).exp()
++        expected_output = torch.zeros_like(output)
++        for row, slot in enumerate((2, 0, 1)):
++            if slot == 0:
++                continue
++            h = expected_state[slot] * decay[row, :, None, None]
++            for step in range(steps):
++                k = keys[row, step]
++                error = values[row, step] - (h * k[:, None, :]).sum(-1)
++                h = h + (beta[row, step, :, None] * error)[:, :, None] * k[:, None, :]
++            expected_state[slot] = h
++            expected_output[row] = (h * queries[row, :, None, :]).sum(
++                -1
++            ) * key_dim**-0.5
++        torch.testing.assert_close(state, expected_state, rtol=1e-4, atol=3e-6)
++        torch.testing.assert_close(
++            output,
++            expected_output,
++            rtol=1e-4 if dtype == torch.float32 else 1e-2,
++            atol=3e-6,
++        )
++
++
++def _virtual_inputs(conv, b, a, a_log, bias, m, heads=4, groups=2, kdim=64, vdim=32):
++    t = conv.shape[0]
++    pieces = conv.split([heads * vdim] * m + [groups * kdim] * (m + 1), dim=-1)
++    v = torch.stack([x.view(t, heads, vdim) for x in pieces[:m]], 1)
++    k = torch.stack(
++        [x.view(t, groups, kdim) for x in pieces[m : 2 * m]], 1
++    ).repeat_interleave(heads // groups, 2)
++    q = pieces[-1].view(t, groups, kdim).repeat_interleave(heads // groups, 1)
++    k = l2norm_fwd(k.reshape(t * m, heads, kdim).contiguous())
++    q = l2norm_fwd(q.contiguous())
++    vq = q.new_zeros(t, m, heads, kdim)
++    vq[:, -1] = q
++    g = -a_log.float().exp() * torch.nn.functional.softplus(a.float() + bias.float())
++    vg = g.new_zeros(t, m, heads)
++    vg[:, 0] = g
++    return (
++        vq.reshape(1, t * m, heads, kdim),
++        k.unsqueeze(0),
++        v.reshape(1, t * m, heads, vdim),
++        vg.reshape(1, t * m, heads),
++        b.reshape(1, t * m, heads).sigmoid(),
++    )
++
++
++@requires_gdp_chunk_prefill
++@pytest.mark.parametrize("m", [1, 3, 4])
++@pytest.mark.parametrize("state_dtype", [torch.bfloat16, torch.float32])
++def test_direct_prefill_matches_fla_with_initial_and_checkpoint_states(m, state_dtype):
++    torch.manual_seed(19)
++    t, heads, groups, kdim, vdim = 195, 4, 2, 64, 32
++    width = m * heads * vdim + (m + 1) * groups * kdim
++    projection = torch.randn(
++        t, width + (m + 1) * heads, device="cuda", dtype=torch.bfloat16
++    )
++    conv, b, a = projection.split([width, m * heads, heads], -1)
++    a_log = torch.randn(heads, device="cuda")
++    bias = torch.randn(heads, device="cuda", dtype=torch.bfloat16)
++    cu = torch.tensor([0, 65, 194, 195, 195], device="cuda", dtype=torch.int32)
++    indices = torch.tensor([1, 2, 0, 0], device="cuda", dtype=torch.int32)
++    has = torch.tensor([True, False, False, False], device="cuda")
++    offsets = torch.tensor([64, 64, 0, 0], device="cuda", dtype=torch.int32)
++    checkpoints = torch.tensor([3, 4, 0, 0], device="cuda", dtype=torch.int32)
++    state = torch.randn(6, heads, vdim, kdim, device="cuda", dtype=state_dtype) * 0.1
++    before = state.clone()
++    initial = state[indices].contiguous()
++    initial[~has] = 0
++    ckpt = torch.empty_like(initial)
++    q, k, v, g, beta = _virtual_inputs(conv, b, a, a_log, bias, m)
++    vcu = cu * m
++    reference, final = chunk_gated_delta_rule(
++        q,
++        k,
++        v,
++        g,
++        beta,
++        initial_state=initial,
++        output_final_state=True,
++        cu_seqlens=vcu,
++        chunk_indices=prepare_chunk_indices(vcu, 64),
++        chunk_offsets=prepare_chunk_offsets(vcu, 64),
++        checkpoint_state=ckpt,
++        checkpoint_offsets=offsets * m,
++    )
++    out = gdp_chunk_prefill(
++        conv,
++        b,
++        a,
++        a_log,
++        bias,
++        state,
++        cu,
++        indices,
++        has,
++        num_householder=m,
++        num_heads=heads,
++        num_groups=groups,
++        head_k_dim=kdim,
++        head_v_dim=vdim,
++        checkpoint_offsets=offsets,
++        checkpoint_indices=checkpoints,
++    )
++    expected = reference.view(t, m, heads, vdim)[:, -1]
++    # The two BF16 chunk decompositions accumulate/reorder products differently.
++    torch.testing.assert_close(out, expected, atol=2e-3, rtol=2e-2)
++    torch.testing.assert_close(
++        state[1:3], final[:2].to(state_dtype), atol=2e-2, rtol=2e-2
++    )
++    torch.testing.assert_close(state[3:5], ckpt[:2], atol=2e-2, rtol=2e-2)
++    torch.testing.assert_close(state[[0, 5]], before[[0, 5]], atol=0, rtol=0)
++
++
++@requires_gdp_chunk_prefill
++@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
++@pytest.mark.parametrize("dim_first", [True, False])
++def test_direct_conv_matches_existing_conv_and_exports_windows(dtype, dim_first):
++    torch.manual_seed(23)
++    lengths = [1, 2, 3, 65, 129, 0]
++    cu = torch.tensor(
++        [0, *torch.tensor(lengths).cumsum(0).tolist()], device="cuda", dtype=torch.int32
++    )
++    t = sum(lengths)
++    width = 96
++    x = torch.randn(t, width + 16, device="cuda", dtype=dtype)[:, :width]
++    weight = torch.randn(width, 4, device="cuda", dtype=dtype)
++    # Match both cache layouts, including padding between cache pages.
++    storage = torch.randn(9, width * 3 + 32, device="cuda", dtype=dtype)
++    state = storage[:, : width * 3].view(9, width, 3)
++    if not dim_first:
++        state = storage[:, : width * 3].view(9, 3, width).transpose(-1, -2)
++    initial = state.clone()
++    ref_state = state.clone()
++    indices = torch.tensor([1, 2, 3, 4, 5, 0], device="cuda", dtype=torch.int32)
++    has = torch.tensor([True, False, True, False, True, False], device="cuda")
++    offsets = torch.tensor([0, 0, 0, 64, 64, 0], device="cuda", dtype=torch.int32)
++    ckpts = torch.tensor([0, 0, 0, 6, 7, 0], device="cuda", dtype=torch.int32)
++    expected = causal_conv1d_fn(
++        x.contiguous().T,
++        weight,
++        None,
++        ref_state,
++        cu,
++        cache_indices=indices,
++        has_initial_state=has,
++        activation="silu",
++    ).T
++    actual = causal_conv1d_prefill(
++        x,
++        weight,
++        state,
++        cu,
++        indices,
++        has,
++        checkpoint_offsets=offsets,
++        checkpoint_indices=ckpts,
++    )
++    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
++    torch.testing.assert_close(state[:6], ref_state[:6], atol=0, rtol=0)
++    for row, slot in ((3, 6), (4, 7)):
++        end = int(cu[row]) + 64
++        torch.testing.assert_close(state[slot], x[end - 3 : end].T, atol=0, rtol=0)
++    torch.testing.assert_close(state[[0, 8]], initial[[0, 8]], atol=0, rtol=0)
++
++
++@requires_gdp_chunk_prefill
++@pytest.mark.parametrize("m", [1, 3, 4])
++def test_checkpoint_at_sequence_end(m):
++    torch.manual_seed(29)
++    h, g, k, v, t = 4, 2, 64, 32, 64
++    width = m * h * v + (m + 1) * g * k
++    x = torch.randn(t, width, device="cuda", dtype=torch.bfloat16)
++    b = torch.randn(t, m * h, device="cuda", dtype=torch.bfloat16)
++    a = torch.randn(t, h, device="cuda", dtype=torch.bfloat16)
++    state = torch.randn(3, h, v, k, device="cuda", dtype=torch.bfloat16)
++    gdp_chunk_prefill(
++        x,
++        b,
++        a,
++        torch.zeros(h, device="cuda"),
++        torch.zeros(h, device="cuda", dtype=torch.bfloat16),
++        state,
++        torch.tensor([0, t], device="cuda", dtype=torch.int32),
++        torch.tensor([1], device="cuda", dtype=torch.int32),
++        torch.tensor([True], device="cuda"),
++        num_householder=m,
++        num_heads=h,
++        num_groups=g,
++        head_k_dim=k,
++        head_v_dim=v,
++        checkpoint_offsets=torch.tensor([t], device="cuda", dtype=torch.int32),
++        checkpoint_indices=torch.tensor([2], device="cuda", dtype=torch.int32),
++    )
++    torch.testing.assert_close(state[1], state[2], atol=0, rtol=0)
++
++
++@requires_gdp_chunk_prefill
++def test_large_batch_grid_matches_recurrent():
++    from vllm.model_executor.layers.mamba.ops.gated_delta_product import (
++        fused_recurrent_gated_delta_product,
++    )
++
++    torch.manual_seed(31)
++    n, h, g, k, v, m = 683, 96, 8, 64, 32, 3
++    width = m * h * v + (m + 1) * g * k
++    x = torch.randn(n, width, device="cuda", dtype=torch.bfloat16)
++    b = torch.randn(n, m * h, device="cuda", dtype=torch.bfloat16)
++    a = torch.randn(n, h, device="cuda", dtype=torch.bfloat16)
++    a_log = torch.zeros(h, device="cuda")
++    bias = torch.zeros(h, device="cuda", dtype=torch.bfloat16)
++    state = torch.randn(n + 1, h, v, k, device="cuda", dtype=torch.bfloat16) * 0.1
++    reference = state.clone()
++    expected = torch.empty(n, h, v, device="cuda", dtype=torch.bfloat16)
++    ids = torch.arange(1, n + 1, device="cuda", dtype=torch.int32)
++    actual = gdp_chunk_prefill(
++        x,
++        b,
++        a,
++        a_log,
++        bias,
++        state,
++        torch.arange(n + 1, device="cuda", dtype=torch.int32),
++        ids,
++        torch.ones(n, device="cuda", dtype=torch.bool),
++        num_householder=m,
++        num_heads=h,
++        num_groups=g,
++        head_k_dim=k,
++        head_v_dim=v,
++    )
++    fused_recurrent_gated_delta_product(
++        x,
++        b,
++        a,
++        a_log,
++        bias,
++        reference,
++        expected,
++        num_householder=m,
++        num_heads=h,
++        num_groups=g,
++        state_dim=k,
++        head_dim=v,
++        ssm_state_indices=ids,
++    )
++    torch.testing.assert_close(actual, expected, atol=2e-3, rtol=2e-2)
++    torch.testing.assert_close(state, reference, atol=2e-2, rtol=2e-2)
+diff --git a/tests/models/registry.py b/tests/models/registry.py
+index 535ae66686c3a8462c7b58d9cbd8412458be864c..b43d8976f7bdda65f9f65fa7401adbab8808ca2e 100644
+--- a/tests/models/registry.py
++++ b/tests/models/registry.py
+@@ -278,6 +278,19 @@ _TEXT_GENERATION_EXAMPLE_MODELS = {
+             "layer_types": ["sliding_attention", "mlp"] * 3 + ["full_attention", "mlp"],
+         },
+     ),
++    "Dory1_5ForCausalLM": _HfExamplesInfo(
++        "nvidia/NVIDIA-Nemotron-Labs-Dory1.5-4B-BF16",
++        use_original_num_layers=True,
++        max_model_len=128,
++        hf_overrides={
++            "num_hidden_layers": 9,
++            "n_input_layers": 3,
++            "n_recurrent_layers": 3,
++            "n_output_layers": 3,
++            "n_recurrent_loops": 2,
++            "layer_types": ["linear_attention", "full_attention", "mlp"] * 3,
++        },
++    ),
+     "Ernie4_5ForCausalLM": _HfExamplesInfo("baidu/ERNIE-4.5-0.3B-PT"),
+     "Ernie4_5_MoeForCausalLM": _HfExamplesInfo("baidu/ERNIE-4.5-21B-A3B-PT"),
+     "ExaoneForCausalLM": _HfExamplesInfo(
+diff --git a/tests/models/test_dory1_5.py b/tests/models/test_dory1_5.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..842043ce54a75f86b18ee4f9708ff0397e269d1b
+--- /dev/null
++++ b/tests/models/test_dory1_5.py
+@@ -0,0 +1,370 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
++
++import pytest
++import torch
++
++from vllm.config import DeviceConfig, VllmConfig, set_current_vllm_config
++from vllm.exceptions import VLLMValidationError
++from vllm.model_executor.models.dory1_5 import (
++    Dory1_5LoopConditioning,
++    Dory1_5LoopSeam,
++)
++from vllm.transformers_utils.configs.dory1_5 import (
++    Dory1_5Config,
++)
++
++
++@pytest.mark.parametrize("seam", [False, True])
++@torch.no_grad()
++def test_loop_table_reload_preserves_captured_storage(seam):
++    config = Dory1_5Config(
++        hidden_size=8,
++        loop_conditioning_hidden_size=4,
++        loop_adapter_rank=0,
++        n_recurrent_loops=2,
++    )
++    with set_current_vllm_config(VllmConfig(device_config=DeviceConfig(device="cpu"))):
++        module = (
++            Dory1_5LoopSeam(config) if seam else Dory1_5LoopConditioning(config, "test")
++        )
++    steps = [0, 1, 0, 1, 2]
++    conds = [torch.randn(4) for _ in steps]
++    if seam:
++        module.update(conds, steps)
++    else:
++        module.update(conds)
++    captured_table = module.table.view_as(module.table)
++    before = captured_table.clone()
++    pointer = captured_table.data_ptr()
++    head = module.entry_beta if seam else module.beta_head
++    head.bias.add_(1)
++    if seam:
++        module.update(conds, steps)
++    else:
++        module.update(conds)
++    assert module.table.data_ptr() == pointer
++    torch.testing.assert_close(captured_table, module.table)
++    torch.testing.assert_close(captured_table[:, 8:16], before[:, 8:16] + 1)
++    assert "table" not in module.state_dict()
++
++
++def _cache_layout(model):
++    from vllm.model_executor.layers.attention import Attention
++    from vllm.model_executor.layers.mamba.abstract import MambaBase
++
++    return (
++        sum(isinstance(m, Attention) for m in model.modules()),
++        sum(isinstance(m, MambaBase) for m in model.modules()),
++    )
++
++
++@pytest.mark.usefixtures("enable_pickle")
++@pytest.mark.parametrize("cache_mode", ["per_loop", "last_loop"])
++@pytest.mark.parametrize("gdp_dims", [(64, 32), (128, 64)])
++def test_loop_cache_modes(vllm_runner, tmp_path, cache_mode, gdp_dims):
++    """Last-loop attention must retain independent GDP state through decoding."""
++    from vllm import SamplingParams
++
++    Dory1_5Config(
++        architectures=["Dory1_5ForCausalLM"],
++        vocab_size=64,
++        hidden_size=128,
++        intermediate_size=256,
++        num_hidden_layers=2,
++        layer_types=["linear_attention", "full_attention"],
++        n_input_layers=0,
++        n_recurrent_layers=2,
++        n_output_layers=0,
++        n_recurrent_loops=2,
++        num_attention_heads=2,
++        num_key_value_heads=1,
++        head_dim=64,
++        linear_num_value_heads=4,
++        linear_num_key_heads=2,
++        linear_key_head_dim=gdp_dims[0],
++        linear_value_head_dim=gdp_dims[1],
++        loop_conditioning_hidden_size=8,
++        loop_adapter_rank=0,
++    ).save_pretrained(tmp_path)
++    with vllm_runner(
++        str(tmp_path),
++        load_format="dummy",
++        skip_tokenizer_init=True,
++        dtype="bfloat16",
++        enforce_eager=True,
++        max_model_len=64,
++        max_num_seqs=2,
++        enable_prefix_caching=False,
++        hf_overrides={"recurrent_kv_cache_mode": cache_mode},
++    ) as runner:
++        outputs = runner.llm.generate(
++            [{"prompt_token_ids": [1, 2, 3]}, {"prompt_token_ids": [4, 5]}],
++            SamplingParams(temperature=0, max_tokens=4, ignore_eos=True, logprobs=1),
++        )
++        for output in outputs:
++            completion = output.outputs[0]
++            assert len(completion.token_ids) == 4
++            assert all(
++                torch.isfinite(torch.tensor(step[token].logprob))
++                for token, step in zip(completion.token_ids, completion.logprobs)
++            )
++        attention_caches = 2 if cache_mode == "per_loop" else 1
++        assert runner.apply_model(_cache_layout) == [(attention_caches, 2)]
++
++
++@pytest.mark.parametrize(
++    "precision,enforce_eager,cache_mode",
++    [
++        # Regular CI covers all pairs; slow cases complete the three-way matrix.
++        ("BF16", False, "per_loop"),
++        ("BF16", True, "last_loop"),
++        ("NVFP4", False, "last_loop"),
++        ("NVFP4", True, "per_loop"),
++        pytest.param("BF16", False, "last_loop", marks=pytest.mark.slow_test),
++        pytest.param("BF16", True, "per_loop", marks=pytest.mark.slow_test),
++        pytest.param("NVFP4", False, "per_loop", marks=pytest.mark.slow_test),
++        pytest.param("NVFP4", True, "last_loop", marks=pytest.mark.slow_test),
++    ],
++)
++def test_mixed_request_loops_match_separate_requests(
++    vllm_runner, cache_mode, enforce_eager, precision
++):
++    """A graph for batch budget 3 must not run the engine's maximum budget 4."""
++    from tests.models.utils import check_logprobs_close
++    from vllm import SamplingParams
++
++    prompts = [
++        "The capital of France is",
++        "Compute 12 + 30. The answer is",
++        "Write a Python function that adds two numbers.",
++    ]
++    params = [
++        SamplingParams(
++            temperature=0,
++            max_tokens=16,
++            ignore_eos=True,
++            logprobs=5,
++            extra_args={"num_loops": count},
++        )
++        for count in (1, 2, 3)
++    ]
++    with vllm_runner(
++        f"nvidia/NVIDIA-Nemotron-Labs-Dory1.5-4B-{precision}",
++        dtype="bfloat16",
++        max_model_len=512,
++        max_num_seqs=4,
++        max_num_batched_tokens=256,
++        enable_chunked_prefill=True,
++        enable_prefix_caching=False,
++        enforce_eager=enforce_eager,
++        compilation_config={"cudagraph_capture_sizes": [1, 2, 4]},
++        hf_overrides={"recurrent_kv_cache_mode": cache_mode},
++    ) as runner:
++        fixed = [
++            runner.llm.generate([prompt], param)[0]
++            for prompt, param in zip(prompts, params)
++        ]
++        mixed = runner.llm.generate(prompts, params)
++
++        def results(outputs):
++            return [
++                (list(o.outputs[0].token_ids), o.outputs[0].text, o.outputs[0].logprobs)
++                for o in outputs
++            ]
++
++        check_logprobs_close(
++            outputs_0_lst=results(fixed),
++            outputs_1_lst=results(mixed),
++            name_0="separate",
++            name_1="mixed",
++        )
++
++    with vllm_runner(
++        f"nvidia/NVIDIA-Nemotron-Labs-Dory1.5-4B-{precision}",
++        dtype="bfloat16",
++        max_model_len=512,
++        max_num_seqs=4,
++        max_num_batched_tokens=256,
++        enable_chunked_prefill=True,
++        enable_prefix_caching=False,
++        enforce_eager=enforce_eager,
++        compilation_config={"cudagraph_capture_sizes": [1, 2, 4]},
++        hf_overrides={"recurrent_kv_cache_mode": cache_mode, "n_recurrent_loops": 2},
++    ) as runner:
++        from copy import deepcopy
++
++        fixed_params = deepcopy(params[1])
++        fixed_params.extra_args = None
++        fixed_engine = runner.llm.generate([prompts[1]], fixed_params)
++        check_logprobs_close(
++            outputs_0_lst=results(fixed_engine),
++            outputs_1_lst=results([mixed[1]]),
++            name_0="fixed engine",
++            name_1="request budget",
++        )
++
++
++@pytest.mark.parametrize("cache_mode", ["per_loop", "last_loop"])
++def test_request_loops_isolate_prefixes_at_engine_admission(
++    vllm_runner, monkeypatch, cache_mode
++):
++    """Cache keys depend on the budget even when a frontend supplies its own hashes."""
++    import time
++
++    from vllm import SamplingParams
++    from vllm.v1.engine import EngineCoreRequest
++
++    monkeypatch.setenv("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
++
++    def params(count):
++        return SamplingParams(
++            temperature=0,
++            max_tokens=4,
++            ignore_eos=True,
++            extra_args={"num_loops": count},
++            logprobs=5,
++        )
++
++    with vllm_runner(
++        "nvidia/NVIDIA-Nemotron-Labs-Dory1.5-4B-BF16",
++        dtype="bfloat16",
++        max_model_len=1024,
++        max_num_seqs=2,
++        max_num_batched_tokens=256,
++        enable_chunked_prefill=True,
++        enable_prefix_caching=True,
++        enforce_eager=True,
++        hf_overrides={"recurrent_kv_cache_mode": cache_mode},
++    ) as runner:
++        tokens = runner.llm.get_tokenizer().encode(
++            "Explain the scientific observations. " * 100
++        )[:401]
++        prompt = {"prompt_token_ids": tokens, "cache_salt": "caller"}
++        outputs = [runner.llm.generate([prompt], params(k))[0] for k in (1, 1, 2, 2)]
++        hits = [o.num_cached_tokens for o in outputs]
++        assert hits[0] == hits[2] == 0
++        assert hits[1] > 0 and hits[3] > 0
++        if cache_mode == "per_loop":
++            from tests.models.utils import check_logprobs_close
++
++            def result(o):
++                c = o.outputs[0]
++                return (list(c.token_ids), c.text, c.logprobs)
++
++            check_logprobs_close(
++                outputs_0_lst=[result(outputs[0]), result(outputs[2])],
++                outputs_1_lst=[result(outputs[1]), result(outputs[3])],
++                name_0="cold prefix",
++                name_1="warm prefix",
++            )
++        core = runner.llm.llm_engine.engine_core.engine_core
++
++        def request(count, hashes=None):
++            return EngineCoreRequest(
++                request_id=f"budget-{count}",
++                prompt_token_ids=tokens,
++                sampling_params=params(count),
++                pooling_params=None,
++                mm_features=None,
++                arrival_time=time.time(),
++                lora_request=None,
++                cache_salt="caller",
++                data_parallel_rank=None,
++                block_hashes=hashes,
++            )
++
++        baseline, _ = core.preprocess_add_request(request(4))
++        supplied_hashes = list(baseline.block_hashes)
++        default_request = request(4, supplied_hashes)
++        default_admitted, _ = core.preprocess_add_request(default_request)
++        assert default_request.block_hashes is supplied_hashes
++        assert default_admitted.block_hashes == baseline.block_hashes
++        incoming = request(1, supplied_hashes)
++        admitted, _ = core.preprocess_add_request(incoming)
++        assert incoming.block_hashes is None
++        assert admitted.block_hashes and admitted.block_hashes != baseline.block_hashes
++        for invalid in (True, 0, 5, "2"):
++            with pytest.raises(VLLMValidationError, match="num_loops"):
++                core.preprocess_add_request(request(invalid))
++            with pytest.raises(VLLMValidationError, match="num_loops"):
++                runner.llm.generate(["test"], params(invalid))
++
++
++@pytest.mark.parametrize(
++    "case,match",
++    [
++        ("shape", "shape/dtype"),
++        ("dtype", "shape/dtype"),
++        ("missing", "Incomplete checkpoint"),
++        ("duplicate", "Duplicate source tensor"),
++        ("unknown", "Unexpected checkpoint tensor"),
++    ],
++)
++def test_packed_loader_rejects_inconsistent_tensors(case, match):
++    from vllm.model_executor.models.dory1_5 import _load_per_matrix_weights
++
++    module = torch.nn.Linear(16, 8, dtype=torch.bfloat16)
++    tensors = [(name, torch.ones_like(p)) for name, p in module.named_parameters()]
++    if case == "shape":
++        tensors[0] = ("weight", torch.ones(8, 8, dtype=torch.bfloat16))
++    elif case == "dtype":
++        tensors[0] = ("weight", tensors[0][1].float())
++    elif case == "missing":
++        tensors.pop()
++    elif case == "duplicate":
++        tensors.append(tensors[0])
++    else:
++        tensors.append(("missing.weight", tensors[0][1]))
++    with pytest.raises(ValueError, match=match):
++        _load_per_matrix_weights(module, tensors)
++
++
++@pytest.mark.parametrize(
++    "allocation,match",
++    [
++        (None, "allocation file was not found"),
++        ({"formats": []}, "formats mapping"),
++        ({"formats": {"model.layers.0.mixer.up_proj.weight": "FP3"}}, "Unsupported"),
++        ({"formats": {"missing.weight": "NVFP4"}}, "only pack linear matrix weights"),
++    ],
++)
++def test_packed_model_rejects_invalid_allocation(
++    dist_init, tmp_path, allocation, match
++):
++    import json
++
++    from vllm.config import ModelConfig
++    from vllm.model_executor.models.dory1_5 import (
++        Dory1_5ForCausalLM,
++    )
++
++    Dory1_5Config(
++        architectures=["Dory1_5ForCausalLM"],
++        vocab_size=64,
++        hidden_size=128,
++        intermediate_size=256,
++        num_hidden_layers=1,
++        layer_types=["mlp"],
++        n_input_layers=0,
++        n_recurrent_layers=1,
++        n_output_layers=0,
++        n_recurrent_loops=1,
++        loop_conditioning_hidden_size=8,
++        loop_adapter_rank=0,
++        per_tensor_quantization={"version": 1, "allocation": "allocation.json"},
++    ).save_pretrained(tmp_path)
++    if allocation is not None:
++        (tmp_path / "allocation.json").write_text(json.dumps(allocation))
++    config = VllmConfig(
++        model_config=ModelConfig(
++            model=str(tmp_path),
++            skip_tokenizer_init=True,
++            dtype="bfloat16",
++            max_model_len=64,
++            enforce_eager=True,
++        )
++    )
++    with set_current_vllm_config(config), pytest.raises(ValueError, match=match):
++        Dory1_5ForCausalLM(vllm_config=config)
+diff --git a/tests/transformers_utils/test_dory1_5_config.py b/tests/transformers_utils/test_dory1_5_config.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..864dfb55440e1c17bac37ab79e70b2134b48392d
+--- /dev/null
++++ b/tests/transformers_utils/test_dory1_5_config.py
+@@ -0,0 +1,120 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
++
++import pytest
++from huggingface_hub.errors import (
++    StrictDataclassClassValidationError,
++    StrictDataclassFieldValidationError,
++)
++
++from vllm.config import ModelConfig, ParallelConfig
++from vllm.exceptions import VLLMValidationError
++from vllm.transformers_utils.config import get_config
++from vllm.transformers_utils.configs.dory1_5 import (
++    Dory1_5Config,
++)
++
++
++@pytest.mark.parametrize("cache_mode", ["per_loop", "last_loop"])
++def test_dory1_5_native_config_roundtrip_and_hybrid_layout(tmp_path, cache_mode):
++    original = Dory1_5Config(
++        architectures=["Dory1_5ForCausalLM"],
++        recurrent_kv_cache_mode=cache_mode,
++    )
++    original.save_pretrained(tmp_path)
++    restored = get_config(tmp_path, trust_remote_code=False)
++    assert isinstance(restored, Dory1_5Config)
++    assert Dory1_5Config.from_dict(restored.to_dict()).to_dict() == restored.to_dict()
++    assert restored.layer_types == original.layer_types
++    model = ModelConfig(
++        model=str(tmp_path),
++        skip_tokenizer_init=True,
++        max_model_len=128,
++        hf_overrides={"n_recurrent_loops": 2},
++    )
++    assert model.hf_config.n_recurrent_loops == 2
++    assert model.hf_config.recurrent_kv_cache_mode == cache_mode
++    assert model.get_head_size() == 128
++    assert model.is_hybrid
++    parallel = ParallelConfig()
++    assert model.get_num_layers_by_block_type(parallel, "attention") == 6
++    assert model.get_num_layers_by_block_type(parallel, "linear_attention") == 23
++
++
++def test_dory1_5_accepts_hf_special_token_types():
++    config = Dory1_5Config(eos_token_id=[11, 12], bos_token_id=None, pad_token_id=None)
++    assert config.eos_token_id == [11, 12]
++    assert config.bos_token_id is None
++    assert config.pad_token_id is None
++
++
++@pytest.mark.parametrize(
++    "overrides,match",
++    [
++        ({"n_recurrent_loops": 0}, "must be positive"),
++        ({"n_recurrent_loops": 1.5}, "n_recurrent_loops"),
++        ({"recurrent_kv_cache_mode": "last"}, "recurrent_kv_cache_mode"),
++        ({"n_recurrent_layers": 22}, "partitions"),
++        ({"layer_types": []}, "num_hidden_layers"),
++        ({"layer_types": ["moe"] * 52}, "Dory1.5 layers"),
++        ({"linear_num_key_heads": 7}, "divisible"),
++        ({"head_dim": 0}, "dimensions"),
++        ({"loop_conditioning_hidden_size": 255}, "must be even"),
++        ({"hidden_act": "silu"}, "relu2"),
++    ],
++)
++def test_dory1_5_rejects_incompatible_architecture(overrides, match):
++    with pytest.raises(
++        (
++            ValueError,
++            StrictDataclassClassValidationError,
++            StrictDataclassFieldValidationError,
++        ),
++        match=match,
++    ):
++        Dory1_5Config(**overrides)
++
++
++@pytest.mark.parametrize("count", [True, False, 0, 5, "2", 2.0, None])
++def test_request_loop_budget_rejects_invalid_counts(count):
++    config = Dory1_5Config(n_recurrent_loops=4)
++    with pytest.raises(VLLMValidationError, match="num_loops"):
++        config.request_cache_salt({"num_loops": count}, "caller")
++
++
++def test_request_cache_salt_preserves_default_and_isolates_budgets():
++    config = Dory1_5Config(n_recurrent_loops=4)
++    assert config.request_cache_salt(None, "caller") == "caller"
++    assert config.request_cache_salt({"num_loops": 4}, "caller") == "caller"
++    salts = {
++        config.request_cache_salt({"num_loops": count}, caller)
++        for count in range(1, 5)
++        for caller in (None, "caller", "other")
++    }
++    assert len(salts) == 12
++
++
++@pytest.mark.parametrize(
++    "marker",
++    [
++        {},
++        {"version": 2, "allocation": "x.json"},
++        {"version": True, "allocation": "x.json"},
++        {"version": 1},
++        {"version": 1, "allocation": ""},
++        {"version": 1, "allocation": 1},
++    ],
++)
++def test_invalid_per_tensor_quantization(marker):
++    with pytest.raises(
++        StrictDataclassClassValidationError, match="per_tensor_quantization"
++    ):
++        Dory1_5Config(per_tensor_quantization=marker).validate()
++
++
++def test_per_tensor_quantization_roundtrip(tmp_path):
++    marker = {"version": 1, "allocation": "quantization_allocation.json"}
++    config = Dory1_5Config(per_tensor_quantization=marker)
++    config.save_pretrained(tmp_path)
++    assert Dory1_5Config.from_pretrained(tmp_path).per_tensor_quantization == marker
+diff --git a/vllm/config/compilation.py b/vllm/config/compilation.py
+index a655203648e8fab3067761d2b78b861e75f545da..6f4c633d133c4a2d0fde3bb057fe2411cef86e69 100644
+--- a/vllm/config/compilation.py
++++ b/vllm/config/compilation.py
+@@ -989,6 +989,7 @@ class CompilationConfig:
+         "vllm::qwen4_exp_qsa_prepare_with_output",
+         "vllm::linear_attention",
+         "vllm::qwen_gdn_attention_core",
++        "vllm::gated_delta_product_core",
+         "vllm::qwen_gdn_attention_core_fused_norm_packed",
+         "vllm::qwen_gdn_attention_core_fused_norm_rocm",
+         "vllm::gdn_attention_core_xpu",
+diff --git a/vllm/model_executor/layers/mamba/gdn/gated_delta_product.py b/vllm/model_executor/layers/mamba/gdn/gated_delta_product.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..ba22b684811c045d4fe6392c5d57f3e0df90c823
+--- /dev/null
++++ b/vllm/model_executor/layers/mamba/gdn/gated_delta_product.py
+@@ -0,0 +1,816 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
++"""Gated delta product (GDP) linear attention.
++
++A gated delta product layer applies `m = linear_num_householder` delta-rule updates
++per token: token `t` carries `m` key/value pairs and `m` write strengths `beta`;
++the state decays once (on the first update) and is read once, by the query, after the
++last update. This is exactly a gated delta *rule* over a virtual sequence with `m`
++steps per token, which is how it runs here: on vLLM's gated delta rule kernels, with
++zero decay on steps `1..m-1` and the query placed on step `m-1`.
++
++A layer can own several independent recurrent states (`cache_prefixes`), for models
++that run the same weights more than once per token (looped models): one
++`GatedDeltaProductCache` per extra state registers it with the cache manager, and
++`forward` selects the state by index.
++"""
++
++import math
++import weakref
++
++import torch
++from torch import nn
++
++from vllm.compilation.breakable_cudagraph import eager_break_during_capture
++from vllm.config import VllmConfig, get_current_vllm_config
++from vllm.forward_context import ForwardContext, get_forward_context
++from vllm.logger import init_logger
++from vllm.model_executor.custom_op import PluggableLayer
++from vllm.model_executor.layers.layernorm import RMSNormGated
++from vllm.model_executor.layers.linear import (
++    ColumnParallelLinear,
++    MergedColumnParallelLinear,
++    RowParallelLinear,
++)
++from vllm.model_executor.layers.mamba.abstract import (
++    MambaBase,
++    get_mamba_prefill_checkpoint_alignment,
++    get_mamba_prefill_checkpoint_grid,
++)
++from vllm.model_executor.layers.mamba.checkpoint import (
++    MambaPrefillCheckpointExporter,
++)
++from vllm.model_executor.layers.mamba.gdn.base import GatedDeltaNetAttention
++from vllm.model_executor.layers.mamba.mamba_mixer2 import mamba_v2_sharded_weight_loader
++from vllm.model_executor.layers.mamba.mamba_utils import (
++    MambaStateShapeCalculator,
++    is_conv_state_dim_first,
++)
++from vllm.model_executor.layers.mamba.ops.causal_conv1d import (
++    causal_conv1d_fn,
++    causal_conv1d_update,
++)
++from vllm.model_executor.layers.mamba.ops.causal_conv1d_prefill import (
++    causal_conv1d_prefill,
++)
++from vllm.model_executor.layers.mamba.ops.gated_delta_product import (
++    fused_recurrent_gated_delta_product,
++)
++from vllm.model_executor.layers.mamba.ops.gdp_chunk_prefill import (
++    gdp_chunk_prefill,
++    gdp_chunk_prefill_supported,
++)
++from vllm.model_executor.model_loader.weight_utils import sharded_weight_loader
++from vllm.model_executor.utils import set_weight_attrs
++from vllm.platforms import current_platform
++from vllm.third_party.flash_linear_attention.ops import chunk_gated_delta_rule
++from vllm.third_party.flash_linear_attention.ops.index import (
++    prepare_chunk_indices,
++    prepare_chunk_offsets,
++)
++from vllm.third_party.flash_linear_attention.ops.l2norm import l2norm_fwd
++from vllm.third_party.flash_linear_attention.ops.utils import FLA_CHUNK_SIZE
++from vllm.utils.torch_utils import (
++    LayerNameType,
++    _encode_layer_name,
++    _resolve_layer_name,
++    async_tensor_h2d,
++    direct_register_custom_op,
++)
++from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadata
++from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
++
++logger = init_logger(__name__)
++
++
++def _set_weight_loader(weight: torch.Tensor, loader) -> None:
++    if hasattr(weight, "weight_loader"):
++        delattr(weight, "weight_loader")
++    set_weight_attrs(weight, {"weight_loader": loader})
++
++
++# CUDA limits grid axes 1 and 2 to this many blocks.
++_GRID_AXIS_LIMIT = 65535
++
++
++# Virtual-sequence chunk metadata of the latest prefill batches, shared by every layer
++# of a forward (each layer has its own metadata object, built from the same query
++# starts): [(query starts on the host, m, device, (cu_seqlens, chunk_indices,
++# chunk_offsets))], keyed by value.
++_virtual_chunk_metadata_cache: list[tuple] = []
++_VIRTUAL_CHUNK_METADATA_CACHE_SIZE = 4
++
++
++def virtual_chunk_metadata(
++    query_start_cpu: torch.Tensor | None, device: torch.device, m: int
++) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None:
++    """(cu_seqlens, chunk_indices, chunk_offsets) of a prefill batch's virtual
++    sequences, built once per batch from the host copy of the query starts (no
++    device-to-host sync) and reused by every layer. None without the host copy.
++    """
++    if query_start_cpu is None:
++        return None
++    for cached_query_start, cached_m, cached_device, cached in reversed(
++        _virtual_chunk_metadata_cache
++    ):
++        if (
++            cached_m == m
++            and cached_device == device
++            and torch.equal(cached_query_start, query_start_cpu)
++        ):
++            return cached
++    cu_seqlens_cpu = (query_start_cpu * m).to(torch.int32)
++    result = (
++        async_tensor_h2d(cu_seqlens_cpu, device=device),
++        async_tensor_h2d(
++            prepare_chunk_indices(cu_seqlens_cpu, FLA_CHUNK_SIZE), device=device
++        ),
++        async_tensor_h2d(
++            prepare_chunk_offsets(cu_seqlens_cpu, FLA_CHUNK_SIZE), device=device
++        ),
++    )
++    _virtual_chunk_metadata_cache.append((query_start_cpu.clone(), m, device, result))
++    del _virtual_chunk_metadata_cache[:-_VIRTUAL_CHUNK_METADATA_CACHE_SIZE]
++    return result
++
++
++class GatedDeltaProductCache(nn.Module, MambaBase):
++    """An additional recurrent state of a `GatedDeltaProductAttention` layer.
++
++    Registers itself under its own layer name so the cache manager allocates a state for
++    it, and runs the owning layer's core on that state. Holds no weights.
++    """
++
++    def __init__(self, owner: "GatedDeltaProductAttention", prefix: str) -> None:
++        super().__init__()
++        object.__setattr__(self, "_owner_ref", weakref.ref(owner))
++        self.prefix = prefix
++        compilation_config = get_current_vllm_config().compilation_config
++        if prefix in compilation_config.static_forward_context:
++            raise ValueError(f"Duplicate layer name: {prefix}")
++        compilation_config.static_forward_context[prefix] = self
++
++    @property
++    def owner(self) -> "GatedDeltaProductAttention":
++        owner = self._owner_ref()
++        if owner is None:
++            raise RuntimeError(f"{self.prefix}: the owning layer was released")
++        return owner
++
++    @property
++    def mamba_type(self) -> MambaAttentionBackendEnum:
++        return self.owner.mamba_type
++
++    def get_state_dtype(self) -> tuple[torch.dtype, ...]:
++        return self.owner.get_state_dtype()
++
++    def get_state_shape(self) -> tuple[tuple[int, ...], tuple[int, ...]]:
++        return self.owner.get_state_shape()
++
++    def get_prefill_checkpoint_alignment(self) -> int | None:
++        return self.owner.get_prefill_checkpoint_alignment()
++
++    def get_kv_cache_checkpoint_alignment(self, vllm_config: VllmConfig) -> int | None:
++        return self.owner.get_kv_cache_checkpoint_alignment(vllm_config)
++
++    def _forward_core(self, **kwargs) -> None:
++        self.owner._forward_core_on(self, **kwargs)
++
++
++@PluggableLayer.register("gated_delta_product_attention")
++class GatedDeltaProductAttention(GatedDeltaNetAttention):
++    """Gated delta product linear attention on vLLM's gated delta rule kernels.
++
++    Projections (one sharded GEMM): `z` (output gate), `m` value copies, `m` key
++    copies, the query, `m` write strengths `b` and the decay input `a`. `v/k/q`
++    pass a causal convolution; keys and query are L2-normalized; `beta = sigmoid(b)`,
++    `g = -exp(A_log) * softplus(a + dt_bias)`; the output passes a gated RMSNorm
++    (grouped by key group) and the output projection.
++
++    """
++
++    def __init__(
++        self,
++        config,
++        vllm_config: VllmConfig,
++        prefix: str = "",
++        cache_prefixes: list[str] | None = None,
++    ) -> None:
++        cache_prefixes = list(cache_prefixes) if cache_prefixes else [prefix]
++        super().__init__(config, vllm_config, prefix=cache_prefixes[0])
++        if self.quant_config is not None:
++            raise NotImplementedError(
++                "Quantized gated delta product layers are not supported."
++            )
++        self.activation = "silu"  # convolution activation
++        self.cache_prefixes = cache_prefixes
++        self.num_v_heads = config.linear_num_value_heads
++        self.num_k_heads = config.linear_num_key_heads
++        self.head_v_dim = config.linear_value_head_dim
++        self.head_k_dim = config.linear_key_head_dim
++        self.conv_kernel_size = config.linear_conv_kernel_dim
++        self.num_householder = m = config.linear_num_householder
++        if self.num_v_heads % self.tp_size or self.num_k_heads % self.tp_size:
++            raise ValueError(
++                f"linear_num_value_heads={self.num_v_heads} and "
++                f"linear_num_key_heads={self.num_k_heads} must be divisible by "
++                f"tensor parallel size {self.tp_size}"
++            )
++        self.value_dim = self.num_v_heads * self.head_v_dim
++        self.key_dim = self.num_k_heads * self.head_k_dim
++        self.conv_dim = m * self.value_dim + (m + 1) * self.key_dim
++        self.local_v_heads = self.num_v_heads // self.tp_size
++        self.local_k_heads = self.num_k_heads // self.tp_size
++        self.local_value_dim = self.value_dim // self.tp_size
++        self.local_key_dim = self.key_dim // self.tp_size
++
++        # Output sections: z, v_0..v_{m-1}, k_0..k_{m-1}, q, b_0..b_{m-1}, a.
++        self.in_proj = MergedColumnParallelLinear(
++            self.hidden_size,
++            [self.value_dim] * (m + 1)
++            + [self.key_dim] * (m + 1)
++            + [self.num_v_heads] * (m + 1),
++            bias=False,
++            quant_config=None,
++            prefix=f"{prefix}.in_proj",
++        )
++        self.conv1d = ColumnParallelLinear(
++            input_size=self.conv_kernel_size,
++            output_size=self.conv_dim,
++            bias=False,
++            prefix=f"{prefix}.conv1d",
++        )
++        self.conv1d.weight.data = self.conv1d.weight.data.unsqueeze(1)
++        # Channels v_0..v_{m-1}, k_0..k_{m-1}, q, each sharded by heads / key groups.
++        _set_weight_loader(
++            self.conv1d.weight,
++            mamba_v2_sharded_weight_loader(
++                [(self.value_dim, 0, False)] * m + [(self.key_dim, 0, False)] * (m + 1),
++                self.tp_size,
++                self.tp_rank,
++            ),
++        )
++        self.dt_bias = nn.Parameter(torch.ones(self.local_v_heads))
++        self.A_log = nn.Parameter(torch.empty(self.local_v_heads, dtype=torch.float32))
++        set_weight_attrs(self.dt_bias, {"weight_loader": sharded_weight_loader(0)})
++        set_weight_attrs(self.A_log, {"weight_loader": sharded_weight_loader(0)})
++        self.norm = RMSNormGated(
++            self.local_value_dim,
++            eps=config.rms_norm_eps,
++            group_size=self.value_dim // self.num_k_heads,
++            norm_before_gate=False,
++            activation="silu",
++            device=current_platform.current_device(),
++        )
++        _set_weight_loader(self.norm.weight, sharded_weight_loader(0))
++        self.out_proj = RowParallelLinear(
++            self.value_dim,
++            self.hidden_size,
++            bias=False,
++            input_is_parallel=True,
++            quant_config=None,
++            prefix=f"{prefix}.out_proj",
++        )
++
++        compilation_config = get_current_vllm_config().compilation_config
++        if self.prefix in compilation_config.static_forward_context:
++            raise ValueError(f"Duplicate layer name: {self.prefix}")
++        compilation_config.static_forward_context[self.prefix] = self
++        self.extra_caches = nn.ModuleList(
++            [GatedDeltaProductCache(self, p) for p in self.cache_prefixes[1:]]
++        )
++        self.fast_prefill = gdp_chunk_prefill_supported(
++            m, self.head_k_dim, self.head_v_dim
++        )
++        self._prefill_kernels_warmed_up = False
++        self._checkpoint_alignment = None
++        if vllm_config.cache_config.enable_prefix_caching:
++            self._checkpoint_alignment = FLA_CHUNK_SIZE // math.gcd(FLA_CHUNK_SIZE, m)
++        self._checkpoint_exporter = MambaPrefillCheckpointExporter(
++            state_len=self.conv_kernel_size - 1
++        )
++
++    def get_prefill_checkpoint_alignment(self) -> int | None:
++        return self._checkpoint_alignment
++
++    def get_kv_cache_checkpoint_alignment(self, vllm_config: VllmConfig) -> int | None:
++        if (
++            self._checkpoint_alignment is None
++            or get_mamba_prefill_checkpoint_alignment(vllm_config) is None
++        ):
++            return None
++        return get_mamba_prefill_checkpoint_grid(vllm_config)
++
++    def get_state_shape(self) -> tuple[tuple[int, ...], tuple[int, ...]]:
++        return MambaStateShapeCalculator.gated_delta_product_state_shape(
++            self.tp_size,
++            self.num_k_heads,
++            self.num_v_heads,
++            self.head_k_dim,
++            self.head_v_dim,
++            self.num_householder,
++            self.conv_kernel_size,
++        )
++
++    def load_in_proj_weight(self, role: str, loaded_weight: torch.Tensor) -> None:
++        """Load one per-role projection (`z`, `v`, `k`, `q`, `b` or `a`)
++        into the merged input projection. `v`, `k` and `b` hold their `m` copies
++        stacked.
++        """
++        m = self.num_householder
++        first_shard = {
++            "z": 0,
++            "v": 1,
++            "k": m + 1,
++            "q": 2 * m + 1,
++            "b": 2 * m + 2,
++            "a": 3 * m + 2,
++        }
++        pieces = loaded_weight.chunk(m) if role in ("v", "k", "b") else (loaded_weight,)
++        loader = self.in_proj.weight.weight_loader
++        for i, piece in enumerate(pieces):
++            loader(self.in_proj.weight, piece, first_shard[role] + i)
++
++    def forward(
++        self, hidden_states: torch.Tensor, cache_index: int = 0
++    ) -> torch.Tensor:
++        """Run the layer on its recurrent state `cache_index`."""
++        num_tokens = hidden_states.shape[0]
++        m = self.num_householder
++        projected, _ = self.in_proj(hidden_states)
++        conv_end = (
++            self.local_value_dim
++            + m * self.local_value_dim
++            + (m + 1) * self.local_key_dim
++        )
++        z = projected[:, : self.local_value_dim]
++        mixed_qkv = projected[:, self.local_value_dim : conv_end]
++        b = projected[:, conv_end : conv_end + m * self.local_v_heads]
++        a = projected[:, conv_end + m * self.local_v_heads :]
++        core_attn_out = torch.zeros(
++            num_tokens,
++            self.local_v_heads,
++            self.head_v_dim,
++            dtype=hidden_states.dtype,
++            device=hidden_states.device,
++        )
++        torch.ops.vllm.gated_delta_product_core(
++            mixed_qkv,
++            b,
++            a,
++            core_attn_out,
++            _encode_layer_name(self.cache_prefixes[cache_index]),
++        )
++        normed = self.norm(core_attn_out.view(num_tokens, self.local_value_dim), z)
++        output, _ = self.out_proj(normed)
++        return output
++
++    # ------------------------------------------------------------------ core
++
++    def _forward_core(self, **kwargs) -> None:
++        self._forward_core_on(self, **kwargs)
++
++    def _forward_core_on(
++        self,
++        cache_layer: "GatedDeltaProductAttention | GatedDeltaProductCache",
++        mixed_qkv: torch.Tensor,
++        b: torch.Tensor,
++        a: torch.Tensor,
++        core_attn_out: torch.Tensor,
++    ) -> None:
++        """Convolution and gated delta product on the recurrent state of
++        `cache_layer`."""
++        attn_metadata = get_forward_context().attn_metadata
++        if attn_metadata is None:
++            # Profile run: tune the prefill kernels while memory is still free.
++            self._warmup_prefill_kernels(mixed_qkv.dtype, mixed_qkv.device)
++            return
++        assert isinstance(attn_metadata, dict)
++        metadata = attn_metadata.get(cache_layer.prefix)
++        if metadata is None:
++            # Dummy runs skip mamba-family metadata.
++            return
++        assert isinstance(metadata, GDNAttentionMetadata)
++        num_tokens = metadata.num_actual_tokens
++        if num_tokens == 0:
++            return
++        mixed_qkv, b, a = mixed_qkv[:num_tokens], b[:num_tokens], a[:num_tokens]
++        conv_state = (
++            cache_layer.kv_cache[0]
++            if is_conv_state_dim_first()
++            else cache_layer.kv_cache[0].transpose(-1, -2)
++        )
++        ssm_state = cache_layer.kv_cache[1]
++        conv_weights = self.conv1d.weight.view(
++            self.conv1d.weight.size(0), self.conv1d.weight.size(2)
++        )
++
++        state_indices = metadata.non_spec_state_indices_tensor
++        assert state_indices is not None
++        if metadata.num_prefills > 0:
++            self._prefill(
++                metadata,
++                mixed_qkv,
++                b,
++                a,
++                conv_state,
++                ssm_state,
++                conv_weights,
++                core_attn_out[:num_tokens],
++            )
++        else:
++            conv_out = causal_conv1d_update(
++                mixed_qkv,
++                conv_state,
++                conv_weights,
++                None,
++                self.activation,
++                conv_state_indices=state_indices[:num_tokens],
++                validate_data=False,
++            )
++            fused_recurrent_gated_delta_product(
++                conv_out,
++                b,
++                a,
++                self.A_log,
++                self.dt_bias,
++                ssm_state,
++                core_attn_out[:num_tokens],
++                num_householder=self.num_householder,
++                num_groups=self.local_k_heads,
++                num_heads=self.local_v_heads,
++                state_dim=self.head_k_dim,
++                head_dim=self.head_v_dim,
++                ssm_state_indices=state_indices[:num_tokens],
++            )
++
++    def _prefill(
++        self, metadata, mixed_qkv, b, a, conv_state, ssm_state, conv_weights, out
++    ):
++        query_start = metadata.non_spec_query_start_loc
++        state_indices = metadata.non_spec_state_indices_tensor
++        has_initial = metadata.has_initial_state
++        assert (
++            query_start is not None
++            and state_indices is not None
++            and has_initial is not None
++        )
++        checkpoint = metadata.checkpoint
++        fast_conv = self.fast_prefill and self.conv_kernel_size == 4
++        if fast_conv:
++            conv_out = causal_conv1d_prefill(
++                mixed_qkv,
++                conv_weights,
++                conv_state,
++                query_start,
++                state_indices,
++                has_initial,
++                checkpoint_offsets=None
++                if checkpoint is None
++                else checkpoint.checkpoint_offsets,
++                checkpoint_indices=None
++                if checkpoint is None
++                else checkpoint.state_indices,
++            )
++        else:
++            conv_out = causal_conv1d_fn(
++                mixed_qkv.contiguous().transpose(0, 1),
++                conv_weights,
++                None,
++                activation=self.activation,
++                conv_states=conv_state,
++                has_initial_state=has_initial,
++                cache_indices=state_indices,
++                query_start_loc=query_start,
++                metadata=metadata,
++            ).transpose(0, 1)
++        chunks = virtual_chunk_metadata(
++            metadata.non_spec_query_start_loc_cpu,
++            query_start.device,
++            self.num_householder,
++        )
++        if self.fast_prefill:
++            gdp_chunk_prefill(
++                conv_out,
++                b,
++                a,
++                self.A_log,
++                self.dt_bias,
++                ssm_state,
++                query_start,
++                state_indices,
++                has_initial,
++                num_householder=self.num_householder,
++                num_heads=self.local_v_heads,
++                num_groups=self.local_k_heads,
++                head_k_dim=self.head_k_dim,
++                head_v_dim=self.head_v_dim,
++                chunk_metadata=chunks,
++                checkpoint_offsets=None
++                if checkpoint is None
++                else checkpoint.checkpoint_offsets,
++                checkpoint_indices=None
++                if checkpoint is None
++                else checkpoint.state_indices,
++                out=out,
++            )
++            if checkpoint is not None and not fast_conv:
++                self._checkpoint_exporter.export(
++                    checkpoint,
++                    raw_qkv=mixed_qkv,
++                    conv_state=conv_state,
++                    cu_seqlens=query_start,
++                )
++        else:
++            q, k, v, g, beta = self._virtual_inputs(conv_out, b, a)
++            initial = ssm_state[state_indices].contiguous()
++            initial.masked_fill_(~has_initial.view(-1, 1, 1, 1), 0)
++            checkpoint_state = (
++                torch.empty_like(initial) if checkpoint is not None else None
++            )
++            virtual_out, final = self._chunked_prefill(
++                q,
++                k,
++                v,
++                g,
++                beta,
++                initial,
++                query_start,
++                checkpoint_state,
++                None if checkpoint is None else checkpoint.checkpoint_offsets,
++                chunks,
++            )
++            ssm_state[state_indices] = final.to(ssm_state.dtype)
++            out.copy_(
++                virtual_out.reshape(
++                    -1, self.num_householder, self.local_v_heads, self.head_v_dim
++                )[:, -1]
++            )
++            if checkpoint is not None:
++                self._checkpoint_exporter.export(
++                    checkpoint,
++                    raw_qkv=mixed_qkv,
++                    conv_state=conv_state,
++                    cu_seqlens=query_start,
++                    recurrent_checkpoint=checkpoint_state,
++                    recurrent_state=ssm_state,
++                )
++
++    def _virtual_inputs(
++        self, conv_out: torch.Tensor, b: torch.Tensor, a: torch.Tensor
++    ) -> tuple[torch.Tensor, ...]:
++        """(q, k, v, g, beta) of the virtual gated delta rule sequence, `m` steps per
++        token."""
++        num_tokens = conv_out.shape[0]
++        m = self.num_householder
++        heads, groups = self.local_v_heads, self.local_k_heads
++        pieces = conv_out.split(
++            [self.local_value_dim] * m + [self.local_key_dim] * (m + 1), dim=-1
++        )
++        value = torch.stack(
++            [p.view(num_tokens, heads, self.head_v_dim) for p in pieces[:m]], dim=1
++        ).reshape(num_tokens * m, heads, self.head_v_dim)
++        key = torch.stack(
++            [p.view(num_tokens, groups, self.head_k_dim) for p in pieces[m : 2 * m]],
++            dim=1,
++        ).reshape(num_tokens * m, groups, self.head_k_dim)
++        query = pieces[-1].reshape(num_tokens, groups, self.head_k_dim)
++        if heads != groups:
++            key = key.repeat_interleave(heads // groups, dim=1)
++            query = query.repeat_interleave(heads // groups, dim=1)
++        key = l2norm_fwd(key.contiguous())
++        query = l2norm_fwd(query.contiguous())
++        # The query reads the state after the token's last step; the decay acts on its
++        # first.
++        virtual_query = query.new_zeros(num_tokens, m, heads, self.head_k_dim)
++        virtual_query[:, -1] = query
++        g = -self.A_log.float().exp() * nn.functional.softplus(
++            a.float() + self.dt_bias.float()
++        )
++        virtual_g = g.new_zeros(num_tokens, m, heads)
++        virtual_g[:, 0] = g
++        beta = torch.sigmoid(b.view(num_tokens, m, heads))
++        return (
++            virtual_query.reshape(1, num_tokens * m, heads, self.head_k_dim),
++            key.unsqueeze(0).contiguous(),
++            value.unsqueeze(0).contiguous(),
++            virtual_g.reshape(1, num_tokens * m, heads),
++            beta.reshape(1, num_tokens * m, heads).contiguous(),
++        )
++
++    def _chunked_prefill(
++        self,
++        q: torch.Tensor,
++        k: torch.Tensor,
++        v: torch.Tensor,
++        g: torch.Tensor,
++        beta: torch.Tensor,
++        initial_state: torch.Tensor,
++        query_start: torch.Tensor,
++        checkpoint_state: torch.Tensor | None = None,
++        checkpoint_offsets: torch.Tensor | None = None,
++        chunk_metadata: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
++    ) -> tuple[torch.Tensor, torch.Tensor]:
++        """The chunked gated delta rule over the virtual sequences of a prefill batch.
++
++        The chunked kernels launch one block per (sequence, value head) on a grid axis
++        limited to 65535 blocks, so a batch with more sequences than
++        `65535 // value_heads` runs in groups of sequences (each group is a contiguous
++        slice of the virtual tokens; inputs are `[1, virtual tokens, heads, ...]`).
++        """
++        m = self.num_householder
++        num_seqs = query_start.shape[0] - 1
++        max_seqs = _GRID_AXIS_LIMIT // q.shape[-2]
++
++        def run(q, k, v, g, beta, initial_state, real_cu_seqlens, states, offsets):
++            cu_seqlens = (real_cu_seqlens * m).to(torch.int32)
++            if chunk_metadata is not None and num_seqs <= max_seqs:
++                cu_seqlens, indices, offsets_by_chunk = chunk_metadata
++            else:
++                indices = prepare_chunk_indices(cu_seqlens, FLA_CHUNK_SIZE)
++                offsets_by_chunk = prepare_chunk_offsets(cu_seqlens, FLA_CHUNK_SIZE)
++            return chunk_gated_delta_rule(
++                q=q,
++                k=k,
++                v=v,
++                g=g,
++                beta=beta,
++                initial_state=initial_state,
++                output_final_state=True,
++                checkpoint_state=states,
++                checkpoint_offsets=None if offsets is None else offsets * m,
++                cu_seqlens=cu_seqlens,
++                chunk_indices=indices,
++                chunk_offsets=offsets_by_chunk,
++            )
++
++        if num_seqs <= max_seqs:
++            return run(
++                q,
++                k,
++                v,
++                g,
++                beta,
++                initial_state,
++                query_start,
++                checkpoint_state,
++                checkpoint_offsets,
++            )
++        bounds = query_start.tolist()
++        outs, finals = [], []
++        for s0 in range(0, num_seqs, max_seqs):
++            s1 = min(s0 + max_seqs, num_seqs)
++            t0, t1 = bounds[s0] * m, bounds[s1] * m
++            out, final = run(
++                q[:, t0:t1],
++                k[:, t0:t1],
++                v[:, t0:t1],
++                g[:, t0:t1],
++                beta[:, t0:t1],
++                initial_state[s0:s1],
++                query_start[s0 : s1 + 1] - bounds[s0],
++                None if checkpoint_state is None else checkpoint_state[s0:s1],
++                None if checkpoint_offsets is None else checkpoint_offsets[s0:s1],
++            )
++            outs.append(out)
++            finals.append(final)
++        return torch.cat(outs, dim=1), torch.cat(finals)
++
++    def _warmup_fast_prefill(
++        self, dtype: torch.dtype, state_dtype: torch.dtype, device: torch.device
++    ) -> None:
++        """Compile the fast path's kernels (fixed configurations, no autotuning) on a
++        one-chunk sequence, with and without a checkpoint."""
++        m, heads = self.num_householder, self.local_v_heads
++        tokens = FLA_CHUNK_SIZE
++        conv_dim = m * self.local_value_dim + (m + 1) * self.local_key_dim
++        cu_seqlens = torch.tensor([0, tokens], dtype=torch.int32, device=device)
++        slot = torch.ones(1, dtype=torch.int32, device=device)
++        has_state = torch.zeros(1, dtype=torch.bool, device=device)
++        virtual_cu = (cu_seqlens * m).to(torch.int32)
++        chunk_metadata = (
++            virtual_cu,
++            prepare_chunk_indices(virtual_cu, FLA_CHUNK_SIZE),
++            prepare_chunk_offsets(virtual_cu, FLA_CHUNK_SIZE),
++        )
++        try:
++            for checkpoints in ((None, None), (torch.zeros_like(slot), slot + 1)):
++                conv_out = torch.randn(tokens, conv_dim, dtype=dtype, device=device)
++                if self.conv_kernel_size == 4:
++                    shape = (
++                        (3, conv_dim, 3)
++                        if is_conv_state_dim_first()
++                        else (3, 3, conv_dim)
++                    )
++                    conv_state = torch.zeros(shape, dtype=dtype, device=device)
++                    if not is_conv_state_dim_first():
++                        conv_state = conv_state.transpose(-1, -2)
++                    conv_out = causal_conv1d_prefill(
++                        conv_out,
++                        torch.zeros(conv_dim, 4, dtype=dtype, device=device),
++                        conv_state,
++                        cu_seqlens,
++                        slot,
++                        has_state,
++                        checkpoint_offsets=checkpoints[0],
++                        checkpoint_indices=checkpoints[1],
++                    )
++                gdp_chunk_prefill(
++                    conv_out,
++                    torch.zeros(tokens, m * heads, dtype=dtype, device=device),
++                    torch.zeros(tokens, heads, dtype=dtype, device=device),
++                    torch.zeros(heads, dtype=torch.float32, device=device),
++                    torch.zeros(heads, dtype=self.dt_bias.dtype, device=device),
++                    torch.zeros(
++                        3,
++                        heads,
++                        self.head_v_dim,
++                        self.head_k_dim,
++                        dtype=state_dtype,
++                        device=device,
++                    ),
++                    cu_seqlens,
++                    slot,
++                    has_state,
++                    num_householder=m,
++                    num_heads=heads,
++                    num_groups=self.local_k_heads,
++                    head_k_dim=self.head_k_dim,
++                    head_v_dim=self.head_v_dim,
++                    chunk_metadata=chunk_metadata,
++                    checkpoint_offsets=checkpoints[0],
++                    checkpoint_indices=checkpoints[1],
++                )
++        except Exception:
++            logger.warning(
++                "Gated delta product prefill kernel warmup failed for %s; the first "
++                "prefill will compile its kernels.",
++                self.prefix,
++                exc_info=True,
++            )
++
++    def _warmup_prefill_kernels(self, dtype: torch.dtype, device: torch.device) -> None:
++        """Autotune the chunked kernels on a one-chunk sequence during the profile run,
++        so the first real prefill does not need autotuning memory after the caches are
++        allocated.
++        """
++        if self._prefill_kernels_warmed_up:
++            return
++        self._prefill_kernels_warmed_up = True
++        heads, tokens = self.local_v_heads, FLA_CHUNK_SIZE * self.num_householder
++        _, state_dtype = self.get_state_dtype()
++        if self.fast_prefill:
++            self._warmup_fast_prefill(dtype, state_dtype, device)
++            return
++        q = torch.randn(1, tokens, heads, self.head_k_dim, dtype=dtype, device=device)
++        k = l2norm_fwd(torch.randn_like(q))
++        v = torch.randn(1, tokens, heads, self.head_v_dim, dtype=dtype, device=device)
++        g = torch.zeros(1, tokens, heads, dtype=torch.float32, device=device)
++        beta = torch.sigmoid(torch.randn(1, tokens, heads, dtype=dtype, device=device))
++        state = torch.zeros(
++            1, heads, self.head_v_dim, self.head_k_dim, dtype=state_dtype, device=device
++        )
++        cu_seqlens = torch.tensor([0, tokens], dtype=torch.int32, device=device)
++        try:
++            chunk_gated_delta_rule(
++                q=q,
++                k=k,
++                v=v,
++                g=g,
++                beta=beta,
++                initial_state=state,
++                output_final_state=True,
++                cu_seqlens=cu_seqlens,
++                chunk_indices=prepare_chunk_indices(cu_seqlens, FLA_CHUNK_SIZE),
++                chunk_offsets=prepare_chunk_offsets(cu_seqlens, FLA_CHUNK_SIZE),
++            )
++        except Exception:
++            logger.warning(
++                "Gated delta product prefill kernel warmup failed for %s; the first "
++                "prefill may need additional autotuning memory.",
++                self.prefix,
++                exc_info=True,
++            )
++
++
++@eager_break_during_capture
++def gated_delta_product_core(
++    mixed_qkv: torch.Tensor,
++    b: torch.Tensor,
++    a: torch.Tensor,
++    core_attn_out: torch.Tensor,
++    layer_name: LayerNameType,
++) -> None:
++    """Convolution and gated delta product of one layer's recurrent state
++    (`layer_name`)."""
++    forward_context: ForwardContext = get_forward_context()
++    layer = forward_context.no_compile_layers[_resolve_layer_name(layer_name)]
++    layer._forward_core(mixed_qkv=mixed_qkv, b=b, a=a, core_attn_out=core_attn_out)
++
++
++direct_register_custom_op(
++    op_name="gated_delta_product_core",
++    op_func=gated_delta_product_core,
++    mutates_args=["core_attn_out"],
++)
+diff --git a/vllm/model_executor/layers/mamba/mamba_utils.py b/vllm/model_executor/layers/mamba/mamba_utils.py
+index b98021e63b79846d0735937dfded8331d6fd04d1..b62e0e13d8e0752b3485251a50ddbdc5694283b3 100644
+--- a/vllm/model_executor/layers/mamba/mamba_utils.py
++++ b/vllm/model_executor/layers/mamba/mamba_utils.py
+@@ -320,6 +320,34 @@ class MambaStateShapeCalculator:
+             (local_v_heads, replayssm_buffer_len),
+         )
+ 
++    @classmethod
++    def gated_delta_product_state_shape(
++        cls,
++        tp_world_size: int,
++        num_k_heads: int,
++        num_v_heads: int,
++        head_k_dim: int,
++        head_v_dim: int,
++        num_householder: int,
++        conv_kernel_size: int,
++    ):
++        """Like the gated delta net state, but the conv covers `num_householder`
++        copies of the keys and values (plus one query)."""
++        conv_dim = (
++            num_householder * head_v_dim * num_v_heads
++            + (num_householder + 1) * head_k_dim * num_k_heads
++        )
++        conv_state_shape = cls._orient_conv_shape(
++            divide(conv_dim, tp_world_size),
++            conv_kernel_size - 1,
++        )
++        temporal_state_shape = (
++            divide(num_v_heads, tp_world_size),
++            head_v_dim,
++            head_k_dim,
++        )
++        return conv_state_shape, temporal_state_shape
++
+     @classmethod
+     def kda_state_shape(
+         cls,
+diff --git a/vllm/model_executor/layers/mamba/ops/causal_conv1d_prefill.py b/vllm/model_executor/layers/mamba/ops/causal_conv1d_prefill.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..ed7b5f0ae76423b7d881ebbc4d01cfc633a8311f
+--- /dev/null
++++ b/vllm/model_executor/layers/mamba/ops/causal_conv1d_prefill.py
+@@ -0,0 +1,267 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
++"""Device-driven width-four causal convolution with SiLU activation.
++
++One launch computes outputs, updates each sequence's convolution state, and
++exports checkpoint windows without host-built chunk metadata or an input copy.
++FP32 uses explicit FMAs to preserve the upstream kernel's accumulation order.
++
++Each program handles a tile of tokens and channels. It finds sequence boundaries
++by binary search. Tokens after the first three read their taps from input rows;
++the first three also use the cached window. The program containing a sequence's
++first token owns its state and checkpoint writes, avoiding races between tiles.
++"""
++
++import torch
++
++from vllm.triton_utils import tl, triton
++from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
++
++
++@triton.jit(
++    do_not_specialize=["T", "N", "stride_x_tok", "stride_o_tok", "stride_state_seq"]
++)
++def _causal_conv1d_prefill_kernel(
++    x_ptr,  # [T, DIM] rows of stride_x_tok
++    w_ptr,  # [DIM, 4] contiguous
++    state_ptr,  # [slots, DIM, 3] any strides
++    o_ptr,  # [T, DIM] rows of stride_o_tok
++    cu_ptr,  # [N + 1] token offsets of the sequences, from 0
++    cache_indices_ptr,  # [N] cache line of each sequence
++    has_initial_state_ptr,  # [N]
++    ckpt_offsets_ptr,  # [N] checkpoint offset in tokens, 0 for none
++    ckpt_indices_ptr,  # [N] cache line of each checkpoint
++    T,
++    N,
++    stride_x_tok,
++    stride_o_tok,
++    stride_state_seq,
++    stride_state_dim: tl.constexpr,
++    stride_state_tok: tl.constexpr,
++    DIM: tl.constexpr,
++    BLOCK_M: tl.constexpr,
++    BLOCK_N: tl.constexpr,
++    NULL_BLOCK: tl.constexpr,
++    HAS_CKPT: tl.constexpr,
++):
++    t0 = tl.program_id(0).to(tl.int64) * BLOCK_M
++    # tokens present: the last offset (rows beyond it are padding)
++    T = min(T, tl.load(cu_ptr + N))
++    if t0 >= T:
++        return
++    feats = tl.program_id(1) * BLOCK_N + tl.arange(0, BLOCK_N)
++    m_f = feats < DIM
++
++    # sequence of the first token: the last one starting at or before it (so it is not
++    # empty)
++    lo = N * 0
++    hi = N + 0
++    while hi - lo > 1:
++        mid = (lo + hi) // 2
++        if tl.load(cu_ptr + mid).to(tl.int64) <= t0:
++            lo = mid
++        else:
++            hi = mid
++    seq = lo
++    seq_start = tl.load(cu_ptr + seq).to(tl.int64)
++    seq_end = tl.load(cu_ptr + seq + 1).to(tl.int64)
++
++    w0 = tl.load(w_ptr + feats * 4 + 0, mask=m_f, other=0.0)
++    w1 = tl.load(w_ptr + feats * 4 + 1, mask=m_f, other=0.0)
++    w2 = tl.load(w_ptr + feats * 4 + 2, mask=m_f, other=0.0)
++    w3 = tl.load(w_ptr + feats * 4 + 3, mask=m_f, other=0.0)
++
++    rows = t0 + tl.arange(0, BLOCK_M)  # [BLOCK_M] token index
++    start = tl.zeros([BLOCK_M], dtype=tl.int64) + seq_start  # each row's sequence start
++
++    # ---- sequences starting in this block ----
++    block_end = min(t0 + BLOCK_M, T)
++    t = t0
++    if seq_start < t0:
++        t = seq_end  # next sequence start (>= t0 + 1)
++        seq += 1
++    while t < block_end:
++        # `seq` starts at token t; skip empty sequences
++        seq_end = tl.load(cu_ptr + seq + 1).to(tl.int64)
++        while seq_end <= t:
++            seq += 1
++            seq_end = tl.load(cu_ptr + seq + 1).to(tl.int64)
++        start = tl.where(rows >= t, t, start)
++        seq_len = seq_end - t
++        slot = tl.load(cache_indices_ptr + seq).to(tl.int64)
++        state_base = state_ptr + slot * stride_state_seq + feats * stride_state_dim
++        c0 = tl.zeros([BLOCK_N], dtype=x_ptr.dtype.element_ty)
++        c1 = tl.zeros([BLOCK_N], dtype=x_ptr.dtype.element_ty)
++        c2 = tl.zeros([BLOCK_N], dtype=x_ptr.dtype.element_ty)
++        if (slot != NULL_BLOCK) & tl.load(has_initial_state_ptr + seq).to(tl.int1):
++            c0 = tl.load(state_base, mask=m_f, other=0.0)
++            c1 = tl.load(state_base + stride_state_tok, mask=m_f, other=0.0)
++            c2 = tl.load(state_base + 2 * stride_state_tok, mask=m_f, other=0.0)
++        for j in tl.static_range(3):
++            if j < seq_len:
++                xj = tl.load(
++                    x_ptr + (t + j) * stride_x_tok + feats, mask=m_f, other=0.0
++                )
++                acc = tl.zeros([BLOCK_N], dtype=tl.float32)
++                # Match the FP32 contraction order of causal_conv1d_fn.
++                if x_ptr.dtype.element_ty == tl.float32:
++                    acc = tl.fma(c0, w0, acc)
++                    acc = tl.fma(c1, w1, acc)
++                    acc = tl.fma(c2, w2, acc)
++                    acc = tl.fma(xj, w3, acc)
++                else:
++                    acc += c0 * w0
++                    acc += c1 * w1
++                    acc += c2 * w2
++                    acc += xj * w3
++                acc = acc / (1 + tl.exp(-acc))
++                tl.store(o_ptr + (t + j) * stride_o_tok + feats, acc, mask=m_f)
++                c0 = c1
++                c1 = c2
++                c2 = xj
++        if slot != NULL_BLOCK:
++            # new window: the last 3 of (old window ++ inputs)
++            if seq_len >= 3:
++                c0 = tl.load(
++                    x_ptr + (seq_end - 3) * stride_x_tok + feats, mask=m_f, other=0.0
++                )
++                c1 = tl.load(
++                    x_ptr + (seq_end - 2) * stride_x_tok + feats, mask=m_f, other=0.0
++                )
++                c2 = tl.load(
++                    x_ptr + (seq_end - 1) * stride_x_tok + feats, mask=m_f, other=0.0
++                )
++            tl.store(state_base, c0, mask=m_f)
++            tl.store(state_base + stride_state_tok, c1, mask=m_f)
++            tl.store(state_base + 2 * stride_state_tok, c2, mask=m_f)
++        if HAS_CKPT:
++            ckpt_offset = tl.load(ckpt_offsets_ptr + seq).to(tl.int64)
++            ckpt_slot = tl.load(ckpt_indices_ptr + seq).to(tl.int64)
++            if (ckpt_slot != NULL_BLOCK) & (ckpt_offset >= 3):
++                ckpt_base = (
++                    state_ptr + ckpt_slot * stride_state_seq + feats * stride_state_dim
++                )
++                for j in tl.static_range(3):
++                    xj = tl.load(
++                        x_ptr + (t + ckpt_offset - 3 + j) * stride_x_tok + feats,
++                        mask=m_f,
++                        other=0.0,
++                    )
++                    tl.store(ckpt_base + j * stride_state_tok, xj, mask=m_f)
++        t = seq_end
++        seq += 1
++
++    # ---- tokens at least 3 into their sequence: taps from the input rows ----
++    m_r = (rows < T) & (rows - start >= 3)
++    mask = m_r[:, None] & m_f[None, :]
++    base = x_ptr + rows[:, None] * stride_x_tok + feats[None, :]
++    acc = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
++    x0 = tl.load(base - 3 * stride_x_tok, mask=mask, other=0.0)
++    x1 = tl.load(base - 2 * stride_x_tok, mask=mask, other=0.0)
++    x2 = tl.load(base - stride_x_tok, mask=mask, other=0.0)
++    x3 = tl.load(base, mask=mask, other=0.0)
++    if x_ptr.dtype.element_ty == tl.float32:
++        acc = tl.fma(x0, w0[None, :], acc)
++        acc = tl.fma(x1, w1[None, :], acc)
++        acc = tl.fma(x2, w2[None, :], acc)
++        acc = tl.fma(x3, w3[None, :], acc)
++    else:
++        acc += x0 * w0[None, :]
++        acc += x1 * w1[None, :]
++        acc += x2 * w2[None, :]
++        acc += x3 * w3[None, :]
++    acc = acc / (1 + tl.exp(-acc))
++    tl.store(o_ptr + rows[:, None] * stride_o_tok + feats[None, :], acc, mask=mask)
++
++
++def causal_conv1d_prefill(
++    x: torch.Tensor,
++    weight: torch.Tensor,
++    conv_states: torch.Tensor,
++    query_start_loc: torch.Tensor,
++    cache_indices: torch.Tensor,
++    has_initial_state: torch.Tensor,
++    checkpoint_offsets: torch.Tensor | None = None,
++    checkpoint_indices: torch.Tensor | None = None,
++    out: torch.Tensor | None = None,
++    block_m: int = 8,
++    block_n: int = 128,
++    num_warps: int = 2,
++) -> torch.Tensor:
++    """SiLU(causal conv1d) of a varlen batch, with conv-state and checkpoint-window
++    I/O in
++    the cache.
++
++    x: [T, dim] tokens of all sequences (unit column stride, any row stride; no
++    copy is
++    made). Rows beyond the last
++    offset of `query_start_loc` are padding: not read, and their output rows not
++    written.
++    weight: [dim, 4] contiguous. conv_states: [slots, dim, 3] with any strides,
++    updated
++    in place.
++    query_start_loc: [N + 1] integer token offsets from 0 (empty sequences
++    allowed).
++    cache_indices: [N] integers; a sequence on the null block gets its outputs
++    computed
++    from a zero window and
++    stores nothing. has_initial_state: [N] bool; False starts from a zero window.
++    checkpoint_offsets / checkpoint_indices: [N] integers; where the index is not
++    the
++    null block and the offset is
++    >= 3, the window `x[start + offset - 3 : start + offset]` is stored in that
++    cache
++    line.
++    Returns [T, dim] (`out` when given: unit column stride).
++    """
++    T, dim = x.shape
++    assert weight.shape == (dim, 4) and weight.is_contiguous(), weight.shape
++    assert conv_states.shape[1:] == (dim, 3), conv_states.shape
++    assert x.dtype == conv_states.dtype == weight.dtype
++    assert x.stride(1) == 1
++    if out is None:
++        out = torch.empty(T, dim, device=x.device, dtype=x.dtype)
++    assert out.shape == (T, dim) and out.stride(1) == 1
++    if T == 0:
++        return out
++    # Cache indices can be a strided column of the block table. The kernel uses
++    # unit strides for all per-sequence inputs.
++    assert (
++        query_start_loc.ndim == 1
++        and cache_indices.ndim == 1
++        and has_initial_state.ndim == 1
++    )
++    query_start_loc = query_start_loc.contiguous()
++    cache_indices = cache_indices.contiguous()
++    has_initial_state = has_initial_state.contiguous()
++    has_ckpt = checkpoint_offsets is not None
++    if checkpoint_offsets is not None:
++        assert checkpoint_indices is not None
++        checkpoint_offsets = checkpoint_offsets.contiguous()
++        checkpoint_indices = checkpoint_indices.contiguous()
++    _causal_conv1d_prefill_kernel[(triton.cdiv(T, block_m), triton.cdiv(dim, block_n))](
++        x,
++        weight,
++        conv_states,
++        out,
++        query_start_loc,
++        cache_indices,
++        has_initial_state,
++        checkpoint_offsets if has_ckpt else cache_indices,
++        checkpoint_indices if has_ckpt else cache_indices,
++        T,
++        query_start_loc.shape[0] - 1,
++        x.stride(0),
++        out.stride(0),
++        stride_state_seq=conv_states.stride(0),
++        stride_state_dim=conv_states.stride(1),
++        stride_state_tok=conv_states.stride(2),
++        DIM=dim,
++        BLOCK_M=block_m,
++        BLOCK_N=block_n,
++        NULL_BLOCK=NULL_BLOCK_ID,
++        HAS_CKPT=has_ckpt,
++        num_warps=num_warps,
++    )
++    return out
+diff --git a/vllm/model_executor/layers/mamba/ops/gated_delta_product.py b/vllm/model_executor/layers/mamba/ops/gated_delta_product.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..50a72d7a554e38b654b7169de9d538841f3a3cb7
+--- /dev/null
++++ b/vllm/model_executor/layers/mamba/ops/gated_delta_product.py
+@@ -0,0 +1,164 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
++"""Single-token decode kernel for gated delta product layers."""
++
++import torch
++
++from vllm.triton_utils import tl, triton
++
++
++@triton.jit
++def fused_recurrent_gated_delta_product_kernel(
++    conv_out,
++    b,
++    a,
++    A_log,
++    dt_bias,
++    o,
++    state,
++    ssm_state_indices,
++    stride_conv_tok: tl.constexpr,
++    stride_b_tok: tl.constexpr,
++    stride_a_tok: tl.constexpr,
++    stride_o_tok: tl.constexpr,
++    stride_state_slot: tl.constexpr,
++    stride_indices_seq: tl.constexpr,
++    M: tl.constexpr,  # Householder sub-steps per real token
++    H: tl.constexpr,  # key/query groups
++    HV: tl.constexpr,  # value heads
++    K: tl.constexpr,  # state (key) dim
++    V: tl.constexpr,  # head (value) dim
++    BK: tl.constexpr,
++    BV: tl.constexpr,
++):
++    i_nh, i_v = tl.program_id(0), tl.program_id(1)
++    i_n, i_hv = i_nh // HV, i_nh % HV
++    i_h = i_hv // (HV // H)
++
++    tok = i_n.to(tl.int64)
++
++    o_k = tl.arange(0, BK)
++    o_v = i_v * BV + tl.arange(0, BV)
++    mask_k = o_k < K
++    mask_v = o_v < V
++    mask_h = mask_v[:, None] & mask_k[None, :]
++
++    VDIM: tl.constexpr = HV * V
++    KDIM: tl.constexpr = H * K
++
++    state_idx = tl.load(ssm_state_indices + i_n * stride_indices_seq).to(tl.int64)
++
++    if state_idx <= 0:
++        # NULL slot: the kernel skips this sequence; keep its output rows defined.
++        zero = tl.zeros([BV], dtype=tl.float32).to(o.dtype.element_ty)
++        p_o = o + tok * stride_o_tok + i_hv * V + o_v
++        tl.store(p_o, zero, mask=mask_v)
++        return
++
++    p_state = (
++        state
++        + state_idx * stride_state_slot
++        + i_hv * V * K
++        + o_v[:, None] * K
++        + o_k[None, :]
++    )
++    b_h = tl.load(p_state, mask=mask_h, other=0).to(tl.float32)
++
++    A_log_val = tl.load(A_log + i_hv).to(tl.float32)
++    dt_bias_val = tl.load(dt_bias + i_hv).to(tl.float32)
++    neg_A = -tl.exp(A_log_val)
++
++    p_conv = conv_out + tok * stride_conv_tok
++    # gate on the first sub-step only (eager path: virtual_g[:, 0] = g)
++    a_val = tl.load(a + tok * stride_a_tok + i_hv).to(tl.float32)
++    x = a_val + dt_bias_val
++    softplus_x = tl.where(x <= 20.0, tl.log(1.0 + tl.exp(x)), x)
++    g_val = neg_A * softplus_x
++    b_h *= tl.exp(g_val)
++
++    for s in tl.static_range(M):
++        b_v = tl.load(p_conv + s * VDIM + i_hv * V + o_v, mask=mask_v, other=0).to(
++            tl.float32
++        )
++        b_k = tl.load(
++            p_conv + M * VDIM + s * KDIM + i_h * K + o_k, mask=mask_k, other=0
++        ).to(tl.float32)
++        b_k = b_k / tl.sqrt(tl.sum(b_k * b_k) + 1e-6)
++        beta_val = tl.sigmoid(
++            tl.load(b + tok * stride_b_tok + s * HV + i_hv).to(tl.float32)
++        )
++        b_v -= tl.sum(b_h * b_k[None, :], 1)
++        b_v *= beta_val
++        b_h += b_v[:, None] * b_k[None, :]
++
++    # output of the last sub-step with the (normalised, scaled) query
++    b_q = tl.load(
++        p_conv + M * VDIM + M * KDIM + i_h * K + o_k, mask=mask_k, other=0
++    ).to(tl.float32)
++    b_q = b_q / tl.sqrt(tl.sum(b_q * b_q) + 1e-6)
++    b_q = b_q * K**-0.5
++    b_o = tl.sum(b_h * b_q[None, :], 1)
++    p_o = o + tok * stride_o_tok + i_hv * V + o_v
++    tl.store(p_o, b_o.to(p_o.dtype.element_ty), mask=mask_v)
++
++    tl.store(p_state, b_h.to(p_state.dtype.element_ty), mask=mask_h)
++
++
++def fused_recurrent_gated_delta_product(
++    conv_out: torch.Tensor,
++    b: torch.Tensor,
++    a: torch.Tensor,
++    A_log: torch.Tensor,
++    dt_bias: torch.Tensor,
++    ssm_state: torch.Tensor,
++    out: torch.Tensor,
++    *,
++    num_householder: int,
++    num_groups: int,
++    num_heads: int,
++    state_dim: int,
++    head_dim: int,
++    ssm_state_indices: torch.Tensor,
++) -> None:
++    """Update one state slot per request and write the next-token outputs."""
++    M, H, HV, K, V = num_householder, num_groups, num_heads, state_dim, head_dim
++    T = conv_out.shape[0]
++    assert conv_out.shape[1] == M * HV * V + (M + 1) * H * K, conv_out.shape
++    assert conv_out.stride(1) == 1 and b.stride(1) == 1 and a.stride(1) == 1
++    assert out.shape[0] >= T and out.shape[1:] == (HV, V) and out.is_contiguous()
++    assert ssm_state.stride(-1) == 1 and ssm_state.shape[1:] == (HV, V, K)
++    stride_seq = ssm_state_indices.stride(0)
++    BK = triton.next_power_of_2(K)
++    assert triton.cdiv(K, BK) == 1
++    BV = min(triton.next_power_of_2(V), 32)
++    NV = triton.cdiv(V, BV)
++    if T == 0:
++        return
++    # Sequences x heads on grid axis 0: axis 1 is limited to 65535 blocks.
++    grid = (T * HV, NV)
++    fused_recurrent_gated_delta_product_kernel[grid](
++        conv_out,
++        b,
++        a,
++        A_log,
++        dt_bias,
++        out,
++        ssm_state,
++        ssm_state_indices,
++        stride_conv_tok=conv_out.stride(0),
++        stride_b_tok=b.stride(0),
++        stride_a_tok=a.stride(0),
++        stride_o_tok=out.stride(0),
++        stride_state_slot=ssm_state.stride(0),
++        stride_indices_seq=stride_seq,
++        M=M,
++        H=H,
++        HV=HV,
++        K=K,
++        V=V,
++        BK=BK,
++        BV=BV,
++        num_warps=1,
++        num_stages=3,
++    )
+diff --git a/vllm/model_executor/layers/mamba/ops/gdp_chunk_prefill.py b/vllm/model_executor/layers/mamba/ops/gdp_chunk_prefill.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..7034790b537486b62f6466151c79856f870e9aaf
+--- /dev/null
++++ b/vllm/model_executor/layers/mamba/ops/gdp_chunk_prefill.py
+@@ -0,0 +1,870 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
++# SPDX-FileCopyrightText: Songlin Yang, Yu Zhang
++#
++# The chunked gated delta rule math in this file follows the flash-linear-attention
++# kernels vendored in
++# vllm/third_party/flash_linear_attention (MIT license, Copyright (c) 2023-2025, Songlin
++# Yang, Yu Zhang).
++"""Chunked GDP prefill with m delta-rule updates per real token.
++
++The math is the chunked gated delta rule over a virtual sequence of m steps per
++real token, in chunks of 64 virtual steps. Kernels read the original projections
++and state cache directly, avoiding expanded input tensors. Five stages compute:
++
++1. L2-normalized keys for virtual steps and queries for real tokens.
++2. Chunk-local decay sums and (I + A)^-1, with A strictly lower triangular.
++3. The WY factors w and u, reading values from convolution output rows.
++4. Recurrent state across chunks, including initial and checkpoint cache states.
++5. Outputs for real tokens only, into the caller's output rows.
++"""
++
++import torch
++
++from vllm.third_party.flash_linear_attention.ops.index import (
++    prepare_chunk_indices,
++    prepare_chunk_offsets,
++)
++from vllm.triton_utils import tl, triton
++from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
++
++# CUDA limits grid axes 1 and 2 to this many blocks.
++_GRID_AXIS_LIMIT = 65535
++CHUNK = 64  # virtual steps per chunk (FLA_CHUNK_SIZE)
++L2_ROWS = (
++    32  # l2norm_fwd_kernel2's row tile; the same tile gives the same reduction order
++)
++
++
++@triton.jit
++def _gdp_kq_kernel(
++    conv_ptr,
++    conv_stride,
++    q_ptr,
++    k_ptr,
++    T,
++    eps,
++    n_key_progs,
++    M: tl.constexpr,
++    H: tl.constexpr,
++    G: tl.constexpr,
++    DK: tl.constexpr,
++    DV: tl.constexpr,
++    BD: tl.constexpr,
++    L2_ROWS: tl.constexpr,
++):
++    """Keys of the [T * M * G] (token, step, group) rows and queries of the [T * G]
++    rows,
++    L2-normalized as
++    `l2norm_fwd` does (same tile and expressions).
++    """
++    pid = tl.program_id(0)
++    VALUE_W: tl.constexpr = M * H * DV
++    KEY_W: tl.constexpr = M * G * DK
++    col = tl.arange(0, BD)[None, :]
++    if pid < n_key_progs:
++        row = pid * L2_ROWS + tl.arange(0, L2_ROWS)[:, None]
++        rmask = row < T * M * G
++        mask = rmask & (col < DK)
++        t = row // (M * G)
++        src = (
++            conv_ptr
++            + t.to(tl.int64) * conv_stride
++            + VALUE_W
++            + (row % (M * G)) * DK
++            + col
++        )
++        xs = tl.load(src, mask, other=0.0).to(tl.float32)
++        square = tl.broadcast_to(xs * xs, [L2_ROWS, BD])
++        square_sum = tl.sum(tl.where(rmask, square, 0), 1)[:, None]
++        rsqrt = tl.rsqrt(square_sum + eps)
++        tl.store(
++            k_ptr + row.to(tl.int64) * DK + col,
++            (xs * rsqrt).to(k_ptr.dtype.element_ty),
++            mask,
++        )
++    else:
++        row = (pid - n_key_progs) * L2_ROWS + tl.arange(0, L2_ROWS)[:, None]
++        rmask = row < T * G
++        mask = rmask & (col < DK)
++        t = row // G
++        src = (
++            conv_ptr
++            + t.to(tl.int64) * conv_stride
++            + VALUE_W
++            + KEY_W
++            + (row % G) * DK
++            + col
++        )
++        xs = tl.load(src, mask, other=0.0).to(tl.float32)
++        square = tl.broadcast_to(xs * xs, [L2_ROWS, BD])
++        square_sum = tl.sum(tl.where(rmask, square, 0), 1)[:, None]
++        rsqrt = tl.rsqrt(square_sum + eps)
++        tl.store(
++            q_ptr + row.to(tl.int64) * DK + col,
++            (xs * rsqrt).to(q_ptr.dtype.element_ty),
++            mask,
++        )
++
++
++@triton.jit
++def _beta(b, tok, step, i_h, m_t, stride_b, H: tl.constexpr):
++    """sigmoid(b) of the steps, rounded to the activation dtype as the eager op does
++    (zero
++    on masked steps).
++    """
++    x = tl.load(b + tok * stride_b + step * H + i_h, mask=m_t, other=0.0).to(tl.float32)
++    beta = tl.math.div_rn(1.0, 1.0 + tl.extra.cuda.libdevice.exp(-x))
++    return tl.where(m_t, beta, 0.0).to(b.dtype.element_ty, fp_downcast_rounding="rtne")
++
++
++@triton.jit
++def _inverse_16(b_A, o_i):
++    """Invert I + A for a strictly lower triangular 16x16 block."""
++    b_Ai = -b_A
++    for i in range(2, 16):
++        b_a = -tl.sum(tl.where((o_i == i)[:, None], b_A, 0.0), 0)  # row i of A
++        b_a = b_a + tl.sum(b_a[:, None] * b_Ai, 0)
++        b_Ai = tl.where((o_i == i)[:, None], b_a, b_Ai)
++    return b_Ai + (o_i[:, None] == o_i[None, :])
++
++
++@triton.jit
++def _solve_rows(
++    r,
++    k,
++    b,
++    gc,
++    bos,
++    bos_tok,
++    t0,
++    T,
++    i_h,
++    i_g,
++    stride_b,
++    M: tl.constexpr,
++    H: tl.constexpr,
++    G: tl.constexpr,
++    K: tl.constexpr,
++):
++    """Rows `16 r .. 16 r + 15` of the chunk: mask, decay cumsum, keys (two halves)
++    and
++    beta-scaled keys.
++    """
++    o_t = t0 + r * 16 + tl.arange(0, 16)  # virtual step in the sequence
++    m_t = o_t < T
++    b_g = tl.load(gc + (bos + o_t) * H + i_h, mask=m_t, other=0.0)
++    b_beta = _beta(b, bos_tok + o_t // M, o_t % M, i_h, m_t, stride_b, H)
++    o_k = tl.arange(0, 32)
++    p_k = k + ((bos + o_t) * G + i_g)[:, None] * K + o_k[None, :]
++    b_k0 = tl.load(p_k, mask=m_t[:, None] & (o_k < K)[None, :], other=0.0)
++    b_k1 = tl.load(p_k + 32, mask=m_t[:, None] & (o_k + 32 < K)[None, :], other=0.0)
++    return o_t, m_t, b_g, b_k0, b_k1, b_k0 * b_beta[:, None], b_k1 * b_beta[:, None]
++
++
++@triton.jit
++def _gram(b_kb0, b_kb1, b_k0, b_k1, b_g_row, b_g_col, mask):
++    """Masked Gram block: beta_i (k_i . k_j) exp(g_i - g_j)."""
++    b_A = tl.zeros([16, 16], dtype=tl.float32)
++    b_A += tl.dot(b_kb0, tl.trans(b_k0))
++    b_A += tl.dot(b_kb1, tl.trans(b_k1))
++    b_A = b_A * tl.exp(b_g_row[:, None] - b_g_col[None, :])
++    return tl.where(mask, b_A, 0)
++
++
++@triton.jit(do_not_specialize=["stride_b", "stride_a"])
++def _gdp_solve_kernel(
++    k,  # [T * M, G, K] normalized keys of the virtual steps
++    b,  # [tokens, M * H] raw write strengths (step major)
++    a,  # [tokens, H] raw decay inputs
++    A_log,  # [H]
++    dt_bias,  # [H]
++    gc,  # out [T * M, H] fp32 chunk-local cumulative log decay
++    Ti,  # out [T * M, H, 64]: rows of (I + A)^-1, lower 16x16 blocks only
++    cu_seqlens,  # [N + 1] virtual-step offsets
++    chunk_indices,  # [chunks, 2] (sequence, chunk in sequence)
++    stride_b,
++    stride_a,
++    M: tl.constexpr,
++    H: tl.constexpr,
++    G: tl.constexpr,
++    K: tl.constexpr,
++):
++    i_c, i_h = tl.program_id(0).to(tl.int64), tl.program_id(1).to(tl.int64)
++    i_g = i_h // (H // G)
++    i_n = tl.load(chunk_indices + i_c * 2).to(tl.int64)
++    t0 = tl.load(chunk_indices + i_c * 2 + 1).to(tl.int64) * 64
++    bos = tl.load(cu_seqlens + i_n).to(tl.int64)
++    T = tl.load(cu_seqlens + i_n + 1).to(tl.int64) - bos
++    bos_tok = bos // M
++
++    # chunk-local cumulative log decay: g on each token's first step, zero on the others
++    o_c = t0 + tl.arange(0, 64)
++    m_c = o_c < T
++    x = tl.load(a + (bos_tok + o_c // M) * stride_a + i_h, mask=m_c, other=0.0).to(
++        tl.float32
++    )
++    x = x + tl.load(dt_bias + i_h).to(tl.float32)
++    softplus = tl.where(
++        x > 20.0, x, tl.extra.cuda.libdevice.log1p(tl.extra.cuda.libdevice.exp(x))
++    )
++    b_g = -tl.extra.cuda.libdevice.exp(tl.load(A_log + i_h).to(tl.float32)) * softplus
++    b_g = tl.where(m_c & (o_c % M == 0), b_g, 0.0)
++    tl.store(gc + (bos + o_c) * H + i_h, tl.cumsum(b_g, axis=0), mask=m_c)
++    tl.debug_barrier()
++
++    o_i = tl.arange(0, 16)
++    o_t0, m_t0, b_g0, b_k00, b_k01, b_kb00, b_kb01 = _solve_rows(
++        0, k, b, gc, bos, bos_tok, t0, T, i_h, i_g, stride_b, M, H, G, K
++    )
++    o_t1, m_t1, b_g1, b_k10, b_k11, b_kb10, b_kb11 = _solve_rows(
++        1, k, b, gc, bos, bos_tok, t0, T, i_h, i_g, stride_b, M, H, G, K
++    )
++    o_t2, m_t2, b_g2, b_k20, b_k21, b_kb20, b_kb21 = _solve_rows(
++        2, k, b, gc, bos, bos_tok, t0, T, i_h, i_g, stride_b, M, H, G, K
++    )
++    o_t3, m_t3, b_g3, b_k30, b_k31, b_kb30, b_kb31 = _solve_rows(
++        3, k, b, gc, bos, bos_tok, t0, T, i_h, i_g, stride_b, M, H, G, K
++    )
++
++    # strictly lower Gram blocks A[r][c], c <= r
++    m_lower = o_i[:, None] > o_i[None, :]
++    b_A00 = _gram(
++        b_kb00,
++        b_kb01,
++        b_k00,
++        b_k01,
++        b_g0,
++        b_g0,
++        m_lower & (m_t0[:, None] & m_t0[None, :]),
++    )
++    b_A11 = _gram(
++        b_kb10,
++        b_kb11,
++        b_k10,
++        b_k11,
++        b_g1,
++        b_g1,
++        m_lower & (m_t1[:, None] & m_t1[None, :]),
++    )
++    b_A22 = _gram(
++        b_kb20,
++        b_kb21,
++        b_k20,
++        b_k21,
++        b_g2,
++        b_g2,
++        m_lower & (m_t2[:, None] & m_t2[None, :]),
++    )
++    b_A33 = _gram(
++        b_kb30,
++        b_kb31,
++        b_k30,
++        b_k31,
++        b_g3,
++        b_g3,
++        m_lower & (m_t3[:, None] & m_t3[None, :]),
++    )
++    b_A10 = _gram(
++        b_kb10, b_kb11, b_k00, b_k01, b_g1, b_g0, m_t1[:, None] & m_t0[None, :]
++    )
++    b_A21 = _gram(
++        b_kb20, b_kb21, b_k10, b_k11, b_g2, b_g1, m_t2[:, None] & m_t1[None, :]
++    )
++    b_A32 = _gram(
++        b_kb30, b_kb31, b_k20, b_k21, b_g3, b_g2, m_t3[:, None] & m_t2[None, :]
++    )
++    b_A20 = _gram(
++        b_kb20, b_kb21, b_k00, b_k01, b_g2, b_g0, m_t2[:, None] & m_t0[None, :]
++    )
++    b_A31 = _gram(
++        b_kb30, b_kb31, b_k10, b_k11, b_g3, b_g1, m_t3[:, None] & m_t1[None, :]
++    )
++    b_A30 = _gram(
++        b_kb30, b_kb31, b_k00, b_k01, b_g3, b_g0, m_t3[:, None] & m_t0[None, :]
++    )
++
++    # (I + A)^-1 by blocks
++    b_T00 = _inverse_16(b_A00, o_i)
++    b_T11 = _inverse_16(b_A11, o_i)
++    b_T22 = _inverse_16(b_A22, o_i)
++    b_T33 = _inverse_16(b_A33, o_i)
++    b_T10 = -tl.dot(
++        tl.dot(b_T11, b_A10, input_precision="ieee"), b_T00, input_precision="ieee"
++    )
++    b_T21 = -tl.dot(
++        tl.dot(b_T22, b_A21, input_precision="ieee"), b_T11, input_precision="ieee"
++    )
++    b_T32 = -tl.dot(
++        tl.dot(b_T33, b_A32, input_precision="ieee"), b_T22, input_precision="ieee"
++    )
++    b_T20 = -tl.dot(
++        b_T22,
++        tl.dot(b_A20, b_T00, input_precision="ieee")
++        + tl.dot(b_A21, b_T10, input_precision="ieee"),
++        input_precision="ieee",
++    )
++    b_T31 = -tl.dot(
++        b_T33,
++        tl.dot(b_A31, b_T11, input_precision="ieee")
++        + tl.dot(b_A32, b_T21, input_precision="ieee"),
++        input_precision="ieee",
++    )
++    b_T30 = -tl.dot(
++        b_T33,
++        tl.dot(b_A30, b_T00, input_precision="ieee")
++        + tl.dot(b_A31, b_T10, input_precision="ieee")
++        + tl.dot(b_A32, b_T20, input_precision="ieee"),
++        input_precision="ieee",
++    )
++
++    dt = Ti.dtype.element_ty
++    p_T = Ti + (bos * H + i_h) * 64 + o_i[None, :]
++    p0 = p_T + (o_t0 * (H * 64))[:, None]
++    p1 = p_T + (o_t1 * (H * 64))[:, None]
++    p2 = p_T + (o_t2 * (H * 64))[:, None]
++    p3 = p_T + (o_t3 * (H * 64))[:, None]
++    tl.store(p0, b_T00.to(dt, fp_downcast_rounding="rtne"), mask=m_t0[:, None])
++    tl.store(p1, b_T10.to(dt, fp_downcast_rounding="rtne"), mask=m_t1[:, None])
++    tl.store(p1 + 16, b_T11.to(dt, fp_downcast_rounding="rtne"), mask=m_t1[:, None])
++    tl.store(p2, b_T20.to(dt, fp_downcast_rounding="rtne"), mask=m_t2[:, None])
++    tl.store(p2 + 16, b_T21.to(dt, fp_downcast_rounding="rtne"), mask=m_t2[:, None])
++    tl.store(p2 + 32, b_T22.to(dt, fp_downcast_rounding="rtne"), mask=m_t2[:, None])
++    tl.store(p3, b_T30.to(dt, fp_downcast_rounding="rtne"), mask=m_t3[:, None])
++    tl.store(p3 + 16, b_T31.to(dt, fp_downcast_rounding="rtne"), mask=m_t3[:, None])
++    tl.store(p3 + 32, b_T32.to(dt, fp_downcast_rounding="rtne"), mask=m_t3[:, None])
++    tl.store(p3 + 48, b_T33.to(dt, fp_downcast_rounding="rtne"), mask=m_t3[:, None])
++
++
++@triton.jit(do_not_specialize=["stride_conv", "stride_b"])
++def _gdp_wu_kernel(
++    k,  # [T * M, G, K]
++    conv,  # [tokens, ...] conv output rows; values of step j at columns j * H * V ..
++    b,  # [tokens, M * H]
++    gc,  # [T * M, H] fp32
++    Ti,  # [T * M, H, 64]
++    w,  # out [T * M, H, K]
++    u,  # out [T * M, H, V]
++    cu_seqlens,
++    chunk_indices,
++    stride_conv,
++    stride_b,
++    M: tl.constexpr,
++    H: tl.constexpr,
++    G: tl.constexpr,
++    K: tl.constexpr,
++    V: tl.constexpr,
++    BV: tl.constexpr,
++):
++    """WY factors: u = (I + A)^-1 (beta v), w = (I + A)^-1 (beta exp(g) k)."""
++    i_c, i_h = tl.program_id(0).to(tl.int64), tl.program_id(1).to(tl.int64)
++    i_g = i_h // (H // G)
++    i_n = tl.load(chunk_indices + i_c * 2).to(tl.int64)
++    i_t = tl.load(chunk_indices + i_c * 2 + 1).to(tl.int64)
++    bos = tl.load(cu_seqlens + i_n).to(tl.int64)
++    T = tl.load(cu_seqlens + i_n + 1).to(tl.int64) - bos
++    o_c = tl.arange(0, 64)
++    o_t = i_t * 64 + o_c
++    m_t = o_t < T
++    row = bos + o_t
++    tok = bos // M + o_t // M
++    step = o_t % M
++    b_beta = _beta(b, tok, step, i_h, m_t, stride_b, H)
++    # rows of the inverse; only its lower 16x16 blocks were stored
++    b_A = tl.load(
++        Ti + (row * H + i_h)[:, None] * 64 + o_c[None, :],
++        mask=m_t[:, None] & ((o_c[None, :] // 16) <= (o_c[:, None] // 16)),
++        other=0.0,
++    )
++    b_g = tl.exp(tl.load(gc + row * H + i_h, mask=m_t, other=0.0))
++
++    o_v = tl.arange(0, BV)
++    m_v = m_t[:, None] & (o_v < V)[None, :]
++    b_v = tl.load(
++        conv + (tok * stride_conv + step * (H * V) + i_h * V)[:, None] + o_v[None, :],
++        mask=m_v,
++        other=0.0,
++    )
++    b_vb = (b_v * b_beta[:, None]).to(b_v.dtype)
++    b_u = tl.dot(b_A, b_vb, allow_tf32=False)
++    tl.store(
++        u + (row * H + i_h)[:, None] * V + o_v[None, :],
++        b_u.to(u.dtype.element_ty),
++        mask=m_v,
++    )
++
++    for i_k in range(tl.cdiv(K, 32)):
++        o_k = i_k * 32 + tl.arange(0, 32)
++        m_k = m_t[:, None] & (o_k < K)[None, :]
++        b_k = tl.load(
++            k + (row * G + i_g)[:, None] * K + o_k[None, :], mask=m_k, other=0.0
++        )
++        b_kb = (b_k * b_beta[:, None] * b_g[:, None]).to(b_k.dtype)
++        b_w = tl.dot(b_A, b_kb)
++        tl.store(
++            w + (row * H + i_h)[:, None] * K + o_k[None, :],
++            b_w.to(w.dtype.element_ty),
++            mask=m_k,
++        )
++
++
++@triton.jit(do_not_specialize=["stride_ssm"])
++def _gdp_state_kernel(
++    k,  # [T * M, G, K]
++    w,  # [T * M, H, K]
++    u,  # [T * M, H, V]
++    gc,  # [T * M, H] fp32
++    h,  # out [chunks, H, V, K]: state at the start of every chunk
++    v_new,  # out [T * M, H, V]
++    ssm,  # [slots, H, V, K] state cache
++    state_indices,  # [N]
++    has_initial_state,  # [N]
++    ckpt_offsets,  # [N] tokens, 0 for none
++    ckpt_indices,  # [N] cache slots
++    cu_seqlens,  # [N + 1] virtual-step offsets
++    chunk_offsets,  # [N + 1] first chunk of each sequence
++    stride_ssm,
++    M: tl.constexpr,
++    H: tl.constexpr,
++    G: tl.constexpr,
++    K: tl.constexpr,
++    V: tl.constexpr,
++    BV: tl.constexpr,
++    NULL_BLOCK: tl.constexpr,
++    HAS_CKPT: tl.constexpr,
++):
++    """State recurrence of one (sequence, value head) over its chunks, states in the
++    cache
++    in place.
++    """
++    i_v, i_nh = tl.program_id(0), tl.program_id(1).to(tl.int64)
++    i_n, i_h = i_nh // H, i_nh % H
++    i_g = i_h // (H // G)
++    bos = tl.load(cu_seqlens + i_n).to(tl.int64)
++    T = tl.load(cu_seqlens + i_n + 1).to(tl.int64) - bos
++    NT = tl.cdiv(T, 64)
++    boh = tl.load(chunk_offsets + i_n).to(tl.int64)
++    dt = k.dtype.element_ty
++    st = ssm.dtype.element_ty
++
++    o_v = i_v * BV + tl.arange(0, BV)
++    m_v = o_v < V
++    o_k = tl.arange(0, 64)
++    m_k = o_k < K
++    m_h = m_v[:, None] & m_k[None, :]
++    slot = tl.load(state_indices + i_n).to(tl.int64)
++    p_s = ssm + slot * stride_ssm + (i_h * V + o_v)[:, None] * K + o_k[None, :]
++    use_state = tl.load(has_initial_state + i_n).to(tl.int1)
++    b_h = tl.zeros([BV, 64], dtype=tl.float32)
++    b_h += tl.load(p_s, mask=m_h & use_state & (slot != NULL_BLOCK), other=0.0).to(
++        tl.float32
++    )
++
++    ck_chunk = NT  # never reached
++    if HAS_CKPT:
++        ck_offset = tl.load(ckpt_offsets + i_n).to(tl.int64)
++        ck_slot = tl.load(ckpt_indices + i_n).to(tl.int64)
++        if (ck_slot != NULL_BLOCK) & (ck_offset > 0):
++            ck_chunk = ck_offset * M // 64
++        p_ck = ssm + ck_slot * stride_ssm + (i_h * V + o_v)[:, None] * K + o_k[None, :]
++
++    for i_t in range(NT):
++        if HAS_CKPT:  # noqa: SIM102 - constexpr guards the checkpoint pointer
++            if i_t == ck_chunk:
++                tl.store(p_ck, b_h.to(st), mask=m_h)
++        tl.store(
++            h + ((boh + i_t) * H + i_h) * (V * K) + o_v[:, None] * K + o_k[None, :],
++            b_h.to(dt),
++            mask=m_h,
++        )
++        o_t = i_t * 64 + tl.arange(0, 64)
++        m_t = o_t < T
++        row = bos + o_t
++        b_w = tl.load(
++            w + (row * H + i_h)[:, None] * K + o_k[None, :],
++            mask=m_t[:, None] & m_k[None, :],
++            other=0.0,
++        )
++        b_v = tl.dot(b_w, tl.trans(b_h).to(b_w.dtype))
++        p_v = (row * H + i_h)[:, None] * V + o_v[None, :]
++        b_v = tl.load(u + p_v, mask=m_t[:, None] & m_v[None, :], other=0.0) - b_v
++        tl.store(
++            v_new + p_v,
++            b_v.to(v_new.dtype.element_ty),
++            mask=m_t[:, None] & m_v[None, :],
++        )
++
++        last_idx = min((i_t + 1) * 64, T) - 1
++        b_g_last = tl.load(gc + (bos + last_idx) * H + i_h)
++        b_g = tl.load(gc + row * H + i_h, mask=m_t, other=0.0)
++        b_v = b_v * tl.where(m_t, tl.exp(b_g_last - b_g), 0)[:, None]
++        b_g_last = tl.exp(b_g_last)
++        b_h *= b_g_last
++        b_v = b_v.to(dt)
++        b_k = tl.load(
++            k + o_k[:, None] + ((row * G + i_g) * K)[None, :],
++            mask=m_k[:, None] & m_t[None, :],
++            other=0.0,
++        )
++        b_h += tl.trans(tl.dot(b_k, b_v))
++
++    if (slot != NULL_BLOCK) & (T > 0):
++        tl.store(p_s, b_h.to(st), mask=m_h)
++    if HAS_CKPT:  # noqa: SIM102 - constexpr guards checkpoint-only values
++        if (ck_chunk == NT) & (ck_offset > 0) & (ck_slot != NULL_BLOCK):
++            tl.store(p_ck, b_h.to(st), mask=m_h)
++
++
++@triton.jit(do_not_specialize=["stride_o"])
++def _gdp_output_kernel(
++    q,  # [tokens, G, K] normalized queries
++    k,  # [T * M, G, K]
++    v_new,  # [T * M, H, V]
++    h,  # [chunks, H, V, K]
++    gc,  # [T * M, H] fp32
++    o,  # out [tokens, H, V] rows of stride_o
++    cu_seqlens,
++    chunk_indices,
++    scale,
++    stride_o,
++    M: tl.constexpr,
++    H: tl.constexpr,
++    G: tl.constexpr,
++    K: tl.constexpr,
++    V: tl.constexpr,
++    BV: tl.constexpr,
++    BQ: tl.constexpr,
++):
++    """Outputs of the tokens whose last step (the one the query reads after) lies in the
++    chunk.
++    """
++    i_v, i_c, i_h = (
++        tl.program_id(0),
++        tl.program_id(1).to(tl.int64),
++        tl.program_id(2).to(tl.int64),
++    )
++    i_g = i_h // (H // G)
++    i_n = tl.load(chunk_indices + i_c * 2).to(tl.int64)
++    c0 = tl.load(chunk_indices + i_c * 2 + 1).to(tl.int64) * 64
++    bos = tl.load(cu_seqlens + i_n).to(tl.int64)
++    T = tl.load(cu_seqlens + i_n + 1).to(tl.int64) - bos
++    bos_tok = bos // M
++
++    o_t = c0 + tl.arange(0, 64)
++    m_t = o_t < T
++    o_q = (
++        c0 + (M - 1 - c0 % M) + M * tl.arange(0, BQ)
++    )  # last steps of the tokens ending in the chunk
++    m_q = (o_q < c0 + 64) & (o_q < T)
++    tok = bos_tok + o_q // M
++    o_k = tl.arange(0, 64)
++    m_k = o_k < K
++    o_v = i_v * BV + tl.arange(0, BV)
++    m_v = o_v < V
++
++    b_q = tl.load(
++        q + (tok * G + i_g)[:, None] * K + o_k[None, :],
++        mask=m_q[:, None] & m_k[None, :],
++        other=0.0,
++    )
++    b_k = tl.load(
++        k + o_k[:, None] + ((bos + o_t) * G + i_g)[None, :] * K,
++        mask=m_k[:, None] & m_t[None, :],
++        other=0.0,
++    )
++    b_h = tl.load(
++        h + (i_c * H + i_h) * (V * K) + o_v[:, None] * K + o_k[None, :],
++        mask=m_v[:, None] & m_k[None, :],
++        other=0.0,
++    )
++    b_o = tl.dot(b_q, tl.trans(b_h))  # [BQ, BV]
++    b_A = tl.dot(b_q, b_k)  # [BQ, 64]
++
++    b_g = tl.load(gc + (bos + o_t) * H + i_h, mask=m_t, other=0.0)
++    b_gq = tl.load(gc + (bos + o_q) * H + i_h, mask=m_q, other=0.0)
++    b_o = b_o * tl.exp(b_gq)[:, None]
++    b_A = b_A * tl.exp(b_gq[:, None] - b_g[None, :])
++    b_A = tl.where(
++        (o_q[:, None] >= o_t[None, :]) & (m_q[:, None] & m_t[None, :]), b_A, 0
++    )
++
++    b_v = tl.load(
++        v_new + ((bos + o_t) * H + i_h)[:, None] * V + o_v[None, :],
++        mask=m_t[:, None] & m_v[None, :],
++        other=0.0,
++    )
++    b_o = b_o * scale + tl.dot(b_A.to(b_v.dtype), b_v) * scale
++    tl.store(
++        o + (tok * stride_o)[:, None] + (i_h * V + o_v)[None, :],
++        b_o.to(o.dtype.element_ty),
++        mask=m_q[:, None] & m_v[None, :],
++    )
++
++
++def gdp_chunk_prefill_supported(
++    num_householder: int, head_k_dim: int, head_v_dim: int
++) -> bool:
++    return (
++        head_k_dim <= 64
++        and head_v_dim <= 32
++        and num_householder >= 1
++        and torch.version.hip is None
++    )
++
++
++def _prefill_group(
++    conv_out,
++    b,
++    a,
++    A_log,
++    dt_bias,
++    ssm_state,
++    state_indices,
++    has_initial_state,
++    chunk_metadata,
++    m,
++    H,
++    G,
++    K,
++    V,
++    checkpoint_offsets,
++    checkpoint_indices,
++    out,
++):
++    T = conv_out.shape[0]
++    if T == 0:
++        return
++    cu_seqlens, chunk_indices, chunk_offsets = chunk_metadata
++    NT = chunk_indices.shape[0]
++    N = cu_seqlens.shape[0] - 1
++    dev, dt = conv_out.device, conv_out.dtype
++    BV = 16 if V <= 16 else 32
++    k = torch.empty(T * m, G, K, device=dev, dtype=dt)
++    q = torch.empty(T, G, K, device=dev, dtype=dt)
++    n_key = triton.cdiv(T * m * G, L2_ROWS)
++    _gdp_kq_kernel[(n_key + triton.cdiv(T * G, L2_ROWS),)](
++        conv_out,
++        conv_out.stride(0),
++        q,
++        k,
++        T,
++        1e-6,
++        n_key,
++        M=m,
++        H=H,
++        G=G,
++        DK=K,
++        DV=V,
++        BD=triton.next_power_of_2(K),
++        L2_ROWS=L2_ROWS,
++        num_warps=4,
++    )
++    gc = torch.empty(T * m, H, device=dev, dtype=torch.float32)
++    Ti = torch.empty(T * m, H, CHUNK, device=dev, dtype=dt)
++    _gdp_solve_kernel[(NT, H)](
++        k,
++        b,
++        a,
++        A_log,
++        dt_bias,
++        gc,
++        Ti,
++        cu_seqlens,
++        chunk_indices,
++        b.stride(0),
++        a.stride(0),
++        M=m,
++        H=H,
++        G=G,
++        K=K,
++        num_warps=1,
++    )
++    w = torch.empty(T * m, H, K, device=dev, dtype=dt)
++    u = torch.empty(T * m, H, V, device=dev, dtype=dt)
++    _gdp_wu_kernel[(NT, H)](
++        k,
++        conv_out,
++        b,
++        gc,
++        Ti,
++        w,
++        u,
++        cu_seqlens,
++        chunk_indices,
++        conv_out.stride(0),
++        b.stride(0),
++        M=m,
++        H=H,
++        G=G,
++        K=K,
++        V=V,
++        BV=BV,
++        num_warps=2,
++        num_stages=2,
++    )
++    h = torch.empty(NT, H, V, K, device=dev, dtype=dt)
++    v_new = torch.empty(T * m, H, V, device=dev, dtype=dt)
++    has_ckpt = checkpoint_offsets is not None
++    _gdp_state_kernel[(triton.cdiv(V, BV), N * H)](
++        k,
++        w,
++        u,
++        gc,
++        h,
++        v_new,
++        ssm_state,
++        state_indices,
++        has_initial_state,
++        checkpoint_offsets if has_ckpt else state_indices,
++        checkpoint_indices if has_ckpt else state_indices,
++        cu_seqlens,
++        chunk_offsets,
++        ssm_state.stride(0),
++        M=m,
++        H=H,
++        G=G,
++        K=K,
++        V=V,
++        BV=BV,
++        NULL_BLOCK=NULL_BLOCK_ID,
++        HAS_CKPT=has_ckpt,
++        num_warps=4,
++        num_stages=3,
++    )
++    _gdp_output_kernel[(triton.cdiv(V, BV), NT, H)](
++        q,
++        k,
++        v_new,
++        h,
++        gc,
++        out,
++        cu_seqlens,
++        chunk_indices,
++        K**-0.5,
++        out.stride(0),
++        M=m,
++        H=H,
++        G=G,
++        K=K,
++        V=V,
++        BV=BV,
++        BQ=max(16, triton.next_power_of_2(triton.cdiv(CHUNK, m))),
++        num_warps=2,
++        num_stages=3,
++    )
++
++
++def gdp_chunk_prefill(
++    conv_out: torch.Tensor,
++    b: torch.Tensor,
++    a: torch.Tensor,
++    A_log: torch.Tensor,
++    dt_bias: torch.Tensor,
++    ssm_state: torch.Tensor,
++    query_start: torch.Tensor,
++    state_indices: torch.Tensor,
++    has_initial_state: torch.Tensor,
++    *,
++    num_householder: int,
++    num_heads: int,
++    num_groups: int,
++    head_k_dim: int,
++    head_v_dim: int,
++    chunk_metadata: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
++    checkpoint_offsets: torch.Tensor | None = None,
++    checkpoint_indices: torch.Tensor | None = None,
++    out: torch.Tensor | None = None,
++) -> torch.Tensor:
++    """Chunked prefill of a batch of sequences.
++
++    conv_out / b / a: the prefill rows' tokens (unit column strides, any row stride).
++    query_start: [N + 1]
++    real-token offsets from 0. ssm_state: [slots, heads, head_v_dim, head_k_dim]; each
++    sequence's state is read
++    from `state_indices` where `has_initial_state` (zeros elsewhere) and its final
++    state written back in place.
++    checkpoint_offsets / checkpoint_indices: [N] int32; where the index is not the null
++    block and the offset (real
++    tokens, a multiple of `64 / gcd(64, m)`) is > 0, the state after that many tokens
++    is stored in that slot.
++    chunk_metadata: (cu_seqlens, chunk_indices, chunk_offsets) of the virtual sequences
++    (`virtual_chunk_metadata`), used when the batch runs as one group; built here
++    otherwise.
++    Returns the per-token outputs [T, heads, head_v_dim] (`out` when given: unit
++    strides within a row).
++    """
++    m, H, G, K, V = num_householder, num_heads, num_groups, head_k_dim, head_v_dim
++    assert gdp_chunk_prefill_supported(m, K, V), (m, K, V)
++    assert conv_out.stride(-1) == 1 and b.stride(-1) == 1 and a.stride(-1) == 1
++    # The kernels index the per-sequence tensors with unit stride; the state indices can
++    # be a column of the
++    # block table (stride 1 + speculative blocks).
++    assert state_indices.ndim == 1 and has_initial_state.ndim == 1
++    state_indices = state_indices.contiguous()
++    has_initial_state = has_initial_state.contiguous()
++    if checkpoint_offsets is not None:
++        assert checkpoint_indices is not None
++        checkpoint_offsets = checkpoint_offsets.contiguous()
++        checkpoint_indices = checkpoint_indices.contiguous()
++    if chunk_metadata is not None:
++        chunk_metadata = tuple(x.contiguous() for x in chunk_metadata)
++    assert ssm_state.shape[1:] == (H, V, K) and ssm_state[0].is_contiguous()
++    T = conv_out.shape[0]
++    if out is None:
++        out = conv_out.new_empty(T, H, V)
++    assert out.shape == (T, H, V) and (T == 0 or out[0].is_contiguous())
++
++    def metadata(real_cu):
++        cu = (real_cu * m).to(torch.int32)
++        return cu, prepare_chunk_indices(cu, CHUNK), prepare_chunk_offsets(cu, CHUNK)
++
++    num_seqs = query_start.shape[0] - 1
++    # The kernels launch one block per (sequence, value head) on a grid axis limited to
++    # 65535 blocks.
++    max_seqs = _GRID_AXIS_LIMIT // H
++    if num_seqs <= max_seqs:
++        _prefill_group(
++            conv_out,
++            b,
++            a,
++            A_log,
++            dt_bias,
++            ssm_state,
++            state_indices,
++            has_initial_state,
++            chunk_metadata if chunk_metadata is not None else metadata(query_start),
++            m,
++            H,
++            G,
++            K,
++            V,
++            checkpoint_offsets,
++            checkpoint_indices,
++            out,
++        )
++        return out
++    bounds = query_start.tolist()
++    for s0 in range(0, num_seqs, max_seqs):
++        s1 = min(s0 + max_seqs, num_seqs)
++        t0, t1 = bounds[s0], bounds[s1]
++        _prefill_group(
++            conv_out[t0:t1],
++            b[t0:t1],
++            a[t0:t1],
++            A_log,
++            dt_bias,
++            ssm_state,
++            state_indices[s0:s1],
++            has_initial_state[s0:s1],
++            metadata(query_start[s0 : s1 + 1] - bounds[s0]),
++            m,
++            H,
++            G,
++            K,
++            V,
++            None if checkpoint_offsets is None else checkpoint_offsets[s0:s1],
++            None if checkpoint_indices is None else checkpoint_indices[s0:s1],
++            out[t0:t1],
++        )
++    return out
+diff --git a/vllm/model_executor/models/dory1_5.py b/vllm/model_executor/models/dory1_5.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..05f599d6d578509fee7a48da47f86d0c901a1fbf
+--- /dev/null
++++ b/vllm/model_executor/models/dory1_5.py
+@@ -0,0 +1,908 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
++"""Inference-only Dory1.5 model."""
++
++import math
++import types
++from collections.abc import Iterable
++from dataclasses import dataclass
++from typing import TYPE_CHECKING
++
++import numpy as np
++import torch
++import torch.nn.functional as F
++from torch import nn
++
++from vllm.compilation.decorators import support_torch_compile
++from vllm.config import VllmConfig
++from vllm.distributed import get_tensor_model_parallel_world_size
++from vllm.model_executor.layers.attention import Attention
++from vllm.model_executor.layers.layernorm import RMSNorm
++from vllm.model_executor.layers.linear import (
++    LinearBase,
++    LinearMethodBase,
++    QKVParallelLinear,
++    ReplicatedLinear,
++    RowParallelLinear,
++)
++from vllm.model_executor.layers.logits_processor import LogitsProcessor
++from vllm.model_executor.layers.mamba.gdn.gated_delta_product import (
++    GatedDeltaProductAttention,
++)
++from vllm.model_executor.layers.mamba.mamba_utils import (
++    MambaStateCopyFuncCalculator,
++    MambaStateDtypeCalculator,
++    MambaStateShapeCalculator,
++)
++from vllm.model_executor.layers.vocab_parallel_embedding import (
++    ParallelLMHead,
++    VocabParallelEmbedding,
++)
++from vllm.model_executor.model_loader.weight_utils import default_weight_loader
++from vllm.sequence import IntermediateTensors
++from vllm.transformers_utils.configs.dory1_5 import (
++    Dory1_5Config,
++)
++from vllm.transformers_utils.repo_utils import get_hf_file_to_dict
++from vllm.v1.core.sched.output import NewRequestData
++from vllm.v1.worker.gpu.input_batch import InputBatch
++from vllm.v1.worker.gpu.model_states.mamba_hybrid import MambaHybridModelState
++from vllm.v1.worker.gpu.states import RequestState
++
++from .interfaces import HasInnerState, IsHybrid
++from .nemotron_h import NemotronHMLP
++from .utils import extract_layer_index, maybe_prefix
++
++if TYPE_CHECKING:
++    from vllm.model_executor.kernels.linear.mxfp8.marlin import MarlinMxfp8LinearKernel
++    from vllm.model_executor.kernels.linear.nvfp4.marlin import MarlinNvFp4LinearKernel
++
++GDP_PROJECTION_ROLES = ("z_proj", "v_proj", "k_proj", "q_proj", "b_proj", "a_proj")
++QKV_PROJECTION_ROLES = ("q_proj", "k_proj", "v_proj")
++
++
++class Dory1_5PackedMethod(LinearMethodBase):
++    kernel: "MarlinMxfp8LinearKernel | MarlinNvFp4LinearKernel"
++
++    def __init__(self, shape):
++        self.shape = shape
++
++    def create_weights(self, *args, **kwargs):
++        raise RuntimeError(
++            "Dory1.5 packed weights are installed before checkpoint load"
++        )
++
++    def process_weights_after_loading(self, layer):
++        layer.output_size_per_partition, layer.input_size_per_partition = self.shape
++        layer.params_dtype = torch.bfloat16
++        self.kernel.process_weights_after_loading(layer)
++
++    def apply(self, layer, x, bias=None):
++        return self.kernel.apply_weights(layer, x, bias)
++
++
++class Dory1_5MxFp8Method(Dory1_5PackedMethod):
++    def __init__(self, shape):
++        super().__init__(shape)
++        from vllm.model_executor.kernels.linear.mxfp8 import Mxfp8LinearLayerConfig
++        from vllm.model_executor.kernels.linear.mxfp8.marlin import (
++            MarlinMxfp8LinearKernel,
++        )
++
++        self.kernel = MarlinMxfp8LinearKernel(Mxfp8LinearLayerConfig(shape))
++
++
++class Dory1_5NvFp4Method(Dory1_5PackedMethod):
++    def __init__(self, shape):
++        super().__init__(shape)
++        from vllm.model_executor.kernels.linear.nvfp4 import NvFp4LinearLayerConfig
++        from vllm.model_executor.kernels.linear.nvfp4.marlin import (
++            MarlinNvFp4LinearKernel,
++        )
++
++        self.kernel = MarlinNvFp4LinearKernel(NvFp4LinearLayerConfig())
++
++    def process_weights_after_loading(self, layer):
++        layer.register_parameter(
++            "weight_global_scale", layer._parameters.pop("weight_scale_2")
++        )
++        super().process_weights_after_loading(layer)
++
++
++class Dory1_5PackedLinear(nn.Linear):
++    def forward(self, x):
++        return self.quant_method.apply(self, x, self.bias)
++
++
++@dataclass(frozen=True)
++class PackedFormat:
++    block_size: int
++    elements_per_byte: int
++    weight_dtype: torch.dtype
++    scale_dtype: torch.dtype
++    method: type[Dory1_5PackedMethod]
++    tensor_scale: bool = False
++
++
++PACKED_FORMATS = {
++    "MXFP8": PackedFormat(32, 1, torch.float8_e4m3fn, torch.uint8, Dory1_5MxFp8Method),
++    "NVFP4": PackedFormat(
++        16, 2, torch.uint8, torch.float8_e4m3fn, Dory1_5NvFp4Method, True
++    ),
++}
++
++
++def install_packed_linear(module, fmt):
++    """Allocate source-format storage while retaining vLLM parameter metadata."""
++    spec = PACKED_FORMATS[fmt]
++    w = module.weight
++    n, k = w.shape
++    if k % spec.block_size:
++        raise ValueError(f"{fmt} block size does not divide input size {k}")
++    w.requires_grad_(False)
++    w.data = torch.empty(
++        n, k // spec.elements_per_byte, dtype=spec.weight_dtype, device=w.device
++    )
++    module.register_parameter(
++        "weight_scale",
++        nn.Parameter(
++            torch.empty(
++                n, k // spec.block_size, dtype=spec.scale_dtype, device=w.device
++            ),
++            requires_grad=False,
++        ),
++    )
++    if spec.tensor_scale:
++        module.register_parameter(
++            "weight_scale_2",
++            nn.Parameter(
++                torch.empty((), dtype=torch.float32, device=w.device),
++                requires_grad=False,
++            ),
++        )
++    module.quant_method = spec.method((n, k))
++    if isinstance(module, nn.Linear):
++        module.__class__ = Dory1_5PackedLinear
++
++
++class SplitProjection(nn.Module):
++    def __init__(self, roles, sizes, k):
++        super().__init__()
++        self.parts = nn.ModuleDict(
++            {role: nn.Linear(k, n, bias=False) for role, n in zip(roles, sizes)}
++        )
++
++    def forward(self, x):
++        return torch.cat([part(x) for part in self.parts.values()], dim=-1), None
++
++
++def mapped_name(model, name):
++    if name.startswith("model.layers.") and ".mixer." in name:
++        stem, leaf = name.rsplit(".mixer.", 1)
++        role, _, suffix = leaf.partition(".")
++        kind = model.config.layer_types[int(stem.split(".")[-1])]
++        if kind == "linear_attention" and role in GDP_PROJECTION_ROLES:
++            return f"{stem}.mixer.in_proj.parts.{role}.{suffix}"
++        if kind == "full_attention" and role in QKV_PROJECTION_ROLES:
++            return f"{stem}.mixer.qkv_proj.parts.{role}.{suffix}"
++    return name
++
++
++def _install_per_matrix_weights(model, vllm_config):
++    marker = model.config.per_tensor_quantization
++    if (
++        vllm_config.parallel_config.tensor_parallel_size != 1
++        or vllm_config.parallel_config.pipeline_parallel_size != 1
++    ):
++        raise ValueError("Dory1.5 packed weights require TP=PP=1")
++    if vllm_config.model_config.dtype != torch.bfloat16:
++        raise ValueError("Dory1.5 packed weights require --dtype bfloat16")
++    if model.config.tie_word_embeddings:
++        raise ValueError("Per-matrix Dory1.5 checkpoints require untied embeddings")
++    allocation = get_hf_file_to_dict(
++        marker["allocation"],
++        vllm_config.model_config.model,
++        revision=vllm_config.model_config.revision,
++    )
++    if allocation is None:
++        raise ValueError("Dory1.5 quantization allocation file was not found")
++    if not isinstance(allocation, dict) or not isinstance(
++        allocation.get("formats"), dict
++    ):
++        raise ValueError("Dory1.5 quantization allocation requires a formats mapping")
++    for i, layer in enumerate(model.model.layers):
++        mixer = layer.mixer
++        kind = model.config.layer_types[i]
++        if kind == "linear_attention":
++            m = mixer.num_householder
++            sizes = [
++                mixer.value_dim,
++                m * mixer.value_dim,
++                m * mixer.key_dim,
++                mixer.key_dim,
++                m * mixer.num_v_heads,
++                mixer.num_v_heads,
++            ]
++            mixer.in_proj = SplitProjection(
++                GDP_PROJECTION_ROLES, sizes, model.config.hidden_size
++            )
++        elif kind == "full_attention":
++            mixer.qkv_proj = SplitProjection(
++                QKV_PROJECTION_ROLES,
++                [mixer.q_size, mixer.kv_size, mixer.kv_size],
++                model.config.hidden_size,
++            )
++    modules = dict(model.named_modules())
++    for name, fmt in allocation["formats"].items():
++        if fmt == "BF16":
++            continue
++        if fmt not in PACKED_FORMATS:
++            raise ValueError(f"Unsupported Dory1.5 matrix format {fmt!r}: {name}")
++        module = modules.get(mapped_name(model, name).rsplit(".", 1)[0])
++        if (
++            not name.endswith(".weight")
++            or not isinstance(module, (nn.Linear, LinearBase, ParallelLMHead))
++            or module.weight.ndim != 2
++        ):
++            raise ValueError(f"Dory1.5 can only pack linear matrix weights: {name}")
++        install_packed_linear(module, fmt)
++
++
++def _load_per_matrix_weights(model, weights):
++    params = dict(model.named_parameters())
++    loaded = set()
++    for name, value in weights:
++        target = mapped_name(model, name)
++        if target in loaded:
++            raise ValueError(f"Duplicate source tensor {name}")
++        if target not in params:
++            raise ValueError(
++                f"Unexpected checkpoint tensor or missing allocation: {name}"
++            )
++        p = params[target]
++        if value.shape != p.shape or (
++            value.dtype != p.dtype and not name.endswith(".A_log")
++        ):
++            raise ValueError(f"Packed shape/dtype mismatch: {name}")
++        p.data.copy_(value)
++        loaded.add(target)
++    if loaded != set(params):
++        raise ValueError(f"Incomplete checkpoint: missing {set(params) - loaded}")
++    return loaded
++
++
++class Dory1_5Attention(nn.Module):
++    """Grouped-query attention without positional embeddings."""
++
++    def __init__(self, config, vllm_config, prefix, cache_prefixes):
++        super().__init__()
++        tp_size = get_tensor_model_parallel_world_size()
++        self.num_heads = config.num_attention_heads // tp_size
++        self.num_kv_heads = max(1, config.num_key_value_heads // tp_size)
++        self.head_dim = config.head_dim
++        self.q_size = self.num_heads * self.head_dim
++        self.kv_size = self.num_kv_heads * self.head_dim
++        self.qkv_proj = QKVParallelLinear(
++            config.hidden_size,
++            self.head_dim,
++            config.num_attention_heads,
++            config.num_key_value_heads,
++            bias=False,
++            prefix=f"{prefix}.qkv_proj",
++        )
++        self.o_proj = RowParallelLinear(
++            config.num_attention_heads * self.head_dim,
++            config.hidden_size,
++            bias=False,
++            prefix=f"{prefix}.o_proj",
++        )
++        self.per_loop_kv = config.recurrent_kv_cache_mode == "per_loop"
++        stash = None
++        if not self.per_loop_kv and len(cache_prefixes) > 1:
++            stash = torch.zeros(
++                vllm_config.scheduler_config.max_num_batched_tokens,
++                2 * self.kv_size,
++                dtype=vllm_config.model_config.dtype,
++                device=self.qkv_proj.weight.device,
++            )
++        self.register_buffer("stash", stash, persistent=False)
++        self.attn = nn.ModuleList(
++            [
++                Attention(
++                    self.num_heads,
++                    self.head_dim,
++                    scale=self.head_dim**-0.5,
++                    num_kv_heads=self.num_kv_heads,
++                    cache_config=vllm_config.cache_config,
++                    prefix=f"{p}.attn",
++                )
++                for p in (cache_prefixes if self.per_loop_kv else cache_prefixes[:1])
++            ]
++        )
++
++    def forward(self, hidden_states, loop_idx=0, active=None):
++        qkv, _ = self.qkv_proj(hidden_states)
++        q, kv = qkv.split([self.q_size, 2 * self.kv_size], dim=-1)
++        if self.stash is not None:
++            stash = self.stash[: kv.shape[0]]
++            kv = torch.where(active.unsqueeze(-1), kv, stash)
++            stash.copy_(kv)
++        k, v = kv.split(self.kv_size, dim=-1)
++        # Each loop overwrites this step's KV; earlier steps retain last-loop KV.
++        output, _ = self.o_proj(self.attn[loop_idx if self.per_loop_kv else 0](q, k, v))
++        return output
++
++
++def _sinusoidal_embedding(value: float, dim: int, like: torch.Tensor) -> torch.Tensor:
++    half = dim // 2
++    freqs = torch.exp(
++        -math.log(100.0)
++        * torch.arange(half, device=like.device, dtype=torch.float32)
++        / half
++    )
++    args = value * freqs * 100.0
++    return torch.cat([torch.cos(args), torch.sin(args)]).to(like.dtype)
++
++
++class Dory1_5LoopConditioner(nn.Module):
++    """`(progress, budget) -> c`: sinusoidal embeddings, Linear, SiLU, Linear."""
++
++    def __init__(self, cond_dim: int) -> None:
++        super().__init__()
++        self.cond_dim = cond_dim
++        self.mlp = nn.Sequential(
++            nn.Linear(2 * cond_dim, cond_dim), nn.SiLU(), nn.Linear(cond_dim, cond_dim)
++        )
++
++    def forward(self, progress: float, budget: float) -> torch.Tensor:
++        like = self.mlp[0].bias
++        return self.mlp(
++            torch.cat(
++                [
++                    _sinusoidal_embedding(progress, self.cond_dim, like),
++                    _sinusoidal_embedding(budget, self.cond_dim, like),
++                ]
++            )
++        )
++
++
++class Dory1_5LoopConditioning(nn.Module):
++    """Adaptive normalization and a gated low-rank adapter."""
++
++    def __init__(self, config: Dory1_5Config, prefix: str):
++        super().__init__()
++        hidden, cond, rank = (
++            config.hidden_size,
++            config.loop_conditioning_hidden_size,
++            config.loop_adapter_rank,
++        )
++        self.hidden_size = hidden
++        self.adapter_rank = rank
++        self.gamma_head = nn.Linear(cond, hidden)
++        self.beta_head = nn.Linear(cond, hidden)
++        self.gate_head = nn.Linear(cond, hidden)
++        self.adapter_gate = nn.Linear(cond, rank) if rank else None
++        self.up_proj = (
++            ReplicatedLinear(rank, hidden, bias=False, prefix=f"{prefix}.up_proj")
++            if rank
++            else None
++        )
++        self.down_proj = (
++            ReplicatedLinear(hidden, rank, bias=False, prefix=f"{prefix}.down_proj")
++            if rank
++            else None
++        )
++        self.register_buffer(
++            "table",
++            torch.zeros(
++                config.n_recurrent_loops * (config.n_recurrent_loops + 3) // 2,
++                3 * hidden + rank,
++            ),
++            persistent=False,
++        )
++
++    def update(self, conds):
++        rows = []
++        for c in conds:
++            parts = [1 + self.gamma_head(c), self.beta_head(c), 1 + self.gate_head(c)]
++            if self.adapter_gate is not None:
++                parts.append(self.adapter_gate(c))
++            rows.append(torch.cat(parts))
++        self.table.copy_(torch.stack(rows))
++
++    def forward(self, hidden_states, step):
++        scale, shift, gate, adapter_gate = self.table[step].split(
++            [self.hidden_size] * 3 + [self.adapter_rank], dim=-1
++        )
++        hidden_states = scale * hidden_states + shift
++        if self.down_proj is not None and self.up_proj is not None:
++            adapter, _ = self.down_proj(hidden_states)
++            adapter, _ = self.up_proj(adapter_gate * adapter)
++            hidden_states = hidden_states + adapter
++        return hidden_states, gate
++
++
++class Dory1_5LoopSeam(nn.Module):
++    """Conditioned recurrent entry and exit."""
++
++    def __init__(self, config: Dory1_5Config):
++        super().__init__()
++        hidden, cond = config.hidden_size, config.loop_conditioning_hidden_size
++        self.hidden_size = hidden
++        self.entry_norm = RMSNorm(hidden, eps=config.rms_norm_eps)
++        self.entry_gamma = nn.Linear(cond, hidden)
++        self.entry_beta = nn.Linear(cond, hidden)
++        self.exit_gate = nn.Linear(cond, hidden)
++        self.input_mix = nn.Linear(cond, hidden) if config.loop_input_mixing else None
++        self.register_buffer(
++            "table",
++            torch.zeros(
++                config.n_recurrent_loops * (config.n_recurrent_loops + 3) // 2,
++                hidden * (4 if self.input_mix is not None else 3),
++            ),
++            persistent=False,
++        )
++
++    def update(self, conds, steps):
++        rows = []
++        for step, c in zip(steps, conds):
++            parts = [
++                1 + self.entry_gamma(c),
++                self.entry_beta(c),
++                (1.0 if step == 0 else 0.0) + self.exit_gate(c),
++            ]
++            if self.input_mix is not None:
++                parts.append(self.input_mix(c))
++            rows.append(torch.cat(parts))
++        self.table.copy_(torch.stack(rows))
++
++    def entry(self, loop_input, input_h, step):
++        parts = self.table[step].split(self.hidden_size, dim=-1)
++        hidden_states = parts[0] * self.entry_norm(loop_input) + parts[1]
++        if self.input_mix is not None:
++            hidden_states = hidden_states + parts[3] * input_h
++        return hidden_states
++
++    def exit(self, state, new_state, step):
++        gate = self.table[step, 2 * self.hidden_size : 3 * self.hidden_size]
++        return state + gate * (new_state - state)
++
++
++class Dory1_5StateUpdate(nn.Module):
++    """`state + sigmoid(W x + b) * softplus(base_alpha_raw) * (new - state)`, with
++    `x` the loop input."""
++
++    def __init__(self, config: Dory1_5Config, prefix: str) -> None:
++        super().__init__()
++        self.proj = ReplicatedLinear(
++            config.hidden_size, config.hidden_size, bias=True, prefix=f"{prefix}.proj"
++        )
++        self.base_alpha_raw = nn.Parameter(torch.empty(config.hidden_size))
++
++    def forward(
++        self, state: torch.Tensor, new_state: torch.Tensor, loop_input: torch.Tensor
++    ) -> torch.Tensor:
++        logits, _ = self.proj(loop_input)
++        beta = torch.sigmoid(logits) * F.softplus(self.base_alpha_raw)
++        return state + beta * (new_state - state)
++
++
++class Dory1_5DecoderLayer(nn.Module):
++    def __init__(self, config, vllm_config, prefix, layer_idx):
++        super().__init__()
++        self.layer_type = config.layer_types[layer_idx]
++        self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
++        n_in, n_rec = config.n_input_layers, config.n_recurrent_layers
++        loops = config.n_recurrent_loops if n_in <= layer_idx < n_in + n_rec else 1
++        # Virtual indices distinguish caches; projections keep physical indices.
++        indices = [layer_idx + loop * config.num_hidden_layers for loop in range(loops)]
++        cache_prefixes = [
++            f"{prefix}.mixer".replace(f"layers.{layer_idx}.", f"layers.{i}.", 1)
++            for i in indices
++        ]
++        if self.layer_type == "linear_attention":
++            self.mixer = GatedDeltaProductAttention(
++                config,
++                vllm_config,
++                prefix=f"{prefix}.mixer",
++                cache_prefixes=cache_prefixes,
++            )
++        elif self.layer_type == "full_attention":
++            self.mixer = Dory1_5Attention(
++                config, vllm_config, f"{prefix}.mixer", cache_prefixes
++            )
++        else:
++            self.mixer = NemotronHMLP(
++                config=None,
++                hidden_size=config.hidden_size,
++                intermediate_size=config.intermediate_size,
++                hidden_act=config.hidden_act,
++                prefix=f"{prefix}.mixer",
++            )
++        self.loop_conditioning = (
++            Dory1_5LoopConditioning(config, f"{prefix}.loop_conditioning")
++            if layer_idx >= n_in
++            else None
++        )
++
++    def forward(self, hidden_states, loop_idx=0, cond_idx=0, active=None):
++        residual = hidden_states
++        hidden_states = self.norm(hidden_states)
++        if self.loop_conditioning is not None:
++            hidden_states, gate = self.loop_conditioning(hidden_states, cond_idx)
++        if self.layer_type == "mlp":
++            hidden_states = self.mixer(hidden_states)
++        elif self.layer_type == "full_attention":
++            hidden_states = self.mixer(hidden_states, loop_idx, active)
++        else:
++            hidden_states = self.mixer(hidden_states, loop_idx)
++        if self.loop_conditioning is not None:
++            hidden_states = hidden_states * gate
++        return residual + hidden_states
++
++
++def _compiled_stage_class(cls: type[nn.Module], name: str) -> type[nn.Module]:
++    """A subclass of a `support_torch_compile` stage class with its own copy of
++    `forward`'s code object and qualified name. vLLM keys compiled code by both
++    (guards are not evaluated), so stage instances sharing them would all run the
++    first instance's graph, which is bound to that instance's caches."""
++    base = cls.forward
++    forward = types.FunctionType(
++        base.__code__.replace(co_qualname=f"{name}.forward"),
++        base.__globals__,
++        "forward",
++        base.__defaults__,
++        base.__closure__,
++    )
++    forward.__annotations__ = dict(base.__annotations__)
++    return type(name, (cls,), {"forward": forward})
++
++
++def loop_table_row(num_loops, step):
++    """Packed row for a budget and step; step == budget selects the output block."""
++    return (num_loops - 1) * (num_loops + 2) // 2 + step
++
++
++@support_torch_compile
++class Dory1_5InputBlock(nn.Module):
++    def __init__(self, *, vllm_config, prefix, model):
++        super().__init__()
++        self.embed_tokens = model.embed_tokens
++        self.layers = model.layers[: model.config.n_input_layers]
++
++    def forward(
++        self,
++        input_ids: torch.Tensor | None,
++        positions: torch.Tensor,
++        inputs_embeds: torch.Tensor | None = None,
++    ) -> torch.Tensor:
++        h = inputs_embeds if inputs_embeds is not None else self.embed_tokens(input_ids)
++        for layer in self.layers:
++            h = layer(h)
++        return h
++
++
++@support_torch_compile
++class Dory1_5Loop(nn.Module):
++    def __init__(self, *, vllm_config, prefix, model, loop):
++        super().__init__()
++        config = model.config
++        self.loop = loop
++        self.layers = model.layers[
++            config.n_input_layers : config.n_input_layers + config.n_recurrent_layers
++        ]
++        self.loop_seam = model.loop_seam
++        self.state_update = model.state_update
++
++    def forward(
++        self, state: torch.Tensor, input_h: torch.Tensor, loop_counts: torch.Tensor
++    ) -> torch.Tensor:
++        rows = loop_table_row(
++            loop_counts.long(), loop_counts.clamp(max=self.loop + 1) - 1
++        )
++        active = loop_counts > self.loop
++        loop_input = state + input_h
++        h = self.loop_seam.entry(loop_input, input_h, rows) if self.loop else loop_input
++        for layer in self.layers:
++            h = layer(h, self.loop, rows, active)
++        new_state = self.state_update(state, h, loop_input)
++        new_state = self.loop_seam.exit(state, new_state, rows)
++        return torch.where(active.unsqueeze(-1), new_state, state)
++
++
++@support_torch_compile
++class Dory1_5OutputBlock(nn.Module):
++    def __init__(self, *, vllm_config, prefix, model):
++        super().__init__()
++        config = model.config
++        self.layers = model.layers[config.n_input_layers + config.n_recurrent_layers :]
++        self.norm = model.norm_f
++
++    def forward(self, state: torch.Tensor, loop_counts: torch.Tensor) -> torch.Tensor:
++        rows = loop_table_row(loop_counts.long(), loop_counts)
++        for layer in self.layers:
++            state = layer(state, cond_idx=rows)
++        return self.norm(state)
++
++
++class Dory1_5Stages(nn.Module):
++    """Separately compiled stages sharing physical weights and distinct loop caches."""
++
++    def __init__(self, model, vllm_config, prefix):
++        super().__init__()
++        from vllm.compilation.backends import set_model_tag
++
++        def stage(cls, name, **kwargs):
++            with set_model_tag(name):
++                return _compiled_stage_class(cls, name)(
++                    vllm_config=vllm_config,
++                    prefix=f"{prefix}.{name}",
++                    model=model,
++                    **kwargs,
++                )
++
++        self.input_block = stage(Dory1_5InputBlock, "dory1_5_input")
++        self.loops = nn.ModuleList(
++            [
++                stage(Dory1_5Loop, f"dory1_5_loop_{i}", loop=i)
++                for i in range(model.config.n_recurrent_loops)
++            ]
++        )
++        self.output_block = stage(Dory1_5OutputBlock, "dory1_5_output")
++
++
++class Dory1_5Model(nn.Module):
++    def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
++        super().__init__()
++        config = vllm_config.model_config.hf_config
++        self.config = config
++        self.embed_tokens = VocabParallelEmbedding(
++            config.vocab_size, config.hidden_size
++        )
++        self.layers = nn.ModuleList(
++            [
++                Dory1_5DecoderLayer(config, vllm_config, f"{prefix}.layers.{i}", i)
++                for i in range(config.num_hidden_layers)
++            ]
++        )
++        self.norm_f = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
++        self.loop_conditioner = Dory1_5LoopConditioner(
++            config.loop_conditioning_hidden_size
++        )
++        self.loop_seam = Dory1_5LoopSeam(config)
++        self.state_update = Dory1_5StateUpdate(config, f"{prefix}.state_update")
++        self.stages = Dory1_5Stages(self, vllm_config, prefix)
++        tokens = vllm_config.scheduler_config.max_num_batched_tokens
++        self.register_buffer(
++            "input_h",
++            self.embed_tokens.weight.new_zeros(tokens, config.hidden_size),
++            persistent=False,
++        )
++        self.register_buffer("state", torch.zeros_like(self.input_h), persistent=False)
++
++    @torch.no_grad()
++    def build_loop_tables(self):
++        config = self.config
++        conds, steps = [], []
++        for count in range(1, config.n_recurrent_loops + 1):
++            budget = (
++                min(count, config.loop_conditioning_max_loops)
++                / config.loop_conditioning_max_loops
++            )
++            for step in range(count + 1):
++                conds.append(
++                    self.loop_conditioner(min((step + 1) / count, 1.0), budget)
++                )
++                steps.append(step)
++        for layer in self.layers:
++            if layer.loop_conditioning is not None:
++                layer.loop_conditioning.update(conds)
++        self.loop_seam.update(conds, steps)
++
++    def forward(self, input_ids, positions, inputs_embeds, loop_counts, num_loops):
++        num_tokens = positions.shape[-1]
++        input_h, state = self.input_h[:num_tokens], self.state[:num_tokens]
++        h = self.stages.input_block(input_ids, positions, inputs_embeds)
++        input_h.copy_(h)
++        state.copy_(h)
++        for loop in range(num_loops):
++            state.copy_(self.stages.loops[loop](state, input_h, loop_counts))
++        return self.stages.output_block(state, loop_counts)
++
++
++class Dory1_5ModelState(MambaHybridModelState):
++    """Hybrid model state plus each request's loop count, delivered to the forward as
++    a per-token `loop_counts` tensor (persistent, so CUDA graphs see each step's
++    values)."""
++
++    def __init__(self, vllm_config: VllmConfig, model: nn.Module, *args, **kwargs):
++        super().__init__(vllm_config, model, *args, **kwargs)
++        config = vllm_config.model_config.hf_config
++        self.default_num_loops = config.n_recurrent_loops
++        self.max_loops = config.n_recurrent_loops
++        # Host copies, to pick each batch's loop count (the largest of its requests).
++        self.num_loops_by_slot_np = np.full(
++            self.max_num_reqs, self.default_num_loops, dtype=np.int32
++        )
++        self.num_loops_by_slot = torch.full(
++            (self.max_num_reqs,),
++            self.default_num_loops,
++            dtype=torch.int32,
++            device=self.device,
++        )
++        self.loop_counts = torch.full(
++            (self.max_num_tokens,),
++            self.default_num_loops,
++            dtype=torch.int32,
++            device=self.device,
++        )
++
++    def add_request(self, req_index: int, new_req_data: NewRequestData) -> None:
++        super().add_request(req_index, new_req_data)
++        # Validated by the config hook at engine admission.
++        params = new_req_data.sampling_params
++        num_loops = self.model_config.hf_config.get_num_loops(
++            params.extra_args if params is not None else None
++        )
++        self.num_loops_by_slot[req_index].fill_(num_loops)
++        self.num_loops_by_slot_np[req_index] = num_loops
++
++    def cudagraph_variants(self) -> tuple[int, ...]:
++        # FULL graphs per loop count: a batch runs as many loops as its largest
++        # loop count needs.
++        return tuple(range(1, self.max_loops + 1))
++
++    def prepare_inputs(
++        self, input_batch: InputBatch, req_states: RequestState
++    ) -> dict[str, torch.Tensor | None]:
++        inputs = super().prepare_inputs(input_batch, req_states)
++        num_reqs, num_tokens = input_batch.num_reqs, input_batch.num_tokens
++        slots = input_batch.idx_mapping_np[:num_reqs]
++        loops = self.num_loops_by_slot_np[slots]
++        if num_reqs and loops.min() == loops.max():
++            # Every request runs the same loop count (the usual case): one fill
++            # instead of an eager repeat_interleave (cumsum + gather) per step.
++            self.loop_counts[:num_tokens].fill_(int(loops[0]))
++        else:
++            query_start_loc = input_batch.query_start_loc[: num_reqs + 1]
++            self.loop_counts[:num_tokens] = torch.repeat_interleave(
++                self.num_loops_by_slot[input_batch.idx_mapping[:num_reqs]],
++                query_start_loc[1:] - query_start_loc[:-1],
++                output_size=num_tokens,
++            )
++        # Padding tokens keep earlier (valid) loop counts.
++        inputs["loop_counts"] = self.loop_counts[: input_batch.num_tokens_after_padding]
++        self.cudagraph_variant = (
++            int(loops.max()) if num_reqs else self.default_num_loops
++        )
++        inputs["num_loops"] = self.cudagraph_variant
++        return inputs
++
++    def prepare_dummy_inputs(self, num_reqs: int, num_tokens: int) -> dict:
++        inputs = super().prepare_dummy_inputs(num_reqs, num_tokens)
++        inputs["loop_counts"] = self.loop_counts[:num_tokens]
++        num_loops = self.cudagraph_variant or self.max_loops
++        self.cudagraph_variant = num_loops
++        self.loop_counts[:num_tokens].fill_(num_loops)
++        inputs["num_loops"] = num_loops
++        return inputs
++
++
++class Dory1_5ForCausalLM(nn.Module, HasInnerState, IsHybrid):
++    packed_modules_mapping = {"qkv_proj": ["q_proj", "k_proj", "v_proj"]}
++
++    @staticmethod
++    def get_model_state_cls():
++        return Dory1_5ModelState
++
++    def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
++        super().__init__()
++        config = self.config = vllm_config.model_config.hf_config
++        config.validate()
++        if vllm_config.quant_config is not None:
++            raise ValueError(
++                "Dory1.5 quantization uses per_tensor_quantization; "
++                "do not pass --quantization"
++            )
++        if vllm_config.speculative_config is not None:
++            raise ValueError("Dory1.5 currently supports plain decoding only")
++        self.model = Dory1_5Model(
++            vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model")
++        )
++        self.lm_head = ParallelLMHead(
++            config.vocab_size,
++            config.hidden_size,
++            prefix=maybe_prefix(prefix, "lm_head"),
++        )
++        if config.tie_word_embeddings:
++            self.lm_head = self.lm_head.tie_weights(self.model.embed_tokens)
++        self.logits_processor = LogitsProcessor(config.vocab_size)
++        if config.per_tensor_quantization:
++            _install_per_matrix_weights(self, vllm_config)
++
++    def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
++        return self.model.embed_tokens(input_ids)
++
++    def forward(
++        self,
++        input_ids: torch.Tensor | None,
++        positions: torch.Tensor,
++        intermediate_tensors: IntermediateTensors | None = None,
++        inputs_embeds: torch.Tensor | None = None,
++        *,
++        loop_counts: torch.Tensor,
++        num_loops: int,
++    ) -> torch.Tensor:
++        return self.model(input_ids, positions, inputs_embeds, loop_counts, num_loops)
++
++    def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor | None:
++        return self.logits_processor(self.lm_head, hidden_states)
++
++    def process_weights_after_loading(self) -> None:
++        # Also called by loaders that restore parameters without load_weights.
++        self.model.build_loop_tables()
++
++    @classmethod
++    def get_mamba_state_dtype_from_config(cls, vllm_config):
++        return MambaStateDtypeCalculator.gated_delta_net_state_dtype(
++            vllm_config.model_config.dtype,
++            vllm_config.cache_config.mamba_cache_dtype,
++            vllm_config.cache_config.mamba_ssm_cache_dtype,
++        )
++
++    @classmethod
++    def get_mamba_state_shape_from_config(cls, vllm_config):
++        c = vllm_config.model_config.hf_config
++        return MambaStateShapeCalculator.gated_delta_product_state_shape(
++            vllm_config.parallel_config.tensor_parallel_size,
++            c.linear_num_key_heads,
++            c.linear_num_value_heads,
++            c.linear_key_head_dim,
++            c.linear_value_head_dim,
++            c.linear_num_householder,
++            c.linear_conv_kernel_dim,
++        )
++
++    @classmethod
++    def get_mamba_state_copy_func(cls):
++        return MambaStateCopyFuncCalculator.gated_delta_net_state_copy_func()
++
++    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
++        if self.config.per_tensor_quantization:
++            return _load_per_matrix_weights(self, weights)
++        params = dict(self.named_parameters())
++        loaded = set()
++        for name, weight in weights:
++            if self.config.tie_word_embeddings and name.startswith("lm_head."):
++                continue
++            if name.startswith("model.layers."):
++                layer_idx = extract_layer_index(name)
++                stem, sep, leaf = name.rpartition(".mixer.")
++                role = leaf.split(".")[0]
++                layer_type = self.config.layer_types[layer_idx]
++                if (
++                    sep
++                    and layer_type == "linear_attention"
++                    and role
++                    in ("z_proj", "v_proj", "k_proj", "q_proj", "b_proj", "a_proj")
++                ):
++                    self.model.layers[layer_idx].mixer.load_in_proj_weight(
++                        role[0], weight
++                    )
++                    loaded.add(f"{stem}.mixer.in_proj.weight")
++                    continue
++                if (
++                    sep
++                    and layer_type == "full_attention"
++                    and role in ("q_proj", "k_proj", "v_proj")
++                ):
++                    name = f"{stem}.mixer.qkv_proj.weight"
++                    params[name].weight_loader(params[name], weight, role[0])
++                    loaded.add(name)
++                    continue
++            param = params[name]
++            getattr(param, "weight_loader", default_weight_loader)(param, weight)
++            loaded.add(name)
++        self.model.build_loop_tables()
++        return loaded
+diff --git a/vllm/model_executor/models/registry.py b/vllm/model_executor/models/registry.py
+index 5abf52e2e55aeffb0aa1edf37064789c207476af..c27849066a908cc89e0a346aafbe1524a959ad3b 100644
+--- a/vllm/model_executor/models/registry.py
++++ b/vllm/model_executor/models/registry.py
+@@ -100,6 +100,7 @@ _TEXT_GENERATION_MODELS = {
+     "DeepseekV4ForCausalLM": ("vllm.models.deepseek_v4", "DeepseekV4ForCausalLM"),
+     "DomynEdgeForCausalLM": ("domyn_edge", "DomynEdgeForCausalLM"),
+     "DoryForCausalLM": ("dory", "DoryForCausalLM"),
++    "Dory1_5ForCausalLM": ("dory1_5", "Dory1_5ForCausalLM"),
+     "Ernie4_5_MoeForCausalLM": ("ernie45_moe", "Ernie4_5_MoeForCausalLM"),
+     "Exaone4ForCausalLM": ("exaone4", "Exaone4ForCausalLM"),
+     "ExaoneMoeForCausalLM": ("exaone_moe", "ExaoneMoeForCausalLM"),
+diff --git a/vllm/transformers_utils/config.py b/vllm/transformers_utils/config.py
+index 2d947e79c7356d3727d0d53445aa9bed3d3a3d0f..ab1ee3561f62e7aea3589ec810f167269be5f737 100644
+--- a/vllm/transformers_utils/config.py
++++ b/vllm/transformers_utils/config.py
+@@ -190,6 +190,7 @@ _CONFIG_REGISTRY: dict[str, type[PreTrainedConfig]] = LazyConfigDict(
+     qwen3_vl_nemotron_embed="Qwen3VLNemotronEmbedConfig",
+     deepseek_vl_v2="DeepseekVLV2Config",
+     dory="DoryConfig",
++    dory1_5="Dory1_5Config",
+     dots3_note="Dots3NoteConfig",
+     k3_dspark="K3DSparkConfig",
+     funaudiochat="FunAudioChatConfig",
+diff --git a/vllm/transformers_utils/configs/__init__.py b/vllm/transformers_utils/configs/__init__.py
+index 675a430104333abc901d7bbb35708e7ae74dab51..2122fc93c4bd6df88b230a3c04cf6165861d99f0 100644
+--- a/vllm/transformers_utils/configs/__init__.py
++++ b/vllm/transformers_utils/configs/__init__.py
+@@ -28,6 +28,7 @@ _CLASS_TO_MODULE: dict[str, str] = {
+     "DeepseekVLV2Config": "vllm.transformers_utils.configs.deepseek_vl2",
+     "DeepseekV41Config": "vllm.transformers_utils.configs.deepseek_v41",
+     "DoryConfig": "vllm.transformers_utils.configs.dory",
++    "Dory1_5Config": "vllm.transformers_utils.configs.dory1_5",
+     "Dots3NoteConfig": "vllm.transformers_utils.configs.dots3_note",
+     "K3DSparkConfig": "vllm.transformers_utils.configs.k3_dspark",
+     "DotsOCRConfig": "vllm.transformers_utils.configs.dotsocr",
+@@ -107,6 +108,7 @@ __all__ = [
+     "DeepseekVLV2Config",
+     "DeepseekV3Config",
+     "DoryConfig",
++    "Dory1_5Config",
+     "Dots3NoteConfig",
+     "K3DSparkConfig",
+     "DotsOCRConfig",
+diff --git a/vllm/transformers_utils/configs/dory1_5.py b/vllm/transformers_utils/configs/dory1_5.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..1fb617ac1d7b7b3aabdbd527f4b6a13a181e1ce9
+--- /dev/null
++++ b/vllm/transformers_utils/configs/dory1_5.py
+@@ -0,0 +1,142 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
++"""Configuration for the recurrent Dory1.5 hybrid architecture."""
++
++import json
++from typing import Any
++
++from huggingface_hub.dataclasses import strict
++from transformers.configuration_utils import PreTrainedConfig
++
++from vllm.exceptions import VLLMValidationError
++
++
++@strict
++class Dory1_5Config(PreTrainedConfig):
++    model_type = "dory1_5"
++
++    vocab_size: int = 131072
++    hidden_size: int = 3072
++    num_hidden_layers: int = 52
++    layer_types: list[str] | None = None
++    n_input_layers: int = 14
++    n_recurrent_layers: int = 24
++    n_output_layers: int = 14
++    n_recurrent_loops: int = 4
++    recurrent_kv_cache_mode: str = "per_loop"
++    per_tensor_quantization: dict[str, Any] | None = None
++    num_attention_heads: int = 24
++    num_key_value_heads: int = 8
++    head_dim: int = 128
++    intermediate_size: int = 12288
++    hidden_act: str = "relu2"
++    linear_num_value_heads: int = 96
++    linear_value_head_dim: int = 32
++    linear_num_key_heads: int = 8
++    linear_key_head_dim: int = 64
++    linear_conv_kernel_dim: int = 4
++    linear_num_householder: int = 3
++    loop_conditioning_hidden_size: int = 256
++    loop_conditioning_max_loops: int = 4
++    loop_adapter_rank: int = 256
++    loop_input_mixing: bool = True
++    rms_norm_eps: float = 1e-5
++    max_position_embeddings: int = 262144
++    tie_word_embeddings: bool = False
++    bos_token_id: int | None = 1
++    eos_token_id: int | list[int] | None = 11
++    pad_token_id: int | None = 11
++
++    def __post_init__(self, **kwargs):
++        if self.layer_types is None:
++            pattern = "M-M-M*-M-M-M*-M-M-M*-M-M-M*-M-M-M*-M-M-M-M*-M-M-M-M-"
++            kinds = {"M": "linear_attention", "*": "full_attention", "-": "mlp"}
++            self.layer_types = [kinds[kind] for kind in pattern]
++        super().__post_init__(**kwargs)
++
++    def validate_layer_type(self):
++        if self.layer_types is None or len(self.layer_types) != self.num_hidden_layers:
++            raise ValueError("layer_types must have num_hidden_layers entries")
++        if set(self.layer_types) - {"linear_attention", "full_attention", "mlp"}:
++            raise ValueError(
++                "Dory1.5 layers must be linear_attention, full_attention, or mlp"
++            )
++
++    def validate_architecture(self):
++        partitions = (
++            self.n_input_layers,
++            self.n_recurrent_layers,
++            self.n_output_layers,
++        )
++        if min(partitions) < 0 or sum(partitions) != self.num_hidden_layers:
++            raise ValueError("Dory1.5 layer partitions must sum to num_hidden_layers")
++        if self.n_recurrent_layers < 1 or self.n_recurrent_loops < 1:
++            raise ValueError(
++                "n_recurrent_layers and n_recurrent_loops must be positive"
++            )
++        if self.recurrent_kv_cache_mode not in ("per_loop", "last_loop"):
++            raise ValueError("recurrent_kv_cache_mode must be per_loop or last_loop")
++        dimensions = (
++            self.hidden_size,
++            self.intermediate_size,
++            self.num_attention_heads,
++            self.num_key_value_heads,
++            self.head_dim,
++            self.linear_num_value_heads,
++            self.linear_value_head_dim,
++            self.linear_num_key_heads,
++            self.linear_key_head_dim,
++            self.linear_num_householder,
++            self.loop_conditioning_hidden_size,
++            self.loop_conditioning_max_loops,
++        )
++        if min(dimensions) <= 0:
++            raise ValueError("Dory1.5 dimensions must be positive")
++        if self.num_attention_heads % self.num_key_value_heads:
++            raise ValueError(
++                "num_attention_heads must be divisible by num_key_value_heads"
++            )
++        if self.linear_num_value_heads % self.linear_num_key_heads:
++            raise ValueError(
++                "linear_num_value_heads must be divisible by linear_num_key_heads"
++            )
++        if self.linear_conv_kernel_dim not in (2, 3, 4):
++            raise ValueError("linear_conv_kernel_dim must be 2, 3, or 4")
++        if self.loop_conditioning_hidden_size % 2 or self.loop_adapter_rank < 0:
++            raise ValueError(
++                "Loop conditioning size must be even and adapter rank nonnegative"
++            )
++        if self.hidden_act != "relu2" or self.rms_norm_eps <= 0:
++            raise ValueError("Dory1.5 requires relu2 and positive rms_norm_eps")
++
++    def validate_per_tensor_quantization(self):
++        marker = self.per_tensor_quantization
++        if marker is None:
++            return
++        if (
++            type(marker.get("version")) is not int
++            or marker["version"] != 1
++            or not isinstance(marker.get("allocation"), str)
++            or not marker["allocation"]
++        ):
++            raise ValueError(
++                "per_tensor_quantization requires version 1 and an allocation filename"
++            )
++
++    def get_num_loops(self, extra_args: dict[str, Any] | None) -> int:
++        num_loops = (extra_args or {}).get("num_loops", self.n_recurrent_loops)
++        if type(num_loops) is not int or not 1 <= num_loops <= self.n_recurrent_loops:
++            raise VLLMValidationError(
++                f"num_loops must be an integer in [1, {self.n_recurrent_loops}]",
++                parameter="num_loops",
++            )
++        return num_loops
++
++    def request_cache_salt(
++        self, extra_args: dict[str, Any] | None, cache_salt: str | None
++    ) -> str | None:
++        num_loops = self.get_num_loops(extra_args)
++        if num_loops == self.n_recurrent_loops:
++            return cache_salt
++        return json.dumps((self.model_type, num_loops, cache_salt))
+diff --git a/vllm/v1/attention/backends/gdn_attn.py b/vllm/v1/attention/backends/gdn_attn.py
+index 2fb092b0584daa524cf83a4b5c9a18ee14f9be38..cf82222d943319202a2af22a2e25626cc4d4a7de 100644
+--- a/vllm/v1/attention/backends/gdn_attn.py
++++ b/vllm/v1/attention/backends/gdn_attn.py
+@@ -127,6 +127,9 @@ class GDNAttentionMetadata:
+         None  # shape: [batch - num_spec_decodes + 1,]
+     )
+ 
++    # Host query starts are valid for prefills; decode-only tensors may be padded.
++    non_spec_query_start_loc_cpu: torch.Tensor | None = None
++
+     spec_state_indices_tensor: torch.Tensor | None = None  # shape: [batch, num_spec]
+     non_spec_state_indices_tensor: torch.Tensor | None = (
+         None  # shape: [batch - num_spec_decodes,]
+@@ -786,6 +789,9 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
+             aiter_prefill_metadata=aiter_prefill_metadata,
+             spec_query_start_loc=spec_query_start_loc,
+             non_spec_query_start_loc=non_spec_query_start_loc,
++            non_spec_query_start_loc_cpu=(
++                non_spec_query_start_loc_cpu if num_prefills else None
++            ),
+             spec_state_indices_tensor=spec_state_indices_tensor,
+             non_spec_state_indices_tensor=non_spec_state_indices_tensor,
+             spec_sequence_masks=spec_sequence_masks,
+diff --git a/vllm/v1/engine/core.py b/vllm/v1/engine/core.py
+index b1085193f44868f74a23bf0330ec803d0af22c0c..2ce323fd216ac246c1ba5d27b975dbe639729b79 100644
+--- a/vllm/v1/engine/core.py
++++ b/vllm/v1/engine/core.py
+@@ -1313,6 +1313,17 @@ class EngineCore:
+                 warn_watermarking_override()
+             params.watermarking = True
+ 
++        request_cache_salt = getattr(
++            self.vllm_config.model_config.hf_config, "request_cache_salt", None
++        )
++        if request_cache_salt is not None:
++            salt = request_cache_salt(
++                params.extra_args if params is not None else None, request.cache_salt
++            )
++            if salt != request.cache_salt:
++                request.cache_salt = salt
++                # Frontends may hash before applying model-specific semantics.
++                request.block_hashes = None
+         frontend_hashes = frontend_block_hashes(request, self.prefix_hash_config)
+         req = Request.from_engine_core_request(
+             request, self.request_block_hasher, frontend_hashes
+diff --git a/vllm/v1/engine/input_processor.py b/vllm/v1/engine/input_processor.py
+index 192a041f9c18e42bf49ed7d1bb0aa261255d9e10..171c52fa7455395de72821b20849feea0b00516f 100644
+--- a/vllm/v1/engine/input_processor.py
++++ b/vllm/v1/engine/input_processor.py
+@@ -191,6 +191,12 @@ class InputProcessor:
+                 )
+ 
+             self.validate_logits_processors_params(params)
++            request_cache_salt = getattr(
++                self.model_config.hf_config, "request_cache_salt", None
++            )
++            if request_cache_salt is not None:
++                # Validate here for a useful frontend error; the engine salts once.
++                request_cache_salt(params.extra_args, None)
+ 
+             if self.model_config.is_diffusion:
+                 # Without --diffusion-config the served canvas is unknown here;
+diff --git a/vllm/v1/worker/gpu/cudagraph_utils.py b/vllm/v1/worker/gpu/cudagraph_utils.py
+index 52243d4978bbcd81871804533315882ddcf9a1c9..001b290edd926462e9e01ef588b9bd4eefcb2e99 100644
+--- a/vllm/v1/worker/gpu/cudagraph_utils.py
++++ b/vllm/v1/worker/gpu/cudagraph_utils.py
+@@ -660,11 +660,22 @@ class ModelCudaGraphManager(CudaGraphManager):
+             varlen_decode=varlen_decode,
+             ubatch_runner=ubatch_runner,
+         )
++        self.model_state: ModelState
++        self.variant_graphs: dict[
++            Hashable, dict[BatchExecutionDescriptor, torch.cuda.CUDAGraph]
++        ] = {}
+         self.hidden_states: torch.Tensor | None = None
+         self.aux_hidden_states: list[torch.Tensor] = []
+         self.use_aux_hidden_state_outputs = False
+         self.intermediate_tensors: IntermediateTensors | None = None
+ 
++    def init_breakable_cg_runner(
++        self, model: nn.Module, key_fn: Callable[..., Hashable] | None = None
++    ) -> None:
++        super().init_breakable_cg_runner(
++            model, key_fn or (lambda *_, **__: self.model_state.cudagraph_variant)
++        )
++
+     def capture(
+         self,
+         model: nn.Module,
+@@ -680,6 +691,7 @@ class ModelCudaGraphManager(CudaGraphManager):
+         progress_bar_desc: str = "Capturing CUDA graphs",
+     ) -> None:
+         """Capture CUDA graphs for model forward pass."""
++        self.model_state = model_state
+         self.use_aux_hidden_state_outputs = use_aux_hidden_state_outputs
+         if self.use_breakable_cg:
+             self.init_breakable_cg_runner(model)
+@@ -856,12 +868,22 @@ class ModelCudaGraphManager(CudaGraphManager):
+ 
+             return forward_fn
+ 
+-        super().capture(create_forward_fn, progress_bar_desc)
++        for variant in model_state.cudagraph_variants():
++            model_state.cudagraph_variant = variant
++            self.graphs = self.variant_graphs.setdefault(variant, {})
++            super().capture(create_forward_fn, progress_bar_desc)
++
++    def release_graphs(self) -> None:
++        super().release_graphs()
++        for graphs in self.variant_graphs.values():
++            graphs.clear()
++        self.variant_graphs.clear()
+ 
+     def run_fullgraph(
+         self, desc: BatchExecutionDescriptor
+     ) -> torch.Tensor | tuple[torch.Tensor, list[torch.Tensor]] | IntermediateTensors:
+         """Replay a captured FULL cudagraph and return hidden states."""
++        self.graphs = self.variant_graphs[self.model_state.cudagraph_variant]
+         super().run_fullgraph(desc)
+         if not self.is_last_pp_rank:
+             assert self.intermediate_tensors is not None
+@@ -1084,6 +1106,7 @@ def profile_cudagraph_memory(runner: "GPUModelRunner") -> int:
+             # they share the global pool at runtime, so the overlap is not
+             # double-counted.
+             num_full_graphs = len(manager._capture_descs.get(CUDAGraphMode.FULL, []))
++            num_full_graphs *= len(runner.model_state.cudagraph_variants())
+             full_estimate = _extrapolate_full_graph_memory(mem_samples, num_full_graphs)
+             return max(measured - sum(mem_samples) + full_estimate, 0)
+         finally:
+diff --git a/vllm/v1/worker/gpu/model_states/interface.py b/vllm/v1/worker/gpu/model_states/interface.py
+index daaadc1db3f0810452f73855856fb666c3a18628..3fd9236f2936ecb2bbec3d73ee386a9660139a30 100644
+--- a/vllm/v1/worker/gpu/model_states/interface.py
++++ b/vllm/v1/worker/gpu/model_states/interface.py
+@@ -1,6 +1,7 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ from abc import ABC, abstractmethod
++from collections.abc import Hashable
+ from typing import Any, ClassVar, cast
+ 
+ import torch
+@@ -40,6 +41,12 @@ class ModelSpecificAttnMetadata:
+ 
+ 
+ class ModelState(ABC):
++    cudagraph_variant: Hashable = None
++    """Forward topology selected by prepare_inputs or prepare_dummy_inputs."""
++
++    def cudagraph_variants(self) -> tuple[Hashable, ...]:
++        return (None,)
++
+     supports_prompt_embeds: ClassVar[bool] = False
+     """Whether this state implements user-provided prompt embeddings."""
+ 

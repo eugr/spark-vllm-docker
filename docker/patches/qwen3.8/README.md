@@ -47,6 +47,9 @@ The vLLM order is:
 15. Enable decode context parallelism in the FlashInfer sparse MLA backend on
     SM120 and SM121 with BF16 queries and a packed FP8 KV cache.
     [vLLM #66909](https://github.com/vllm-project/vllm/pull/66909)
+16. Support NVIDIA Nemotron Labs Dory-1.5 models, including gated delta
+    product layers, per-request recurrent loop counts, and prefix caching
+    by loop count. [vLLM #69214](https://github.com/vllm-project/vllm/pull/69214)
 
 Disk-offloaded PLE tables from
 [#59958](https://github.com/vllm-project/vllm/pull/59958) are supplied by upstream

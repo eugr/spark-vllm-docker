@@ -16,6 +16,9 @@ the sparse loader quantizes only selected rows while sharing validation remains.
 Use the method-specific speculative configuration and current MTP interfaces;
 the retired Model Runner V1 guard is no longer needed.
 
+The lm_head.py hunks use shared context so new upstream quantization and
+padding helpers alongside _quantize_copy survive the patch.
+
 diff --git a/.buildkite/test_areas/spec_decode.yaml b/.buildkite/test_areas/spec_decode.yaml
 index 7f9a265d66a5..79ce0df52cb9 100644
 --- a/.buildkite/test_areas/spec_decode.yaml
@@ -1518,19 +1521,16 @@ index 000000000000..6c6825a0f5ac
 +        # the target lm_head after weight updates.
 +        model.draft_token_map_head = draft_vocab.rows
 diff --git a/vllm/model_executor/layers/quantization/online/lm_head.py b/vllm/model_executor/layers/quantization/online/lm_head.py
-index 9c3f9ea90efc..1170a3c4d795 100644
 --- a/vllm/model_executor/layers/quantization/online/lm_head.py
 +++ b/vllm/model_executor/layers/quantization/online/lm_head.py
-@@ -31,6 +31,7 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import QuantKey
- from vllm.model_executor.layers.vocab_parallel_embedding import (
+@@ -32,5 +32,6 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
      ParallelLMHead,
      UnquantizedEmbeddingMethod,
 +    VocabParallelEmbedding,
  )
  from vllm.model_executor.model_loader.reload.layerwise import get_layerwise_info
  from vllm.model_executor.utils import replace_parameter, set_weight_attrs
-@@ -217,7 +218,11 @@ _LM_HEAD_METHODS: dict[str, type[OnlineLinearBase]] = {
- }
+@@ -218,6 +219,10 @@
  
  
 -def _quantize_copy(lm_head: ParallelLMHead, quantization: str) -> ParallelLMHead:
