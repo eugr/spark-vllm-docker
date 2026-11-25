@@ -593,15 +593,16 @@ index 6c6825a0f5acad03af25a33ec6a38d932801021c..4210d2f6e5175de7e399c401f6c04244
      eos_ids: list[int] = []
      for eos in (
 diff --git a/vllm/model_executor/layers/quantization/online/lm_head.py b/vllm/model_executor/layers/quantization/online/lm_head.py
-index 1170a3c4d795d08675147aeffca1ba81e6e0dd8e..20f633e2fdc2536201665ead6ca94261f8e855c3 100644
+index fbe4c2001df22aafbf74b2b922ee81f83bc399ed..fe6743147f5b8227d6d678a1067026fae95f019b 100644
 --- a/vllm/model_executor/layers/quantization/online/lm_head.py
 +++ b/vllm/model_executor/layers/quantization/online/lm_head.py
-@@ -6,11 +6,13 @@ private quantized copies of an already-loaded lm_head for speculative-decoding
+@@ -6,12 +6,14 @@ private quantized copies of an already-loaded lm_head for speculative-decoding
  drafters (`draft_lm_head_quantization`)."""
  
  from abc import abstractmethod
 +from collections.abc import Callable
  from itertools import chain
+ from math import lcm
  from typing import ClassVar, Literal
  from weakref import WeakKeyDictionary
  
@@ -610,7 +611,7 @@ index 1170a3c4d795d08675147aeffca1ba81e6e0dd8e..20f633e2fdc2536201665ead6ca94261
  from torch.nn import Module, Parameter
  
  from vllm.logger import init_logger
-@@ -18,6 +20,7 @@ from vllm.model_executor.kernels.linear import (
+@@ -19,6 +21,7 @@ from vllm.model_executor.kernels.linear import (
      MPLinearKernel,
      MPLinearLayerConfig,
      choose_mp_linear_kernel,
@@ -618,7 +619,7 @@ index 1170a3c4d795d08675147aeffca1ba81e6e0dd8e..20f633e2fdc2536201665ead6ca94261
  )
  from vllm.model_executor.layers.linear import UnquantizedLinearMethod
  from vllm.model_executor.layers.quantization.online.fp8 import (
-@@ -27,7 +30,14 @@ from vllm.model_executor.layers.quantization.online.fp8 import (
+@@ -28,7 +31,14 @@ from vllm.model_executor.layers.quantization.online.fp8 import (
  from vllm.model_executor.layers.quantization.online.nvfp4 import (
      Nvfp4WeightOnlyOnlineLinearMethod,
  )
@@ -632,9 +633,9 @@ index 1170a3c4d795d08675147aeffca1ba81e6e0dd8e..20f633e2fdc2536201665ead6ca94261
 +    weight_amax,
 +)
  from vllm.model_executor.layers.vocab_parallel_embedding import (
+     DEFAULT_VOCAB_PADDING_SIZE,
      ParallelLMHead,
-     UnquantizedEmbeddingMethod,
-@@ -212,6 +222,54 @@ class OnlineLMHeadMethodBase(OnlineLinearBase):
+@@ -214,6 +224,54 @@ class OnlineLMHeadMethodBase(OnlineLinearBase):
          return self.kernel.apply_weights(layer, x, bias)
  
  
@@ -689,7 +690,7 @@ index 1170a3c4d795d08675147aeffca1ba81e6e0dd8e..20f633e2fdc2536201665ead6ca94261
  _LM_HEAD_METHODS: dict[str, type[OnlineLinearBase]] = {
      "fp8": Fp8PtpcOnlineLinearMethod,
      "nvfp4": Nvfp4WeightOnlyOnlineLinearMethod,
-@@ -221,7 +279,7 @@ _LM_HEAD_METHODS: dict[str, type[OnlineLinearBase]] = {
+@@ -236,7 +294,7 @@ def lm_head_padding_size(tp_size: int) -> int:
  def _quantize_copy(
      lm_head: VocabParallelEmbedding,
      quantization: str,
@@ -698,7 +699,7 @@ index 1170a3c4d795d08675147aeffca1ba81e6e0dd8e..20f633e2fdc2536201665ead6ca94261
  ) -> ParallelLMHead:
      if (
          not isinstance(
-@@ -234,30 +292,38 @@ def _quantize_copy(
+@@ -249,30 +307,38 @@ def _quantize_copy(
              "Quantizing an lm_head copy needs an unquantized fp16/bf16 lm_head "
              "without bias."
          )
@@ -748,7 +749,7 @@ index 1170a3c4d795d08675147aeffca1ba81e6e0dd8e..20f633e2fdc2536201665ead6ca94261
      head.weight = torch.nn.Parameter(weight, requires_grad=False)
      head.quant_method.process_weights_after_loading(head)
      # The copy is never loaded. The online loader wrapper captures the layer,
-@@ -268,17 +334,20 @@ def _quantize_copy(
+@@ -283,17 +349,20 @@ def _quantize_copy(
      return head
  
  
@@ -774,7 +775,7 @@ index 1170a3c4d795d08675147aeffca1ba81e6e0dd8e..20f633e2fdc2536201665ead6ca94261
  ) -> ParallelLMHead:
      """A ParallelLMHead holding this rank's shard of `lm_head`, quantized.
  
-@@ -288,14 +357,17 @@ def quantized_lm_head_copy(
+@@ -303,14 +372,17 @@ def quantized_lm_head_copy(
      unchanged and no bf16 copy of its weight is made. The copy is derived state:
      `refresh_quantized_lm_heads` re-derives it after `lm_head` changes.
  
@@ -796,7 +797,7 @@ index 1170a3c4d795d08675147aeffca1ba81e6e0dd8e..20f633e2fdc2536201665ead6ca94261
      logger.info(
          "Quantized a %s copy of the lm_head (%d x %d per rank).",
          quantization,
-@@ -305,20 +377,39 @@ def quantized_lm_head_copy(
+@@ -320,20 +392,39 @@ def quantized_lm_head_copy(
      return head
  
  
@@ -844,7 +845,7 @@ index 1170a3c4d795d08675147aeffca1ba81e6e0dd8e..20f633e2fdc2536201665ead6ca94261
  
  
  # (parent, attribute, copy) for each copy swapped out by share_source_lm_heads.
-@@ -335,7 +426,6 @@ def share_source_lm_heads(model: Module) -> None:
+@@ -350,7 +441,6 @@ def share_source_lm_heads(model: Module) -> None:
          (module, name, child)
          for module in model.modules()
          for name, child in module.named_children()
