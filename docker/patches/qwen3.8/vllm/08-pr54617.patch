@@ -4,7 +4,7 @@ Subject: [PATCH] [Kernel][Quant][MoE] Per-forward NVFP4 W4A4/W4A16 selection for
 Upstream-PR: https://github.com/vllm-project/vllm/pull/54617
 Upstream-Commit: 69d21d81808bcea2de3b97a0b68c97545808a043
 Integration-Base: 8084f0624dba24aba6ebac62d8e10cc00730a0fe
-Refresh-Base: 0fda86a35419c9c70dbfada224c838c10fbb62ad
+Refresh-Base: e4ac319d203f3dad675d71b0b36e35e293ec291f
 
 Preserve the expanded upstream MonoKernel documentation.
 
@@ -278,7 +278,7 @@ index 0000000000000000000000000000000000000000..bb58ef9015b5678c21be7faee78073ed
 +    assert err.mean() < 2.5e-1, f"mean rel err {err.mean():.3e}"
 +    assert torch.equal(outs[0], outs[2])
 diff --git a/vllm/config/kernel.py b/vllm/config/kernel.py
-index 614d91c04390b5b3cc816c9f16b5a4f305288651..2da8d06e489d3753907daf9a3ba59f6673692678 100644
+index cb94f4a81f0bd6f50414b21a4835e5dcb3b40599..342ad0d8d44ebcda185e68ed5e0cee4a45afc2ac 100644
 --- a/vllm/config/kernel.py
 +++ b/vllm/config/kernel.py
 @@ -137,6 +137,7 @@ MoEBackend = Literal[
@@ -289,10 +289,10 @@ index 614d91c04390b5b3cc816c9f16b5a4f305288651..2da8d06e489d3753907daf9a3ba59f66
      "b12x",
      "flashinfer_moe_ep_mega_deep_gemm",
      "marlin",
-@@ -348,6 +349,17 @@ class KernelConfig:
-     "latency_specialized"}'`, the specialized decode of RFC #60904: setting
-     either one enables the model's specialized decode, whichever it reads."""
-
+@@ -342,6 +343,17 @@ class KernelConfig:
+     models, hardware and parallel layouts support it is model-specific; an
+     unsupported deployment is refused at startup."""
+ 
 +    nvfp4_moe_dynamic_max_tokens: int = Field(default=0, ge=0)
 +    """With moe_backend="flashinfer_cutile", run NVFP4 routed experts as W4A16
 +    for forwards of at most this many tokens and W4A4 above it. Zero selects
@@ -306,8 +306,8 @@ index 614d91c04390b5b3cc816c9f16b5a4f305288651..2da8d06e489d3753907daf9a3ba59f66
 +
      moe_backend: MoEBackend = "auto"
      """Backend for MoE expert computation kernels. Available options:
-
-@@ -369,6 +381,9 @@ class KernelConfig:
+ 
+@@ -365,6 +377,9 @@ class KernelConfig:
        or MXFP4 weights on Hopper; requires expert parallelism and NVSHMEM
      - "flashinfer_b12x": Use FlashInfer CuteDSL fused MoE for SM12x
        (RTX Pro 6000 / DGX Spark)
@@ -757,7 +757,7 @@ index 597ee775a3d23ff4fb3ed643ead91fec8965d59e..2e760a628334950365c3c70194be6ac9
 +    amax_for_moe_activation_quant,
  )
  from vllm.model_executor.utils import move_parameter, refill_derived
-
+ 
 @@ -51,6 +52,7 @@ class NvFp4MoeBackend(Enum):
      FLASHINFER_CUTEDSL = "FLASHINFER_CUTEDSL"
      FLASHINFER_CUTEDSL_BATCHED = "FLASHINFER_CUTEDSL_BATCHED"
@@ -767,9 +767,9 @@ index 597ee775a3d23ff4fb3ed643ead91fec8965d59e..2e760a628334950365c3c70194be6ac9
      MARLIN = "MARLIN"
      HUMMING = "HUMMING"
 @@ -134,6 +136,13 @@ def backend_to_kernel_cls(
-
+ 
          return [FlashInferB12xExperts]
-
+ 
 +    elif backend == NvFp4MoeBackend.FLASHINFER_CUTILE:
 +        from vllm.model_executor.layers.fused_moe.experts.flashinfer_cutile_moe import (  # noqa: E501
 +            FlashInferCuTileNvfp4Experts,

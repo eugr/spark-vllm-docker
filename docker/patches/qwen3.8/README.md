@@ -40,7 +40,7 @@ The vLLM order is:
 13. [#65182](https://github.com/vllm-project/vllm/pull/65182): reuse MRV2's
     persistent Mamba2 aligned state indices and accepted-token buffers as CUDA
     graph inputs, avoiding redundant metadata copies. Frozen at
-    `26490d2c7b9646bb722e20873e0127a52f10417d`, with upstream aliasing tests.
+    `ba6de8e9da23fd9b317efc3ccbe549dcfb6b7989`, with upstream aliasing tests.
 14. Gather MLA prefill queries before latent expansion under decode context
     parallelism. Set `mla_dcp_query_gather_min_tokens` to a positive threshold
     to enable it. The default is zero. [vLLM #66906](https://github.com/vllm-project/vllm/pull/66906)
@@ -79,6 +79,12 @@ Canonical NVFP4 W4A4 MoE from
 upstream commit `397b9607c83cf201f3c44684c555c3698869b6bd`.
 
 ## Integration and refresh
+
+On November 26 the regular series was validated on vLLM
+`e4ac319d203f3dad675d71b0b36e35e293ec291f` and FlashInfer
+`74fb3fb8a64cd36b8f4452a5ef1a7f865eef013e`. Patch 08 preserves the
+updated monokernel documentation. Patch 18 tracks the revised Mamba2
+per-group graph-input binding and its ReplaySSM staging tests.
 
 On November 23 the complete series applied to vLLM
 `179ebd9896cff5fddc27f622649ff4c99ed5c733` and FlashInfer
