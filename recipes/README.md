@@ -83,6 +83,25 @@ headroom on Spark's shared memory.
 
 Automatic tool calling is enabled by default with the Inkling tool parser.
 
+For Inco AI's external draft, use the
+[Inkling 2 Mini DFlash2 recipe](inkling-2-mini-dflash2.yaml). It pins the vLLM
+image, target revision, and
+[draft checkpoint](https://huggingface.co/incoai/Inkling-2-Mini-DFlash2). It
+applies the Inkling capture and scoring adapter and uses seven probabilistic
+draft tokens with the same 262,144-token context.
+
+```bash
+./run-recipe.sh inkling-2-mini-dflash2 --solo --setup
+```
+
+vLLM fetches the draft checkpoint separately during startup. To pre-cache it for
+offline use, download the pinned revision into the Hugging Face cache before launch.
+
+```bash
+uvx hf download incoai/Inkling-2-Mini-DFlash2 config.json model.safetensors \
+  --revision 4f9088ea66c21f2b99ed657d1941c306b03e84d2
+```
+
 ### Nemotron 3.5 on a Single DGX Spark
 
 These recipes use the standard `vllm-node` image and require `--solo`:

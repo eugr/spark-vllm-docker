@@ -1261,6 +1261,22 @@ test_readme_inkling_2_mini() {
         "${INKLING_2_MINI_ARGS[@]}"
 }
 
+test_readme_inkling_2_mini_dflash2() {
+    local recipe_name="inkling-2-mini-dflash2"
+    verify_recipe_args "$recipe_name" \
+        "$INKLING_2_MINI_MODEL" \
+        "$INKLING_2_MINI_DFLASH2_CONTAINER" \
+        "${INKLING_2_MINI_DFLASH2_ARGS[@]}"
+
+    local output
+    output=$(run_recipe_dry_run "$recipe_name" "solo")
+    if extract_launch_cmd "$output" | grep -qF -- "--apply-mod mods/inkling2-dflash2"; then
+        log_pass "README match: $recipe_name applies the Inkling adapter"
+    else
+        log_fail "README match: $recipe_name omits the Inkling adapter"
+    fi
+}
+
 # Test: Qwen3.8 NVFP4 DFlash2 matches the documented experimental configuration
 test_readme_qwen38_dflash2() {
     verify_recipe_args "qwen3.8-27b-nvfp4-dflash2-fp8-head" \
@@ -1708,6 +1724,7 @@ main() {
     test_readme_gpt_oss
     test_readme_minimax
     test_readme_inkling_2_mini
+    test_readme_inkling_2_mini_dflash2
     test_readme_qwen38_dflash2
     test_readme_qwen38_dflash2_integration
     test_readme_glm_flash_mod

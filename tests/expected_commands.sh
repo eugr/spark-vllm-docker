@@ -85,6 +85,22 @@ INKLING_2_MINI_ARGS=(
     "--speculative-config '{\"method\":\"dspark\",\"num_speculative_tokens\":7,\"draft_sample_method\":\"probabilistic\"}'"
 )
 
+# Inkling 2 Mini with the Inco AI DFlash2 draft
+INKLING_2_MINI_DFLASH2_CONTAINER="vllm/vllm-openai@sha256:c2dc759f5984f69c1e2418c6af7c26eb756f5ed2a8934c768ae1253645d1449e"
+INKLING_2_MINI_DFLASH2_ARGS=(
+    "--revision c9d028302cd0f035fdf8e7e91f089a4ce94d2195"
+    "--tokenizer-revision c9d028302cd0f035fdf8e7e91f089a4ce94d2195"
+    "--port 8000"
+    "--host 0.0.0.0"
+    "--tensor-parallel-size 1"
+    "--max-model-len 262144"
+    "--gpu-memory-utilization 0.8"
+    "--reasoning-parser inkling"
+    "--enable-auto-tool-choice"
+    "--tool-call-parser inkling"
+    "--speculative-config '{\"method\":\"dflash\",\"model\":\"incoai/Inkling-2-Mini-DFlash2\",\"revision\":\"4f9088ea66c21f2b99ed657d1941c306b03e84d2\",\"num_speculative_tokens\":7,\"draft_sample_method\":\"probabilistic\"}'"
+)
+
 # ==============================================================================
 # qwen3.8-27b-nvfp4-dflash2-fp8-head
 # README Reference: DFlash2 with compressed-tensors FP8 lm_head
