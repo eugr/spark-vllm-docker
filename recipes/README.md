@@ -94,6 +94,12 @@ draft tokens with the same 262,144-token context.
 ./run-recipe.sh inkling-2-mini-dflash2 --solo --setup
 ```
 
+The recipe uses Humming for Inkling's NVFP4 experts. In a single-Spark
+comparison with surrounding controls, Humming improved 25.5K-token prefill by
+20% and four-request throughput by 10%. Pass `-- --moe-backend auto` to use the
+original expert backend selection.
+[Benchmark findings](../docs/inkling-2-mini-spark-findings.html)
+
 vLLM fetches the draft checkpoint separately during startup. To pre-cache it for
 offline use, download the pinned revision into the Hugging Face cache before launch.
 

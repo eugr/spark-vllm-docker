@@ -1,0 +1,362 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>Inkling 2 Mini on DGX Spark | Inference findings</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --paper: #f5f2e9;
+      --card: #fffdf7;
+      --ink: #202a26;
+      --muted: #4c5a54;
+      --line: #d8d9cc;
+      --accent: #1c5c49;
+      --wash: #e5eee6;
+      --rust: #913d24;
+      --neutral: #829087;
+      --mono: ui-monospace, SFMono-Regular, Consolas, monospace;
+    }
+    * { box-sizing: border-box; }
+    html { scroll-behavior: smooth; scroll-padding-top: 1.25rem; }
+    body { margin: 0; background: var(--paper); color: var(--ink); font: 1rem/1.6 system-ui, sans-serif; }
+    a { color: var(--accent); text-underline-offset: .19em; }
+    :focus-visible { outline: 3px solid var(--rust); outline-offset: 4px; }
+    main, footer { width: min(100% - 2.5rem, 70rem); margin-inline: auto; }
+    header { padding: clamp(2.5rem, 8vw, 6rem) 0 1.8rem; border-bottom: 1px solid var(--line); }
+    .meta { font: 700 .76rem/1.4 var(--mono); letter-spacing: .08em; text-transform: uppercase; color: var(--rust); }
+    h1, h2 { font-family: Georgia, serif; font-weight: 500; letter-spacing: -.035em; line-height: 1.06; }
+    h1 { font-size: clamp(2.75rem, 7.4vw, 5.7rem); margin: .36em 0 .28em; max-width: 13ch; }
+    h2 { font-size: clamp(2rem, 4.2vw, 3.35rem); margin: 0 0 .85rem; }
+    h3 { font-size: 1.05rem; margin: 1.5rem 0 .45rem; }
+    p { margin: .55rem 0 1rem; }
+    .lede { max-width: 58ch; font-size: clamp(1.05rem, 2vw, 1.24rem); color: var(--muted); }
+    nav ul { display: flex; flex-wrap: wrap; column-gap: 1.5rem; row-gap: .6rem; list-style: none; padding: 0; margin: 0; }
+    nav { padding: 1rem 0; border-bottom: 1px solid var(--line); font-size: .88rem; }
+    nav a { font-weight: 650; }
+    section { border-bottom: 1px solid var(--line); padding: clamp(1.8rem, 5vw, 3.25rem) 0; }
+    .grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 1rem; margin: 1.4rem 0; }
+    .panel { background: var(--card); border: 1px solid var(--line); padding: clamp(.9rem, 2.5vw, 1.5rem); border-radius: .6rem; min-width: 0; }
+    .panel h3 { margin-top: 0; }
+    .figure-number { font: 500 clamp(2rem, 4vw, 3rem)/1.05 Georgia, serif; color: var(--accent); margin: .5rem 0; }
+    .metric-no { font-variant-numeric: tabular-nums; }
+    .small, figcaption { color: var(--muted); font-size: .89rem; }
+    figure { margin: 0; }
+    .bar-row { display: grid; grid-template-columns: 5.6rem minmax(0, 1fr) 3.5rem; align-items: center; gap: .55rem; font-size: .8rem; margin: .65rem 0; }
+    .bar-row span:last-child { text-align: right; font: .75rem var(--mono); }
+    .track { height: .7rem; border-radius: 1rem; background: var(--wash); overflow: hidden; }
+    .bar { display: block; height: 100%; border-radius: inherit; background: var(--accent); width: var(--w); }
+    .control { background: var(--neutral); }
+    .alternate { background: var(--rust); }
+    .callout { padding: .8rem 1rem; background: var(--wash); border-left: 3px solid var(--accent); }
+    .callout p { margin: 0; }
+    .table-wrap { overflow-x: auto; margin: 1.1rem 0; border: 1px solid var(--line); background: var(--card); border-radius: .5rem; }
+    table { width: 100%; border-collapse: collapse; font-size: .89rem; font-variant-numeric: tabular-nums; text-align: left; }
+    th, td { padding: .61rem .75rem; border-bottom: 1px solid var(--line); vertical-align: top; }
+    thead th { background: var(--wash); font-size: .8rem; }
+    tbody tr:last-child > * { border-bottom: 0; }
+    .numeric { text-align: right; white-space: nowrap; }
+    .wide { min-width: 46rem; }
+    .compact { margin: .6rem 0; padding-left: 1.25rem; }
+    .compact li + li { margin-top: .45rem; }
+    dt { font-weight: 700; }
+    dd { margin: 0 0 .75rem; }
+    code { font-family: var(--mono); font-size: .87em; overflow-wrap: anywhere; }
+    pre { padding: 1rem; border-radius: .5rem; overflow-x: auto; color: #eaf3e9; background: #26382f; line-height: 1.62; }
+    pre code { overflow-wrap: normal; }
+    details { padding: .85rem 1rem; border: 1px solid var(--line); border-radius: .5rem; background: var(--card); margin: .8rem 0; }
+    summary { cursor: pointer; font-weight: 650; }
+    footer { color: var(--muted); font-size: .86rem; padding: 1rem 0 3rem; }
+    @media (max-width: 620px) {
+      .grid { grid-template-columns: 1fr; }
+      main, footer { width: calc(100% - 1.4rem); }
+      th, td { padding: .52rem .57rem; }
+    }
+    @media (prefers-reduced-motion: reduce) { html { scroll-behavior: auto; } }
+    @media print {
+      body { background: white; }
+      main, footer { width: 100%; }
+      nav { display: none; }
+      section, header { padding: 1rem 0; }
+      .panel, tr, pre { break-inside: avoid; }
+      .table-wrap { overflow: visible; }
+      .wide { min-width: 0; }
+      * { print-color-adjust: exact; }
+    }
+  </style>
+</head>
+<body>
+<main id="top">
+  <header>
+    <p class="meta">Benchmark report · <time datetime="2026-11-26">26</time>–<time datetime="2026-11-27">27 November 2026</time> · One DGX Spark</p>
+    <h1>Inkling 2 Mini on DGX Spark</h1>
+    <p class="lede">DFlash2 raised single-request decode throughput by <strong>37–41%</strong> over DSpark. A follow-up trial with Humming raised 25.5K-token prefill by <strong>20%</strong> over the original DFlash2 configuration. Humming also raised coding-task decode throughput by <strong>3.4%</strong> on the same GB10 system.</p>
+  </header>
+  <nav aria-label="Report sections">
+    <ul>
+      <li><a href="#humming">Humming results</a></li>
+      <li><a href="#coding">Coding benchmark</a></li>
+      <li><a href="#dflash2">DFlash2 results</a></li>
+      <li><a href="#dspark">DSpark and CUDA graphs</a></li>
+      <li><a href="#verification">Verification</a></li>
+      <li><a href="#method">Method and hardware</a></li>
+      <li><a href="#launch">Launch commands</a></li>
+      <li><a href="#evidence">Run ledger</a></li>
+    </ul>
+  </nav>
+
+  <section id="humming">
+    <h2>Humming results</h2>
+    <p>The best tested configuration combines DFlash2 with Humming’s NVFP4 expert kernels. The updated DFlash2 recipe uses this backend by default. The follow-up changed only the expert backend and measured the candidate between two default-backend controls. Both paths used seven probabilistic draft tokens, the original 2,048-token batch budget, and a 262,144-token context.</p>
+    <div class="table-wrap" role="region" aria-label="Humming versus the original DFlash2 backend" tabindex="0">
+      <table>
+        <thead><tr><th scope="col">Metric</th><th scope="col" class="numeric">Default control median</th><th scope="col" class="numeric">Humming</th><th scope="col" class="numeric">Change</th></tr></thead>
+        <tbody>
+          <tr><th scope="row">Single-request decode</th><td class="numeric">51.84 tok/s</td><td class="numeric">53.81 tok/s</td><td class="numeric">+3.8%</td></tr>
+          <tr><th scope="row">Four-request throughput</th><td class="numeric">105.25 tok/s</td><td class="numeric">115.69 tok/s</td><td class="numeric">+9.9%</td></tr>
+          <tr><th scope="row">Eight-request throughput</th><td class="numeric">169.76 tok/s</td><td class="numeric">179.87 tok/s</td><td class="numeric">+6.0%</td></tr>
+          <tr><th scope="row">Warmed prefill, 3,302 tokens</th><td class="numeric">2,906 tok/s</td><td class="numeric">3,364 tok/s</td><td class="numeric">+15.7%</td></tr>
+          <tr><th scope="row">Warmed prefill, 25,554 tokens</th><td class="numeric">2,814 tok/s</td><td class="numeric">3,374 tok/s</td><td class="numeric">+19.9%</td></tr>
+          <tr><th scope="row">Long-prompt TTFT during concurrent decode</th><td class="numeric">9.72 s</td><td class="numeric">8.15 s</td><td class="numeric">−16.1%</td></tr>
+          <tr><th scope="row">Mixed traffic p95 gap between stream updates</th><td class="numeric">769 ms</td><td class="numeric">644 ms</td><td class="numeric">−16.3%</td></tr>
+          <tr><th scope="row">Mixed traffic token-weighted p95 gap</th><td class="numeric">244 ms</td><td class="numeric">256 ms</td><td class="numeric">+5.0%</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p>The mixed workload submitted a fresh approximately 25.5K-token prompt while a fixed 256-token request was decoding. The stream-update gap measures time between updates with visible content. The token-weighted gap counts tokens delivered in the same update together. Humming shortened the longer pauses between updates while token-weighted p95 rose 5%. The four- and eight-request runs used 256 output tokens per request.</p>
+    <div class="callout">
+      <p><strong>Context and output checks passed.</strong> Humming matched all three greedy probes against both controls. Tool calling, reasoning, and vision passed. Cold prompts of 130,991 and 261,396 tokens each returned all three retrieval codes.</p>
+    </div>
+    <h3>What the other trials showed</h3>
+    <ul class="compact">
+      <li><strong>4,096-token batch budget.</strong> At 25,554 tokens, warmed prefill dropped 5.6%. During concurrent decoding, long-prompt time to first token rose 11% and p95 gaps between stream updates grew from about 765 ms to 1,522 ms. Eight-request throughput rose 5.3% against the median of the controls and 2.8% against the faster control.</li>
+      <li><strong>Adaptive verification.</strong> The pinned image rejected variable per-request query lengths during graph initialization. Its Inkling short-convolution backend requires a fixed decode shape.</li>
+      <li><strong>Decode profile.</strong> Expert GEMMs accounted for about 53% of summed GPU kernel time across 12 profiled decode iterations. The draft output-head projection accounted for 6.6%, or about 4 ms per iteration. That led to the Humming trial.</li>
+    </ul>
+    <p class="small">Humming repacks Inkling’s existing NVFP4 expert weights for its GPU kernels. <a href="https://vllm-project.github.io/2026/10/19/humming.html">vLLM’s Humming overview</a></p>
+  </section>
+
+  <section id="coding">
+    <h2>Coding benchmark</h2>
+    <p>Humming was faster than Inkling’s default Triton expert kernel on every task with DFlash2. Median decode throughput rose from <strong>55.29 to 57.17 tok/s (+3.4%)</strong>. Humming was faster on all 12 matched requests against both default passes.</p>
+    <div class="table-wrap" role="region" aria-label="Coding benchmark decode throughput by task" tabindex="0">
+      <table>
+        <thead><tr><th scope="col">Task</th><th scope="col" class="numeric">Default (tok/s)</th><th scope="col" class="numeric">Humming (tok/s)</th><th scope="col" class="numeric">Change</th></tr></thead>
+        <tbody>
+          <tr><th scope="row">Python TTL LRU cache</th><td class="numeric">55.33</td><td class="numeric">57.17</td><td class="numeric">+3.3%</td></tr>
+          <tr><th scope="row">TypeScript async map</th><td class="numeric">50.44</td><td class="numeric">52.26</td><td class="numeric">+3.6%</td></tr>
+          <tr><th scope="row">Rust log aggregation</th><td class="numeric">49.93</td><td class="numeric">52.14</td><td class="numeric">+4.4%</td></tr>
+          <tr><th scope="row">PostgreSQL event analytics</th><td class="numeric">57.18</td><td class="numeric">59.40</td><td class="numeric">+3.9%</td></tr>
+          <tr><th scope="row">Overall</th><td class="numeric">55.29</td><td class="numeric">57.17</td><td class="numeric">+3.4%</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p>Median request latency fell from 9.43 s to 9.13 s (−3.2%), and median time to first token fell from 236 ms to 221 ms (−6.1%). DFlash2 draft acceptance was 34.1% in all three passes, with 3.38 output tokens per verification step on average. All 12 Humming response hashes matched the corresponding responses in both default passes. The script measures speed and response hashes. It does not execute the generated code.</p>
+    <p>The suite ran on 27 November with <a href="../benchmark-code-generation.py"><code>benchmark-code-generation.py</code></a>. The backends ran in default → Humming → default order, with one warm-up per launch and three sequential requests per task per pass. Each measured request generated 512 tokens with EOS ignored, temperature 0, seed 42, and Inkling’s reasoning effort set to <code>none</code>. Every pass used seven probabilistic DFlash2 draft tokens. The default column averages the medians of the two <code>--moe-backend auto</code> passes, which reached 55.59 and 55.00 tok/s overall.</p>
+  </section>
+
+  <section id="dflash2">
+    <h2>DFlash2 results</h2>
+    <p>Both drafters proposed seven tokens per step with probabilistic sampling. This first comparison uses the fresh seven-token DSpark control and two corrected DFlash2 runs on the original expert backend. The repeat went through the opt-in recipe and launcher as configured on 26 November.</p>
+    <div class="grid">
+      <figure class="panel">
+        <h3>Single-request decode</h3>
+        <p class="figure-number metric-no">+37–41%</p>
+        <div class="bar-row"><span>DSpark</span><span class="track" aria-hidden="true"><span class="bar control" style="--w:65.67%"></span></span><span>36.12</span></div>
+        <div class="bar-row"><span>DFlash2</span><span class="track" aria-hidden="true"><span class="bar" style="--w:90.05%"></span></span><span>49.53</span></div>
+        <div class="bar-row"><span>Recipe repeat</span><span class="track" aria-hidden="true"><span class="bar alternate" style="--w:92.44%"></span></span><span>50.84</span></div>
+        <figcaption>Tokens per second, median of six prompts</figcaption>
+      </figure>
+      <figure class="panel">
+        <h3>Four-request throughput</h3>
+        <p class="figure-number metric-no">+18–37%</p>
+        <div class="bar-row"><span>DSpark</span><span class="track" aria-hidden="true"><span class="bar control" style="--w:67.88%"></span></span><span>74.67</span></div>
+        <div class="bar-row"><span>DFlash2</span><span class="track" aria-hidden="true"><span class="bar" style="--w:93.33%"></span></span><span>102.66</span></div>
+        <div class="bar-row"><span>Recipe repeat</span><span class="track" aria-hidden="true"><span class="bar alternate" style="--w:79.96%"></span></span><span>87.96</span></div>
+        <figcaption>Aggregate output tokens per second across four requests</figcaption>
+      </figure>
+    </div>
+    <div class="table-wrap" role="region" aria-label="DFlash2 latency and storage measurements" tabindex="0">
+      <table>
+        <thead><tr><th scope="col">Metric</th><th scope="col" class="numeric">DSpark</th><th scope="col" class="numeric">DFlash2 direct</th><th scope="col" class="numeric">DFlash2 recipe</th></tr></thead>
+        <tbody>
+          <tr><th scope="row">Emitted tokens per verification</th><td class="numeric">2.480</td><td class="numeric">3.301</td><td class="numeric">3.200</td></tr>
+          <tr><th scope="row">Draft token acceptance</th><td class="numeric">21.1%</td><td class="numeric">32.9%</td><td class="numeric">31.4%</td></tr>
+          <tr><th scope="row">Warm short time to first token</th><td class="numeric">204.05 ms</td><td class="numeric">—</td><td class="numeric">202.01 ms</td></tr>
+          <tr><th scope="row">Warmed-kernel prefill, 3,302 tokens</th><td class="numeric">2,887.37 tok/s</td><td class="numeric">—</td><td class="numeric">2,640.40 tok/s</td></tr>
+          <tr><th scope="row">Warmed-kernel prefill, 25,554 tokens</th><td class="numeric">2,800.58 tok/s</td><td class="numeric">—</td><td class="numeric">2,713.31 tok/s</td></tr>
+          <tr><th scope="row">Launch to API health</th><td class="numeric">154 s</td><td class="numeric">174 s</td><td class="numeric">205 s</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p>Warmed prefill fell by 8.6% at 3,302 tokens and 3.1% at 25,554 tokens in the recipe comparison. Warm time to first token was within about 2 ms. The recipe launch includes the launcher and adapter startup. The direct DFlash2 run reported 20.83 GiB of model memory and room for 1,465,652 KV tokens, versus 19.74 GiB and 1,334,301 KV tokens in the fresh DSpark control. Those KV figures are engine capacity estimates.</p>
+
+    <h3>Why Inkling needs an adapter</h3>
+    <ol class="compact">
+      <li>Inkling’s 24 physical layers execute as 48 visits. The draft expects three specific loop visits and the final normalized state. The pinned vLLM image’s generic DFlash route increments the draft’s layer indices. The adapter uses the checkpoint’s <code>[5, 23, 41, 48]</code> convention, where 48 denotes the appended final state.</li>
+      <li>Sharing the raw embedding table yielded only <strong>1.003 emitted tokens per verification</strong> and <strong>15.48 tok/s</strong> at one request. Sharing Inkling’s input embedding normalization with the draft restored useful acceptance.</li>
+      <li>The adapter bounds proposals to Inkling’s usable vocabulary and applies the logit soft cap after the selector’s transition correction. The launcher selects the <code>dflash</code> method and loads the <code>DFlash2DraftModel</code> architecture from Inco AI’s checkpoint.</li>
+    </ol>
+    <p class="small">Inco AI reported around 27–40% higher single-request throughput than DSpark on an H200 with patched SGLang. The values in this report come from the local vLLM runs. <a href="https://huggingface.co/incoai/Inkling-2-Mini-DFlash2#throughput">Inco AI evaluation</a></p>
+  </section>
+
+  <section id="dspark">
+    <h2>DSpark and CUDA graphs</h2>
+    <h3>Draft depth</h3>
+    <p>The bundled DSpark draft uses <strong>seven probabilistic draft tokens</strong>. In the first valid control, positions five through seven contributed 236 of 2,937 accepted draft tokens (8%). The four-token trial failed at startup because the pinned engine requires seven tokens for the checkpoint’s eight-position draft block.</p>
+    <h3>Sparse prefill capture</h3>
+    <p>The experimental CUDA graph configuration captured <strong>15 prefill shapes</strong> in place of 51. Both configurations captured 48 full decode graphs and covered prefill graph sizes up to 512 tokens.</p>
+    <div class="table-wrap" role="region" aria-label="CUDA graph comparison" tabindex="0">
+      <table>
+        <thead><tr><th scope="col">Metric</th><th scope="col" class="numeric">Default, warm control</th><th scope="col" class="numeric">Sparse capture</th></tr></thead>
+        <tbody>
+          <tr><th scope="row">CUDA graph memory</th><td class="numeric">2.03 GiB</td><td class="numeric">1.45 GiB</td></tr>
+          <tr><th scope="row">Graph capture</th><td class="numeric">10 s</td><td class="numeric">8 s</td></tr>
+          <tr><th scope="row">Launch to API health</th><td class="numeric">154 s</td><td class="numeric">142 s</td></tr>
+          <tr><th scope="row">Single-request decode</th><td class="numeric">36.74 tok/s</td><td class="numeric">36.71 tok/s</td></tr>
+          <tr><th scope="row">Four-request throughput</th><td class="numeric">78.46 tok/s</td><td class="numeric">76.37 tok/s</td></tr>
+          <tr><th scope="row">Warm short time to first token</th><td class="numeric">202.47 ms</td><td class="numeric">198.41 ms</td></tr>
+          <tr><th scope="row">Warmed-kernel prefill, 3,302 tokens</th><td class="numeric">2,825.57 tok/s</td><td class="numeric">2,903.63 tok/s</td></tr>
+          <tr><th scope="row">Warmed-kernel prefill, 25,554 tokens</th><td class="numeric">2,839.96 tok/s</td><td class="numeric">2,868.22 tok/s</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <div class="callout">
+      <p><strong>Graph memory fell by 29%.</strong> Graph capture accounted for 2 seconds of the 12-second readiness difference. Weight loading was also about 8 seconds faster during the sparse run. Request throughput stayed within 3% of the warm control.</p>
+    </div>
+    <p class="small">The earlier 347-second control included substantial first-use JIT. It measured 37.45 tok/s at one request and 74.50 tok/s across four. The warm control is the startup comparison shown above.</p>
+  </section>
+
+  <section id="verification">
+    <h2>Verification</h2>
+    <p>Chat, reasoning, tool round-trip, and vision passed for both corrected DFlash2 runs and the sparse graph configuration. DFlash2 matched <strong>all three greedy probes exactly</strong> against the fresh DSpark control. Two probes reached their 256-token output limit. Sparse graph capture matched <strong>two of three</strong> greedy probes, with a difference on the coding prompt.</p>
+    <div class="table-wrap" role="region" aria-label="Long-context retrieval results" tabindex="0">
+      <table>
+        <thead><tr><th scope="col">Run</th><th scope="col" class="numeric">Prompt tokens</th><th scope="col">Prefix</th><th scope="col" class="numeric">Codes</th><th scope="col" class="numeric">Elapsed</th></tr></thead>
+        <tbody>
+          <tr><th scope="row">Sparse CUDA graphs</th><td class="numeric">130,996</td><td>Warm replay</td><td class="numeric">3/3</td><td class="numeric">4.97 s</td></tr>
+          <tr><th scope="row">Sparse CUDA graphs</th><td class="numeric">261,800</td><td>Warm replay</td><td class="numeric">3/3</td><td class="numeric">5.28 s</td></tr>
+          <tr><th scope="row">DFlash2</th><td class="numeric">130,996</td><td>Cold prompt</td><td class="numeric">3/3</td><td class="numeric">68.10 s</td></tr>
+          <tr><th scope="row">DFlash2</th><td class="numeric">261,392</td><td>Cold prompt</td><td class="numeric">3/3</td><td class="numeric">174.99 s</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p>The first graph-tuning long-context probes returned no codes in the final response under a 64-token output cap. Two requests with 261,798 input tokens each also completed after concurrent submission under that cap. The larger-budget single-request replays qualified retrieval. The cold DFlash2 probes passed with the larger budget on their first attempt. Elapsed times include generation and depend on prefix cache state.</p>
+    <p>Repository validation passed 74 recipe checks, 18 image consistency and diagnostic checks, 8 runtime PR checks, 11 early-OOM fixtures, and 9 networking checks. The normal launcher applied the adapter and served the pinned DFlash2 checkpoint. The temporary containers were removed and the inference workload released the GPU.</p>
+  </section>
+
+  <section id="method">
+    <h2>Method and hardware</h2>
+    <div class="grid">
+      <div class="panel">
+        <h3>Shared settings</h3>
+        <dl>
+          <dt>Host and runtime</dt><dd>One NVIDIA GB10 DGX Spark. NVIDIA driver 580.178.04. vLLM <code>0.1.dev25855+g7cb5dae22</code>, PyTorch 2.14.0 with CUDA 13.0.</dd>
+          <dt>Model and limits</dt><dd>Official Inkling 2 Mini with native mixed NVFP4/MXFP8 expert weights, tensor parallelism 1, 262,144 context tokens, and a 0.8 GPU memory utilization target. The host watchdog used an 11 GiB shared-memory floor.</dd>
+          <dt>Generation workload</dt><dd>Six fixed coding, prose, and reasoning prompts. Requested up to 512 output tokens per request, with temperature 0.6, seed 42, and high reasoning effort.</dd>
+        </dl>
+      </div>
+      <div class="panel">
+        <h3>Reading the timing</h3>
+        <p>Single-request decode uses the median of six completion-token rates after the first streamed content. Four-request throughput divides the total output tokens by the time from first request start to last finish.</p>
+        <p>Prefill uses actual prompt tokens divided by time to the first token. The detailed tables distinguish first-use measurements from three-repeat warmed-kernel medians using fresh prompts. First-use Triton compilation depressed some short-prompt measurements.</p>
+        <p>The initial 321-second boot served health checks, but the client sent an internal checkpoint path and received HTTP 404. The client subsequently read the public model ID from <code>/v1/models</code>.</p>
+      </div>
+    </div>
+    <h3>Hardware measurements and estimates</h3>
+    <p>A warm device copy measured <strong>207.7 GB/s</strong> of combined read and write traffic. Dense BF16 GEMM measured <strong>86.8 TFLOP/s</strong> at size 4,096 and <strong>89.2 TFLOP/s</strong> at size 8,192. The copy is a bandwidth proxy. The estimates below use checkpoint tensor sizes and assume fresh weight reads across visits.</p>
+    <div class="table-wrap" role="region" aria-label="No-draft decode and BF16-equivalent prefill estimates" tabindex="0">
+      <table>
+        <thead><tr><th scope="col">Context or prompt tokens</th><th scope="col" class="numeric">No-draft decode estimate</th><th scope="col" class="numeric">BF16-equivalent prefill estimate</th></tr></thead>
+        <tbody>
+          <tr><th scope="row">128</th><td class="numeric">37.6 tok/s</td><td class="numeric">—</td></tr>
+          <tr><th scope="row">2,560</th><td class="numeric">—</td><td class="numeric">4,290 tok/s</td></tr>
+          <tr><th scope="row">4,096</th><td class="numeric">35.8 tok/s</td><td class="numeric">4,259 tok/s</td></tr>
+          <tr><th scope="row">20,480</th><td class="numeric">—</td><td class="numeric">3,955 tok/s</td></tr>
+          <tr><th scope="row">32,768</th><td class="numeric">30.8 tok/s</td><td class="numeric">3,754 tok/s</td></tr>
+          <tr><th scope="row">131,072</th><td class="numeric">20.9 tok/s</td><td class="numeric">—</td></tr>
+          <tr><th scope="row">262,144</th><td class="numeric">14.6 tok/s</td><td class="numeric">1,927 tok/s</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p>The bandwidth model budgets 2.732 GB of dense tensors, 0.926 GB for the output head, and 1.839 GB of routed expert weights for a short single-token target step. The short target-pass bandwidth floor is about 26.6 ms before scheduling and tokenization. Speculative verification can emit several tokens per target pass.</p>
+    <p>Across the 48 visits, eight use full attention and forty use a 1,024-token sliding window. The logical BF16 target KV minimum is 8.16 GiB per 262,144-token sequence. Engine allocation also includes draft state, convolution state, block grouping, and workspace. The BF16-equivalent prefill estimates use half the measured GEMM rate and omit scheduler and kernel overhead.</p>
+  </section>
+
+  <section id="launch">
+    <h2>Launch commands</h2>
+    <div class="grid">
+      <div class="panel">
+        <h3>Opt-in DFlash2 recipe</h3>
+        <p>Use the pinned Inco AI drafter, Inkling adapter, and Humming expert backend.</p>
+        <pre><code>./run-recipe.sh inkling-2-mini-dflash2 --solo</code></pre>
+        <p class="small">Append <code>-- --moe-backend auto</code> to reproduce the original DFlash2 expert backend selection.</p>
+        <p class="small"><a href="../recipes/inkling-2-mini-dflash2.yaml">Recipe YAML</a> · <a href="../mods/inkling2-dflash2/patch_inkling_dflash2.py">Adapter source</a></p>
+      </div>
+      <div class="panel">
+        <h3>DSpark with sparse CUDA graphs</h3>
+        <p>Apply the tested 15-shape capture list to the bundled DSpark recipe.</p>
+        <pre><code>./run-recipe.sh inkling-2-mini --solo -- \
+  --compilation-config '{"prefill_cudagraph_capture_token_sizes":[1,2,4,8,16,24,32,48,64,96,128,192,256,384,512]}'</code></pre>
+        <p class="small"><a href="../recipes/inkling-2-mini.yaml">Recipe YAML</a></p>
+      </div>
+    </div>
+    <p>The DFlash2 experiment used the recipe’s default graph list. The combined DFlash2 and sparse graph settings were outside the benchmark matrix.</p>
+    <details>
+      <summary>Pinned image and checkpoints</summary>
+      <dl>
+        <dt>vLLM image</dt><dd><code>vllm/vllm-openai@sha256:c2dc759f5984f69c1e2418c6af7c26eb756f5ed2a8934c768ae1253645d1449e</code></dd>
+        <dt>Target and tokenizer</dt><dd><code>thinkingmachines/Inkling-2-Mini</code> at <code>c9d028302cd0f035fdf8e7e91f089a4ce94d2195</code></dd>
+        <dt>DFlash2 checkpoint</dt><dd><code>incoai/Inkling-2-Mini-DFlash2</code> at <code>4f9088ea66c21f2b99ed657d1941c306b03e84d2</code>, about 990 MB of weights</dd>
+      </dl>
+    </details>
+  </section>
+
+  <section id="evidence">
+    <h2>Run ledger</h2>
+    <p>These are the first-pass measurements from the 26 November runs. The 27 November follow-up measurements appear in the Humming and coding benchmark sections. The warmed-kernel medians appear in the dedicated comparison tables. A dash marks an unavailable measurement.</p>
+    <div class="table-wrap" role="region" aria-label="All benchmark runs" tabindex="0">
+  <table class="wide" id="all-runs">
+    <thead><tr><th scope="col">Run</th><th scope="col" class="numeric">Ready (s)</th><th scope="col" class="numeric">1 request (tok/s)</th><th scope="col" class="numeric">4 requests (tok/s)</th><th scope="col" class="numeric">Short TTFT (ms)</th><th scope="col" class="numeric">3,302 prefill (tok/s)</th><th scope="col" class="numeric">25,554 prefill (tok/s)</th><th scope="col" class="numeric">Min. host memory available (GiB)</th></tr></thead>
+    <tbody>
+      <tr><th scope="row">Cold startup probe (HTTP 404)</th><td class="numeric">321</td><td class="numeric">—</td><td class="numeric">—</td><td class="numeric">—</td><td class="numeric">—</td><td class="numeric">—</td><td class="numeric">15.1</td></tr>
+      <tr><th scope="row">DSpark control A</th><td class="numeric">347</td><td class="numeric">37.45</td><td class="numeric">74.50</td><td class="numeric">1,592.4</td><td class="numeric">673.3</td><td class="numeric">2,312.0</td><td class="numeric">15.9</td></tr>
+      <tr><th scope="row">DSpark sparse graphs</th><td class="numeric">142</td><td class="numeric">36.71</td><td class="numeric">76.37</td><td class="numeric">205.3</td><td class="numeric">2,656.7</td><td class="numeric">2,824.6</td><td class="numeric">14.5</td></tr>
+      <tr><th scope="row">DSpark graph control B</th><td class="numeric">154</td><td class="numeric">36.74</td><td class="numeric">78.46</td><td class="numeric">209.8</td><td class="numeric">2,775.9</td><td class="numeric">2,807.4</td><td class="numeric">15.2</td></tr>
+      <tr><th scope="row">DFlash2, raw embeddings</th><td class="numeric">172</td><td class="numeric">15.48</td><td class="numeric">35.53</td><td class="numeric">228.6</td><td class="numeric">2,565.8</td><td class="numeric">2,662.3</td><td class="numeric">15.2</td></tr>
+      <tr><th scope="row">DFlash2, normalized embeddings</th><td class="numeric">174</td><td class="numeric">49.53</td><td class="numeric">102.66</td><td class="numeric">225.3</td><td class="numeric">2,446.7</td><td class="numeric">2,702.4</td><td class="numeric">15.0</td></tr>
+      <tr><th scope="row">DSpark drafter control</th><td class="numeric">154</td><td class="numeric">36.12</td><td class="numeric">74.67</td><td class="numeric">211.2</td><td class="numeric">2,603.7</td><td class="numeric">2,793.4</td><td class="numeric">15.6</td></tr>
+      <tr><th scope="row">DFlash2, recipe repeat</th><td class="numeric">205</td><td class="numeric">50.84</td><td class="numeric">87.96</td><td class="numeric">229.2</td><td class="numeric">1,245.9</td><td class="numeric">2,702.6</td><td class="numeric">19.0</td></tr>
+    </tbody>
+  </table>
+</div>
+    <details>
+      <summary>Single-request decode samples</summary>
+      <div class="table-wrap" role="region" aria-label="Individual decode samples" tabindex="0">
+  <table id="decode-samples">
+    <thead><tr><th scope="col">Run</th><th scope="col">Six samples (tok/s)</th></tr></thead>
+    <tbody>
+      <tr><th scope="row">DSpark control A</th><td>42.43, 38.08, 36.83, 35.18, 51.23, 32.97</td></tr>
+      <tr><th scope="row">DSpark sparse graphs</th><td>41.57, 37.13, 36.29, 34.08, 49.80, 32.42</td></tr>
+      <tr><th scope="row">DSpark graph control B</th><td>42.18, 37.53, 35.95, 34.36, 50.32, 32.37</td></tr>
+      <tr><th scope="row">DFlash2, raw embeddings</th><td>15.53, 15.52, 15.52, 15.33, 15.44, 15.35</td></tr>
+      <tr><th scope="row">DFlash2, normalized embeddings</th><td>55.39, 47.65, 39.45, 51.41, 57.54, 45.05</td></tr>
+      <tr><th scope="row">DSpark drafter control</th><td>41.21, 36.65, 35.59, 33.68, 48.83, 31.69</td></tr>
+      <tr><th scope="row">DFlash2, recipe repeat</th><td>56.16, 48.64, 40.38, 53.05, 58.96, 45.54</td></tr>
+    </tbody>
+  </table>
+</div>
+    </details>
+    <h3>Sources</h3>
+    <ul class="compact">
+      <li><a href="https://vllm.ai/blog/2026-11-20-inkling2-mini">vLLM’s Inkling 2 Mini launch notes</a></li>
+      <li><a href="https://huggingface.co/incoai/Inkling-2-Mini-DFlash2">Inco AI’s DFlash2 checkpoint and benchmarks</a></li>
+      <li><a href="https://huggingface.co/incoai/Inkling-2-Mini-DFlash2/blob/4f9088ea66c21f2b99ed657d1941c306b03e84d2/sglang_inkling_dflash2.py">Inco AI’s Inkling compatibility code</a></li>
+    </ul>
+  </section>
+</main>
+<footer>Benchmark measurements collected on 26–27 November 2026, Japan Standard Time. <a href="#top">Back to top</a></footer>
+</body>
+</html>

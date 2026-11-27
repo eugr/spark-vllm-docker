@@ -98,6 +98,7 @@ INKLING_2_MINI_DFLASH2_ARGS=(
     "--reasoning-parser inkling"
     "--enable-auto-tool-choice"
     "--tool-call-parser inkling"
+    "--moe-backend humming"
     "--speculative-config '{\"method\":\"dflash\",\"model\":\"incoai/Inkling-2-Mini-DFlash2\",\"revision\":\"4f9088ea66c21f2b99ed657d1941c306b03e84d2\",\"num_speculative_tokens\":7,\"draft_sample_method\":\"probabilistic\"}'"
 )
 
