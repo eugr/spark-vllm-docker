@@ -1,142 +1,242 @@
 Subject: [PATCH] [PR #65182] Fuse Mamba2 aligned metadata CUDA graph inputs
 Upstream-PR: https://github.com/vllm-project/vllm/pull/65182
-Upstream-Commit: 26490d2c7b9646bb722e20873e0127a52f10417d
-Integration-Base: 0fda86a35419c9c70dbfada224c838c10fbb62ad
+Upstream-Commit: ba6de8e9da23fd9b317efc3ccbe549dcfb6b7989
+Integration-Base: e4ac319d203f3dad675d71b0b36e35e293ec291f
 
-diff --git a/tests/v1/attention/test_mamba2_prefill_checkpoints.py b/tests/v1/attention/test_mamba2_prefill_checkpoints.py
-index ed780baf2b4d..53a710194ac7 100644
---- a/tests/v1/attention/test_mamba2_prefill_checkpoints.py
-+++ b/tests/v1/attention/test_mamba2_prefill_checkpoints.py
-@@ -2,6 +2,7 @@
- # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
- """Internal prefill checkpoints for Mamba2 prefix caching."""
-
-+import pytest
- import torch
-
+diff --git a/tests/v1/worker/test_mamba_hybrid_model_state.py b/tests/v1/worker/test_mamba_hybrid_model_state.py
+index e483da20f5a5219978812e85dfa6e9a4e329eef5..d093416803a2ef55fadbef78f291aca3ea09b423 100644
+--- a/tests/v1/worker/test_mamba_hybrid_model_state.py
++++ b/tests/v1/worker/test_mamba_hybrid_model_state.py
+@@ -16,7 +16,9 @@ from tests.v1.attention.test_gdn_metadata_builder import (
  from tests.v1.attention.utils import (
-@@ -10,6 +11,8 @@
+     BatchSpec,
      create_vllm_config,
-     register_mamba_layers,
++    register_mamba_layers,
  )
 +from vllm.config import SpeculativeConfig
-+from vllm.config.compilation import CUDAGraphMode
- from vllm.v1.attention.backends.mamba2_attn import (
-     Mamba2AttentionMetadataBuilder,
+ from vllm.config.compilation import CUDAGraphMode
+ from vllm.config.mamba import MambaBackendEnum
+ from vllm.platforms import current_platform
+@@ -29,6 +31,7 @@ from vllm.v1.attention.backends.recoverssm_metadata import (
+     RecoverSSMMetadata,
+     RecoverSSMPostprocessMetadata,
  )
-@@ -77,11 +80,24 @@ def _create_mamba2_builder(
-     enable_prefix_caching: bool = True,
-     num_prefill_checkpoint_blocks: int = 1,
-     prefill_checkpoint_alignment: int | None = 1,
-+    num_speculative_tokens: int = 0,
-+    full_cudagraph: bool = False,
-+    pipeline_parallel_size: int = 1,
-+    use_replayssm: bool = False,
- ) -> Mamba2AttentionMetadataBuilder:
-     vllm_config = create_vllm_config(
-         model_name="Qwen/Qwen3.5-0.8B", block_size=MAMBA_BLOCK_SIZE
-     )
-     vllm_config.cache_config.enable_prefix_caching = enable_prefix_caching
-+    vllm_config.cache_config.use_replayssm = use_replayssm
-+    vllm_config.parallel_config.pipeline_parallel_size = pipeline_parallel_size
++from vllm.v1.attention.backends.utils import mamba_get_block_table_tensor
+ from vllm.v1.core.single_type_kv_cache_manager import MambaManager
+ from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheGroup, MambaSpec
+ from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
+@@ -37,6 +40,7 @@ from vllm.v1.worker.gpu.model_states.mamba_hybrid import (
+     MambaHybridModelState,
+ )
+ from vllm.v1.worker.gpu.model_states.recoverssm import RecoverSSMState
++from vllm.v1.worker.mamba_utils import MambaSpecDecodeGPUContext
+ from vllm.v1.worker.utils import AttentionGroup
+ 
+ 
+@@ -51,6 +55,215 @@ GPU_DEVICE = current_platform.device_type
+ HAS_GPU = current_platform.is_cuda_alike() or current_platform.is_xpu()
+ 
+ 
++@pytest.mark.skipif(not current_platform.is_cuda(), reason="Requires CUDA")
++@pytest.mark.parametrize("num_speculative_tokens", [0, 2])
++@torch.inference_mode()
++def test_prepare_attn_binds_mrv2_inputs_per_mamba2_group(
++    num_speculative_tokens: int,
++) -> None:
++    max_num_reqs = 4
++    num_active_reqs = 2
++    block_size = 16
++    layer_names = ["mamba.0", "mamba.1"]
++    config = create_vllm_config(
++        model_name="Qwen/Qwen3.5-0.8B",
++        block_size=block_size,
++        max_num_seqs=max_num_reqs,
++        max_num_batched_tokens=32,
++    )
++    config.cache_config.enable_prefix_caching = True
++    config.compilation_config.cudagraph_mode = CUDAGraphMode.FULL
++    config.model_config.hf_text_config.mamba_chunk_size = block_size
 +    if num_speculative_tokens:
-+        vllm_config.speculative_config = SpeculativeConfig(
++        config.speculative_config = SpeculativeConfig(
 +            method="ngram",
 +            num_speculative_tokens=num_speculative_tokens,
 +        )
-+    if full_cudagraph:
-+        vllm_config.compilation_config.cudagraph_mode = CUDAGraphMode.FULL
-     # get_mamba_chunk_size() reads `mamba_chunk_size` then `chunk_size`.
-     vllm_config.model_config.hf_text_config.mamba_chunk_size = CHUNK_SIZE
-     spec = MambaSpec(
-@@ -105,6 +121,99 @@ def _create_mamba2_builder(
-     return builder
-
-
-+@torch.inference_mode()
-+@pytest.mark.parametrize("num_speculative_tokens", [0, 2])
-+@pytest.mark.parametrize("pipeline_parallel_size", [1, 2])
-+def test_mrv2_graph_inputs_alias_aligned_metadata(
-+    num_speculative_tokens: int,
-+    pipeline_parallel_size: int,
-+) -> None:
-+    builder = _create_mamba2_builder(
-+        num_prefill_checkpoint_blocks=0,
-+        prefill_checkpoint_alignment=None,
-+        num_speculative_tokens=num_speculative_tokens,
-+        full_cudagraph=True,
-+        pipeline_parallel_size=pipeline_parallel_size,
++    register_mamba_layers(config, layer_names, None)
++    spec = MambaSpec(
++        block_size=block_size,
++        shapes=((4, 8),),
++        dtypes=(torch.float16,),
 +    )
-+    num_reqs = 2
-+    num_slots = 1 + num_speculative_tokens
-+    aligned = torch.arange(
-+        builder.decode_cudagraph_max_bs * num_slots,
-+        dtype=torch.int32,
-+    ).view(builder.decode_cudagraph_max_bs, num_slots)
-+    accepted = (
-+        torch.arange(
-+            1,
-+            builder.decode_cudagraph_max_bs + 1,
-+            dtype=torch.int32,
++    builders = [
++        Mamba2AttentionMetadataBuilder(spec, [name], config, torch.device("cuda"))
++        for name in layer_names
++    ]
++    groups = [
++        AttentionGroup(
++            Mamba2AttentionBackend,  # type: ignore[type-abstract]
++            [name],
++            spec,
++            kv_cache_group_id=group_idx,
++            metadata_builders=[builders[group_idx]],
 +        )
++        for group_idx, name in enumerate(layer_names)
++    ]
++    attn_groups = [[group] for group in groups]
++    kv_cache_config = KVCacheConfig(
++        num_blocks=64,
++        kv_cache_tensors=[],
++        kv_cache_groups=[
++            KVCacheGroup.from_layers(
++                {name: MambaManager.layer_config(group.kv_cache_spec)}
++            )
++            for name, group in zip(layer_names, groups)
++        ],
++    )
++
++    block_tables = tuple(
++        (
++            torch.arange(max_num_reqs * 8, dtype=torch.int32, device="cuda")
++            .reshape(max_num_reqs, 8)
++            .add_(100 * (group_idx + 1))
++        )
++        for group_idx in range(len(groups))
++    )
++    seq_lens = torch.tensor([35, 51, 0, 0], dtype=torch.int32, device="cuda")
++    num_state_slots = 1 + num_speculative_tokens
++    ctx = object.__new__(MambaSpecDecodeGPUContext)
++    ctx.block_size = block_size
++    ctx.mamba_group_ids = list(range(len(groups)))
++    ctx.num_groups = len(groups)
++    ctx.block_table_stride_req = block_tables[0].stride(0)
++    ctx.aligned_index_block_table_ptrs = torch.tensor(
++        [table.data_ptr() for table in block_tables],
++        dtype=torch.int64,
++        device="cuda",
++    )
++    ctx.aligned_state_indices = torch.empty(
++        (len(groups), max_num_reqs, num_state_slots),
++        dtype=torch.int32,
++        device="cuda",
++    )
++    ctx.is_initialized = True
++
++    state = object.__new__(MambaHybridModelState)
++    state.vllm_config = config
++    state.prefix_caching = True
++    state._use_replayssm_trackers = False
++    state.recoverssm = None
++    state._mamba_ctx = ctx
++    state.num_accepted_tokens_gpu = torch.tensor(
++        [2, 1, 1, 1], dtype=torch.int32, device="cuda"
++    )
++    state._mamba_num_accepted_tokens_batch = (
++        torch.ones(max_num_reqs, dtype=torch.int32, device="cuda")
 +        if num_speculative_tokens
 +        else None
 +    )
-+    builder.mamba_aligned_state_indices = aligned[:num_reqs]
-+    builder.bind_mrv2_graph_inputs(aligned, accepted)
 +
 +    query_len = 1 + num_speculative_tokens
-+    common = create_common_attn_metadata(
-+        BatchSpec(
-+            seq_lens=[32, 48],
-+            query_lens=[query_len, query_len],
++    num_tokens = num_active_reqs * query_len
++    buffers = InputBuffers(max_num_reqs, num_tokens, torch.device("cuda"))
++    batch = InputBatch.make_dummy(num_active_reqs, num_tokens, buffers)
++    batch.num_reqs_after_padding = max_num_reqs
++    batch.num_tokens_after_padding = num_tokens
++    batch.num_scheduled_tokens = np.full(num_active_reqs, query_len, dtype=np.int32)
++    batch.num_draft_tokens_per_req = (
++        np.full(num_active_reqs, num_speculative_tokens, dtype=np.int32)
++        if num_speculative_tokens
++        else None
++    )
++    batch.query_start_loc_np = np.array(
++        [0, query_len, num_tokens, num_tokens, num_tokens], dtype=np.int32
++    )
++    buffers.query_start_loc.copy_(torch.from_numpy(batch.query_start_loc_np))
++    batch.query_start_loc = buffers.query_start_loc
++    batch.idx_mapping = torch.arange(num_active_reqs, dtype=torch.int32, device="cuda")
++    batch.seq_lens_cpu_upper_bound = seq_lens.cpu()
++    batch.seq_lens = seq_lens
++    batch.is_prefilling_np = np.zeros(num_active_reqs, dtype=bool)
++    batch.prefill_runs_as_decode_np = None
++    batch.dcp_local_seq_lens = None
++    batch.positions = torch.zeros(num_tokens, dtype=torch.int64, device="cuda")
++    batch.prompt_lens = None
++
++    metadata = state.prepare_attn(
++        input_batch=batch,
++        cudagraph_mode=CUDAGraphMode.FULL,
++        block_tables=block_tables,
++        slot_mappings=torch.zeros(
++            len(groups), num_tokens, dtype=torch.int64, device="cuda"
 +        ),
-+        MAMBA_BLOCK_SIZE,
-+        DEVICE,
-+        arange_block_indices=True,
-+    ).replace(is_prefilling=torch.zeros(num_reqs, dtype=torch.bool))
-+    metadata = builder.build(
-+        common_prefix_len=0,
-+        common_attn_metadata=common,
-+        num_accepted_tokens=None if accepted is None else accepted[:num_reqs],
-+        num_decode_draft_tokens_cpu=(
-+            None
-+            if not num_speculative_tokens
-+            else torch.full((num_reqs,), num_speculative_tokens, dtype=torch.int32)
-+        ),
++        attn_groups=attn_groups,
++        kv_cache_config=kv_cache_config,
 +    )
 +
-+    assert metadata.state_indices_tensor_d is not None
-+    assert metadata.state_indices_tensor_d.data_ptr() == aligned.data_ptr()
-+    torch.testing.assert_close(
-+        metadata.state_indices_tensor_d,
-+        aligned[:num_reqs],
-+    )
-+    if accepted is None:
-+        assert metadata.num_accepted_tokens is None
-+    else:
-+        assert metadata.num_accepted_tokens is not None
-+        assert metadata.num_accepted_tokens.data_ptr() == accepted.data_ptr()
-+        torch.testing.assert_close(
-+            metadata.num_accepted_tokens,
-+            accepted[:num_reqs],
++    for group_idx, name in enumerate(layer_names):
++        expected = mamba_get_block_table_tensor(
++            block_tables[group_idx],
++            seq_lens,
++            spec,
++            True,
++            num_speculative_tokens,
 +        )
++        torch.testing.assert_close(ctx.aligned_state_indices[group_idx], expected)
++        group_metadata = metadata[name]
++        torch.testing.assert_close(group_metadata.state_indices_tensor_d, expected)
++        assert (
++            group_metadata.state_indices_tensor_d.data_ptr()
++            == ctx.aligned_state_indices[group_idx].data_ptr()
++        )
++        if num_speculative_tokens:
++            assert group_metadata.num_accepted_tokens is not None
++            accepted_batch = state._mamba_num_accepted_tokens_batch
++            assert accepted_batch is not None
++            assert (
++                group_metadata.num_accepted_tokens.data_ptr()
++                == accepted_batch.data_ptr()
++            )
++            assert group_metadata.num_accepted_tokens.tolist() == [2, 1, 1, 1]
++
++    assert not torch.equal(
++        metadata[layer_names[0]].state_indices_tensor_d,
++        metadata[layer_names[1]].state_indices_tensor_d,
++    )
 +
 +
++@pytest.mark.skipif(not current_platform.is_cuda(), reason="Requires CUDA")
 +@torch.inference_mode()
 +def test_mrv2_graph_inputs_keep_state_staging_for_replayssm() -> None:
-+    builder = _create_mamba2_builder(
-+        num_prefill_checkpoint_blocks=0,
-+        prefill_checkpoint_alignment=None,
++    config = create_vllm_config(
++        model_name="Qwen/Qwen3.5-0.8B",
++        block_size=16,
++        max_num_seqs=4,
++    )
++    config.cache_config.enable_prefix_caching = True
++    config.cache_config.use_replayssm = True
++    config.speculative_config = SpeculativeConfig(
++        method="ngram",
 +        num_speculative_tokens=2,
-+        full_cudagraph=True,
-+        use_replayssm=True,
++    )
++    config.compilation_config.cudagraph_mode = CUDAGraphMode.FULL
++    config.model_config.hf_text_config.mamba_chunk_size = 16
++    register_mamba_layers(config, ["mamba"], None)
++    builder = Mamba2AttentionMetadataBuilder(
++        MambaSpec(
++            block_size=16,
++            shapes=((4, 8),),
++            dtypes=(torch.float16,),
++        ),
++        ["mamba"],
++        config,
++        torch.device("cuda"),
 +    )
 +    original_state_indices = builder.state_indices_tensor_d
 +    aligned = torch.arange(
-+        builder.decode_cudagraph_max_bs, dtype=torch.int32
++        builder.decode_cudagraph_max_bs, dtype=torch.int32, device="cuda"
 +    ).unsqueeze(-1)
-+    accepted = torch.ones(builder.decode_cudagraph_max_bs, dtype=torch.int32)
++    accepted = torch.ones(
++        builder.decode_cudagraph_max_bs, dtype=torch.int32, device="cuda"
++    )
 +
 +    builder.bind_mrv2_graph_inputs(aligned, accepted)
 +
@@ -146,26 +246,46 @@ index ed780baf2b4d..53a710194ac7 100644
 +    assert builder.decode_num_accepted_tokens.data_ptr() == accepted.data_ptr()
 +
 +
- def _build(builder, seq_lens, query_lens):
-     common = create_common_attn_metadata(
-         BatchSpec(seq_lens=seq_lens, query_lens=query_lens),
-diff --git a/vllm/v1/attention/backends/mamba_attn.py b/vllm/v1/attention/backends/mamba_attn.py
-index bb2532356e34..ed777156f9ed 100644
---- a/vllm/v1/attention/backends/mamba_attn.py
-+++ b/vllm/v1/attention/backends/mamba_attn.py
-@@ -109,6 +109,8 @@ def __init__(
-         self.checkpoint_alignment = get_kv_cache_checkpoint_alignment(
-             vllm_config, layer_names
-         )
+ def test_prepare_attn_forwards_positions(monkeypatch: pytest.MonkeyPatch) -> None:
+     state = object.__new__(MambaHybridModelState)
+     state.vllm_config = SimpleNamespace(num_speculative_tokens=0)
+@@ -126,6 +339,7 @@ def test_padded_prompt_tail_builds_as_spec_decode(
+     state.prefix_caching = False
+     state._use_replayssm_trackers = False
+     state.recoverssm = None
++    state._mamba_num_accepted_tokens_batch = None
+     state.num_accepted_tokens_gpu = torch.ones(4, dtype=torch.int32)
+ 
+     # A verify decode, a padded prompt tail (128 of 129 prompt tokens already
+@@ -191,6 +405,7 @@ def _mamba_hybrid_state(num_speculative_tokens: int) -> MambaHybridModelState:
+     state.prefix_caching = False
+     state._use_replayssm_trackers = False
+     state.recoverssm = None
++    state._mamba_num_accepted_tokens_batch = None
+     # A request that accepted 3 drafts (plus the bonus token) on the previous
+     # step; the others have never had a draft accepted.
+     state.num_accepted_tokens_gpu = torch.tensor([4, 1, 1], dtype=torch.int32)
+diff --git a/vllm/v1/attention/backends/mamba2_attn.py b/vllm/v1/attention/backends/mamba2_attn.py
+index c9c246095a0df8d40c7ba4dbea98ee6b384e1bf9..862d616bc9da17ce5941c9794f68021e938c0e39 100644
+--- a/vllm/v1/attention/backends/mamba2_attn.py
++++ b/vllm/v1/attention/backends/mamba2_attn.py
+@@ -149,6 +149,8 @@ class Mamba2AttentionMetadataBuilder(
+         device: torch.device,
+     ):
+         super().__init__(kv_cache_spec, layer_names, vllm_config, device)
 +        if torch.device(device).type == "cuda":
 +            self.mamba_aligned_state_indices: torch.Tensor | None = None
-
-         # Enable speculative decoding support
-         self.speculative_config = vllm_config.speculative_config
-@@ -198,6 +200,33 @@ def __init__(
+         chunk_size = vllm_config.model_config.get_mamba_chunk_size()
+         assert chunk_size is not None, (
+             "chunk_size needs to be set in the model config for Mamba2 models"
+diff --git a/vllm/v1/attention/backends/mamba_attn.py b/vllm/v1/attention/backends/mamba_attn.py
+index 035c70ae20df9fbc1cfcecc7a6e1faecd60f9927..77ac3f4ee4bb0e9100349b1539c35e3cd8f22455 100644
+--- a/vllm/v1/attention/backends/mamba_attn.py
++++ b/vllm/v1/attention/backends/mamba_attn.py
+@@ -211,6 +211,33 @@ class BaseMambaAttentionMetadataBuilder(AttentionMetadataBuilder[M], abc.ABC):
          if self.use_spec_decode:
              self.supports_update_block_table = False
-
+ 
 +    def bind_mrv2_graph_inputs(
 +        self,
 +        state_indices: torch.Tensor,
@@ -196,10 +316,10 @@ index bb2532356e34..ed777156f9ed 100644
      def build_for_cudagraph_capture(
          self, common_attn_metadata: CommonAttentionMetadata
      ) -> M:
-@@ -474,13 +503,15 @@ def _compute_common_metadata(
+@@ -487,13 +514,15 @@ class BaseMambaAttentionMetadataBuilder(AttentionMetadataBuilder[M], abc.ABC):
          is_flush_d = None
          replayssm_scratch = None
-
+ 
 -        state_indices_tensor = mamba_get_block_table_tensor(
 -            common_attn_metadata.block_table_tensor,
 -            common_attn_metadata.seq_lens,
@@ -216,10 +336,10 @@ index bb2532356e34..ed777156f9ed 100644
 +                self.vllm_config.cache_config.enable_prefix_caching,
 +                self.num_speculative_blocks,
 +            )
-
+ 
          if state_indices_tensor.dim() == 1:
              state_indices_tensor = state_indices_tensor.unsqueeze(-1)
-@@ -601,18 +632,27 @@ def _update_metadata_for_cudagraph_capture(
+@@ -617,18 +646,27 @@ class BaseMambaAttentionMetadataBuilder(AttentionMetadataBuilder[M], abc.ABC):
              and self.compilation_config.cudagraph_mode.has_full_cudagraphs()
          ):
              padded_bs = metadata.num_reqs
@@ -236,7 +356,7 @@ index bb2532356e34..ed777156f9ed 100644
 +                )
              state_indices_tensor_d = self.state_indices_tensor_d[:padded_bs]
              state_indices_tensor_d[metadata.num_decodes :] = NULL_BLOCK_ID
-
+ 
              if self.use_spec_decode and num_accepted_tokens is not None:
                  assert query_start_loc_d is not None
                  query_start_loc_d = query_start_loc_d[: padded_bs + 1]
@@ -253,11 +373,34 @@ index bb2532356e34..ed777156f9ed 100644
                  num_accepted_tokens = self.decode_num_accepted_tokens[:padded_bs]
                  num_accepted_tokens[metadata.num_decodes :] = (
                      1  # pad with 1st slot index
+@@ -683,13 +721,15 @@ class BaseMambaAttentionMetadataBuilder(AttentionMetadataBuilder[M], abc.ABC):
+         blk_table: torch.Tensor,
+         slot_mapping: torch.Tensor,
+     ) -> M:
+-        state_indices_tensor = mamba_get_block_table_tensor(
+-            blk_table,
+-            metadata.seq_lens,
+-            self.kv_cache_spec,
+-            self.vllm_config.cache_config.enable_prefix_caching,
+-            self.num_speculative_blocks,
+-        )
++        state_indices_tensor = getattr(self, "mamba_aligned_state_indices", None)
++        if state_indices_tensor is None:
++            state_indices_tensor = mamba_get_block_table_tensor(
++                blk_table,
++                metadata.seq_lens,
++                self.kv_cache_spec,
++                self.vllm_config.cache_config.enable_prefix_caching,
++                self.num_speculative_blocks,
++            )
+         if state_indices_tensor.dim() == 1:
+             state_indices_tensor = state_indices_tensor.unsqueeze(-1)
+ 
 diff --git a/vllm/v1/worker/gpu/model_states/mamba_hybrid.py b/vllm/v1/worker/gpu/model_states/mamba_hybrid.py
-index c87fb340e614..43688201d71a 100644
+index c87fb340e6147b34627a25a43ad75668b3bf3304..1aa8a2815ec0c8a1ac8c2590f5aaab60a06c9ff5 100644
 --- a/vllm/v1/worker/gpu/model_states/mamba_hybrid.py
 +++ b/vllm/v1/worker/gpu/model_states/mamba_hybrid.py
-@@ -95,6 +95,11 @@ def __init__(
+@@ -95,6 +95,11 @@ class MambaHybridModelState(DefaultModelState):
          # the postprocess copy machinery, so the per-step src columns and the
          # running state_idx are kept GPU-resident.
          self.prefix_caching = self.cache_config.enable_prefix_caching
@@ -269,12 +412,12 @@ index c87fb340e614..43688201d71a 100644
          self._use_replayssm_trackers = vllm_config.use_replayssm_trackers
          if self._use_replayssm_trackers:
              self._is_prefilling_gpu = torch.zeros(
-@@ -272,7 +277,12 @@ def prepare_attn(
+@@ -272,7 +277,12 @@ class MambaHybridModelState(DefaultModelState):
          num_accepted_tokens = None
          num_decode_draft_tokens_cpu = None
          if not for_capture and self.vllm_config.num_speculative_tokens > 0:
 -            num_accepted_tokens = self.num_accepted_tokens_gpu.new_ones(num_reqs)
-+            accepted_batch = getattr(self, "_mamba_num_accepted_tokens_batch", None)
++            accepted_batch = self._mamba_num_accepted_tokens_batch
 +            if accepted_batch is None:
 +                num_accepted_tokens = self.num_accepted_tokens_gpu.new_ones(num_reqs)
 +            else:
@@ -283,7 +426,7 @@ index c87fb340e614..43688201d71a 100644
              num_accepted_tokens[: input_batch.num_reqs] = self.num_accepted_tokens_gpu[
                  input_batch.idx_mapping
              ]
-@@ -313,8 +323,17 @@ def prepare_attn(
+@@ -313,8 +323,17 @@ class MambaHybridModelState(DefaultModelState):
                  all_group_indices = ctx.compute_aligned_state_indices(
                      input_batch.seq_lens, num_reqs
                  )
@@ -299,6 +442,6 @@ index c87fb340e614..43688201d71a 100644
 +                            ctx.aligned_state_indices[group_idx, :graph_size],
 +                            None if accepted is None else accepted[:graph_size],
 +                        )
-
+ 
          mamba_attn_metadata = MambaHybridAttnMetadata(
              is_prefilling=is_prefilling,
