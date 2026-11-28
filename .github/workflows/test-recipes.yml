@@ -69,6 +69,7 @@ jobs:
         chmod +x tests/test_recipes.sh tests/test_launch_cluster_image_sync.sh
         chmod +x tests/test_launch_cluster_vllm_pr.sh
         chmod +x tests/test_launch_cluster_earlyoom.sh
+        chmod +x tests/test_launch_cluster_remote_quoting.sh
     
     - name: Test per-device CUDA kernel target selection
       run: python3 tests/test_blackwell_target_union.py
@@ -101,6 +102,7 @@ jobs:
         ./tests/test_launch_cluster_image_sync.sh
         ./tests/test_launch_cluster_vllm_pr.sh
         ./tests/test_launch_cluster_earlyoom.sh
+        ./tests/test_launch_cluster_remote_quoting.sh
         python3 tests/test_launch_cluster_networking.py
 
     - name: Test Docker image identity and distribution
