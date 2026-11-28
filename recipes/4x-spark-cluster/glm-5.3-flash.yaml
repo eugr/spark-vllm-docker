@@ -1,0 +1,63 @@
+# Recipe: GLM-5.3-Flash (zai-org/GLM-5.3-Flash) on 4x DGX Spark (TP=4 + Ray)
+
+recipe_version: "1"
+name: glm-5.3-flash
+description: GLM-5.3-Flash (native FP8, glm5_next)
+model: zai-org/GLM-5.3-Flash
+
+# Stock per-model image that ships glm5_next. Pull instead of building.
+container: vllm/vllm-openai:glm53-flash-arm64-cu130
+pull_image: true
+
+# 320B FP8 does not fit one node; requires a 4-node cluster at TP=4.
+cluster_only: true
+
+mods:
+  # stock image does not have ray, needs to be installed.
+  - mods/install-ray
+  # The dress-up mod (rope-pad NoPE-MLA into fp8_ds_mla) is needed for sm120
+  - mods/fix-glm53-nope-rope-pad
+  # Multimodal support
+  - mods/fix-glm53-mm-model-path
+  # supports longer context
+  - mods/fix-persistent-topk-sm120
+
+defaults:
+  port: 8000
+  host: 0.0.0.0
+  tensor_parallel: 4
+  gpu_memory_utilization: 0.88
+  max_model_len: 524288  # 1048576 is the arch ceiling
+  max_num_seqs: 4
+  max_num_batched_tokens: 4096
+  spec_config: '{"method":"mtp","num_speculative_tokens":5}'
+  served_model_name: glm-5.3-flash
+
+env:
+  # --- sparse indexer persistent_topk gate (mods/fix-persistent-topk-sm120) ---
+  # This "turns on" the topk mod
+  VLLM_SPARSE_IDX_FORCE_PERSISTENT_TOPK: "0"
+  # dress-up gate (mods/fix-glm53-nope-rope-pad)
+  VLLM_MLA_NOPE_PAD_ROPE: "1"
+
+command: |
+  vllm serve zai-org/GLM-5.3-Flash \
+      --host {host} \
+      --port {port} \
+      --served-model-name {served_model_name} \
+      --tensor-parallel-size {tensor_parallel} \
+      --max-model-len {max_model_len} \
+      --max-num-seqs {max_num_seqs} \
+      --max-num-batched-tokens {max_num_batched_tokens} \
+      --gpu-memory-utilization {gpu_memory_utilization} \
+      --kv-cache-dtype fp8_ds_mla \
+      --moe-backend marlin \
+      --disable-custom-all-reduce \
+      --speculative-config '{spec_config}' \
+      --enable-auto-tool-choice \
+      --enable-chunked-prefill \
+      --enable-prefix-caching \
+      --reasoning-parser glm45 \
+      --tool-call-parser glm47 \
+      --distributed-executor-backend ray \
+      --trust-remote-code
