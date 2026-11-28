@@ -102,6 +102,12 @@ INKLING_2_MINI_DFLASH2_ARGS=(
     "--speculative-config '{\"method\":\"dflash\",\"model\":\"incoai/Inkling-2-Mini-DFlash2\",\"revision\":\"4f9088ea66c21f2b99ed657d1941c306b03e84d2\",\"num_speculative_tokens\":7,\"draft_sample_method\":\"probabilistic\"}'"
 )
 
+# Inkling 2 Mini DFlash2 with Humming MXFP8 dense/coda kernels + sparse prefill graphs
+INKLING_2_MINI_DFLASH2_MXFP8_ARGS=(
+    "${INKLING_2_MINI_DFLASH2_ARGS[@]}"
+    "--compilation-config '{\"prefill_cudagraph_capture_token_sizes\":[1,2,4,8,16,24,32,48,64,96,128,192,256,384,512]}'"
+)
+
 # ==============================================================================
 # qwen3.8-27b-nvfp4-dflash2-fp8-head
 # README Reference: DFlash2 with compressed-tensors FP8 lm_head

@@ -100,6 +100,33 @@ comparison with surrounding controls, Humming improved 25.5K-token prefill by
 original expert backend selection.
 [Benchmark findings](../docs/inkling-2-mini-spark-findings.html)
 
+Two optimized single-Spark variants layer [mods/inkling2-perf-opt](../mods/inkling2-perf-opt/README.md)
+on top of the DFlash2 recipe:
+
+- [Inkling 2 Mini DFlash2 Lossless](inkling-2-mini-dflash2-lossless.yaml):
+  quantizes only the DFlash2 draft model at load time (`NVFP4` draft `lm_head` +
+  `MXFP8` 5-layer draft backbone), keeping the target model and target `lm_head`
+  untouched (**4/4 bitwise-identical greedy hashes** with the baseline DFlash2
+  recipe; **+5.9%** coding decode, **+6.5%** sampled reasoning, **+9.2%** decode
+  at 41K context).
+- [Inkling 2 Mini DFlash2 MXFP8](inkling-2-mini-dflash2-mxfp8.yaml): fastest
+  tested single-Spark configuration. Adds Humming `MXFP8` on the four coda MoE
+  layers with cached W4A4 alignment, online block-32 `MXFP8 W8A16` on target
+  dense attention projections (`qkvr`/`wo_ud`) and `lm_head`, and sparse prefill
+  CUDA graphs (**+31.6%** coding decode at `73.40 tok/s`, **+34.4%** sampled
+  reasoning at `68.41 tok/s`, **+16.9%** 4-req and **+7.1%** 8-req throughput,
+  **+8.2%** 32K prefill, and **+27.8%** decode at 41K context). Pass
+  `-e INKLING2_OPT_TARGET_DENSE=mxfp8` to keep the target `lm_head` in BF16, or
+  `-- --max-num-batched-tokens 4096` for peak 32K prefill (`3,336 tok/s`).
+
+```bash
+# Strictly target-lossless (quantized DFlash2 draft only)
+./run-recipe.sh inkling-2-mini-dflash2-lossless --solo --setup
+
+# Fastest overall (full Humming MXFP8 dense + coda + quantized DFlash2)
+./run-recipe.sh inkling-2-mini-dflash2-mxfp8 --solo --setup
+```
+
 vLLM fetches the draft checkpoint separately during startup. To pre-cache it for
 offline use, download the pinned revision into the Hugging Face cache before launch.
 

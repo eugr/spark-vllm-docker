@@ -1,0 +1,41 @@
+# Inkling 2 Mini with quantized DFlash2 drafter on one DGX Spark (100% target-lossless).
+# Quantizes only the draft model's lm_head (NVFP4) and 5-layer backbone (MXFP8)
+# via Humming at startup while leaving the target model and target lm_head untouched.
+recipe_version: "1"
+name: Inkling 2 Mini DFlash2 Lossless
+description: Serve Inkling 2 Mini with Humming NVFP4 experts and a Humming-quantized DFlash2 drafter (100% target-lossless) on one DGX Spark
+
+model: thinkingmachines/Inkling-2-Mini
+container: vllm/vllm-openai@sha256:c2dc759f5984f69c1e2418c6af7c26eb756f5ed2a8934c768ae1253645d1449e
+pull_image: true
+solo_only: true
+
+mods:
+  - mods/inkling2-dflash2
+  - mods/inkling2-perf-opt
+
+env:
+  INKLING2_OPT_DFLASH_LMHEAD: "nvfp4"
+  INKLING2_OPT_DFLASH_BACKBONE: "mxfp8"
+
+defaults:
+  port: 8000
+  host: 0.0.0.0
+  tensor_parallel: 1
+  max_model_len: 262144
+  gpu_memory_utilization: 0.8
+
+command: |
+  vllm serve thinkingmachines/Inkling-2-Mini \
+    --revision c9d028302cd0f035fdf8e7e91f089a4ce94d2195 \
+    --tokenizer-revision c9d028302cd0f035fdf8e7e91f089a4ce94d2195 \
+    --host {host} \
+    --port {port} \
+    --tensor-parallel-size {tensor_parallel} \
+    --max-model-len {max_model_len} \
+    --gpu-memory-utilization {gpu_memory_utilization} \
+    --reasoning-parser inkling \
+    --enable-auto-tool-choice \
+    --tool-call-parser inkling \
+    --moe-backend humming \
+    --speculative-config '{{"method":"dflash","model":"incoai/Inkling-2-Mini-DFlash2","revision":"4f9088ea66c21f2b99ed657d1941c306b03e84d2","num_speculative_tokens":7,"draft_sample_method":"probabilistic"}}'
