@@ -1,0 +1,75 @@
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py b/vllm/distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py
+index 823ea8b..2a1e2b9 100644
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py
+@@ -240,6 +240,23 @@ STREAM_WAVE_CHUNKS = max(
+     0, int(os.environ.get("VLLM_OFFLOAD_STREAM_WAVE_CHUNKS", "0") or 0)
+ )
+ STREAM_ENABLED = STREAM_WAVE_CHUNKS > 0
++# OPEN A, LOUD FAILURE. A wave that has made no progress for this many seconds
++# KILLS THE ENGINE instead of retrying forever. Observed on a build of this
++# profile: a wave whose source files did not exist on disk retried ~1.6M times
++# over 95 minutes -- engine pinned at ~170% CPU, 97% of GPU KV held, nothing
++# served, and the client's 15-minute resends walked into the same hole six
++# times. A dead engine is visible; that was not.
++#
++# Why a crash and not recompute: falling back means reporting this request's
++# still-unloaded GPU blocks as failed loads so vLLM recomputes them, which runs
++# through the worker-side load-error path on EVERY rank, and whether vLLM
++# re-enters cleanly on already-allocated blocks has not been verified.
++# Unverified KV reuse produces garbage output; a crash cannot.
++#
++# Why 120 s is safe: over 16 days of production journal, no wave outside that
++# incident ever reached even MAX_WAVE_PROMOTE_RETRIES (50 steps).
++# 0 = retry forever (the previous behaviour).
++WAVE_STUCK_S = float(os.environ.get("VLLM_OFFLOAD_STREAM_WAVE_STUCK_S", "120") or 0)
+ # WAVE STREAMING (draft): log ceiling for a wave that makes no progress --
+ # its promotion refused by a full primary tier under concurrent contention, or
+ # re-staged because a staged key left the primary tier before its load (design
+@@ -1091,16 +1108,30 @@ class OffloadingConnectorScheduler:
+         self._connector_stats.increase_counter(
+             _ConnectorMetricName.WAVE_RETRY, labelvalues=(reason,)
+         )
++        now = time.monotonic()
++        if w.first_retry_at is None:
++            w.first_retry_at = now
++        elif WAVE_STUCK_S > 0 and now - w.first_retry_at > WAVE_STUCK_S:
++            # Deliberately uncaught: EngineCore dies and the API returns
++            # errors. See WAVE_STUCK_S.
++            raise RuntimeError(
++                f"KVWAVE STUCK: request {req_id} wave {wave_idx} made no progress "
++                f"for {now - w.first_retry_at:.0f}s ({w.retry_count} retries, "
++                f"last: {reason}, {len(w.keys)} keys). No recompute fallback "
++                f"exists (OPEN A); killing the engine rather than spinning. "
++                f"Check 'block I/O failed' lines above for the missing files."
++            )
+         stuck_multiple, rem = divmod(w.retry_count, MAX_WAVE_PROMOTE_RETRIES)
+         if rem == 0 and stuck_multiple & (stuck_multiple - 1) == 0:
+             logger.warning(
+                 "Request %s: wave %d has made no progress in %d steps (last: %s). "
+-                "Retrying indefinitely; an abort-and-recompute fallback is not "
+-                "implemented (OPEN A).",
++                "No recompute fallback (OPEN A); the engine will be killed if "
++                "this lasts %.0fs.",
+                 req_id,
+                 wave_idx,
+                 w.retry_count,
+                 reason,
++                WAVE_STUCK_S,
+             )
+         elif PROBE_ENABLED:
+             logger.info(
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/offloading/wave_slicer.py b/vllm/distributed/kv_transfer/kv_connector/v1/offloading/wave_slicer.py
+index 190092c..9da09bb 100644
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/offloading/wave_slicer.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/offloading/wave_slicer.py
+@@ -38,6 +38,9 @@ class WaveSpec:
+     load_job_id: int | None = None
+     # Steps this wave made no progress so far (see _wave_retry); never reset.
+     retry_count: int = 0
++    # time.monotonic() of this wave's first no-progress step; bounds how long
++    # it may keep retrying before the engine is killed (WAVE_STUCK_S).
++    first_retry_at: float | None = None
+ 
+ 
+ def slice_group_into_waves(
