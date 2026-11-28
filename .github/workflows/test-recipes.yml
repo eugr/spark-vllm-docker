@@ -19,6 +19,7 @@ on:
       - 'hf-cache.py'
       - 'recipes/**'
       - 'mods/memory-profile/**'
+      - 'mods/fix-glm-4.7-flash-AWQ/**'
       - 'tests/**'
       - '.github/workflows/test-recipes.yml'
   pull_request:
@@ -38,6 +39,7 @@ on:
       - 'hf-cache.py'
       - 'recipes/**'
       - 'mods/memory-profile/**'
+      - 'mods/fix-glm-4.7-flash-AWQ/**'
       - 'tests/**'
       - '.github/workflows/test-recipes.yml'
   workflow_dispatch:
@@ -72,6 +74,9 @@ jobs:
     
     - name: Test per-device CUDA kernel target selection
       run: python3 tests/test_blackwell_target_union.py
+
+    - name: Test GLM-4.7 Flash AWQ mod
+      run: bash tests/test_fix_glm47_flash_awq_mod.sh
 
     - name: Test Hugging Face cache ownership repair
       run: python3 tests/test_hf_download_permissions.py
