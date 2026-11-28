@@ -2431,6 +2431,10 @@ The repository includes several pre-configured mods in the `mods/` directory:
 
 - **fix-Salyut1-GLM-4.7-NVFP4/**: Fixes the GLM4MoE parser for Salyut1/GLM-4.7-NVFP4 fused QKV quantization.
 - **fix-glm-4.7-flash-AWQ/**: Applies GLM-4.7-Flash-AWQ compatibility and performance fixes.
+- **fix-glm47-phantom-fallback/**: Rescues the prose the glm47 tool-call parser swallows
+  when the model writes a stray tool-call opener and never closes it: the prose is returned
+  as regular message content instead of being dropped (streaming) or turned into a bogus
+  tool call (non-streaming). Experimental (issue #465).
 - **fix-qwen3.5-chat-template/** and **fix-qwen3.6-chat-template/**: Install fixed chat templates used by the Qwen3.5 and Qwen3.6 recipes.
 - **fix-qwen3.5-autoround/** and **fix-qwen35-tp4-marlin/**: Model-specific Qwen AutoRound and Marlin compatibility fixes. The Intel Qwen3-Coder-Next AutoRound recipe uses vLLM's built-in INC router support.
 - **fix-qwen3-coder-next/**: Qwen3-Coder-Next runtime and performance fixes.
