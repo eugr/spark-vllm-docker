@@ -90,7 +90,9 @@ elif tool == "docker":
     if node not in settings.get("docker_ineffective", []):
         fixed_marker(fields["src"]).touch()
 elif tool == "uvx":
-    assert args == ["hf", "download", "org/model"], args
+    assert args[:3] == ["hf", "download", "org/model"], args
+    # Only an explicit worker limit may extend the default hf command.
+    assert args[3:] == [] or (len(args) == 5 and args[3] == "--max-workers"), args
     Path(os.environ["TEST_HUB"], "models--org--model").mkdir(parents=True, exist_ok=True)
 elif tool == "ssh":
     assert args[:2] == ["-o", "BatchMode=yes"], args
@@ -423,6 +425,44 @@ class CachePermissionsTests(unittest.TestCase):
                 self.assertFalse(self.calls_for("sudo"))
                 self.assertFalse(self.calls_for("uvx"))
 
+    def uvx_args(self):
+        return [call["args"] for call in self.calls_for("uvx")]
+
+    def test_max_workers_defaults_to_hf_behavior(self):
+        self.env.pop("HF_MAX_WORKERS", None)
+        self.run_download()
+        self.assertEqual(self.uvx_args(), [["hf", "download", "org/model"]])
+
+    def test_max_workers_from_cli_and_environment(self):
+        cases = [(("--max-workers", "2"), None, "2"),
+                 ((), "3", "3"),
+                 (("--max-workers", "1"), "4", "1")]
+        for flags, env_value, expected in cases:
+            with self.subTest(flags=flags, env=env_value):
+                if env_value is None:
+                    self.env.pop("HF_MAX_WORKERS", None)
+                else:
+                    self.env["HF_MAX_WORKERS"] = env_value
+                self.run_download(*flags)
+                self.assertEqual(self.uvx_args(),
+                                 [["hf", "download", "org/model", "--max-workers", expected]])
+
+    def test_invalid_max_workers_fail_before_download(self):
+        cases = [(("--max-workers", "0"), None), (("--max-workers", "-1"), None),
+                 (("--max-workers", "abc"), None), (("--max-workers",), None),
+                 (("--max-workers", "2x"), None), ((), "0"), ((), "abc"),
+                 (("--delete", "--force", "--max-workers", "2"), None)]
+        for flags, env_value in cases:
+            with self.subTest(flags=flags, env=env_value):
+                if env_value is None:
+                    self.env.pop("HF_MAX_WORKERS", None)
+                else:
+                    self.env["HF_MAX_WORKERS"] = env_value
+                self.run_download(*flags, success=False)
+                self.assertRegex(self.output, r"--max-workers|HF_MAX_WORKERS")
+                self.assertNotIn("Unknown option", self.output)
+                self.assertFalse(self.calls_for("uvx"))
+                self.assertFalse(self.calls_for("find"))
 
 if __name__ == "__main__":
     unittest.main()
