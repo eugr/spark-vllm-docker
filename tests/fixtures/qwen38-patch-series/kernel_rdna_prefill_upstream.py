@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-# Excerpt from upstream b409a4f0d787fdddb75ec2e8ddb6dfcfd36235b7.
+# Excerpt from upstream 8a60de0605eaf0490a0784d47d29b3ae37cc8a1d.
 from __future__ import annotations
 
 class KernelConfig:
@@ -27,11 +27,23 @@ class KernelConfig:
       the budget
     """
 
+    b12x_moe_uncompressed_scales: bool = False
+    """Decode `csf`-compressed NVFP4 MoE block scales at load. By default the
+    B12X MoE backend keeps them compressed on the GPU and expands the routed
+    experts' scales on each call, which saves memory (2.57 GiB on
+    Qwen3.8-Flash-Next-FP4-Local) at some latency at higher batch sizes."""
+
     @field_validator("moe_backend", mode="before")
     @classmethod
     def _normalize_moe_backend(cls, value: Any) -> Any:
         if isinstance(value, str):
             return value.lower().replace("-", "_")
+        return value
+
+    @field_validator("moe_backend")
+    @classmethod
+    def _validate_moe_backend(cls, value: str) -> str:
+        validate_moe_backend(value)
         return value
 
     @field_validator("linear_backend", mode="before")

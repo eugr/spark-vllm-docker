@@ -4,15 +4,15 @@ Subject: [PATCH] [Kernel] Allow steering the unquantized linear backend independ
 Upstream-PR: https://github.com/vllm-project/vllm/pull/59021
 Upstream-Commit: 7563f2b33f213c7ed6dfd2377f14b8da084fbfb4
 Integration-Base: 8084f0624dba24aba6ebac62d8e10cc00730a0fe
-Refresh-Base: b409a4f0d787fdddb75ec2e8ddb6dfcfd36235b7
+Refresh-Base: 8a60de0605eaf0490a0784d47d29b3ae37cc8a1d
 
 Preserve upstream RDNA hybrid prefill dequantization settings and validation.
 
 diff --git a/vllm/config/kernel.py b/vllm/config/kernel.py
-index 3e8e5e6d92d414d2d162407cfa460172b46ed978..49b8fcd3197d9b5cca8ed83d0102eb06385bb893 100644
+index b70e2451eb9b9cc4f804f138af4f9c40da7a118f..f59f8a939df4656c018d7757dff160955452ed45 100644
 --- a/vllm/config/kernel.py
 +++ b/vllm/config/kernel.py
-@@ -478,6 +478,11 @@ class KernelConfig:
+@@ -507,6 +507,11 @@ class KernelConfig:
      precedence over `linear_backend`; for example,
      `{"nvfp4_w4a16": "humming"}`."""
 
@@ -24,8 +24,8 @@ index 3e8e5e6d92d414d2d162407cfa460172b46ed978..49b8fcd3197d9b5cca8ed83d0102eb06
      rdna_hybrid_w4a16_prefill_dequant: RDNAHybridW4A16PrefillDequantMode = "disable"
      """Cache a dense dequantized copy of each weight for the RDNA hybrid W4A16
      linear kernel's prefill GEMM. Applies only on gfx11/gfx12 RDNA GPUs, where
-@@ -507,7 +512,7 @@ class KernelConfig:
-             return value.lower().replace("-", "_")
+@@ -542,7 +547,7 @@ class KernelConfig:
+         validate_moe_backend(value)
          return value
 
 -    @field_validator("linear_backend", mode="before")

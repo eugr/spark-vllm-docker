@@ -4,7 +4,7 @@ Subject: [PATCH] [Kernel][Quant][MoE] Per-forward NVFP4 W4A4/W4A16 selection for
 Upstream-PR: https://github.com/vllm-project/vllm/pull/54617
 Upstream-Commit: 69d21d81808bcea2de3b97a0b68c97545808a043
 Integration-Base: 8084f0624dba24aba6ebac62d8e10cc00730a0fe
-Refresh-Base: e4ac319d203f3dad675d71b0b36e35e293ec291f
+Refresh-Base: 8a60de0605eaf0490a0784d47d29b3ae37cc8a1d
 
 Preserve the expanded upstream MonoKernel documentation.
 
@@ -278,10 +278,10 @@ index 0000000000000000000000000000000000000000..bb58ef9015b5678c21be7faee78073ed
 +    assert err.mean() < 2.5e-1, f"mean rel err {err.mean():.3e}"
 +    assert torch.equal(outs[0], outs[2])
 diff --git a/vllm/config/kernel.py b/vllm/config/kernel.py
-index cb94f4a81f0bd6f50414b21a4835e5dcb3b40599..342ad0d8d44ebcda185e68ed5e0cee4a45afc2ac 100644
+index 2d50acdc00fd1cda762e9a2457a8d13c17f92507..b70e2451eb9b9cc4f804f138af4f9c40da7a118f 100644
 --- a/vllm/config/kernel.py
 +++ b/vllm/config/kernel.py
-@@ -137,6 +137,7 @@ MoEBackend = Literal[
+@@ -137,6 +137,7 @@ InTreeMoEBackend = Literal[
      "flashinfer_cutedsl",
      "flashinfer_moe_ep_cutedsl",
      "flashinfer_b12x",
@@ -289,7 +289,7 @@ index cb94f4a81f0bd6f50414b21a4835e5dcb3b40599..342ad0d8d44ebcda185e68ed5e0cee4a
      "b12x",
      "flashinfer_moe_ep_mega_deep_gemm",
      "marlin",
-@@ -342,6 +343,17 @@ class KernelConfig:
+@@ -359,6 +360,17 @@ class KernelConfig:
      models, hardware and parallel layouts support it is model-specific; an
      unsupported deployment is refused at startup."""
  
@@ -305,9 +305,9 @@ index cb94f4a81f0bd6f50414b21a4835e5dcb3b40599..342ad0d8d44ebcda185e68ed5e0cee4a
 +    """FlashInfer W4A4 backend for moe_backend="flashinfer_cutile"."""
 +
      moe_backend: MoEBackend = "auto"
-     """Backend for MoE expert computation kernels. Available options:
- 
-@@ -365,6 +377,9 @@ class KernelConfig:
+     """Backend for MoE expert computation kernels. Out-of-tree platforms can
+     add names to the in-tree options:
+@@ -383,6 +395,9 @@ class KernelConfig:
        or MXFP4 weights on Hopper; requires expert parallelism and NVSHMEM
      - "flashinfer_b12x": Use FlashInfer CuteDSL fused MoE for SM12x
        (RTX Pro 6000 / DGX Spark)
